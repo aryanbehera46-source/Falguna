@@ -83,8 +83,9 @@ class StructuredEditWorker(WorkerAdapter):
                     {
                         "role": "system",
                         "content": (
-                            "You are a bounded repository editor. Return complete replacement contents only for files "
-                            "that must change. Do not invent files, omit requested behavior, weaken tests, or include markdown."
+                            "You are a bounded repository editor. Return minimal exact old-to-new text patches. Each old "
+                            "snippet must occur exactly once in its file. Preserve all unrelated text byte-for-byte. "
+                            "Do not invent files, weaken tests, or include markdown."
                         ),
                     },
                     {
@@ -101,17 +102,21 @@ class StructuredEditWorker(WorkerAdapter):
                             "type": "object",
                             "properties": {
                                 "summary": {"type": "string"},
-                                "edits": {
+                                "patches": {
                                     "type": "array",
                                     "items": {
                                         "type": "object",
-                                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                                        "required": ["path", "content"],
+                                        "properties": {
+                                            "path": {"type": "string"},
+                                            "old": {"type": "string"},
+                                            "new": {"type": "string"},
+                                        },
+                                        "required": ["path", "old", "new"],
                                         "additionalProperties": False,
                                     },
                                 },
                             },
-                            "required": ["summary", "edits"],
+                            "required": ["summary", "patches"],
                             "additionalProperties": False,
                         },
                     },
@@ -123,21 +128,26 @@ class StructuredEditWorker(WorkerAdapter):
                 raise ValueError("model refused bounded edit")
             response = json.loads(message["content"])
             allowed = set(self.editable_files)
-            edits = response["edits"]
-            if not edits:
-                raise ValueError("model returned no edits")
-            seen = set()
+            patches = response["patches"]
+            if not patches:
+                raise ValueError("model returned no patches")
             changed = 0
-            for edit in edits:
-                relative = edit["path"]
-                if relative not in allowed or relative in seen:
-                    raise ValueError(f"unapproved or duplicate edit path: {relative}")
-                seen.add(relative)
+            contents = dict(files)
+            for patch in patches:
+                relative = patch["path"]
+                if relative not in allowed:
+                    raise ValueError(f"unapproved edit path: {relative}")
                 target = (root / relative).resolve()
                 if target != root and root not in target.parents:
                     raise ValueError(f"edit path escapes worktree: {relative}")
-                if target.read_text(encoding="utf-8") != edit["content"]:
-                    target.write_text(edit["content"], encoding="utf-8")
+                old = patch["old"]
+                new = patch["new"]
+                if not old or old == new or contents[relative].count(old) != 1:
+                    raise ValueError(f"patch old text must match exactly once and change content: {relative}")
+                contents[relative] = contents[relative].replace(old, new, 1)
+            for relative, content in contents.items():
+                if content != files[relative]:
+                    (root / relative).write_text(content, encoding="utf-8")
                     changed += 1
             if not changed:
                 raise ValueError("model edits made no changes")

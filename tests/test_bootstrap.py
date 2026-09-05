@@ -114,7 +114,7 @@ class BootstrapTests(unittest.TestCase):
         def response(config, payload, timeout):
             self.assertEqual(set(json.loads(payload["messages"][1]["content"])["editable_files"]), {"falguna/feature.py"})
             return {
-                "choices": [{"message": {"content": json.dumps({"summary": "set value", "edits": [{"path": "falguna/feature.py", "content": "VALUE = 2\n"}]})}}],
+                "choices": [{"message": {"content": json.dumps({"summary": "set value", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2"}]})}}],
                 "usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {"cached_tokens": 10}},
             }
         worker = StructuredEditWorker(gateway, ["falguna/feature.py"], transport=response)
@@ -126,11 +126,20 @@ class BootstrapTests(unittest.TestCase):
     def test_structured_worker_rejects_unapproved_path(self):
         gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
         def response(config, payload, timeout):
-            return {"choices": [{"message": {"content": json.dumps({"summary": "bad", "edits": [{"path": ".env", "content": "SECRET=x\n"}]})}}]}
+            return {"choices": [{"message": {"content": json.dumps({"summary": "bad", "patches": [{"path": ".env", "old": "x", "new": "SECRET=x"}]})}}]}
         worker = StructuredEditWorker(gateway, ["falguna/feature.py"], transport=response)
         result = worker.execute(self.repo, "bounded edit", "test-run")
         self.assertFalse(result.success)
         self.assertFalse((self.repo / ".env").exists())
+
+    def test_structured_worker_rejects_non_unique_patch(self):
+        gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
+        def response(config, payload, timeout):
+            return {"choices": [{"message": {"content": json.dumps({"summary": "ambiguous", "patches": [{"path": "falguna/feature.py", "old": " ", "new": "  "}]})}}]}
+        worker = StructuredEditWorker(gateway, ["falguna/feature.py"], transport=response)
+        result = worker.execute(self.repo, "bounded edit", "test-run")
+        self.assertFalse(result.success)
+        self.assertEqual((self.repo / "falguna" / "feature.py").read_text(), "VALUE = 1\n")
 
 
 if __name__ == "__main__":
