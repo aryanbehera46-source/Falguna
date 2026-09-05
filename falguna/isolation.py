@@ -70,10 +70,14 @@ class ProcessIsolator:
             safe_env.update(env)
             argv = list(spec.argv)
             backend = "resource-limits-only"
-            if platform.system() == "Darwin" and shutil.which("sandbox-exec") and network_mode == "deny":
+            inherited_seatbelt = os.environ.get("FALGUNA_SEATBELT_ACTIVE") == "1"
+            if platform.system() == "Darwin" and inherited_seatbelt:
+                backend = "inherited-macos-seatbelt"
+            elif platform.system() == "Darwin" and shutil.which("sandbox-exec") and network_mode == "deny":
                 profile = self._seatbelt_profile(home, network_mode)
                 argv = ["sandbox-exec", "-p", profile, *argv]
                 backend = "macos-seatbelt"
+                safe_env["FALGUNA_SEATBELT_ACTIVE"] = "1"
             elif platform.system() == "Darwin" and network_mode == "loopback":
                 backend = "application-loopback-policy+resource-limits"
             process = subprocess.Popen(argv, cwd=self.worktree, env=safe_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=self._limit_resources, start_new_session=True)
@@ -84,7 +88,7 @@ class ProcessIsolator:
                 os.killpg(process.pid, signal.SIGKILL)
                 stdout, stderr = process.communicate()
                 completed = subprocess.CompletedProcess(spec.argv, 124, (exc.stdout or "") + (stdout or ""), (exc.stderr or "") + (stderr or "") + "\ncommand timed out and process group was contained")
-            write_scope = f"{self.worktree} and private temp home" if backend == "macos-seatbelt" else "application policy only for browser subprocesses"
+            write_scope = f"{self.worktree} and private temp home" if backend in {"macos-seatbelt", "inherited-macos-seatbelt"} else "application policy only for browser subprocesses"
             limits = "cpu and address-space; process count is not safely per-tree on Darwin" if platform.system() == "Darwin" else "cpu, address-space, and process count"
             evidence = IsolationEvidence(platform.system(), backend, network_mode, write_scope, resource_limits=limits)
             return completed, evidence

@@ -226,7 +226,7 @@ class BootstrapTests(unittest.TestCase):
             completed = terminal.run(CommandSpec(["python3", "probe.py"], 30, "containment-probe"))
         finally:
             os.environ.pop("FALGUNA_HOST_SECRET_TEST", None)
-        if terminal.last_isolation_evidence.backend == "macos-seatbelt":
+        if terminal.last_isolation_evidence.backend in {"macos-seatbelt", "inherited-macos-seatbelt"}:
             self.assertNotEqual(completed.returncode, 0)
             self.assertFalse(marker.exists())
         else:
