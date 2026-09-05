@@ -78,7 +78,7 @@ class ControlPlane:
                     self.audit.append("WORKER_ATTEMPT", {"run_id": run_id, "attempt": attempt, "success": result.success, "exit_code": result.exit_code})
                     for call in result.model_calls:
                         self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": call.get("purpose", "implementation"), "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
-                    if result.cost_usd:
+                    if result.model_calls or result.cost_usd:
                         self.store.create("cost_events", {"run_id": run_id, "category": "MODEL", "amount_usd": result.cost_usd, "metadata_json": json.dumps({"attempt": attempt}), "created_at": utcnow()})
                     if result.cost_usd > policy.max_cost_usd:
                         raise PolicyViolation("run cost cap exceeded")
@@ -115,7 +115,7 @@ class ControlPlane:
                     self.audit.append("REPAIR_ATTEMPT", {"run_id": run_id, "attempt": current_attempt + 1, "success": repair.success, "exit_code": repair.exit_code})
                     for call in repair.model_calls:
                         self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": "repair", "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
-                    if repair.cost_usd:
+                    if repair.model_calls or repair.cost_usd:
                         self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REPAIR", "amount_usd": repair.cost_usd, "metadata_json": json.dumps({"attempt": current_attempt + 1}), "created_at": utcnow()})
                     total_cost = sum(float(event["amount_usd"]) for event in self.store.list("cost_events", "run_id=?", (run_id,)))
                     if total_cost > policy.max_cost_usd:
@@ -139,7 +139,7 @@ class ControlPlane:
                     self._record_artifact(run_id, "REVIEW_CALIBRATION", calibration_path)
                     for call in calibration["model_calls"]:
                         self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": "review-calibration", "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
-                    if calibration["cost_usd"]:
+                    if calibration["model_calls"] or calibration["cost_usd"]:
                         self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REVIEW_CALIBRATION", "amount_usd": calibration["cost_usd"], "metadata_json": json.dumps({"cases": calibration["total"]}), "created_at": utcnow()})
                     calibration_total = sum(float(event["amount_usd"]) for event in self.store.list("cost_events", "run_id=?", (run_id,)))
                     if calibration_total > policy.max_cost_usd:
@@ -158,7 +158,7 @@ class ControlPlane:
                 self._record_artifact(run_id, "REVIEW", evidence_dir / "review.json")
                 for call in review.model_calls:
                     self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": call.get("purpose", "independent-semantic-review"), "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
-                if review.cost_usd:
+                if review.model_calls or review.cost_usd:
                     self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REVIEW", "amount_usd": review.cost_usd, "metadata_json": "{}", "created_at": utcnow()})
                 total_cost = sum(float(event["amount_usd"]) for event in self.store.list("cost_events", "run_id=?", (run_id,)))
                 if total_cost > policy.max_cost_usd:

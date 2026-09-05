@@ -14,6 +14,7 @@ from falguna.review import CalibrationCase, ModelSemanticReviewer, ReviewerCalib
 from falguna.runtime import open_control_plane
 from falguna.workers import ScriptedWorker, StructuredEditWorker
 from falguna.gateway import OpenAICompatibleGateway
+from falguna.codex_transport import CodexCliJSONTransport
 from falguna.workers import AiderWorker
 
 
@@ -242,6 +243,17 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual((result["false_accepts"], result["false_rejects"]), (0, 0))
         self.assertNotIn("reasoning", result["cases"][0])
+
+    def test_codex_transport_extracts_strict_json_and_subscription_metadata(self):
+        def runner(argv, **kwargs):
+            output = Path(argv[argv.index("--output-last-message") + 1])
+            output.write_text(json.dumps({"summary": "ok"}))
+            return subprocess.CompletedProcess(argv, 0, '{"usage":{"input_tokens":12,"output_tokens":3}}\n', '')
+        transport = CodexCliJSONTransport(Path("/bin/echo"), Path(self.temp.name), runner=runner)
+        decoded = transport({"model": "test"}, {"messages": [{"role": "user", "content": "test"}], "response_format": {"json_schema": {"schema": {"type": "object"}}}}, 30)
+        self.assertEqual(decoded["usage"]["prompt_tokens"], 12)
+        self.assertEqual(decoded["_falguna_cost_usd"], 0.0)
+        self.assertEqual(decoded["_falguna_provider"], "codex-cli-subscription")
 
     def test_command_policy_blocks_inline_code_and_external_resource(self):
         terminal = TerminalCapability(PermissionEngine(self.repo, self.policy))

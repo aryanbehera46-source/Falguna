@@ -155,15 +155,17 @@ class StructuredEditWorker(WorkerAdapter):
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             completion_tokens = int(usage.get("completion_tokens", 0))
             cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
-            cost = max(0, prompt_tokens - cached_tokens) * 0.75e-6 + cached_tokens * 0.075e-6 + completion_tokens * 4.50e-6
+            calculated_cost = max(0, prompt_tokens - cached_tokens) * 0.75e-6 + cached_tokens * 0.075e-6 + completion_tokens * 4.50e-6
+            cost = float(decoded.get("_falguna_cost_usd", calculated_cost))
+            transport_metadata = decoded.get("_falguna_metadata", {})
             call = {
-                "provider": "openai-compatible",
+                "provider": decoded.get("_falguna_provider", "openai-compatible"),
                 "model": config["model"],
                 "purpose": "implementation",
                 "input_tokens": prompt_tokens,
                 "output_tokens": completion_tokens,
                 "cost_usd": cost,
-                "metadata": {"adapter": "structured-edit", "cached_input_tokens": cached_tokens},
+                "metadata": {"adapter": "structured-edit", "cached_input_tokens": cached_tokens, **transport_metadata},
             }
             return WorkerResult(True, response["summary"], 0, [call], cost)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, OSError, urllib.error.URLError) as exc:

@@ -28,3 +28,5 @@ On this Intel Mac, native child commands run under the built-in Seatbelt sandbox
 Browser preflight ties the local Playwright CLI to the committed manifest and lockfile, validates the exact Chromium revision in the standard cache, and records whether an offline cached install was needed. Browser verification carries an active Playwright request allowlist: loopback requests continue and a harmless external request is aborted and evidenced. This is application/runtime enforcement, not a macOS kernel network sandbox.
 
 Independent reviewers can be calibrated through the same replaceable adapter against labeled correct, incomplete, and unsafe candidates. Calibration persists structured verdicts, evidence, blocking findings, uncertainty, confusion-matrix counts, usage, and cost—never hidden reasoning.
+
+Where a metered API credential is unavailable, the optional `CodexCliJSONTransport` can use the already authenticated local Codex runtime in ephemeral read-only mode. It preserves the structured worker/reviewer contracts and records subscription-backed calls with zero additional cash cost; it does not copy account credentials into candidate worktrees.
