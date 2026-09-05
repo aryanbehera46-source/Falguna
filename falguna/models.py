@@ -34,6 +34,9 @@ class RunPolicy:
     allow_network: bool = False
     browser_project_roots: List[str] = field(default_factory=lambda: [".", "browser-tests", "frontend", "web", "app", "client", "ui"])
     browser_base_url: Optional[str] = None
+    browser_require_lockfile: bool = True
+    browser_cached_install_allowed: bool = False
+    browser_external_probe_required: bool = False
     max_memory_mb: int = 1024
     max_processes: int = 64
 

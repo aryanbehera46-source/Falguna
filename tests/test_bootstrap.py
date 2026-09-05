@@ -10,7 +10,7 @@ from falguna.models import CommandSpec, ReviewResult, RunPolicy, WorkerResult
 from falguna.policy import PermissionEngine, PolicyViolation
 from falguna.browser import BrowserDiscovery
 from falguna.capabilities import TerminalCapability
-from falguna.review import ModelSemanticReviewer, ScriptedSemanticReviewer, SemanticIndependentReviewer
+from falguna.review import CalibrationCase, ModelSemanticReviewer, ReviewerCalibrator, ScriptedSemanticReviewer, SemanticIndependentReviewer
 from falguna.runtime import open_control_plane
 from falguna.workers import ScriptedWorker, StructuredEditWorker
 from falguna.gateway import OpenAICompatibleGateway
@@ -160,12 +160,35 @@ class BootstrapTests(unittest.TestCase):
     def test_browser_discovery_supports_nested_manifest_without_fixed_executable(self):
         web = self.repo / "web"
         web.mkdir()
-        (web / "package.json").write_text(json.dumps({"scripts": {"test:e2e": "playwright test"}}))
+        (web / "package.json").write_text(json.dumps({"scripts": {"test:e2e": "playwright test"}, "devDependencies": {"@playwright/test": "1.62.1"}}))
+        (web / "package-lock.json").write_text(json.dumps({"packages": {"node_modules/@playwright/test": {"version": "1.62.1"}}}))
+        cli = web / "node_modules" / ".bin" / "playwright"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("#!/bin/sh\necho 'Version 1.62.1'\n")
+        cli.chmod(0o755)
+        metadata = web / "node_modules" / "playwright-core" / "browsers.json"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(json.dumps({"browsers": [{"name": "chromium-headless-shell", "revision": "1234"}]}))
+        cache = Path(self.temp.name) / "browser-cache"
+        executable = cache / "chromium_headless_shell-1234" / "chrome-headless-shell"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("binary")
+        executable.chmod(0o755)
+        previous = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(cache)
         policy = RunPolicy(browser_base_url="http://127.0.0.1:4173", browser_project_roots=["web"])
-        plan = BrowserDiscovery(self.repo, policy).discover()
+        try:
+            plan = BrowserDiscovery(self.repo, policy).discover()
+        finally:
+            if previous is None:
+                os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+            else:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = previous
         self.assertEqual(plan.project_root, "web")
         self.assertEqual(plan.command.argv[:5], ["npm", "--prefix", "web", "run", "test:e2e"])
         self.assertNotIn(str(self.repo), plan.command.argv)
+        self.assertEqual(plan.provisioning["status"], "READY_CACHED")
+        self.assertFalse(plan.provisioning["network_install_required"])
 
     def test_browser_discovery_blocks_external_target(self):
         policy = RunPolicy(browser_base_url="https://example.com", browser_project_roots=["."])
@@ -199,6 +222,26 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(result.approved)
         self.assertEqual(result.model_calls[0]["purpose"], "independent-semantic-review")
         self.assertGreater(result.cost_usd, 0)
+
+    def test_reviewer_calibration_measures_false_accepts_and_false_rejects(self):
+        def callback(requirement, diff, changed, verification):
+            approved = "complete" in requirement and "unsafe" not in diff
+            dimensions = {
+                "requirement_satisfaction": {"passed": approved, "evidence": "labeled fixture evidence"},
+                "scope_compliance": {"passed": "unsafe" not in diff, "evidence": "bounded fixture scope"},
+                "regression_evidence": {"passed": verification["passed"], "evidence": "fixture verification"},
+                "unresolved_uncertainty": {"passed": approved, "evidence": "none" if approved else "fixture incomplete"},
+            }
+            return ReviewResult(approved, "fixture verdict", [] if approved else ["candidate incomplete or unsafe"], dimensions, [] if approved else ["fixture uncertainty"])
+        cases = [
+            CalibrationCase("correct", True, "complete change", "safe diff", ["falguna/x.py"], {"passed": True}),
+            CalibrationCase("incomplete", False, "partial change", "safe diff", ["falguna/x.py"], {"passed": True}),
+            CalibrationCase("unsafe", False, "complete change", "unsafe policy bypass", ["falguna/x.py"], {"passed": True}),
+        ]
+        result = ReviewerCalibrator(ScriptedSemanticReviewer(callback)).run(cases)
+        self.assertTrue(result["passed"])
+        self.assertEqual((result["false_accepts"], result["false_rejects"]), (0, 0))
+        self.assertNotIn("reasoning", result["cases"][0])
 
     def test_command_policy_blocks_inline_code_and_external_resource(self):
         terminal = TerminalCapability(PermissionEngine(self.repo, self.policy))

@@ -9,16 +9,17 @@ from .models import RunPolicy, RunStatus
 from .policy import PolicyViolation
 from .store import StateStore, utcnow
 from .verification import DefinitionOfDone
-from .review import SemanticIndependentReviewer
+from .review import ReviewerCalibrator, SemanticIndependentReviewer
 from .workers import WorkerAdapter
 
 
 class ControlPlane:
-    def __init__(self, store: StateStore, audit: AuditLog, state_root: Path, reviewer=None):
+    def __init__(self, store: StateStore, audit: AuditLog, state_root: Path, reviewer=None, calibration_cases=None):
         self.store = store
         self.audit = audit
         self.state_root = Path(state_root)
         self.reviewer = reviewer or SemanticIndependentReviewer()
+        self.calibration_cases = list(calibration_cases or [])
 
     def create_mission(self, title: str, requirement: str, repository: Path, policy: RunPolicy) -> dict:
         now = utcnow()
@@ -130,6 +131,21 @@ class ControlPlane:
                 stage, payload = "VERIFIED", {"worktree": str(worktree), "changed_files": changed}
             if stage == "VERIFIED":
                 self.store.update("runs", run_id, status=RunStatus.REVIEWING.value)
+                if self.calibration_cases:
+                    calibration = ReviewerCalibrator(self.reviewer).run(self.calibration_cases)
+                    evidence_dir = self.state_root / "evidence" / run_id
+                    calibration_path = evidence_dir / "review-calibration.json"
+                    calibration_path.write_text(json.dumps({key: value for key, value in calibration.items() if key not in {"model_calls", "cost_usd"}}, indent=2, sort_keys=True))
+                    self._record_artifact(run_id, "REVIEW_CALIBRATION", calibration_path)
+                    for call in calibration["model_calls"]:
+                        self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": "review-calibration", "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
+                    if calibration["cost_usd"]:
+                        self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REVIEW_CALIBRATION", "amount_usd": calibration["cost_usd"], "metadata_json": json.dumps({"cases": calibration["total"]}), "created_at": utcnow()})
+                    calibration_total = sum(float(event["amount_usd"]) for event in self.store.list("cost_events", "run_id=?", (run_id,)))
+                    if calibration_total > policy.max_cost_usd:
+                        raise PolicyViolation("cumulative run cost cap exceeded during reviewer calibration")
+                    if not calibration["passed"]:
+                        raise RuntimeError(f"independent reviewer failed calibration: {calibration['false_accepts']} false accepts, {calibration['false_rejects']} false rejects")
                 changed = payload.get("changed_files") or manager.changed_files(worktree)
                 diff = manager.diff(worktree)
                 verification_path = self.state_root / "evidence" / run_id / "verification.json"

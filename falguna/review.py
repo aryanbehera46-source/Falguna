@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import json
+from dataclasses import dataclass
 from typing import List
 
 from .gateway import ModelGateway
@@ -11,6 +12,59 @@ class ReviewerAdapter(ABC):
     @abstractmethod
     def review(self, requirement: str, diff: str, changed_files: List[str], verification: dict) -> ReviewResult:
         raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class CalibrationCase:
+    name: str
+    expected_approved: bool
+    requirement: str
+    diff: str
+    changed_files: List[str]
+    verification: dict
+
+
+class ReviewerCalibrator:
+    """Measures a reviewer against labeled cases and retains verdict evidence only."""
+
+    def __init__(self, reviewer: ReviewerAdapter):
+        self.reviewer = reviewer
+
+    def run(self, cases: List[CalibrationCase]) -> dict:
+        outcomes = []
+        false_accepts = 0
+        false_rejects = 0
+        calls = []
+        cost = 0.0
+        for case in cases:
+            result = self.reviewer.review(case.requirement, case.diff, case.changed_files, case.verification)
+            if result.approved and not case.expected_approved:
+                false_accepts += 1
+            if not result.approved and case.expected_approved:
+                false_rejects += 1
+            calls.extend(result.model_calls)
+            cost += result.cost_usd
+            outcomes.append({
+                "name": case.name,
+                "expected_approved": case.expected_approved,
+                "actual_approved": result.approved,
+                "matched": result.approved == case.expected_approved,
+                "summary": result.summary,
+                "blocking_findings": result.findings,
+                "unresolved_uncertainty": result.unresolved_uncertainty,
+                "dimensions": result.dimensions,
+            })
+        return {
+            "total": len(cases),
+            "correct": sum(item["matched"] for item in outcomes),
+            "false_accepts": false_accepts,
+            "false_rejects": false_rejects,
+            "passed": bool(cases) and false_accepts == 0 and false_rejects == 0,
+            "cases": outcomes,
+            "model_calls": calls,
+            "cost_usd": cost,
+            "persisted_reasoning": "verdicts, evidence, findings, and uncertainty only",
+        }
 
 
 class SemanticIndependentReviewer(ReviewerAdapter):

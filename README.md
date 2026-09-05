@@ -22,3 +22,9 @@ Browser verification is discovered from an explicit localhost URL and a project 
 Independent review is replaceable and fail-closed. A semantic reviewer must return concise structured verdicts for requirement satisfaction, scope, regression evidence, and unresolved uncertainty. Hidden reasoning is neither requested nor persisted.
 
 On this Intel Mac, native child commands run under the built-in Seatbelt sandbox with writes limited to the worktree/private temporary home and network denied, plus a scrubbed environment, timeouts, and supported resource limits. Chromium cannot reliably start under that deprecated Seatbelt interface, so browser verification uses an application-enforced localhost target plus secret scrubbing, process-group timeout containment, and CPU/address-space limits. macOS does not provide a safe per-process-tree `RLIMIT_NPROC`, and this bootstrap does not claim VM/container-grade kernel isolation. Synthetic local work remains the safety boundary.
+
+## Bootstrap v0.3 reliability boundaries
+
+Browser preflight ties the local Playwright CLI to the committed manifest and lockfile, validates the exact Chromium revision in the standard cache, and records whether an offline cached install was needed. Browser verification carries an active Playwright request allowlist: loopback requests continue and a harmless external request is aborted and evidenced. This is application/runtime enforcement, not a macOS kernel network sandbox.
+
+Independent reviewers can be calibrated through the same replaceable adapter against labeled correct, incomplete, and unsafe candidates. Calibration persists structured verdicts, evidence, blocking findings, uncertainty, confusion-matrix counts, usage, and cost—never hidden reasoning.
