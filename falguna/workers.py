@@ -25,12 +25,15 @@ class AiderWorker(WorkerAdapter):
         config = self.gateway.configuration()
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(worktree / ".falguna-home"), "LANG": "C.UTF-8"}
         api_key_file = config.get("api_key_file")
-        if api_key_file:
+        localhost_proxy = config["base_url"].startswith("http://127.0.0.1:") or config["base_url"].startswith("http://localhost:")
+        if localhost_proxy:
+            env["OPENAI_API_KEY"] = "falguna-local-proxy-token"
+        elif api_key_file:
             key_path = Path(api_key_file).resolve()
             if not key_path.is_file() or key_path.stat().st_mode & 0o077:
                 return WorkerResult(False, "API key file missing or permissions are not 0600", 78)
             env["OPENAI_API_KEY"] = key_path.read_text().strip()
-        argv = [str(self.executable), "--yes-always", "--no-auto-commits", "--no-gitignore", "--model", config["model"], "--openai-api-base", config["base_url"], "--message", requirement]
+        argv = [str(self.executable), "--yes-always", "--no-auto-commits", "--no-gitignore", "--no-stream", "--no-check-update", "--no-analytics", "--model", config["model"], "--openai-api-base", config["base_url"], "--message", requirement]
         try:
             result = subprocess.run(argv, cwd=worktree, env=env, text=True, capture_output=True, timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -47,4 +50,3 @@ class ScriptedWorker(WorkerAdapter):
 
     def execute(self, worktree: Path, requirement: str, run_id: str) -> WorkerResult:
         return self.callback(worktree, requirement, run_id)
-

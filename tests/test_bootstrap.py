@@ -9,6 +9,8 @@ from falguna.models import RunPolicy, WorkerResult
 from falguna.policy import PermissionEngine, PolicyViolation
 from falguna.runtime import open_control_plane
 from falguna.workers import ScriptedWorker
+from falguna.gateway import OpenAICompatibleGateway
+from falguna.workers import AiderWorker
 
 
 def git(repo: Path, *args):
@@ -86,6 +88,12 @@ class BootstrapTests(unittest.TestCase):
         run_id = self.control.start(ids["task_id"], ScriptedWorker(wrong), "scripted-offline-test", "none", self.policy)
         self.assertEqual(self.store.get("runs", run_id)["status"], "FAILED")
         self.assertEqual(self.store.list("approvals", "run_id=?", (run_id,)), [])
+
+    def test_local_proxy_does_not_require_real_key_file(self):
+        gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
+        worker = AiderWorker(Path("/missing/aider"), gateway)
+        config = worker.gateway.configuration()
+        self.assertTrue(config["base_url"].startswith("http://127.0.0.1:"))
 
 
 if __name__ == "__main__":
