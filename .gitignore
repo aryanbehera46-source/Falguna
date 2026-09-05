@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.falguna/
+.falguna-home/
+.aider*
+.env
