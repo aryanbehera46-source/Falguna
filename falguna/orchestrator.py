@@ -83,6 +83,11 @@ class ControlPlane:
                         break
                 if not result or not result.success:
                     raise RuntimeError("worker failed within retry bound")
+                evidence_dir = self.state_root / "evidence" / run_id
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                worker_path = evidence_dir / "worker-output.txt"
+                worker_path.write_text(result.summary)
+                self._record_artifact(run_id, "WORKER_OUTPUT", worker_path)
                 self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree))
                 if force_stop_after == "WORKER_COMPLETE":
                     return run_id

@@ -52,7 +52,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(run["status"], "DONE_CANDIDATE")
         approvals = self.store.list("approvals", "run_id=?", (run_id,))
         self.assertEqual(approvals[0]["status"], "PENDING")
-        self.assertEqual(len(self.store.list("artifacts", "run_id=?", (run_id,))), 3)
+        self.assertEqual(len(self.store.list("artifacts", "run_id=?", (run_id,))), 4)
         self.assertEqual(len(self.store.list("task_steps", "task_id=?", (ids["task_id"],))), 5)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), run["head_sha"])
         self.assertTrue(AuditLog(self.repo / ".falguna" / "audit.jsonl").verify())

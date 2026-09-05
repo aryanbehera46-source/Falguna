@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -16,10 +17,11 @@ class WorkerAdapter(ABC):
 class AiderWorker(WorkerAdapter):
     """Wrapped, replaceable Aider process. It never receives host secrets by default."""
 
-    def __init__(self, executable: Path, gateway: ModelGateway, timeout_seconds: int = 600):
+    def __init__(self, executable: Path, gateway: ModelGateway, timeout_seconds: int = 600, editable_files=None):
         self.executable = Path(executable)
         self.gateway = gateway
         self.timeout_seconds = timeout_seconds
+        self.editable_files = list(editable_files or [])
 
     def execute(self, worktree: Path, requirement: str, run_id: str) -> WorkerResult:
         config = self.gateway.configuration()
@@ -33,13 +35,21 @@ class AiderWorker(WorkerAdapter):
             if not key_path.is_file() or key_path.stat().st_mode & 0o077:
                 return WorkerResult(False, "API key file missing or permissions are not 0600", 78)
             env["OPENAI_API_KEY"] = key_path.read_text().strip()
-        argv = [str(self.executable), "--yes-always", "--no-auto-commits", "--no-gitignore", "--no-stream", "--no-check-update", "--no-analytics", "--model", config["model"], "--openai-api-base", config["base_url"], "--message", requirement]
+        argv = [str(self.executable), "--yes-always", "--no-auto-commits", "--no-gitignore", "--no-stream", "--no-check-update", "--no-analytics", "--edit-format", "diff", "--model", config["model"], "--openai-api-base", config["base_url"]]
+        for path in self.editable_files:
+            argv.extend(["--file", path])
+        argv.extend(["--message", requirement])
         try:
             result = subprocess.run(argv, cwd=worktree, env=env, text=True, capture_output=True, timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
             return WorkerResult(False, "Aider timed out", 124)
         summary = (result.stdout + "\n" + result.stderr)[-12000:]
-        return WorkerResult(result.returncode == 0, summary, result.returncode)
+        token_match = re.search(r"Tokens:\s*([\d.]+)k? sent,\s*([\d.]+)k? received", summary)
+        cost_match = re.search(r"Cost:\s*\$([\d.]+) message", summary)
+        def tokens(value):
+            return int(float(value) * (1000 if "." in value else 1))
+        call = {"provider": "openai-compatible", "model": config["model"], "purpose": "implementation", "input_tokens": tokens(token_match.group(1)) if token_match else 0, "output_tokens": tokens(token_match.group(2)) if token_match else 0, "cost_usd": float(cost_match.group(1)) if cost_match else 0.0, "metadata": {"adapter": "aider"}}
+        return WorkerResult(result.returncode == 0, summary, result.returncode, [call], call["cost_usd"])
 
 
 class ScriptedWorker(WorkerAdapter):
