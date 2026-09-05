@@ -194,7 +194,7 @@ class BootstrapTests(unittest.TestCase):
         def response(config, payload, timeout):
             schema = payload["response_format"]["json_schema"]["schema"]
             self.assertIn("dimensions", schema["required"])
-            return {"choices": [{"message": {"content": json.dumps({"summary": "satisfied", "findings": [], "unresolved_uncertainty": [], "dimensions": dimensions})}}], "usage": {"prompt_tokens": 200, "completion_tokens": 50}}
+            return {"choices": [{"message": {"content": json.dumps({"summary": "satisfied", "blocking_findings": [], "unresolved_uncertainty": [], "dimensions": dimensions})}}], "usage": {"prompt_tokens": 200, "completion_tokens": 50}}
         result = ModelSemanticReviewer(gateway, transport=response).review("requirement", "diff", ["tests/test_bootstrap.py"], {"passed": True})
         self.assertTrue(result.approved)
         self.assertEqual(result.model_calls[0]["purpose"], "independent-semantic-review")

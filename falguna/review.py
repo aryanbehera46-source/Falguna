@@ -69,7 +69,7 @@ class ModelSemanticReviewer(ReviewerAdapter):
         payload = {
             "model": config["model"],
             "messages": [
-                {"role": "system", "content": "Act as an independent release reviewer. Judge only the supplied evidence. Return concise conclusions and evidence references, not private reasoning or chain of thought. Fail uncertain claims closed."},
+                {"role": "system", "content": "Act as an independent release reviewer. Judge only the supplied evidence. Put only defects that block approval in blocking_findings; put positive evidence only in dimension evidence fields. Return concise conclusions and evidence references, not private reasoning or chain of thought. Fail uncertain claims closed."},
                 {"role": "user", "content": json.dumps({"requirement": requirement, "changed_files": changed_files, "diff": diff[-30000:], "verification": verification}, ensure_ascii=False)},
             ],
             "response_format": {
@@ -81,7 +81,7 @@ class ModelSemanticReviewer(ReviewerAdapter):
                         "type": "object",
                         "properties": {
                             "summary": {"type": "string"},
-                            "findings": {"type": "array", "items": {"type": "string"}},
+                            "blocking_findings": {"type": "array", "items": {"type": "string"}},
                             "unresolved_uncertainty": {"type": "array", "items": {"type": "string"}},
                             "dimensions": {
                                 "type": "object",
@@ -90,7 +90,7 @@ class ModelSemanticReviewer(ReviewerAdapter):
                                 "additionalProperties": False,
                             },
                         },
-                        "required": ["summary", "findings", "unresolved_uncertainty", "dimensions"],
+                        "required": ["summary", "blocking_findings", "unresolved_uncertainty", "dimensions"],
                         "additionalProperties": False,
                     },
                 },
@@ -101,13 +101,13 @@ class ModelSemanticReviewer(ReviewerAdapter):
             response = json.loads(decoded["choices"][0]["message"]["content"])
             dimensions = response["dimensions"]
             uncertainty = response["unresolved_uncertainty"]
-            approved = all(item["passed"] for item in dimensions.values()) and not response["findings"] and not uncertainty
+            approved = all(item["passed"] for item in dimensions.values()) and not response["blocking_findings"] and not uncertainty
             usage = decoded.get("usage", {})
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             completion_tokens = int(usage.get("completion_tokens", 0))
             cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
             cost = max(0, prompt_tokens - cached_tokens) * 0.75e-6 + cached_tokens * 0.075e-6 + completion_tokens * 4.50e-6
             call = {"provider": "openai-compatible", "model": config["model"], "purpose": "independent-semantic-review", "input_tokens": prompt_tokens, "output_tokens": completion_tokens, "cost_usd": cost, "metadata": {"adapter": "semantic-review", "cached_input_tokens": cached_tokens}}
-            return ReviewResult(approved, response["summary"], response["findings"], dimensions, uncertainty, [call], cost)
+            return ReviewResult(approved, response["summary"], response["blocking_findings"], dimensions, uncertainty, [call], cost)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
             return ReviewResult(False, "semantic reviewer failed closed", [f"review adapter error: {exc}"], {}, ["review result unavailable"])
