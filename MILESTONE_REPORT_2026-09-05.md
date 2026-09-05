@@ -4,7 +4,7 @@ Date: 2026-09-05 (Asia/Kolkata)
 
 ## Outcome
 
-Milestones A-C and E are implemented as a working bootstrap slice. Milestone D has the localhost-only Playwright capability boundary but no browser self-build acceptance run yet. Milestone F did not reach the authoritative three-consecutive-pass threshold. **Do not claim self-building and do not merge any candidate automatically.**
+Milestones A-E are implemented as a working bootstrap slice. A corrective structured-edit worker reached the authoritative three-consecutive-pass threshold, including a forced interruption/resume and a real localhost Playwright self-build verification. **The safe bootstrap threshold is reached, but no candidate may be merged automatically.**
 
 ## A — control plane, durable state, ModelGateway
 
@@ -39,7 +39,8 @@ Milestones A-C and E are implemented as a working bootstrap slice. Milestone D h
 - Evidence: audit tamper detection passes; worker, verification, diff and review artifacts preserved per completed candidate; proxy ledger is preserved under `.falguna/`.
 - Paid API cost: $0.12512445 cumulative for all Phase-1 worker experiments in this session, below the $0.50 cap. Auto-reload remained off.
 - Human intervention: H0-H1.
-- Limitations: no Phase-1 Playwright self-build run; Aider's text summary rounds per-run cost while the proxy ledger is authoritative.
+- Corrective evidence: run `f4de3ab6-52fb-4282-96fc-a75b68e1b76c` passed native verification and a real headless Chromium check against a localhost-only candidate status page after forced interruption/resume.
+- Limitations: Playwright uses a host-pinned local Chromium executable for this Intel-Mac calibration environment; the proxy ledger remains authoritative for paid cost.
 - Safe to proceed: evidence/audit yes; browser milestone remains partial.
 
 ## E — independent review and DONE_CANDIDATE
@@ -69,4 +70,20 @@ Results:
 
 Longest consecutive passing streak: **2**. Threshold required: **3**. Highest intervention: H1. Unauthorized/security events: 0. Protected main merges: 0.
 
-Decision: **FALGUNA BOOTSTRAP THRESHOLD NOT YET REACHED.** The next iteration must change worker/editor strategy or use a stronger model only after current official pricing and a new explicit run cap are verified. Do not repeat the same Aider mini-model loop.
+Original decision at the preserved checkpoint: **FALGUNA BOOTSTRAP THRESHOLD NOT YET REACHED.** The next iteration had to change worker/editor strategy or use a stronger model only after current official pricing and a new explicit run cap were verified.
+
+## Corrective continuation — threshold result
+
+The worker abstraction was preserved. Aider was replaced for the corrective sequence by `StructuredEditWorker`, which requests strict JSON old-to-new patches, accepts only explicitly declared files, requires each old snippet to match exactly once, preserves unrelated bytes, and records usage/cost through the existing contracts. A stronger model was not used because the first failure mode was editor application reliability rather than demonstrated model incapability.
+
+Before paid execution, `gpt-5.4-mini-2026-03-17` pricing was freshly verified from official OpenAI documentation at $0.75/M input, $0.075/M cached input, and $4.50/M output. The declared limits were $0.10 per task and $0.30 for the corrective sequence.
+
+Fresh authoritative streak from clean main `458e6b96fbd27a4841643bcf28502cdd34749ec3`:
+
+- `f4de3ab6-52fb-4282-96fc-a75b68e1b76c`: PASS, forced stop/resume, native tests PASS, localhost Playwright PASS, independent review PASS, `DONE_CANDIDATE`, merge approval PENDING, cost $0.006807.
+- `69f10063-8dbf-4f06-a5b3-44fb3b61d7dc`: PASS, native tests PASS, independent review PASS, `DONE_CANDIDATE`, merge approval PENDING, cost $0.005232.
+- `5ce2cdcd-78f1-4791-a6b6-437173d2a855`: PASS, native tests PASS, independent review PASS, `DONE_CANDIDATE`, merge approval PENDING, cost $0.005622.
+
+Passing-streak spend: **$0.017661**. Total corrective-continuation paid spend including two eliminated failed calibration attempts: **$0.06059025**, below the $0.30 hard cap. Total Phase-1 paid spend including the preserved checkpoint: **$0.18571470**. Security violations: 0. Protected-main merges: 0. Highest intervention: H1 for worker/harness correction; no human coded any candidate solution. The paid proxy was stopped after the third pass.
+
+Decision: **FALGUNA BOOTSTRAP THRESHOLD REACHED.** The safe next stage is a narrow bootstrap v0.2 hardening cycle: make browser-runtime discovery portable, add a genuinely semantic independent reviewer, and validate process/network isolation before any broader self-building scope. Do not expand into Sales, Marketing, Finance, Trading, or full Company OS.
