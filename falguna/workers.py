@@ -1,6 +1,9 @@
 import os
+import json
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -53,6 +56,128 @@ class AiderWorker(WorkerAdapter):
             return int(float(value) * (1000 if "." in value else 1))
         call = {"provider": "openai-compatible", "model": config["model"], "purpose": "implementation", "input_tokens": tokens(token_match.group(1)) if token_match else 0, "output_tokens": tokens(token_match.group(2)) if token_match else 0, "cost_usd": float(cost_match.group(1)) if cost_match else 0.0, "metadata": {"adapter": "aider"}}
         return WorkerResult(result.returncode == 0, summary, result.returncode, [call], call["cost_usd"])
+
+
+class StructuredEditWorker(WorkerAdapter):
+    """Replaceable worker that applies model-produced full-file edits deterministically."""
+
+    def __init__(self, gateway: ModelGateway, editable_files, timeout_seconds: int = 180, transport=None):
+        self.gateway = gateway
+        self.editable_files = list(editable_files)
+        self.timeout_seconds = timeout_seconds
+        self.transport = transport or self._request
+
+    def execute(self, worktree: Path, requirement: str, run_id: str) -> WorkerResult:
+        config = self.gateway.configuration()
+        try:
+            files = {}
+            root = worktree.resolve()
+            for relative in self.editable_files:
+                target = (root / relative).resolve()
+                if target != root and root not in target.parents:
+                    raise ValueError(f"editable path escapes worktree: {relative}")
+                files[relative] = target.read_text(encoding="utf-8")
+            payload = {
+                "model": config["model"],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a bounded repository editor. Return complete replacement contents only for files "
+                            "that must change. Do not invent files, omit requested behavior, weaken tests, or include markdown."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps({"objective": requirement, "editable_files": files}, ensure_ascii=False),
+                    },
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "bounded_file_edits",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "summary": {"type": "string"},
+                                "edits": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                                        "required": ["path", "content"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                            },
+                            "required": ["summary", "edits"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            }
+            decoded = self.transport(config, payload, self.timeout_seconds)
+            message = decoded["choices"][0]["message"]
+            if message.get("refusal"):
+                raise ValueError("model refused bounded edit")
+            response = json.loads(message["content"])
+            allowed = set(self.editable_files)
+            edits = response["edits"]
+            if not edits:
+                raise ValueError("model returned no edits")
+            seen = set()
+            changed = 0
+            for edit in edits:
+                relative = edit["path"]
+                if relative not in allowed or relative in seen:
+                    raise ValueError(f"unapproved or duplicate edit path: {relative}")
+                seen.add(relative)
+                target = (root / relative).resolve()
+                if target != root and root not in target.parents:
+                    raise ValueError(f"edit path escapes worktree: {relative}")
+                if target.read_text(encoding="utf-8") != edit["content"]:
+                    target.write_text(edit["content"], encoding="utf-8")
+                    changed += 1
+            if not changed:
+                raise ValueError("model edits made no changes")
+            usage = decoded.get("usage", {})
+            prompt_tokens = int(usage.get("prompt_tokens", 0))
+            completion_tokens = int(usage.get("completion_tokens", 0))
+            cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
+            cost = max(0, prompt_tokens - cached_tokens) * 0.75e-6 + cached_tokens * 0.075e-6 + completion_tokens * 4.50e-6
+            call = {
+                "provider": "openai-compatible",
+                "model": config["model"],
+                "purpose": "implementation",
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "cost_usd": cost,
+                "metadata": {"adapter": "structured-edit", "cached_input_tokens": cached_tokens},
+            }
+            return WorkerResult(True, response["summary"], 0, [call], cost)
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, OSError, urllib.error.URLError) as exc:
+            return WorkerResult(False, f"Structured edit failed: {exc}", 65)
+
+    @staticmethod
+    def _request(config, payload, timeout_seconds):
+        api_key_file = config.get("api_key_file")
+        localhost_proxy = config["base_url"].startswith("http://127.0.0.1:") or config["base_url"].startswith("http://localhost:")
+        if localhost_proxy:
+            key = "falguna-local-proxy-token"
+        else:
+            key_path = Path(api_key_file or "").resolve()
+            if not key_path.is_file() or key_path.stat().st_mode & 0o077:
+                raise ValueError("API key file missing or permissions are not 0600")
+            key = key_path.read_text(encoding="utf-8").strip()
+        request = urllib.request.Request(
+            config["base_url"].rstrip("/") + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            return json.loads(response.read())
 
 
 class ScriptedWorker(WorkerAdapter):
