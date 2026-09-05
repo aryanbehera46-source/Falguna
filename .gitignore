@@ -4,3 +4,5 @@ __pycache__/
 .falguna-home/
 .aider*
 .env
+node_modules/
+test-results/

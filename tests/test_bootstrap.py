@@ -1,12 +1,16 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from falguna.audit import AuditLog
-from falguna.models import RunPolicy, WorkerResult
+from falguna.models import CommandSpec, ReviewResult, RunPolicy, WorkerResult
 from falguna.policy import PermissionEngine, PolicyViolation
+from falguna.browser import BrowserDiscovery
+from falguna.capabilities import TerminalCapability
+from falguna.review import ModelSemanticReviewer, ScriptedSemanticReviewer, SemanticIndependentReviewer
 from falguna.runtime import open_control_plane
 from falguna.workers import ScriptedWorker, StructuredEditWorker
 from falguna.gateway import OpenAICompatibleGateway
@@ -34,6 +38,18 @@ class BootstrapTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "seed"], check=True, capture_output=True)
         self.control, self.store = open_control_plane(self.repo)
         self.policy = RunPolicy()
+        self.control.reviewer = ScriptedSemanticReviewer(lambda requirement, diff, changed, verification: ReviewResult(
+            True,
+            "requirement satisfied with bounded scope and passing regression evidence",
+            [],
+            {
+                "requirement_satisfaction": {"passed": True, "evidence": "diff sets required value"},
+                "scope_compliance": {"passed": True, "evidence": "one permitted file"},
+                "regression_evidence": {"passed": verification["passed"], "evidence": "native suite passed"},
+                "unresolved_uncertainty": {"passed": True, "evidence": "none"},
+            },
+            [],
+        ))
 
     def tearDown(self):
         self.store.close()
@@ -140,6 +156,81 @@ class BootstrapTests(unittest.TestCase):
         result = worker.execute(self.repo, "bounded edit", "test-run")
         self.assertFalse(result.success)
         self.assertEqual((self.repo / "falguna" / "feature.py").read_text(), "VALUE = 1\n")
+
+    def test_browser_discovery_supports_nested_manifest_without_fixed_executable(self):
+        web = self.repo / "web"
+        web.mkdir()
+        (web / "package.json").write_text(json.dumps({"scripts": {"test:e2e": "playwright test"}}))
+        policy = RunPolicy(browser_base_url="http://127.0.0.1:4173", browser_project_roots=["web"])
+        plan = BrowserDiscovery(self.repo, policy).discover()
+        self.assertEqual(plan.project_root, "web")
+        self.assertEqual(plan.command.argv[:5], ["npm", "--prefix", "web", "run", "test:e2e"])
+        self.assertNotIn(str(self.repo), plan.command.argv)
+
+    def test_browser_discovery_blocks_external_target(self):
+        policy = RunPolicy(browser_base_url="https://example.com", browser_project_roots=["."])
+        with self.assertRaises(PolicyViolation):
+            BrowserDiscovery(self.repo, policy).discover()
+
+    def test_semantic_review_fails_closed_despite_passing_tests(self):
+        result = SemanticIndependentReviewer().review("set value to 2", "diff --git a/x b/x", ["falguna/feature.py"], {"passed": True})
+        self.assertFalse(result.approved)
+        self.assertIn("unresolved_uncertainty", result.dimensions)
+
+    def test_semantic_review_rejects_missing_dimension(self):
+        reviewer = ScriptedSemanticReviewer(lambda *args: ReviewResult(True, "looks fine", [], {"requirement_satisfaction": {"passed": True}}, []))
+        result = reviewer.review("requirement", "diff", ["falguna/feature.py"], {"passed": True})
+        self.assertFalse(result.approved)
+        self.assertIn("missing required review dimensions", result.findings)
+
+    def test_model_semantic_review_is_structured_and_metered(self):
+        gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
+        dimensions = {
+            "requirement_satisfaction": {"passed": True, "evidence": "assertion matches requirement"},
+            "scope_compliance": {"passed": True, "evidence": "only allowed test file changed"},
+            "regression_evidence": {"passed": True, "evidence": "17 tests passed"},
+            "unresolved_uncertainty": {"passed": True, "evidence": "none"},
+        }
+        def response(config, payload, timeout):
+            schema = payload["response_format"]["json_schema"]["schema"]
+            self.assertIn("dimensions", schema["required"])
+            return {"choices": [{"message": {"content": json.dumps({"summary": "satisfied", "findings": [], "unresolved_uncertainty": [], "dimensions": dimensions})}}], "usage": {"prompt_tokens": 200, "completion_tokens": 50}}
+        result = ModelSemanticReviewer(gateway, transport=response).review("requirement", "diff", ["tests/test_bootstrap.py"], {"passed": True})
+        self.assertTrue(result.approved)
+        self.assertEqual(result.model_calls[0]["purpose"], "independent-semantic-review")
+        self.assertGreater(result.cost_usd, 0)
+
+    def test_command_policy_blocks_inline_code_and_external_resource(self):
+        terminal = TerminalCapability(PermissionEngine(self.repo, self.policy))
+        with self.assertRaises(PolicyViolation):
+            terminal.run(CommandSpec(["python3", "-c", "print('unsafe')"]))
+        with self.assertRaises(PolicyViolation):
+            terminal.run(CommandSpec(["npx", "tool", "https://example.com/resource"]))
+
+    def test_isolation_allows_repo_test_and_records_backend(self):
+        terminal = TerminalCapability(PermissionEngine(self.repo, self.policy))
+        completed = terminal.run(CommandSpec(["python3", "-m", "unittest", "discover", "-s", "tests", "-v"], 60, "tests"))
+        self.assertNotEqual(terminal.last_isolation_evidence.backend, "")
+        self.assertIn(terminal.last_isolation_evidence.network_mode, {"deny", "loopback"})
+        self.assertEqual(completed.returncode, 1)  # fixture intentionally fails before the worker edit
+
+    def test_macos_isolation_blocks_write_outside_worktree_and_scrubs_secret(self):
+        probe = self.repo / "probe.py"
+        marker = Path("/tmp/falguna-v02-prohibited-write")
+        if marker.exists():
+            marker.unlink()
+        probe.write_text("import os\nfrom pathlib import Path\nassert 'FALGUNA_HOST_SECRET_TEST' not in os.environ\nPath('/tmp/falguna-v02-prohibited-write').write_text('blocked')\n")
+        os.environ["FALGUNA_HOST_SECRET_TEST"] = "must-not-cross-boundary"
+        try:
+            terminal = TerminalCapability(PermissionEngine(self.repo, self.policy))
+            completed = terminal.run(CommandSpec(["python3", "probe.py"], 30, "containment-probe"))
+        finally:
+            os.environ.pop("FALGUNA_HOST_SECRET_TEST", None)
+        if terminal.last_isolation_evidence.backend == "macos-seatbelt":
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(marker.exists())
+        else:
+            self.skipTest("host has no native filesystem sandbox; degraded mode is documented")
 
 
 if __name__ == "__main__":

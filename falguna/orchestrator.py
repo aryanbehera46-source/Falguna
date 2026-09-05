@@ -8,15 +8,17 @@ from .gitops import GitWorktreeManager
 from .models import RunPolicy, RunStatus
 from .policy import PolicyViolation
 from .store import StateStore, utcnow
-from .verification import DefinitionOfDone, IndependentReviewer
+from .verification import DefinitionOfDone
+from .review import SemanticIndependentReviewer
 from .workers import WorkerAdapter
 
 
 class ControlPlane:
-    def __init__(self, store: StateStore, audit: AuditLog, state_root: Path):
+    def __init__(self, store: StateStore, audit: AuditLog, state_root: Path, reviewer=None):
         self.store = store
         self.audit = audit
         self.state_root = Path(state_root)
+        self.reviewer = reviewer or SemanticIndependentReviewer()
 
     def create_mission(self, title: str, requirement: str, repository: Path, policy: RunPolicy) -> dict:
         now = utcnow()
@@ -94,11 +96,12 @@ class ControlPlane:
                 stage = "WORKER_COMPLETE"
             if stage == "WORKER_COMPLETE":
                 self.store.update("runs", run_id, status=RunStatus.VERIFYING.value)
-                passed, changed, results = DefinitionOfDone(manager, policy).verify(worktree)
+                passed, changed, results, browser, isolation = DefinitionOfDone(manager, policy).verify(worktree)
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 verification_path = evidence_dir / "verification.json"
-                verification_path.write_text(json.dumps({"passed": passed, "changed_files": changed, "results": results}, indent=2, sort_keys=True))
+                verification_evidence = {"passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation}
+                verification_path.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
                 self._record_artifact(run_id, "VERIFICATION", verification_path)
                 if not passed:
                     current_attempt = int(self.store.get("runs", run_id)["attempt"])
@@ -129,12 +132,21 @@ class ControlPlane:
                 self.store.update("runs", run_id, status=RunStatus.REVIEWING.value)
                 changed = payload.get("changed_files") or manager.changed_files(worktree)
                 diff = manager.diff(worktree)
-                review = IndependentReviewer().review(diff, changed)
+                verification_path = self.state_root / "evidence" / run_id / "verification.json"
+                verification_evidence = json.loads(verification_path.read_text())
+                review = self.reviewer.review(requirement, diff, changed, verification_evidence)
                 evidence_dir = self.state_root / "evidence" / run_id
                 (evidence_dir / "diff.patch").write_text(diff)
                 (evidence_dir / "review.json").write_text(json.dumps(review.__dict__, indent=2, sort_keys=True))
                 self._record_artifact(run_id, "DIFF", evidence_dir / "diff.patch")
                 self._record_artifact(run_id, "REVIEW", evidence_dir / "review.json")
+                for call in review.model_calls:
+                    self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": call.get("purpose", "independent-semantic-review"), "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
+                if review.cost_usd:
+                    self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REVIEW", "amount_usd": review.cost_usd, "metadata_json": "{}", "created_at": utcnow()})
+                total_cost = sum(float(event["amount_usd"]) for event in self.store.list("cost_events", "run_id=?", (run_id,)))
+                if total_cost > policy.max_cost_usd:
+                    raise PolicyViolation("cumulative run cost cap exceeded")
                 if not review.approved:
                     raise RuntimeError("independent review rejected candidate: " + "; ".join(review.findings))
                 approval_id = self.store.create("approvals", {"run_id": run_id, "kind": "PROTECTED_BRANCH_MERGE", "status": "PENDING", "requested_at": utcnow(), "decided_at": None, "decided_by": None, "reason": None, "created_at": utcnow(), "updated_at": utcnow()})

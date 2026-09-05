@@ -1,11 +1,11 @@
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
 from .models import CommandSpec
 from .policy import PermissionEngine, PolicyViolation
+from .isolation import ProcessIsolator
 
 
 class FileCapability:
@@ -24,14 +24,16 @@ class FileCapability:
 class TerminalCapability:
     def __init__(self, permissions: PermissionEngine):
         self.permissions = permissions
+        self.last_isolation_evidence = None
 
-    def run(self, spec: CommandSpec, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    def run(self, spec: CommandSpec, env: Optional[Dict[str, str]] = None, network_mode: str = "deny") -> subprocess.CompletedProcess:
         self.permissions.require_command(spec)
-        with tempfile.TemporaryDirectory(prefix="falguna-command-home-") as command_home:
-            safe_env = {"PATH": os.environ.get("PATH", ""), "HOME": command_home, "LANG": "C.UTF-8"}
-            if env:
-                safe_env.update({key: value for key, value in env.items() if key in {"CI", "NODE_ENV", "PORT"}})
-            return subprocess.run(spec.argv, cwd=self.permissions.repo_root, env=safe_env, text=True, capture_output=True, timeout=spec.timeout_seconds)
+        safe = {}
+        if env:
+            safe.update({key: value for key, value in env.items() if key in {"CI", "NODE_ENV", "PORT", "PLAYWRIGHT_BROWSERS_PATH"}})
+        completed, evidence = ProcessIsolator(self.permissions.repo_root, self.permissions.policy).run(spec, safe, network_mode)
+        self.last_isolation_evidence = evidence
+        return completed
 
 
 class BrowserCapability:
@@ -40,7 +42,10 @@ class BrowserCapability:
     def __init__(self, terminal: TerminalCapability):
         self.terminal = terminal
 
-    def verify(self, command: CommandSpec, base_url: str) -> subprocess.CompletedProcess:
+    def verify(self, command: CommandSpec, base_url: str, browsers_path: Optional[str] = None) -> subprocess.CompletedProcess:
         if not (base_url.startswith("http://127.0.0.1:") or base_url.startswith("http://localhost:")):
             raise PolicyViolation("browser verification is localhost-only")
-        return self.terminal.run(command, {"CI": "1"})
+        env = {"CI": "1"}
+        if browsers_path:
+            env["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
+        return self.terminal.run(command, env, network_mode="loopback")

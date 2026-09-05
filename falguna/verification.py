@@ -3,9 +3,10 @@ import json
 from pathlib import Path
 from typing import List
 
-from .capabilities import TerminalCapability
+from .browser import BrowserDiscovery
+from .capabilities import BrowserCapability, TerminalCapability
 from .gitops import GitWorktreeManager
-from .models import ReviewResult, RunPolicy
+from .models import RunPolicy
 from .policy import PermissionEngine, PolicyViolation
 
 
@@ -20,28 +21,19 @@ class DefinitionOfDone:
         permissions.validate_changed_files(changed)
         terminal = TerminalCapability(permissions)
         results = []
+        isolation = []
         for command in self.policy.verification_commands:
             completed = terminal.run(command, {"CI": "1"})
             results.append({"label": command.label, "argv": command.argv, "exit_code": completed.returncode, "stdout": completed.stdout[-8000:], "stderr": completed.stderr[-8000:]})
-        passed = bool(changed) and all(item["exit_code"] == 0 for item in results)
-        return passed, changed, results
-
-
-class IndependentReviewer:
-    """Deterministic independent run path; a model reviewer can replace it via the same result contract."""
-
-    BLOCKED_MARKERS = ("OPENAI_API_KEY", "AWS_SECRET", "BEGIN PRIVATE KEY", "--no-verify")
-
-    def review(self, diff: str, changed_files: List[str]) -> ReviewResult:
-        findings = []
-        if not diff.strip():
-            findings.append("empty diff")
-        for marker in self.BLOCKED_MARKERS:
-            if marker in diff:
-                findings.append(f"blocked marker in diff: {marker}")
-        if any(path.startswith("schema/") or path == "falguna/policy.py" for path in changed_files):
-            findings.append("protected policy/schema change")
-        return ReviewResult(not findings, "independent deterministic review", findings)
+            isolation.append(terminal.last_isolation_evidence.__dict__)
+        browser_plan = BrowserDiscovery(worktree, self.policy).discover()
+        browser = None
+        if browser_plan:
+            browser_terminal = TerminalCapability(permissions)
+            browser_result = BrowserCapability(browser_terminal).verify(browser_plan.command, browser_plan.base_url, browser_plan.browsers_path)
+            browser = {"discovery": browser_plan.evidence(), "exit_code": browser_result.returncode, "stdout": browser_result.stdout[-8000:], "stderr": browser_result.stderr[-8000:], "isolation": browser_terminal.last_isolation_evidence.__dict__}
+        passed = bool(changed) and all(item["exit_code"] == 0 for item in results) and (browser is None or browser["exit_code"] == 0)
+        return passed, changed, results, browser, isolation
 
 
 def preserve_artifact(source: Path, artifact_dir: Path) -> dict:
@@ -51,4 +43,3 @@ def preserve_artifact(source: Path, artifact_dir: Path) -> dict:
     target = artifact_dir / source.name
     target.write_bytes(data)
     return {"path": str(target), "sha256": digest}
-

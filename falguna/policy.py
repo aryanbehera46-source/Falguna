@@ -1,4 +1,5 @@
 import fnmatch
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Iterable
 
@@ -37,6 +38,16 @@ class PermissionEngine:
             raise PolicyViolation("mutating/publishing git operation requires control-plane handling or approval")
         if spec.timeout_seconds <= 0 or spec.timeout_seconds > 900:
             raise PolicyViolation("invalid command timeout")
+        if any(arg in {"-c", "--eval", "-e"} for arg in spec.argv[1:]):
+            raise PolicyViolation("inline interpreter/evaluator commands are prohibited")
+        for arg in spec.argv[1:]:
+            if "://" in arg:
+                parsed = urlparse(arg)
+                if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                    raise PolicyViolation("external network resource is prohibited")
+            candidate = Path(arg)
+            if candidate.is_absolute():
+                self.resolve(candidate)
 
     def validate_changed_files(self, paths: Iterable[str]) -> None:
         paths = list(paths)
@@ -44,4 +55,3 @@ class PermissionEngine:
             raise PolicyViolation("changed-file limit exceeded")
         for path in paths:
             self.require_write(Path(path))
-

@@ -32,6 +32,10 @@ class RunPolicy:
     max_cost_usd: float = 0.50
     max_changed_files: int = 12
     allow_network: bool = False
+    browser_project_roots: List[str] = field(default_factory=lambda: [".", "browser-tests", "frontend", "web", "app", "client", "ui"])
+    browser_base_url: Optional[str] = None
+    max_memory_mb: int = 1024
+    max_processes: int = 64
 
 
 @dataclass
@@ -48,4 +52,7 @@ class ReviewResult:
     approved: bool
     summary: str
     findings: List[str] = field(default_factory=list)
-
+    dimensions: dict = field(default_factory=dict)
+    unresolved_uncertainty: List[str] = field(default_factory=list)
+    model_calls: List[dict] = field(default_factory=list)
+    cost_usd: float = 0.0
