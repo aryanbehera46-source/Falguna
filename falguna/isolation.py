@@ -58,6 +58,7 @@ class ProcessIsolator:
 (allow sysctl-read)
 (allow mach-lookup)
 (allow file-read*)
+(allow file-write* (literal "/dev/null"))
 {write_rules}
 {network}
 '''
