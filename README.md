@@ -15,3 +15,10 @@ python3 -m falguna status
 
 SQLite is the durable local development store because PostgreSQL is not installed on the current Intel Mac. `schema/postgres.sql` is the canonical promotion schema and storage access stays behind `StateStore`.
 
+## Bootstrap v0.2 hardening boundaries
+
+Browser verification is discovered from an explicit localhost URL and a project Playwright manifest/configuration. The selected command, configuration source, standard browser-cache source, output, and isolation mode are recorded as evidence; repository-specific browser executable paths are not accepted.
+
+Independent review is replaceable and fail-closed. A semantic reviewer must return concise structured verdicts for requirement satisfaction, scope, regression evidence, and unresolved uncertainty. Hidden reasoning is neither requested nor persisted.
+
+On this Intel Mac, native child commands run under the built-in Seatbelt sandbox with writes limited to the worktree/private temporary home and network denied, plus a scrubbed environment, timeouts, and supported resource limits. Chromium cannot reliably start under that deprecated Seatbelt interface, so browser verification uses an application-enforced localhost target plus secret scrubbing, process-group timeout containment, and CPU/address-space limits. macOS does not provide a safe per-process-tree `RLIMIT_NPROC`, and this bootstrap does not claim VM/container-grade kernel isolation. Synthetic local work remains the safety boundary.
