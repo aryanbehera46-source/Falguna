@@ -17,11 +17,12 @@ class WorkerAdapter(ABC):
 class AiderWorker(WorkerAdapter):
     """Wrapped, replaceable Aider process. It never receives host secrets by default."""
 
-    def __init__(self, executable: Path, gateway: ModelGateway, timeout_seconds: int = 600, editable_files=None):
+    def __init__(self, executable: Path, gateway: ModelGateway, timeout_seconds: int = 600, editable_files=None, architect: bool = False):
         self.executable = Path(executable)
         self.gateway = gateway
         self.timeout_seconds = timeout_seconds
         self.editable_files = list(editable_files or [])
+        self.architect = architect
 
     def execute(self, worktree: Path, requirement: str, run_id: str) -> WorkerResult:
         config = self.gateway.configuration()
@@ -38,6 +39,8 @@ class AiderWorker(WorkerAdapter):
         argv = [str(self.executable), "--yes-always", "--no-auto-commits", "--no-gitignore", "--no-stream", "--no-check-update", "--no-analytics", "--edit-format", "diff", "--model", config["model"], "--openai-api-base", config["base_url"]]
         for path in self.editable_files:
             argv.extend(["--file", path])
+        if self.architect:
+            argv.append("--architect")
         argv.extend(["--message", requirement])
         try:
             result = subprocess.run(argv, cwd=worktree, env=env, text=True, capture_output=True, timeout=self.timeout_seconds)
