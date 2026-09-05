@@ -37,7 +37,7 @@ Milestones A-C and E are implemented as a working bootstrap slice. Milestone D h
 
 - Built: localhost-only browser command wrapper; hashed Artifact records; append-only SHA-256 chained audit log; ModelCall and CostEvent persistence; localhost metering proxy remained capped at $0.50.
 - Evidence: audit tamper detection passes; worker, verification, diff and review artifacts preserved per completed candidate; proxy ledger is preserved under `.falguna/`.
-- Paid API cost: $0.11189940 cumulative for all Phase-1 worker experiments in this session, below the $0.50 cap. Auto-reload remained off.
+- Paid API cost: $0.12512445 cumulative for all Phase-1 worker experiments in this session, below the $0.50 cap. Auto-reload remained off.
 - Human intervention: H0-H1.
 - Limitations: no Phase-1 Playwright self-build run; Aider's text summary rounds per-run cost while the proxy ledger is authoritative.
 - Safe to proceed: evidence/audit yes; browser milestone remains partial.
@@ -46,7 +46,7 @@ Milestones A-C and E are implemented as a working bootstrap slice. Milestone D h
 
 - Built: separate deterministic review pass, secret/protected-policy checks, diff/evidence preservation, `DONE_CANDIDATE`, and a pending `PROTECTED_BRANCH_MERGE` approval record. The merge decision API records owner intent only; v0.1 intentionally contains no merge implementation.
 - Evidence: five genuine Aider runs reached `DONE_CANDIDATE`; each kept the approval pending and main untouched.
-- Cost: included in the $0.11189940 total.
+- Cost: included in the $0.12512445 total.
 - Human intervention: no manual candidate code.
 - Limitations: deterministic reviewer is independent from the worker run but is not yet a different-model semantic review.
 - Safe to proceed: yes for candidate generation; no candidate promotion without Aryan's explicit approval.
@@ -70,4 +70,3 @@ Results:
 Longest consecutive passing streak: **2**. Threshold required: **3**. Highest intervention: H1. Unauthorized/security events: 0. Protected main merges: 0.
 
 Decision: **FALGUNA BOOTSTRAP THRESHOLD NOT YET REACHED.** The next iteration must change worker/editor strategy or use a stronger model only after current official pricing and a new explicit run cap are verified. Do not repeat the same Aider mini-model loop.
-
