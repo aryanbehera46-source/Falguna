@@ -96,11 +96,11 @@ class ControlPlane:
                 stage = "WORKER_COMPLETE"
             if stage == "WORKER_COMPLETE":
                 self.store.update("runs", run_id, status=RunStatus.VERIFYING.value)
-                passed, changed, results, browser, isolation = DefinitionOfDone(manager, policy).verify(worktree)
+                passed, changed, results, browser, isolation, containment_probe = DefinitionOfDone(manager, policy).verify(worktree)
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 verification_path = evidence_dir / "verification.json"
-                verification_evidence = {"passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation}
+                verification_evidence = {"passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation, "containment_probe": containment_probe}
                 verification_path.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
                 self._record_artifact(run_id, "VERIFICATION", verification_path)
                 if not passed:

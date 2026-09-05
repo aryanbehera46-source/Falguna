@@ -8,6 +8,7 @@ from .capabilities import BrowserCapability, TerminalCapability
 from .gitops import GitWorktreeManager
 from .models import RunPolicy
 from .policy import PermissionEngine, PolicyViolation
+from .isolation import ProcessIsolator
 
 
 class DefinitionOfDone:
@@ -32,8 +33,9 @@ class DefinitionOfDone:
             browser_terminal = TerminalCapability(permissions)
             browser_result = BrowserCapability(browser_terminal).verify(browser_plan.command, browser_plan.base_url, browser_plan.browsers_path)
             browser = {"discovery": browser_plan.evidence(), "exit_code": browser_result.returncode, "stdout": browser_result.stdout[-8000:], "stderr": browser_result.stderr[-8000:], "isolation": browser_terminal.last_isolation_evidence.__dict__}
-        passed = bool(changed) and all(item["exit_code"] == 0 for item in results) and (browser is None or browser["exit_code"] == 0)
-        return passed, changed, results, browser, isolation
+        containment_probe = ProcessIsolator(worktree, self.policy).harmless_prohibited_write_probe()
+        passed = bool(changed) and all(item["exit_code"] == 0 for item in results) and (browser is None or browser["exit_code"] == 0) and containment_probe["blocked"]
+        return passed, changed, results, browser, isolation, containment_probe
 
 
 def preserve_artifact(source: Path, artifact_dir: Path) -> dict:

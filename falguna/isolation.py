@@ -87,3 +87,20 @@ class ProcessIsolator:
             limits = "cpu and address-space; process count is not safely per-tree on Darwin" if platform.system() == "Darwin" else "cpu, address-space, and process count"
             evidence = IsolationEvidence(platform.system(), backend, network_mode, write_scope, resource_limits=limits)
             return completed, evidence
+
+    def harmless_prohibited_write_probe(self) -> dict:
+        marker = Path("/tmp") / f"falguna-isolation-probe-{os.getpid()}"
+        if marker.exists():
+            marker.unlink()
+        completed, evidence = self.run(CommandSpec(["/usr/bin/touch", str(marker)], 10, "prohibited-write-probe"), {}, "deny")
+        escaped = marker.exists()
+        if escaped:
+            marker.unlink()
+        return {
+            "action": "write outside worktree",
+            "resource": str(marker),
+            "blocked": completed.returncode != 0 and not escaped,
+            "exit_code": completed.returncode,
+            "backend": evidence.backend,
+            "stderr": completed.stderr[-2000:],
+        }
