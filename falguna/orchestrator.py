@@ -101,7 +101,28 @@ class ControlPlane:
                 verification_path.write_text(json.dumps({"passed": passed, "changed_files": changed, "results": results}, indent=2, sort_keys=True))
                 self._record_artifact(run_id, "VERIFICATION", verification_path)
                 if not passed:
-                    raise RuntimeError("Definition of Done failed")
+                    current_attempt = int(self.store.get("runs", run_id)["attempt"])
+                    if current_attempt >= policy.max_attempts:
+                        raise RuntimeError("Definition of Done failed after bounded repair")
+                    failure_summary = json.dumps(results, sort_keys=True)[-6000:]
+                    repair_requirement = requirement + "\n\nThe control-plane verification failed. Diagnose and repair only the permitted files, then rerun tests. Verification evidence:\n" + failure_summary
+                    self.store.update("runs", run_id, status=RunStatus.WORKING.value, attempt=current_attempt + 1)
+                    repair = worker.execute(worktree, repair_requirement, run_id)
+                    self.audit.append("REPAIR_ATTEMPT", {"run_id": run_id, "attempt": current_attempt + 1, "success": repair.success, "exit_code": repair.exit_code})
+                    for call in repair.model_calls:
+                        self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": "repair", "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
+                    if repair.cost_usd:
+                        self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REPAIR", "amount_usd": repair.cost_usd, "metadata_json": json.dumps({"attempt": current_attempt + 1}), "created_at": utcnow()})
+                    total_cost = sum(float(event["amount_usd"]) for event in self.store.list("cost_events", "run_id=?", (run_id,)))
+                    if total_cost > policy.max_cost_usd:
+                        raise PolicyViolation("cumulative run cost cap exceeded")
+                    repair_path = evidence_dir / f"repair-output-{current_attempt + 1}.txt"
+                    repair_path.write_text(repair.summary)
+                    self._record_artifact(run_id, "REPAIR_OUTPUT", repair_path)
+                    if not repair.success:
+                        raise RuntimeError("repair worker failed")
+                    self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree))
+                    return self._continue(run_id, worker, policy, None)
                 self._checkpoint(run_id, "VERIFIED", worktree=str(worktree), changed_files=changed)
                 stage, payload = "VERIFIED", {"worktree": str(worktree), "changed_files": changed}
             if stage == "VERIFIED":

@@ -89,6 +89,20 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(self.store.get("runs", run_id)["status"], "FAILED")
         self.assertEqual(self.store.list("approvals", "run_id=?", (run_id,)), [])
 
+    def test_verification_failure_gets_one_bounded_repair(self):
+        ids = self.control.create_mission("repair", "set value to 2", self.repo, self.policy)
+        calls = {"count": 0}
+        def repairable(worktree, requirement, run_id):
+            calls["count"] += 1
+            value = 3 if calls["count"] == 1 else 2
+            (worktree / "falguna" / "feature.py").write_text(f"VALUE = {value}\n")
+            return WorkerResult(True, f"attempt {calls['count']}", 0)
+        run_id = self.control.start(ids["task_id"], ScriptedWorker(repairable), "scripted-offline-test", "none", self.policy)
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
+        events = [json.loads(line)["event"] for line in (self.repo / ".falguna" / "audit.jsonl").read_text().splitlines()]
+        self.assertIn("REPAIR_ATTEMPT", events)
+
     def test_local_proxy_does_not_require_real_key_file(self):
         gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
         worker = AiderWorker(Path("/missing/aider"), gateway)

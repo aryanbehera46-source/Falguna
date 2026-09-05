@@ -1,5 +1,6 @@
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -26,10 +27,11 @@ class TerminalCapability:
 
     def run(self, spec: CommandSpec, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
         self.permissions.require_command(spec)
-        safe_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.permissions.repo_root / ".falguna-home"), "LANG": "C.UTF-8"}
-        if env:
-            safe_env.update({key: value for key, value in env.items() if key in {"CI", "NODE_ENV", "PORT"}})
-        return subprocess.run(spec.argv, cwd=self.permissions.repo_root, env=safe_env, text=True, capture_output=True, timeout=spec.timeout_seconds)
+        with tempfile.TemporaryDirectory(prefix="falguna-command-home-") as command_home:
+            safe_env = {"PATH": os.environ.get("PATH", ""), "HOME": command_home, "LANG": "C.UTF-8"}
+            if env:
+                safe_env.update({key: value for key, value in env.items() if key in {"CI", "NODE_ENV", "PORT"}})
+            return subprocess.run(spec.argv, cwd=self.permissions.repo_root, env=safe_env, text=True, capture_output=True, timeout=spec.timeout_seconds)
 
 
 class BrowserCapability:
@@ -42,4 +44,3 @@ class BrowserCapability:
         if not (base_url.startswith("http://127.0.0.1:") or base_url.startswith("http://localhost:")):
             raise PolicyViolation("browser verification is localhost-only")
         return self.terminal.run(command, {"CI": "1"})
-
