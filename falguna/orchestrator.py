@@ -166,7 +166,7 @@ class ControlPlane:
                 if not review.approved:
                     raise RuntimeError("independent review rejected candidate: " + "; ".join(review.findings))
                 approval_id = self.store.create("approvals", {"run_id": run_id, "kind": "PROTECTED_BRANCH_MERGE", "status": "PENDING", "requested_at": utcnow(), "decided_at": None, "decided_by": None, "reason": None, "created_at": utcnow(), "updated_at": utcnow()})
-                self.store.update("runs", run_id, status=RunStatus.DONE_CANDIDATE.value)
+                self.store.update("runs", run_id, status=RunStatus.DONE_CANDIDATE.value, error=None)
                 self._checkpoint(run_id, "DONE_CANDIDATE", worktree=str(worktree), approval_id=approval_id)
                 self.audit.append("DONE_CANDIDATE", {"run_id": run_id, "approval_id": approval_id})
             return run_id

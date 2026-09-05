@@ -20,6 +20,7 @@ class CommandSpec:
     argv: List[str]
     timeout_seconds: int = 300
     label: str = "command"
+    network_mode: str = "deny"
 
 
 @dataclass(frozen=True)

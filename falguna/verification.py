@@ -24,7 +24,7 @@ class DefinitionOfDone:
         results = []
         isolation = []
         for command in self.policy.verification_commands:
-            completed = terminal.run(command, {"CI": "1"})
+            completed = terminal.run(command, {"CI": "1"}, network_mode=command.network_mode)
             results.append({"label": command.label, "argv": command.argv, "exit_code": completed.returncode, "stdout": completed.stdout[-8000:], "stderr": completed.stderr[-8000:]})
             isolation.append(terminal.last_isolation_evidence.__dict__)
         browser_plan = BrowserDiscovery(worktree, self.policy).discover()

@@ -38,6 +38,8 @@ class PermissionEngine:
             raise PolicyViolation("mutating/publishing git operation requires control-plane handling or approval")
         if spec.timeout_seconds <= 0 or spec.timeout_seconds > 900:
             raise PolicyViolation("invalid command timeout")
+        if spec.network_mode not in {"deny", "loopback"}:
+            raise PolicyViolation("invalid command network mode")
         if any(arg in {"-c", "--eval", "-e"} for arg in spec.argv[1:]):
             raise PolicyViolation("inline interpreter/evaluator commands are prohibited")
         for arg in spec.argv[1:]:

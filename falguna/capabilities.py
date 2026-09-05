@@ -26,12 +26,12 @@ class TerminalCapability:
         self.permissions = permissions
         self.last_isolation_evidence = None
 
-    def run(self, spec: CommandSpec, env: Optional[Dict[str, str]] = None, network_mode: str = "deny") -> subprocess.CompletedProcess:
+    def run(self, spec: CommandSpec, env: Optional[Dict[str, str]] = None, network_mode: str = "deny", kernel_sandbox: bool = True) -> subprocess.CompletedProcess:
         self.permissions.require_command(spec)
         safe = {}
         if env:
             safe.update({key: value for key, value in env.items() if key in {"CI", "NODE_ENV", "PORT", "PLAYWRIGHT_BROWSERS_PATH"}})
-        completed, evidence = ProcessIsolator(self.permissions.repo_root, self.permissions.policy).run(spec, safe, network_mode)
+        completed, evidence = ProcessIsolator(self.permissions.repo_root, self.permissions.policy).run(spec, safe, network_mode, kernel_sandbox)
         self.last_isolation_evidence = evidence
         return completed
 
@@ -48,4 +48,4 @@ class BrowserCapability:
         env = {"CI": "1"}
         if browsers_path:
             env["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
-        return self.terminal.run(command, env, network_mode="loopback")
+        return self.terminal.run(command, env, network_mode="loopback", kernel_sandbox=False)

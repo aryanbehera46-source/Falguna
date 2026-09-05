@@ -63,7 +63,7 @@ class ProcessIsolator:
 {network}
 '''
 
-    def run(self, spec: CommandSpec, env: Dict[str, str], network_mode: str = "deny") -> tuple:
+    def run(self, spec: CommandSpec, env: Dict[str, str], network_mode: str = "deny", kernel_sandbox: bool = True) -> tuple:
         with tempfile.TemporaryDirectory(prefix="falguna-command-home-") as temp_home:
             home = Path(temp_home).resolve()
             safe_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TMPDIR": str(home), "LANG": "C.UTF-8"}
@@ -73,7 +73,7 @@ class ProcessIsolator:
             inherited_seatbelt = os.environ.get("FALGUNA_SEATBELT_ACTIVE") == "1"
             if platform.system() == "Darwin" and inherited_seatbelt:
                 backend = "inherited-macos-seatbelt"
-            elif platform.system() == "Darwin" and shutil.which("sandbox-exec") and network_mode == "deny":
+            elif platform.system() == "Darwin" and shutil.which("sandbox-exec") and kernel_sandbox:
                 profile = self._seatbelt_profile(home, network_mode)
                 argv = ["sandbox-exec", "-p", profile, *argv]
                 backend = "macos-seatbelt"
@@ -87,7 +87,9 @@ class ProcessIsolator:
             except subprocess.TimeoutExpired as exc:
                 os.killpg(process.pid, signal.SIGKILL)
                 stdout, stderr = process.communicate()
-                completed = subprocess.CompletedProcess(spec.argv, 124, (exc.stdout or "") + (stdout or ""), (exc.stderr or "") + (stderr or "") + "\ncommand timed out and process group was contained")
+                def as_text(value):
+                    return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
+                completed = subprocess.CompletedProcess(spec.argv, 124, as_text(exc.stdout) + as_text(stdout), as_text(exc.stderr) + as_text(stderr) + "\ncommand timed out and process group was contained")
             write_scope = f"{self.worktree} and private temp home" if backend in {"macos-seatbelt", "inherited-macos-seatbelt"} else "application policy only for browser subprocesses"
             limits = "cpu and address-space; process count is not safely per-tree on Darwin" if platform.system() == "Darwin" else "cpu, address-space, and process count"
             evidence = IsolationEvidence(platform.system(), backend, network_mode, write_scope, resource_limits=limits)

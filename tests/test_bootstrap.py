@@ -269,6 +269,11 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn(terminal.last_isolation_evidence.network_mode, {"deny", "loopback"})
         self.assertEqual(completed.returncode, 1)  # fixture intentionally fails before the worker edit
 
+    def test_command_network_mode_is_restricted(self):
+        terminal = TerminalCapability(PermissionEngine(self.repo, self.policy))
+        with self.assertRaises(PolicyViolation):
+            terminal.run(CommandSpec(["python3", "probe.py"], 30, "bad-network", "external"))
+
     def test_macos_isolation_blocks_write_outside_worktree_and_scrubs_secret(self):
         probe = self.repo / "probe.py"
         marker = Path("/tmp/falguna-v02-prohibited-write")
