@@ -1,4 +1,5 @@
 import os
+import json
 import platform
 import resource
 import shutil
@@ -49,6 +50,10 @@ class ProcessIsolator:
     def _seatbelt_profile(self, command_home: Path, network_mode: str) -> str:
         roots = [self.worktree, command_home]
         write_rules = "\n".join(f'(allow file-write* (subpath "{path}"))' for path in roots)
+        if self.policy.verification_write_regexes:
+            write_rules += "\n" + "\n".join(
+                f'(allow file-write* (regex #{json.dumps(rule)}))' for rule in self.policy.verification_write_regexes
+            )
         network = ""
         if network_mode == "loopback":
             network = '(allow network-bind (local ip "localhost:*"))\n(allow network-inbound (local ip "localhost:*"))\n(allow network-outbound (remote ip "localhost:*"))'

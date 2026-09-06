@@ -40,6 +40,8 @@ class RunPolicy:
     browser_external_probe_required: bool = False
     max_memory_mb: int = 1024
     max_processes: int = 64
+    dependency_node_path: Optional[str] = None
+    verification_write_regexes: List[str] = field(default_factory=list)
 
 
 @dataclass

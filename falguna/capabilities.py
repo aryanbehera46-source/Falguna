@@ -30,7 +30,7 @@ class TerminalCapability:
         self.permissions.require_command(spec)
         safe = {}
         if env:
-            safe.update({key: value for key, value in env.items() if key in {"CI", "NODE_ENV", "PORT", "PLAYWRIGHT_BROWSERS_PATH"}})
+            safe.update({key: value for key, value in env.items() if key in {"CI", "NODE_ENV", "NODE_PATH", "PORT", "PLAYWRIGHT_BROWSERS_PATH"}})
         completed, evidence = ProcessIsolator(self.permissions.repo_root, self.permissions.policy).run(spec, safe, network_mode, kernel_sandbox)
         self.last_isolation_evidence = evidence
         return completed

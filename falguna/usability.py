@@ -68,6 +68,7 @@ def evidence_summary(store, state_root: Path, audit, run_id: str) -> dict:
     run = store.get("runs", run_id)
     evidence_dir = Path(state_root) / "evidence" / run_id
     verification = _read_json(evidence_dir / "verification.json")
+    discovery = _read_json(evidence_dir / "discovery.json")
     review = _read_json(evidence_dir / "review.json")
     approvals = store.list("approvals", "run_id=? AND kind=?", (run_id, "PROTECTED_BRANCH_MERGE"))
     costs = store.list("cost_events", "run_id=?", (run_id,))
@@ -80,6 +81,9 @@ def evidence_summary(store, state_root: Path, audit, run_id: str) -> dict:
         **view,
         "requirement_coverage": "PASSED" if review.get("dimensions", {}).get("requirement_satisfaction", {}).get("passed") else "NOT_PROVEN",
         "native_tests": [{"label": item.get("label"), "passed": item.get("exit_code") == 0, "exit_code": item.get("exit_code")} for item in native],
+        "discovered_file_scope": discovery.get("editable_files", []),
+        "discovered_verification_plan": [item.get("argv", []) for item in discovery.get("verification_commands", [])],
+        "discovery_confidence": discovery.get("confidence", "NOT_RECORDED"),
         "browser_e2e": "NOT_APPLICABLE" if not browser else ("PASSED" if browser.get("passed") else "FAILED"),
         "independent_review": "PASSED" if review.get("approved") else ("NOT_RUN" if not review else "FAILED"),
         "files_changed": changed,

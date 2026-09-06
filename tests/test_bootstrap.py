@@ -18,6 +18,7 @@ from falguna.codex_transport import CodexCliJSONTransport
 from falguna.workers import AiderWorker
 from falguna.usability import evidence_summary, mission_view
 from falguna.web import INDEX_HTML, load_profiles, validate_editable
+from falguna.discovery import ProjectDiscovery
 
 
 def git(repo: Path, *args):
@@ -329,6 +330,8 @@ class BootstrapTests(unittest.TestCase):
             "Falguna Engineering", "internal alpha", "Approved project",
             "Run Mission", "Mission Status", "Final Evidence",
             "Approve Merge", "Reject", "Request Changes",
+            "Discover &amp; Run Mission", "pauses before editing",
+            "Resume from Checkpoint",
         ):
             self.assertIn(label, INDEX_HTML)
 
@@ -340,10 +343,35 @@ class BootstrapTests(unittest.TestCase):
 
     def test_approved_project_profile_is_bounded_and_local(self):
         profiles = load_profiles(Path(__file__).parents[1])
-        self.assertEqual([profile["id"] for profile in profiles], ["falguna-engineering"])
-        profile = profiles[0]
+        self.assertIn("falguna-engineering", [profile["id"] for profile in profiles])
+        self.assertIn("serviceflow", [profile["id"] for profile in profiles])
+        profile = next(item for item in profiles if item["id"] == "falguna-engineering")
         self.assertEqual(profile["default_budget_usd"], 0.05)
         self.assertEqual(profile["verification_profiles"]["native"], ["python3 -m unittest discover -s tests -v"])
+
+    def test_project_discovery_proposes_scope_and_native_verification(self):
+        (self.repo / "package.json").write_text(json.dumps({"scripts": {"test": "node --test", "start": "node server.js"}}))
+        (self.repo / "server.js").write_text("function normalizeAppointmentCode(code) { return code.toUpperCase(); }\n")
+        (self.repo / "tests" / "workflow.test.js").write_text("test appointment code update accepts lowercase\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "discovery fixture"], check=True, capture_output=True)
+        plan = ProjectDiscovery(self.repo, {"discovery_roots": ["server.js", "tests"]}).discover(
+            "Make appointment code updates accept lowercase with regression coverage"
+        )
+        self.assertEqual(plan.confidence, "HIGH")
+        self.assertFalse(plan.requires_approval)
+        self.assertIn("server.js", plan.editable_files)
+        self.assertIn("tests/workflow.test.js", plan.editable_files)
+        self.assertEqual(plan.verification_commands[0].argv, ["npm", "run", "test"])
+        self.assertEqual(plan.verification_commands[0].network_mode, "loopback")
+
+    def test_project_discovery_fails_closed_when_scope_is_uncertain(self):
+        (self.repo / "package.json").write_text(json.dumps({"scripts": {"start": "node server.js"}}))
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "uncertain fixture"], check=True, capture_output=True)
+        plan = ProjectDiscovery(self.repo, {"discovery_roots": ["falguna"]}).discover("change unrelated frobnicator behavior")
+        self.assertEqual(plan.confidence, "UNCERTAIN")
+        self.assertTrue(plan.requires_approval)
 
     def test_macos_launcher_preserves_local_only_start_and_safe_stop(self):
         root = Path(__file__).parents[1]

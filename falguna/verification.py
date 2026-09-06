@@ -23,8 +23,14 @@ class DefinitionOfDone:
         terminal = TerminalCapability(permissions)
         results = []
         isolation = []
+        command_env = {"CI": "1"}
+        if self.policy.dependency_node_path:
+            dependency_path = Path(self.policy.dependency_node_path).resolve()
+            if not dependency_path.is_dir():
+                raise PolicyViolation("approved local dependency path is unavailable")
+            command_env["NODE_PATH"] = str(dependency_path)
         for command in self.policy.verification_commands:
-            completed = terminal.run(command, {"CI": "1"}, network_mode=command.network_mode)
+            completed = terminal.run(command, command_env, network_mode=command.network_mode)
             results.append({"label": command.label, "argv": command.argv, "exit_code": completed.returncode, "stdout": completed.stdout[-8000:], "stderr": completed.stderr[-8000:]})
             isolation.append(terminal.last_isolation_evidence.__dict__)
         browser_plan = BrowserDiscovery(worktree, self.policy).discover()

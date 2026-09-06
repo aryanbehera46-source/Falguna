@@ -9,5 +9,38 @@
     "default_verification": "native",
     "default_budget_usd": 0.05,
     "risk": "Bounded trusted local changes only"
+  },
+  {
+    "id": "serviceflow",
+    "name": "ServiceFlow",
+    "repository": "/Users/aryanbehera/Freelancing/serviceflow",
+    "discovery_roots": ["server.js", "public", "tests"],
+    "verification_write_regexes": ["^/tmp/serviceflow-test-[0-9]+[.]db.*$", "^/private/tmp/serviceflow-test-[0-9]+[.]db.*$"],
+    "default_budget_usd": 0.05,
+    "risk": "Trusted local project; discovered scope only"
+  },
+  {
+    "id": "royal-table",
+    "name": "Royal Table",
+    "repository": "/Users/aryanbehera/Freelancing/restaurant-website",
+    "discovery_roots": ["server.js", "public", "tests", "scripts"],
+    "default_budget_usd": 0.05,
+    "risk": "Trusted local project; discovered scope only"
+  },
+  {
+    "id": "nivara-living",
+    "name": "Nivara Living",
+    "repository": "/Users/aryanbehera/Freelancing/nivara-commerce",
+    "discovery_roots": ["server.js", "public", "tests"],
+    "default_budget_usd": 0.05,
+    "risk": "Trusted local project; discovered scope only"
+  },
+  {
+    "id": "briefpilot-ai",
+    "name": "BriefPilot AI",
+    "repository": "/Users/aryanbehera/Freelancing/briefpilot-ai",
+    "discovery_roots": ["server", "client"],
+    "default_budget_usd": 0.05,
+    "risk": "Trusted local project; discovered scope only"
   }
 ]
