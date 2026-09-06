@@ -6,7 +6,16 @@ It is not the Company OS and never merges or deploys automatically.
 
 ## Local commands
 
-For normal use, start the local app from this folder and open the printed address:
+For normal use on macOS, double-click `launcher/Falguna.app`. It starts the
+localhost server, waits until it is ready, and opens the browser. Opening it
+again reuses the existing Falguna instance. Double-click
+`launcher/Stop Falguna.app` to stop a server started by the launcher.
+
+The launcher stores only its process ID and log under
+`~/Library/Application Support/Falguna`; it stores no credentials. Keep the two
+apps inside the repository's `launcher` folder so they can locate Falguna.
+
+The terminal command remains available as a fallback:
 
 ```sh
 python3 -m falguna --root . web

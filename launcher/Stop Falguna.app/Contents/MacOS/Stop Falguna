@@ -1,0 +1,38 @@
+#!/bin/zsh
+
+set -u
+
+STATE_DIR="$HOME/Library/Application Support/Falguna"
+PID_FILE="$STATE_DIR/server.pid"
+URL="http://127.0.0.1:8765"
+
+if [[ ! -f "$PID_FILE" ]]; then
+  /usr/bin/osascript -e 'display notification "No launcher-managed server is running." with title "Falguna"' >/dev/null 2>&1 || true
+  exit 0
+fi
+
+pid="$(<"$PID_FILE")"
+if [[ "$pid" != <-> ]]; then
+  /bin/rm -f "$PID_FILE"
+  exit 1
+fi
+
+command_line="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+if [[ "$command_line" != *"-m falguna"* || "$command_line" != *" web"* || "$command_line" != *"127.0.0.1"* ]]; then
+  /bin/rm -f "$PID_FILE"
+  /usr/bin/osascript -e 'display alert "Falguna was not stopped" message "The saved process is not the launcher-managed local Falguna server." as critical' >/dev/null 2>&1 || true
+  exit 1
+fi
+
+/bin/kill -TERM "$pid" 2>/dev/null || true
+for _ in {1..40}; do
+  if ! /bin/kill -0 "$pid" 2>/dev/null; then
+    /bin/rm -f "$PID_FILE"
+    /usr/bin/osascript -e 'display notification "Local server stopped cleanly." with title "Falguna"' >/dev/null 2>&1 || true
+    exit 0
+  fi
+  /bin/sleep 0.25
+done
+
+/usr/bin/osascript -e 'display alert "Falguna is still running" message "The server did not stop within 10 seconds. No forced shutdown was performed." as critical' >/dev/null 2>&1 || true
+exit 1

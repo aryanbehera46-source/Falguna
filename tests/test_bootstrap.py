@@ -345,6 +345,18 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(profile["default_budget_usd"], 0.05)
         self.assertEqual(profile["verification_profiles"]["native"], ["python3 -m unittest discover -s tests -v"])
 
+    def test_macos_launcher_preserves_local_only_start_and_safe_stop(self):
+        root = Path(__file__).parents[1]
+        start = (root / "launcher/Falguna.app/Contents/MacOS/Falguna").read_text()
+        stop = (root / "launcher/Stop Falguna.app/Contents/MacOS/Stop Falguna").read_text()
+        self.assertIn("--host 127.0.0.1 --port 8765", start)
+        self.assertIn('is_falguna_ready', start)
+        self.assertIn('/usr/bin/open "$URL"', start)
+        self.assertIn('server.pid', start)
+        self.assertIn('"-m falguna"', stop)
+        self.assertIn('/bin/kill -TERM "$pid"', stop)
+        self.assertNotIn("kill -KILL", stop)
+
 
 if __name__ == "__main__":
     unittest.main()
