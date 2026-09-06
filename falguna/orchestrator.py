@@ -31,13 +31,15 @@ class ControlPlane:
         self.audit.append("MISSION_CREATED", {"mission_id": mission_id, "task_id": task_id})
         return {"mission_id": mission_id, "requirement_id": requirement_id, "task_id": task_id}
 
-    def start(self, task_id: str, worker: WorkerAdapter, worker_name: str, model: str, policy: RunPolicy, force_stop_after: Optional[str] = None) -> str:
+    def start(self, task_id: str, worker: WorkerAdapter, worker_name: str, model: str, policy: RunPolicy, force_stop_after: Optional[str] = None, on_run_created=None) -> str:
         task = self.store.get("tasks", task_id)
         if not task:
             raise ValueError("task not found")
         now = utcnow()
         run_id = self.store.create("runs", {"task_id": task_id, "status": RunStatus.CREATED.value, "attempt": 0, "worker": worker_name, "model": model, "worktree": None, "head_sha": None, "error": None, "created_at": now, "updated_at": now})
         self.audit.append("RUN_CREATED", {"run_id": run_id, "task_id": task_id})
+        if on_run_created:
+            on_run_created(run_id)
         return self._continue(run_id, worker, policy, force_stop_after)
 
     def resume(self, run_id: str, worker: WorkerAdapter, policy: RunPolicy) -> str:

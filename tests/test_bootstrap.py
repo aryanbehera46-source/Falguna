@@ -17,6 +17,7 @@ from falguna.gateway import OpenAICompatibleGateway
 from falguna.codex_transport import CodexCliJSONTransport
 from falguna.workers import AiderWorker
 from falguna.usability import evidence_summary, mission_view
+from falguna.web import INDEX_HTML, load_profiles, validate_editable
 
 
 def git(repo: Path, *args):
@@ -322,6 +323,27 @@ class BootstrapTests(unittest.TestCase):
             self.assertFalse(marker.exists())
         else:
             self.skipTest("host has no native filesystem sandbox; degraded mode is documented")
+
+    def test_local_web_shell_exposes_required_operator_controls(self):
+        for label in (
+            "Falguna Engineering", "internal alpha", "Approved project",
+            "Run Mission", "Mission Status", "Final Evidence",
+            "Approve Merge", "Reject", "Request Changes",
+        ):
+            self.assertIn(label, INDEX_HTML)
+
+    def test_web_editable_scope_rejects_paths_outside_project(self):
+        self.assertEqual(validate_editable(["falguna/web.py", "tests/*.py"]), ["falguna/web.py", "tests/*.py"])
+        for unsafe in (["../outside.py"], ["/tmp/outside.py"], [""]):
+            with self.assertRaises(ValueError):
+                validate_editable(unsafe)
+
+    def test_approved_project_profile_is_bounded_and_local(self):
+        profiles = load_profiles(Path(__file__).parents[1])
+        self.assertEqual([profile["id"] for profile in profiles], ["falguna-engineering"])
+        profile = profiles[0]
+        self.assertEqual(profile["default_budget_usd"], 0.05)
+        self.assertEqual(profile["verification_profiles"]["native"], ["python3 -m unittest discover -s tests -v"])
 
 
 if __name__ == "__main__":

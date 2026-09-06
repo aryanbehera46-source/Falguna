@@ -12,6 +12,7 @@ from .review import ModelSemanticReviewer
 from .runtime import open_control_plane
 from .usability import evidence_summary, mission_view
 from .workers import StructuredEditWorker
+from .web import serve
 
 
 def main():
@@ -19,6 +20,9 @@ def main():
     parser.add_argument("--root", default=".")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
+    web = sub.add_parser("web")
+    web.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
+    web.add_argument("--port", type=int, default=8765)
     create = sub.add_parser("create-mission")
     create.add_argument("--title", required=True)
     create.add_argument("--requirement", required=True)
@@ -43,6 +47,10 @@ def main():
     root = Path(args.root).resolve()
     control, store = open_control_plane(root)
     try:
+        if args.command == "web":
+            store.close()
+            serve(root, args.host, args.port)
+            return
         if args.command == "init":
             print(json.dumps({"status": "initialized", "root": str(root)}))
         elif args.command == "create-mission":

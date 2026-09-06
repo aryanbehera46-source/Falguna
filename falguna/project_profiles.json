@@ -1,0 +1,13 @@
+[
+  {
+    "id": "falguna-engineering",
+    "name": "Falguna Engineering",
+    "repository": ".",
+    "verification_profiles": {
+      "native": ["python3 -m unittest discover -s tests -v"]
+    },
+    "default_verification": "native",
+    "default_budget_usd": 0.05,
+    "risk": "Bounded trusted local changes only"
+  }
+]
