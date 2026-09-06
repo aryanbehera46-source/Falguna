@@ -183,11 +183,16 @@ class ControlPlane:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         self.store.create("artifacts", {"run_id": run_id, "kind": kind, "path": str(path), "sha256": digest, "metadata_json": "{}", "created_at": utcnow()})
 
-    def decide_merge(self, run_id: str, approved: bool, actor: str, reason: str) -> None:
+    def decide_merge(self, run_id: str, decision: str, actor: str, reason: str) -> None:
+        statuses = {"approve": "APPROVED", "reject": "REJECTED", "request-changes": "CHANGES_REQUESTED"}
+        if decision not in statuses:
+            raise ValueError("decision must be approve, reject, or request-changes")
         approvals = self.store.list("approvals", "run_id=? AND kind=?", (run_id, "PROTECTED_BRANCH_MERGE"))
         if not approvals:
             raise ValueError("merge approval not requested")
         approval = approvals[-1]
-        self.store.update("approvals", approval["id"], status="APPROVED" if approved else "REJECTED", decided_at=utcnow(), decided_by=actor, reason=reason)
-        self.audit.append("MERGE_DECISION_RECORDED", {"run_id": run_id, "approved": approved, "actor": actor})
+        if approval["status"] != "PENDING":
+            raise ValueError("merge decision already recorded")
+        self.store.update("approvals", approval["id"], status=statuses[decision], decided_at=utcnow(), decided_by=actor, reason=reason)
+        self.audit.append("MERGE_DECISION_RECORDED", {"run_id": run_id, "decision": statuses[decision], "actor": actor})
         # Deliberately records intent only. There is no merge implementation in bootstrap v0.1.

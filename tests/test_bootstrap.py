@@ -16,6 +16,7 @@ from falguna.workers import ScriptedWorker, StructuredEditWorker
 from falguna.gateway import OpenAICompatibleGateway
 from falguna.codex_transport import CodexCliJSONTransport
 from falguna.workers import AiderWorker
+from falguna.usability import evidence_summary, mission_view
 
 
 def git(repo: Path, *args):
@@ -73,6 +74,36 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(self.store.list("task_steps", "task_id=?", (ids["task_id"],))), 5)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), run["head_sha"])
         self.assertTrue(AuditLog(self.repo / ".falguna" / "audit.jsonl").verify())
+
+    def test_operational_view_summary_and_three_human_decisions(self):
+        ids = self.control.create_mission("bounded internal task", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted-offline-test", "none", self.policy)
+        status = mission_view(self.store, self.repo / ".falguna", run_id)
+        summary = evidence_summary(self.store, self.repo / ".falguna", self.control.audit, run_id)
+        self.assertEqual(status["status"], "DONE_CANDIDATE")
+        self.assertIn("Independent review passed", status["current_milestone"])
+        self.assertEqual(summary["requirement_coverage"], "PASSED")
+        self.assertEqual(summary["independent_review"], "PASSED")
+        self.assertEqual(summary["files_changed"], ["falguna/feature.py"])
+        self.assertEqual(summary["merge_approval"], "PENDING")
+        self.assertEqual(summary["available_actions"], ["Approve Merge", "Reject", "Request Changes"])
+        self.assertFalse(summary["protected_main_merge_performed"])
+        self.assertTrue(summary["evidence_hashes_valid"])
+        self.assertTrue(summary["audit_chain_valid"])
+        self.control.decide_merge(run_id, "request-changes", "human-test", "add one edge case")
+        approval = self.store.list("approvals", "run_id=?", (run_id,))[-1]
+        self.assertEqual(approval["status"], "CHANGES_REQUESTED")
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.store.get("runs", run_id)["head_sha"])
+
+    def test_failure_classification_is_actionable(self):
+        ids = self.control.create_mission("bad", "make wrong edit", self.repo, self.policy)
+        def wrong(worktree, requirement, run_id):
+            (worktree / "falguna" / "feature.py").write_text("VALUE = 3\n")
+            return WorkerResult(True, "wrong edit", 0)
+        run_id = self.control.start(ids["task_id"], ScriptedWorker(wrong), "scripted-offline-test", "none", self.policy)
+        failure = mission_view(self.store, self.repo / ".falguna", run_id)["failure"]
+        self.assertEqual(failure["category"], "VERIFICATION_FAILURE")
+        self.assertTrue(failure["action"])
 
     def test_forced_interruption_resumes_from_checkpoint(self):
         ids = self.control.create_mission("resume", "set value to 2", self.repo, self.policy)

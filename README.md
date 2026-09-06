@@ -10,8 +10,14 @@ It is not the Company OS and never merges or deploys automatically.
 python3 -m unittest discover -s tests -v
 python3 -m falguna init
 python3 -m falguna create-mission --title "Example" --requirement "Bounded change"
+python3 -m falguna run --objective "Bounded change" --editable falguna/feature.py --test "python3 -m unittest discover -s tests -v"
 python3 -m falguna status
+python3 -m falguna status --run RUN_ID
+python3 -m falguna summary --run RUN_ID
+python3 -m falguna decide --run RUN_ID --action request-changes --actor "Aryan" --reason "Add edge-case coverage"
 ```
+
+The operational view hides benchmark internals and reports milestones, actionable failure classification, requirement/test/browser/review evidence, changed files, cost, risk, unresolved issues, and the pending human merge decision. `decide` accepts `approve`, `reject`, or `request-changes`; it records the human decision only. Falguna still contains no protected-main merge implementation.
 
 SQLite is the durable local development store because PostgreSQL is not installed on the current Intel Mac. `schema/postgres.sql` is the canonical promotion schema and storage access stays behind `StateStore`.
 
