@@ -6,6 +6,16 @@ It is not the Company OS and never merges or deploys automatically.
 
 ## Local commands
 
+For normal use, start the local app from this folder and open the printed address:
+
+```sh
+python3 -m falguna --root . web
+```
+
+The default address is `http://127.0.0.1:8765`. The server accepts only localhost binding. Project and verification choices come from the approved `falguna/project_profiles.json` file; the browser cannot supply an arbitrary repository or verification command.
+
+The command surface remains available for diagnostics:
+
 ```sh
 python3 -m unittest discover -s tests -v
 python3 -m falguna init
