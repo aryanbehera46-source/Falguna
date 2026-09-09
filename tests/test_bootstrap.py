@@ -537,6 +537,9 @@ class BootstrapTests(unittest.TestCase):
             "Run mission", "Engineering work mode", "Needs approval",
             "Approve", "Reject", "Request Changes", "Resume",
             "What should we build?", "Human approval stays required",
+            "history-empty", "project-dot", "Open navigation",
+            "min-height:80px", "overflow-y:auto", "closeSidebar",
+            "flex:0 0 auto",
         ):
             self.assertIn(label, INDEX_HTML)
 
