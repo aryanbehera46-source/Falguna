@@ -107,38 +107,47 @@ class ControlPlane:
                 passed, changed, results, browser, isolation, containment_probe = DefinitionOfDone(manager, policy).verify(worktree)
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
-                verification_path = evidence_dir / "verification.json"
+                prior_attempts = sorted(evidence_dir.glob("verification-attempt-*.json"))
+                verification_attempt = len(prior_attempts) + 1
+                verification_path = evidence_dir / f"verification-attempt-{verification_attempt}.json"
                 task_checks = []
                 for item in self.store.list("checkpoints", "run_id=?", (run_id,)):
                     checkpoint_payload = json.loads(item["payload"])
                     if checkpoint_payload.get("completed_milestone_task"):
                         task_checks.append(checkpoint_payload)
-                verification_evidence = {"passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation, "containment_probe": containment_probe, "milestone_tasks": task_checks}
+                verification_evidence = {"attempt": verification_attempt, "passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation, "containment_probe": containment_probe, "milestone_tasks": task_checks}
                 verification_path.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
-                self._record_artifact(run_id, "VERIFICATION", verification_path)
+                self._record_artifact(run_id, "VERIFICATION_ATTEMPT", verification_path)
                 if not passed:
-                    current_attempt = int(self.store.get("runs", run_id)["attempt"])
-                    if current_attempt >= policy.max_attempts:
+                    repairs = self.store.list("checkpoints", "run_id=? AND stage=?", (run_id, "REPAIR_COMPLETE"))
+                    if repairs:
+                        (evidence_dir / "verification.json").write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
+                        self._record_artifact(run_id, "VERIFICATION_FINAL", evidence_dir / "verification.json")
                         raise RuntimeError("Definition of Done failed after bounded repair")
                     failure_summary = json.dumps(results, sort_keys=True)[-6000:]
                     repair_requirement = requirement + "\n\nThe control-plane verification failed. Diagnose and repair only the permitted files, then rerun tests. Verification evidence:\n" + failure_summary
-                    self.store.update("runs", run_id, status=RunStatus.WORKING.value, attempt=current_attempt + 1)
+                    repair_attempt = int(self.store.get("runs", run_id)["attempt"]) + 1
+                    self.store.update("runs", run_id, status=RunStatus.WORKING.value, attempt=repair_attempt)
                     repair = worker.execute(worktree, repair_requirement, run_id)
-                    self.audit.append("REPAIR_ATTEMPT", {"run_id": run_id, "attempt": current_attempt + 1, "success": repair.success, "exit_code": repair.exit_code})
+                    self.audit.append("REPAIR_ATTEMPT", {"run_id": run_id, "attempt": repair_attempt, "verification_attempt": verification_attempt, "success": repair.success, "exit_code": repair.exit_code})
                     for call in repair.model_calls:
                         self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": "repair", "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
                     if repair.model_calls or repair.cost_usd:
-                        self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REPAIR", "amount_usd": repair.cost_usd, "metadata_json": json.dumps({"attempt": current_attempt + 1}), "created_at": utcnow()})
+                        self.store.create("cost_events", {"run_id": run_id, "category": "MODEL_REPAIR", "amount_usd": repair.cost_usd, "metadata_json": json.dumps({"attempt": repair_attempt}), "created_at": utcnow()})
                     total_cost = sum(float(event["amount_usd"]) for event in self.store.list("cost_events", "run_id=?", (run_id,)))
                     if total_cost > policy.max_cost_usd:
                         raise PolicyViolation("cumulative run cost cap exceeded")
-                    repair_path = evidence_dir / f"repair-output-{current_attempt + 1}.txt"
+                    repair_path = evidence_dir / f"repair-output-{repair_attempt}.txt"
                     repair_path.write_text(repair.summary)
                     self._record_artifact(run_id, "REPAIR_OUTPUT", repair_path)
                     if not repair.success:
                         raise RuntimeError(f"repair worker failed: {repair.summary}")
+                    self._checkpoint(run_id, "REPAIR_COMPLETE", worktree=str(worktree), verification_attempt=verification_attempt, repair_attempt=repair_attempt)
                     self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree))
                     return self._continue(run_id, worker, policy, None)
+                canonical_verification = evidence_dir / "verification.json"
+                canonical_verification.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
+                self._record_artifact(run_id, "VERIFICATION_FINAL", canonical_verification)
                 self._checkpoint(run_id, "VERIFIED", worktree=str(worktree), changed_files=changed)
                 stage, payload = "VERIFIED", {"worktree": str(worktree), "changed_files": changed}
             if stage == "VERIFIED":

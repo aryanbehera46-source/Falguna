@@ -72,7 +72,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(run["status"], "DONE_CANDIDATE")
         approvals = self.store.list("approvals", "run_id=?", (run_id,))
         self.assertEqual(approvals[0]["status"], "PENDING")
-        self.assertEqual(len(self.store.list("artifacts", "run_id=?", (run_id,))), 4)
+        self.assertEqual(len(self.store.list("artifacts", "run_id=?", (run_id,))), 5)
         self.assertEqual(len(self.store.list("task_steps", "task_id=?", (ids["task_id"],))), 5)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), run["head_sha"])
         self.assertTrue(AuditLog(self.repo / ".falguna" / "audit.jsonl").verify())
@@ -157,8 +157,48 @@ class BootstrapTests(unittest.TestCase):
         run_id = self.control.start(ids["task_id"], ScriptedWorker(repairable), "scripted-offline-test", "none", self.policy)
         self.assertEqual(calls["count"], 2)
         self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
+        evidence_dir = self.repo / ".falguna" / "evidence" / run_id
+        first = json.loads((evidence_dir / "verification-attempt-1.json").read_text())
+        second = json.loads((evidence_dir / "verification-attempt-2.json").read_text())
+        final = json.loads((evidence_dir / "verification.json").read_text())
+        self.assertFalse(first["passed"])
+        self.assertTrue(second["passed"])
+        self.assertEqual(final["attempt"], 2)
+        self.assertTrue(evidence_summary(self.store, self.repo / ".falguna", self.control.audit, run_id)["evidence_hashes_valid"])
         events = [json.loads(line)["event"] for line in (self.repo / ".falguna" / "audit.jsonl").read_text().splitlines()]
         self.assertIn("REPAIR_ATTEMPT", events)
+
+    def test_repair_is_available_after_two_worker_retries_and_stops_after_one(self):
+        ids = self.control.create_mission("repair budget", "set value to 2", self.repo, self.policy)
+        calls = {"count": 0}
+        def delayed(worktree, requirement, run_id):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return WorkerResult(False, "transient worker failure", 65)
+            value = 3 if calls["count"] == 2 else 2
+            (worktree / "falguna" / "feature.py").write_text(f"VALUE = {value}\n")
+            return WorkerResult(True, f"attempt {calls['count']}", 0)
+        run_id = self.control.start(ids["task_id"], ScriptedWorker(delayed), "scripted-offline-test", "none", self.policy)
+        self.assertEqual(calls["count"], 3)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
+        repairs = self.store.list("checkpoints", "run_id=? AND stage=?", (run_id, "REPAIR_COMPLETE"))
+        self.assertEqual(len(repairs), 1)
+
+    def test_milestone_task_verification_survives_bounded_repair(self):
+        ids = self.control.create_mission("milestone repair", "set value to 2", self.repo, self.policy)
+        calls = {"count": 0}
+        def milestone(worktree, requirement, run_id):
+            calls["count"] += 1
+            (worktree / "falguna" / "feature.py").write_text(f"VALUE = {3 if calls['count'] == 1 else 2}\n")
+            worker.checkpoint(1, "implementation and regression")
+            return WorkerResult(True, "milestone", 0)
+        worker = ScriptedWorker(milestone)
+        worker.checkpoint = None
+        run_id = self.control.start(ids["task_id"], worker, "scripted-offline-test", "none", self.policy)
+        final = json.loads((self.repo / ".falguna" / "evidence" / run_id / "verification.json").read_text())
+        self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
+        self.assertGreaterEqual(len(final["milestone_tasks"]), 2)
+        self.assertTrue(all("per_task_verification" in item for item in final["milestone_tasks"]))
 
     def test_local_proxy_does_not_require_real_key_file(self):
         gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
@@ -192,6 +232,18 @@ class BootstrapTests(unittest.TestCase):
         result = worker.execute(self.repo, "change the second value", "run")
         self.assertTrue(result.success)
         self.assertEqual(target.read_text(), "A\nVALUE = 1\nB\nVALUE = 2\nC\n")
+
+    def test_unique_exact_patch_ignores_stale_optional_anchors(self):
+        def response(config, payload, timeout):
+            value = {"summary": "unique edit", "patches": [{
+                "path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2",
+                "before": "stale model context", "after": "also stale", "task": 1,
+            }]}
+            return {"choices": [{"message": {"content": json.dumps(value)}}]}
+        worker = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response)
+        result = worker.execute(self.repo, "deterministic unique edit", "run")
+        self.assertTrue(result.success)
+        self.assertEqual((self.repo / "falguna" / "feature.py").read_text(), "VALUE = 2\n")
 
     def test_stale_old_text_after_prior_edit_replans_against_latest_file(self):
         replies = iter([
@@ -481,11 +533,10 @@ class BootstrapTests(unittest.TestCase):
 
     def test_local_web_shell_exposes_required_operator_controls(self):
         for label in (
-            "Falguna Engineering", "internal alpha", "Approved project",
-            "Run Mission", "Mission Status", "Final Evidence",
-            "Approve Merge", "Reject", "Request Changes",
-            "Discover &amp; Run Mission", "pauses before editing",
-            "Resume from Checkpoint",
+            "Falguna", "internal alpha", "Approved projects", "Recent missions",
+            "Run mission", "Engineering work mode", "Needs approval",
+            "Approve", "Reject", "Request Changes", "Resume",
+            "What should we build?", "Human approval stays required",
         ):
             self.assertIn(label, INDEX_HTML)
 

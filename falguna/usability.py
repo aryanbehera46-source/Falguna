@@ -11,6 +11,15 @@ MILESTONES = {
     "DONE_CANDIDATE": "Independent review passed; human decision required",
 }
 
+PHASE_LABELS = {
+    "CREATED": "Planning",
+    "WORKTREE_READY": "Inspecting",
+    "WORKER_COMPLETE": "Editing complete",
+    "REPAIR_COMPLETE": "Bounded repair complete",
+    "VERIFIED": "Testing passed",
+    "DONE_CANDIDATE": "Review passed",
+}
+
 
 def classify_failure(run: dict) -> Optional[dict]:
     status = run["status"]
@@ -68,6 +77,14 @@ def mission_view(store, state_root: Path, run_id: str) -> dict:
     checkpoints = store.list("checkpoints", "run_id=?", (run_id,))
     completed = [MILESTONES[item["stage"]] for item in checkpoints if item["stage"] in MILESTONES]
     current = MILESTONES.get(checkpoints[-1]["stage"], run["status"]) if checkpoints else run["status"]
+    progress_events = []
+    for item in checkpoints:
+        payload = json.loads(item["payload"])
+        label = PHASE_LABELS.get(item["stage"])
+        if payload.get("completed_milestone_task"):
+            label = f"Task {payload['completed_milestone_task']} tested"
+        if label:
+            progress_events.append({"stage": item["stage"], "label": label, "at": item["created_at"]})
     return {
         "mission": mission["title"],
         "objective": requirement["body"],
@@ -75,6 +92,7 @@ def mission_view(store, state_root: Path, run_id: str) -> dict:
         "status": run["status"],
         "current_milestone": current,
         "completed_milestones": completed,
+        "progress_events": progress_events,
         "attempt": run["attempt"],
         "failure": classify_failure(run),
     }

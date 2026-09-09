@@ -223,6 +223,10 @@ class StructuredEditWorker(WorkerAdapter):
             anchored = [index for index in matches if (not before or current[:index].endswith(before)) and (not after or current[index + len(old):].startswith(after))]
             if not matches:
                 raise PatchTargetError(f"PATCH_STALE: old text is absent in current {relative}; sha256={hashlib.sha256(current.encode()).hexdigest()}")
+            # A unique exact old-text match is already deterministic. Optional model-supplied
+            # anchors are only needed to disambiguate repeated text and may be stale themselves.
+            if len(matches) == 1:
+                anchored = matches
             if len(anchored) != 1:
                 raise PatchTargetError(f"PATCH_AMBIGUOUS: target has {len(anchored)} anchored matches in {relative}; add unique before/after context")
             diff_chars += len(old) + len(new)
