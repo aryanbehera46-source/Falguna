@@ -4,11 +4,16 @@ import re
 import subprocess
 import urllib.error
 import urllib.request
+import hashlib
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 from .gateway import ModelGateway
 from .models import WorkerResult
+
+
+class PatchTargetError(ValueError):
+    pass
 
 
 class WorkerAdapter(ABC):
@@ -61,14 +66,21 @@ class AiderWorker(WorkerAdapter):
 class StructuredEditWorker(WorkerAdapter):
     """Replaceable worker that applies model-produced full-file edits deterministically."""
 
-    def __init__(self, gateway: ModelGateway, editable_files, timeout_seconds: int = 180, transport=None):
+    def __init__(self, gateway: ModelGateway, editable_files, timeout_seconds: int = 180, transport=None, max_replans: int = 2, max_diff_chars: int = 120000, checkpoint=None):
         self.gateway = gateway
         self.editable_files = list(editable_files)
         self.timeout_seconds = timeout_seconds
         self.transport = transport or self._request
+        self.max_replans = max_replans
+        self.max_diff_chars = max_diff_chars
+        self.checkpoint = checkpoint
 
     def execute(self, worktree: Path, requirement: str, run_id: str) -> WorkerResult:
-        config = self.gateway.configuration()
+        config = dict(self.gateway.configuration())
+        config["_falguna_worktree"] = str(worktree.resolve())
+        config["_falguna_editable_files"] = list(self.editable_files)
+        calls = []
+        total_cost = 0.0
         try:
             files = {}
             root = worktree.resolve()
@@ -77,6 +89,12 @@ class StructuredEditWorker(WorkerAdapter):
                 if target != root and root not in target.parents:
                     raise ValueError(f"editable path escapes worktree: {relative}")
                 files[relative] = target.read_text(encoding="utf-8")
+            workspace_context = getattr(self.transport, "uses_workspace_context", False)
+            model_files = list(files) if workspace_context else files
+            if workspace_context:
+                config["_falguna_context_files"] = {
+                    path: self._context_excerpt(content, requirement) for path, content in files.items()
+                }
             payload = {
                 "model": config["model"],
                 "messages": [
@@ -85,12 +103,27 @@ class StructuredEditWorker(WorkerAdapter):
                         "content": (
                             "You are a bounded repository editor. Return minimal exact old-to-new text patches. Each old "
                             "snippet must occur exactly once in its file. Preserve all unrelated text byte-for-byte. "
+                            "For a milestone, label each patch with task 1, 2, or 3 and order related tasks sequentially. "
+                            "The working directory contains read-only copies of only the approved editable files. You may "
+                            "inspect them with read-only shell commands, but do not attempt to edit them with tools. Large "
+                            "files may be contiguous relevance excerpts with omitted prefixes and suffixes; do not treat "
+                            "excerpt boundaries as syntax defects or assume the full file is malformed. Static code evidence "
+                            "is sufficient to prove a defect when the incorrect behavior follows deterministically. When an "
+                            "approved test file is present, add a focused regression assertion that fails before the fix and "
+                            "passes after it. For client-side behavior, execute the relevant logic or an equivalent isolated "
+                            "function with representative data; a source-text includes or regex assertion alone is insufficient. "
+                            "Do not rely only on an unrelated broad smoke test. If an approved existing test harness is blocked "
+                            "only by stale hardcoded calendar dates, make those fixture dates relative to the runtime date without "
+                            "skipping, deleting, or weakening its assertions. "
+                            "When the objective includes control-plane verification evidence, repair the reported verification "
+                            "failure before revising an already-related product fix. Keep linked fixture, query, and expectation "
+                            "dates consistent when converting a past-date scenario to a runtime-relative date. "
                             "Do not invent files, weaken tests, or include markdown."
                         ),
                     },
                     {
                         "role": "user",
-                        "content": json.dumps({"objective": requirement, "editable_files": files}, ensure_ascii=False),
+                        "content": json.dumps({"objective": requirement, "editable_files": model_files}, ensure_ascii=False),
                     },
                 ],
                 "response_format": {
@@ -110,8 +143,11 @@ class StructuredEditWorker(WorkerAdapter):
                                             "path": {"type": "string"},
                                             "old": {"type": "string"},
                                             "new": {"type": "string"},
+                                            "before": {"type": "string"},
+                                            "after": {"type": "string"},
+                                            "task": {"type": "integer", "minimum": 1, "maximum": 3},
                                         },
-                                        "required": ["path", "old", "new"],
+                                        "required": ["path", "old", "new", "before", "after", "task"],
                                         "additionalProperties": False,
                                     },
                                 },
@@ -122,54 +158,115 @@ class StructuredEditWorker(WorkerAdapter):
                     },
                 },
             }
-            decoded = self.transport(config, payload, self.timeout_seconds)
-            message = decoded["choices"][0]["message"]
-            if message.get("refusal"):
-                raise ValueError("model refused bounded edit")
-            response = json.loads(message["content"])
-            allowed = set(self.editable_files)
-            patches = response["patches"]
-            if not patches:
-                raise ValueError("model returned no patches")
-            changed = 0
-            contents = dict(files)
-            for patch in patches:
-                relative = patch["path"]
-                if relative not in allowed:
-                    raise ValueError(f"unapproved edit path: {relative}")
-                target = (root / relative).resolve()
-                if target != root and root not in target.parents:
-                    raise ValueError(f"edit path escapes worktree: {relative}")
-                old = patch["old"]
-                new = patch["new"]
-                if not old or old == new or contents[relative].count(old) != 1:
-                    raise ValueError(f"patch old text must match exactly once and change content: {relative}")
-                contents[relative] = contents[relative].replace(old, new, 1)
-            for relative, content in contents.items():
-                if content != files[relative]:
-                    (root / relative).write_text(content, encoding="utf-8")
-                    changed += 1
+            responses = []
+            last_error = None
+            for replan in range(self.max_replans + 1):
+                if replan:
+                    current = {path: (root / path).read_text(encoding="utf-8") for path in self.editable_files}
+                    config["_falguna_context_files"] = {path: self._context_excerpt(value, requirement) for path, value in current.items()}
+                    payload["messages"].append({"role": "user", "content": json.dumps({
+                        "replan_reason": str(last_error), "current_files": list(current),
+                        "instruction": "Re-read the current approved files and return replacement patches with unique anchors. Do not repeat the failed target."
+                    })})
+                decoded = self.transport(config, payload, self.timeout_seconds)
+                call, call_cost = self._model_call(decoded, config)
+                calls.append(call)
+                total_cost += call_cost
+                message = decoded["choices"][0]["message"]
+                if message.get("refusal"):
+                    raise ValueError("model refused bounded edit")
+                response = json.loads(message["content"])
+                try:
+                    tasks = response.get("tasks")
+                    if not tasks:
+                        grouped = {}
+                        for patch in response.get("patches", []):
+                            grouped.setdefault(int(patch.get("task", 1)), []).append(patch)
+                        tasks = [{"summary": f"milestone task {key}", "patches": grouped[key]} for key in sorted(grouped)]
+                    if not 1 <= len(tasks) <= 3:
+                        raise ValueError("SCOPE_EXPANSION_REQUIRED: milestone must contain one to three related tasks")
+                    for ordinal, task in enumerate(tasks, 1):
+                        self._apply_patches(root, task.get("patches", []))
+                        if self.checkpoint:
+                            self.checkpoint(ordinal, task.get("summary", f"task {ordinal}"))
+                    responses.append(response.get("summary") or "; ".join(task.get("summary", "") for task in tasks))
+                    break
+                except PatchTargetError as exc:
+                    last_error = exc
+                    if replan >= self.max_replans:
+                        raise
+            changed = sum((root / path).read_text(encoding="utf-8") != original for path, original in files.items())
             if not changed:
-                raise ValueError("model edits made no changes")
-            usage = decoded.get("usage", {})
-            prompt_tokens = int(usage.get("prompt_tokens", 0))
-            completion_tokens = int(usage.get("completion_tokens", 0))
-            cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
-            calculated_cost = max(0, prompt_tokens - cached_tokens) * 0.75e-6 + cached_tokens * 0.075e-6 + completion_tokens * 4.50e-6
-            cost = float(decoded.get("_falguna_cost_usd", calculated_cost))
-            transport_metadata = decoded.get("_falguna_metadata", {})
-            call = {
-                "provider": decoded.get("_falguna_provider", "openai-compatible"),
-                "model": config["model"],
-                "purpose": "implementation",
-                "input_tokens": prompt_tokens,
-                "output_tokens": completion_tokens,
-                "cost_usd": cost,
-                "metadata": {"adapter": "structured-edit", "cached_input_tokens": cached_tokens, **transport_metadata},
-            }
-            return WorkerResult(True, response["summary"], 0, [call], cost)
+                raise ValueError("PATCH_NOOP: model edits made no changes")
+            return WorkerResult(True, responses[-1], 0, calls, total_cost)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, OSError, urllib.error.URLError) as exc:
-            return WorkerResult(False, f"Structured edit failed: {exc}", 65)
+            return WorkerResult(False, f"Structured edit failed: {exc}", 65, calls, total_cost)
+
+    def _apply_patches(self, root: Path, patches: list) -> None:
+        if not patches:
+            raise PatchTargetError("PATCH_NOOP: model returned no patches")
+        allowed = set(self.editable_files)
+        diff_chars = 0
+        for patch in patches:
+            relative = patch["path"]
+            if relative not in allowed:
+                raise ValueError(f"SCOPE_EXPANSION_REQUIRED: unapproved edit path: {relative}")
+            target = (root / relative).resolve()
+            if target == root or root not in target.parents:
+                raise ValueError(f"path escapes worktree: {relative}")
+            current = target.read_text(encoding="utf-8")  # re-read before every sequential edit
+            old, new = patch["old"], patch["new"]
+            if not old or old == new:
+                raise PatchTargetError(f"PATCH_NOOP: {relative}")
+            matches = [match.start() for match in re.finditer(re.escape(old), current)]
+            before, after = patch.get("before", ""), patch.get("after", "")
+            anchored = [index for index in matches if (not before or current[:index].endswith(before)) and (not after or current[index + len(old):].startswith(after))]
+            if not matches:
+                raise PatchTargetError(f"PATCH_STALE: old text is absent in current {relative}; sha256={hashlib.sha256(current.encode()).hexdigest()}")
+            if len(anchored) != 1:
+                raise PatchTargetError(f"PATCH_AMBIGUOUS: target has {len(anchored)} anchored matches in {relative}; add unique before/after context")
+            diff_chars += len(old) + len(new)
+            if diff_chars > self.max_diff_chars or len(new) > max(50000, len(current) * 2):
+                raise ValueError(f"CONTEXT_TOO_LARGE: unexpectedly huge diff for {relative}")
+            index = anchored[0]
+            target.write_text(current[:index] + new + current[index + len(old):], encoding="utf-8")
+
+    @staticmethod
+    def _model_call(decoded: dict, config: dict):
+        usage = decoded.get("usage", {})
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        completion_tokens = int(usage.get("completion_tokens", 0))
+        cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
+        calculated_cost = max(0, prompt_tokens - cached_tokens) * 0.75e-6 + cached_tokens * 0.075e-6 + completion_tokens * 4.50e-6
+        cost = float(decoded.get("_falguna_cost_usd", calculated_cost))
+        call = {"provider": decoded.get("_falguna_provider", "openai-compatible"), "model": config["model"], "purpose": "implementation", "input_tokens": prompt_tokens, "output_tokens": completion_tokens, "cost_usd": cost, "metadata": {"adapter": "structured-edit", "cached_input_tokens": cached_tokens, **decoded.get("_falguna_metadata", {})}}
+        return call, cost
+
+    @staticmethod
+    def _context_excerpt(content: str, requirement: str, max_chars: int = 50000) -> str:
+        if len(content) <= max_chars:
+            return content
+        terms = {
+            term for term in re.findall(r"[a-z0-9_]+", requirement.lower())
+            if len(term) >= 4 and term not in {
+                "only", "with", "this", "that", "from", "then", "appropriate", "inspect", "royal", "table",
+                "admin", "find", "genuine", "reproducible", "involving", "workflow", "correct", "exists",
+            }
+        }
+        lines = content.splitlines(keepends=True)
+        ranked = sorted(
+            ((sum(term in line.lower() for term in terms), index) for index, line in enumerate(lines)),
+            key=lambda item: (-item[0], len(lines[item[1]]), item[1]),
+        )
+        best_score, best_index = ranked[0]
+        if best_score == 0:
+            return content[:max_chars]
+        center = sum(len(line) for line in lines[:best_index]) + len(lines[best_index]) // 2
+        start = max(0, center - max_chars // 2)
+        end = min(len(content), start + max_chars)
+        start = content.find("\n", start) + 1 if start else 0
+        end_boundary = content.rfind("\n", start, end)
+        return content[start:end_boundary if end_boundary > start else end]
 
     @staticmethod
     def _request(config, payload, timeout_seconds):

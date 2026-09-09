@@ -38,6 +38,8 @@ class ControlPlane:
         now = utcnow()
         run_id = self.store.create("runs", {"task_id": task_id, "status": RunStatus.CREATED.value, "attempt": 0, "worker": worker_name, "model": model, "worktree": None, "head_sha": None, "error": None, "created_at": now, "updated_at": now})
         self.audit.append("RUN_CREATED", {"run_id": run_id, "task_id": task_id})
+        if hasattr(worker, "checkpoint") and worker.checkpoint is None:
+            worker.checkpoint = lambda ordinal, summary: self._milestone_checkpoint(run_id, policy, ordinal, summary)
         if on_run_created:
             on_run_created(run_id)
         return self._continue(run_id, worker, policy, force_stop_after)
@@ -47,6 +49,8 @@ class ControlPlane:
         if not checkpoint:
             raise ValueError("no checkpoint")
         self.audit.append("RUN_RESUMED", {"run_id": run_id, "stage": checkpoint["stage"]})
+        if hasattr(worker, "checkpoint") and worker.checkpoint is None:
+            worker.checkpoint = lambda ordinal, summary: self._milestone_checkpoint(run_id, policy, ordinal, summary)
         return self._continue(run_id, worker, policy, None)
 
     def _checkpoint(self, run_id: str, stage: str, **payload):
@@ -87,7 +91,8 @@ class ControlPlane:
                     if result.success:
                         break
                 if not result or not result.success:
-                    raise RuntimeError("worker failed within retry bound")
+                    detail = result.summary if result else "worker returned no result"
+                    raise RuntimeError(f"worker failed within retry bound: {detail}")
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 worker_path = evidence_dir / "worker-output.txt"
@@ -103,7 +108,12 @@ class ControlPlane:
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 verification_path = evidence_dir / "verification.json"
-                verification_evidence = {"passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation, "containment_probe": containment_probe}
+                task_checks = []
+                for item in self.store.list("checkpoints", "run_id=?", (run_id,)):
+                    checkpoint_payload = json.loads(item["payload"])
+                    if checkpoint_payload.get("completed_milestone_task"):
+                        task_checks.append(checkpoint_payload)
+                verification_evidence = {"passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation, "containment_probe": containment_probe, "milestone_tasks": task_checks}
                 verification_path.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
                 self._record_artifact(run_id, "VERIFICATION", verification_path)
                 if not passed:
@@ -126,7 +136,7 @@ class ControlPlane:
                     repair_path.write_text(repair.summary)
                     self._record_artifact(run_id, "REPAIR_OUTPUT", repair_path)
                     if not repair.success:
-                        raise RuntimeError("repair worker failed")
+                        raise RuntimeError(f"repair worker failed: {repair.summary}")
                     self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree))
                     return self._continue(run_id, worker, policy, None)
                 self._checkpoint(run_id, "VERIFIED", worktree=str(worktree), changed_files=changed)
@@ -166,7 +176,7 @@ class ControlPlane:
                 if total_cost > policy.max_cost_usd:
                     raise PolicyViolation("cumulative run cost cap exceeded")
                 if not review.approved:
-                    raise RuntimeError("independent review rejected candidate: " + "; ".join(review.findings))
+                    raise RuntimeError("REVIEW_FAILURE: independent review rejected candidate: " + "; ".join(review.findings))
                 approval_id = self.store.create("approvals", {"run_id": run_id, "kind": "PROTECTED_BRANCH_MERGE", "status": "PENDING", "requested_at": utcnow(), "decided_at": None, "decided_by": None, "reason": None, "created_at": utcnow(), "updated_at": utcnow()})
                 self.store.update("runs", run_id, status=RunStatus.DONE_CANDIDATE.value, error=None)
                 self._checkpoint(run_id, "DONE_CANDIDATE", worktree=str(worktree), approval_id=approval_id)
@@ -181,6 +191,14 @@ class ControlPlane:
             self.audit.append("RUN_FAILED", {"run_id": run_id, "error": str(exc)})
             return run_id
 
+    def _milestone_checkpoint(self, run_id: str, policy: RunPolicy, ordinal: int, summary: str) -> None:
+        worktree = Path(self.store.get("runs", run_id)["worktree"])
+        manager = GitWorktreeManager(Path(self.store.get("tasks", self.store.get("runs", run_id)["task_id"])["repository"]), self.state_root / "worktrees")
+        passed, changed, results, browser, isolation, containment_probe = DefinitionOfDone(manager, policy).verify(worktree)
+        self._checkpoint(run_id, "WORKTREE_READY", worktree=str(worktree), completed_milestone_task=ordinal,
+                         summary=summary, per_task_verification={"passed": passed, "changed_files": changed,
+                         "results": results, "browser": browser, "isolation": isolation,
+                         "containment_probe": containment_probe})
     def _record_artifact(self, run_id: str, kind: str, path: Path) -> None:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         self.store.create("artifacts", {"run_id": run_id, "kind": kind, "path": str(path), "sha256": digest, "metadata_json": "{}", "created_at": utcnow()})

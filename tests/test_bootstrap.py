@@ -107,6 +107,13 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(failure["category"], "VERIFICATION_FAILURE")
         self.assertTrue(failure["action"])
 
+    def test_worker_failure_preserves_specific_validation_detail(self):
+        ids = self.control.create_mission("bad worker", "make bounded edit", self.repo, self.policy)
+        failed = ScriptedWorker(lambda *_: WorkerResult(False, "Structured edit failed: model returned no patches", 65))
+        run_id = self.control.start(ids["task_id"], failed, "scripted-offline-test", "none", self.policy)
+        error = self.store.get("runs", run_id)["error"]
+        self.assertIn("model returned no patches", error)
+
     def test_forced_interruption_resumes_from_checkpoint(self):
         ids = self.control.create_mission("resume", "set value to 2", self.repo, self.policy)
         run_id = self.control.start(ids["task_id"], self.worker(), "scripted-offline-test", "none", self.policy, force_stop_after="WORKTREE_READY")
@@ -171,7 +178,74 @@ class BootstrapTests(unittest.TestCase):
         result = worker.execute(self.repo, "set value to 2", "test-run")
         self.assertTrue(result.success)
         self.assertEqual((self.repo / "falguna" / "feature.py").read_text(), "VALUE = 2\n")
-        self.assertEqual(result.model_calls[0]["metadata"]["adapter"], "structured-edit")
+
+    def test_non_unique_old_text_replans_with_unique_anchors(self):
+        target = self.repo / "falguna/feature.py"
+        target.write_text("A\nVALUE = 1\nB\nVALUE = 1\nC\n")
+        replies = iter([
+            {"summary": "ambiguous", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2"}]},
+            {"summary": "anchored", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2", "before": "B\n", "after": "\nC"}]},
+        ])
+        def response(config, payload, timeout):
+            return {"choices": [{"message": {"content": json.dumps(next(replies))}}]}
+        worker = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response)
+        result = worker.execute(self.repo, "change the second value", "run")
+        self.assertTrue(result.success)
+        self.assertEqual(target.read_text(), "A\nVALUE = 1\nB\nVALUE = 2\nC\n")
+
+    def test_stale_old_text_after_prior_edit_replans_against_latest_file(self):
+        replies = iter([
+            {"summary": "two edits", "patches": [
+                {"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2"},
+                {"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 3"},
+            ]},
+            {"summary": "latest state", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 2", "new": "VALUE = 3"}]},
+        ])
+        def response(config, payload, timeout):
+            return {"choices": [{"message": {"content": json.dumps(next(replies))}}]}
+        worker = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response)
+        result = worker.execute(self.repo, "sequential update", "run")
+        self.assertTrue(result.success)
+        self.assertEqual((self.repo / "falguna/feature.py").read_text(), "VALUE = 3\n")
+
+    def test_two_sequential_edits_to_same_file_see_latest_content(self):
+        def response(config, payload, timeout):
+            value = {"summary": "two edits", "patches": [
+                {"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2"},
+                {"path": "falguna/feature.py", "old": "VALUE = 2", "new": "VALUE = 4"},
+            ]}
+            return {"choices": [{"message": {"content": json.dumps(value)}}]}
+        result = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response).execute(self.repo, "two changes", "run")
+        self.assertTrue(result.success)
+        self.assertEqual((self.repo / "falguna/feature.py").read_text(), "VALUE = 4\n")
+
+    def test_noop_patch_is_rejected_after_bounded_replans(self):
+        def response(config, payload, timeout):
+            value = {"summary": "noop", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 1"}]}
+            return {"choices": [{"message": {"content": json.dumps(value)}}]}
+        result = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response).execute(self.repo, "change", "run")
+        self.assertFalse(result.success)
+        self.assertIn("PATCH_NOOP", result.summary)
+
+    def test_milestone_checkpoints_between_up_to_three_tasks(self):
+        checkpoints = []
+        def response(config, payload, timeout):
+            value = {"summary": "milestone", "patches": [
+                {"task": 1, "path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2"},
+                {"task": 2, "path": "falguna/feature.py", "old": "VALUE = 2", "new": "VALUE = 3"},
+            ]}
+            return {"choices": [{"message": {"content": json.dumps(value)}}]}
+        worker = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response, checkpoint=lambda ordinal, summary: checkpoints.append((ordinal, summary)))
+        self.assertTrue(worker.execute(self.repo, "milestone", "run").success)
+        self.assertEqual([item[0] for item in checkpoints], [1, 2])
+
+    def test_scope_expansion_requires_approval(self):
+        def response(config, payload, timeout):
+            value = {"summary": "expand", "patches": [{"path": "outside.py", "old": "x", "new": "y"}]}
+            return {"choices": [{"message": {"content": json.dumps(value)}}]}
+        result = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response).execute(self.repo, "expand", "run")
+        self.assertFalse(result.success)
+        self.assertIn("SCOPE_EXPANSION_REQUIRED", result.summary)
 
     def test_structured_worker_rejects_unapproved_path(self):
         gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
@@ -251,6 +325,9 @@ class BootstrapTests(unittest.TestCase):
         def response(config, payload, timeout):
             schema = payload["response_format"]["json_schema"]["schema"]
             self.assertIn("dimensions", schema["required"])
+            self.assertIn("scope compliance from changed lines", payload["messages"][0]["content"])
+            self.assertIn("normalization of stale fixture dates", payload["messages"][0]["content"])
+            self.assertIn("when it says A or B", payload["messages"][0]["content"])
             return {"choices": [{"message": {"content": json.dumps({"summary": "satisfied", "blocking_findings": [], "unresolved_uncertainty": [], "dimensions": dimensions})}}], "usage": {"prompt_tokens": 200, "completion_tokens": 50}}
         result = ModelSemanticReviewer(gateway, transport=response).review("requirement", "diff", ["tests/test_bootstrap.py"], {"passed": True})
         self.assertTrue(result.approved)
@@ -279,14 +356,91 @@ class BootstrapTests(unittest.TestCase):
 
     def test_codex_transport_extracts_strict_json_and_subscription_metadata(self):
         def runner(argv, **kwargs):
+            context_root = Path(argv[argv.index("-C") + 1])
+            self.assertNotEqual(context_root, self.repo.resolve())
+            self.assertEqual((context_root / "falguna/feature.py").read_text(), "VALUE = 1\n")
+            self.assertFalse((context_root / "tests/test_feature.py").exists())
             output = Path(argv[argv.index("--output-last-message") + 1])
             output.write_text(json.dumps({"summary": "ok"}))
             return subprocess.CompletedProcess(argv, 0, '{"usage":{"input_tokens":12,"output_tokens":3}}\n', '')
         transport = CodexCliJSONTransport(Path("/bin/echo"), Path(self.temp.name), runner=runner)
-        decoded = transport({"model": "test"}, {"messages": [{"role": "user", "content": "test"}], "response_format": {"json_schema": {"schema": {"type": "object"}}}}, 30)
+        decoded = transport({"model": "gpt-5.6-luna", "_falguna_worktree": str(self.repo), "_falguna_editable_files": ["falguna/feature.py"]}, {"messages": [{"role": "user", "content": "test"}], "response_format": {"json_schema": {"schema": {"type": "object"}}}}, 30)
         self.assertEqual(decoded["usage"]["prompt_tokens"], 12)
         self.assertEqual(decoded["_falguna_cost_usd"], 0.0)
         self.assertEqual(decoded["_falguna_provider"], "codex-cli-subscription")
+
+    def test_codex_transport_preserves_stdout_error_when_stderr_is_empty(self):
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "The model is not supported when using Codex with a ChatGPT account.", "")
+        transport = CodexCliJSONTransport(Path("/bin/echo"), Path(self.temp.name), runner=runner)
+        with self.assertRaisesRegex(OSError, "model is not supported"):
+            transport({"model": "gpt-5.6-luna"}, {"messages": [{"role": "user", "content": "test"}], "response_format": {"json_schema": {"schema": {"type": "object"}}}}, 30)
+
+    def test_unsupported_model_is_rejected_before_transport_call(self):
+        calls = {"count": 0}
+        def runner(argv, **kwargs):
+            calls["count"] += 1
+        transport = CodexCliJSONTransport(Path("/bin/echo"), Path(self.temp.name), runner=runner)
+        with self.assertRaisesRegex(OSError, "MODEL_UNSUPPORTED"):
+            transport({"model": "gpt-5.4-mini"}, {"messages": [{"role": "user", "content": "test"}], "response_format": {"json_schema": {"schema": {"type": "object"}}}}, 30)
+        self.assertEqual(calls["count"], 0)
+
+    def test_web_uses_lowest_supported_codex_subscription_model(self):
+        from falguna.web import MODEL
+        self.assertEqual(MODEL, "gpt-5.6-luna")
+
+    def test_structured_worker_gives_codex_transport_the_isolated_worktree(self):
+        gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
+
+        def response(config, payload, timeout):
+            self.assertEqual(Path(config["_falguna_worktree"]), self.repo.resolve())
+            self.assertEqual(config["_falguna_editable_files"], ["falguna/feature.py"])
+            self.assertEqual(config["_falguna_context_files"]["falguna/feature.py"], "VALUE = 1\n")
+            return {"choices": [{"message": {"content": json.dumps({"summary": "bounded", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2"}]})}}]}
+        response.uses_workspace_context = True
+
+        result = StructuredEditWorker(gateway, ["falguna/feature.py"], transport=response).execute(self.repo, "bounded edit", "test-run")
+        self.assertTrue(result.success)
+
+    def test_workspace_transport_does_not_duplicate_full_file_contents_in_prompt(self):
+        gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:8765/v1", "/missing/real-key")
+
+        class WorkspaceResponse:
+            uses_workspace_context = True
+
+            def __call__(self, config, payload, timeout):
+                self_test.assertIn("focused regression assertion", payload["messages"][0]["content"])
+                self_test.assertIn("source-text includes or regex assertion alone is insufficient", payload["messages"][0]["content"])
+                self_test.assertIn("stale hardcoded calendar dates", payload["messages"][0]["content"])
+                self_test.assertIn("repair the reported verification failure", payload["messages"][0]["content"])
+                supplied = json.loads(payload["messages"][1]["content"])["editable_files"]
+                self_test.assertEqual(supplied, ["falguna/feature.py"])
+                return {"choices": [{"message": {"content": json.dumps({"summary": "bounded", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2"}]})}}]}
+
+        self_test = self
+        result = StructuredEditWorker(gateway, ["falguna/feature.py"], transport=WorkspaceResponse()).execute(self.repo, "bounded edit", "test-run")
+        self.assertTrue(result.success)
+
+    def test_workspace_context_excerpts_large_files_around_objective_terms(self):
+        content = "".join(f"unrelated line {index}\n" for index in range(3000)) + "reservation status preservation defect\n" + "tail\n" * 3000
+        excerpt = StructuredEditWorker._context_excerpt(content, "fix reservation status preservation")
+        self.assertLessEqual(len(excerpt), 50000)
+        self.assertIn("reservation status preservation defect", excerpt)
+        self.assertNotEqual(excerpt, content)
+
+    def test_structured_patch_schema_is_strict_runtime_compatible(self):
+        gateway = OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", "")
+        def response(config, payload, timeout):
+            item = payload["response_format"]["json_schema"]["schema"]["properties"]["patches"]["items"]
+            self.assertEqual(set(item["required"]), set(item["properties"]))
+            value = {"summary": "edit", "patches": [{"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2", "before": "", "after": "", "task": 1}]}
+            return {"choices": [{"message": {"content": json.dumps(value)}}]}
+        result = StructuredEditWorker(gateway, ["falguna/feature.py"], transport=response).execute(self.repo, "edit", "run")
+        self.assertTrue(result.success)
+
+    def test_stale_profile_root_is_actionable(self):
+        with self.assertRaisesRegex(ValueError, "PROFILE_STALE"):
+            ProjectDiscovery(self.repo, {"discovery_roots": ["missing"]}).discover("bounded objective")
 
     def test_command_policy_blocks_inline_code_and_external_resource(self):
         terminal = TerminalCapability(PermissionEngine(self.repo, self.policy))
@@ -372,6 +526,54 @@ class BootstrapTests(unittest.TestCase):
         plan = ProjectDiscovery(self.repo, {"discovery_roots": ["falguna"]}).discover("change unrelated frobnicator behavior")
         self.assertEqual(plan.confidence, "UNCERTAIN")
         self.assertTrue(plan.requires_approval)
+
+    def test_royal_table_nested_profile_discovers_admin_reservation_scope(self):
+        (self.repo / "admin.html").write_text("admin reservation status update\n")
+        (self.repo / "ui.js").write_text("reservation ui\n")
+        (self.repo / "server" / "server.js").parent.mkdir()
+        (self.repo / "server" / "server.js").write_text("update reservation status and preserve reservation state\n")
+        (self.repo / "server" / "reservation-smoke-test.js").write_text("test admin reservation status update\n")
+        (self.repo / "server" / "package.json").write_text(json.dumps({"scripts": {"test": "node reservation-smoke-test.js"}}))
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "royal table fixture"], check=True, capture_output=True)
+
+        plan = ProjectDiscovery(self.repo, {
+            "discovery_roots": ["admin.html", "ui.js", "server"],
+            "package_root": "server",
+        }).discover("Inspect the admin reservation status-update workflow and preserve reservation state")
+
+        self.assertEqual(plan.confidence, "HIGH")
+        self.assertFalse(plan.requires_approval)
+        self.assertIn("admin.html", plan.editable_files)
+        self.assertIn("server/reservation-smoke-test.js", plan.editable_files)
+        self.assertEqual(plan.verification_commands[0].argv, ["npm", "--prefix", "server", "run", "test"])
+        self.assertEqual(plan.verification_commands[0].network_mode, "loopback")
+
+    def test_discovery_runs_the_npm_script_for_the_selected_test_file(self):
+        (self.repo / "admin.html").write_text("admin reservation status update\n")
+        (self.repo / "server").mkdir()
+        (self.repo / "server/final-qa-test.js").write_text("reservation status update final qa\n")
+        (self.repo / "server/package.json").write_text(json.dumps({"scripts": {"test": "node old-smoke-test.js", "test:final-qa": "node final-qa-test.js"}}))
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "selected test fixture"], check=True, capture_output=True)
+
+        plan = ProjectDiscovery(self.repo, {"discovery_roots": ["admin.html", "server"], "package_root": "server"}).discover("admin reservation status update")
+
+        self.assertEqual(plan.editable_files, ["admin.html", "server/final-qa-test.js"])
+        self.assertEqual(plan.verification_commands[0].argv, ["npm", "--prefix", "server", "run", "test:final-qa"])
+
+    def test_discovery_rejects_unsafe_approved_package_root(self):
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "discovery fixture"], check=True, capture_output=True)
+        with self.assertRaisesRegex(ValueError, "package_root"):
+            ProjectDiscovery(self.repo, {"package_root": "../outside"}).discover("bounded objective")
+
+    def test_discovery_rejects_invalid_verification_command(self):
+        (self.repo / "package.json").write_text(json.dumps({"scripts": {"test": ""}}))
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "invalid verification fixture"], check=True, capture_output=True)
+        with self.assertRaisesRegex(ValueError, "VERIFY_COMMAND_INVALID"):
+            ProjectDiscovery(self.repo, {"discovery_roots": ["."]}).discover("bounded objective")
 
     def test_macos_launcher_preserves_local_only_start_and_safe_stop(self):
         root = Path(__file__).parents[1]

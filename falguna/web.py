@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .codex_transport import CodexCliJSONTransport
+from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL
 from .discovery import ProjectDiscovery
 from .gateway import OpenAICompatibleGateway
 from .models import CommandSpec, RunPolicy
@@ -18,7 +18,7 @@ from .usability import evidence_summary, mission_view
 from .workers import StructuredEditWorker
 
 
-MODEL = "gpt-5.4-mini"
+MODEL = DEFAULT_CODEX_MODEL
 _operations = {}
 _operations_lock = threading.Lock()
 
@@ -119,6 +119,8 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         if len(objective) < 12:
             raise ValueError("Provide a bounded engineering objective")
         plan = ProjectDiscovery(Path(profile["repository"]), profile).discover(objective)
+        if not plan.verification_commands:
+            raise ValueError("VERIFY_COMMAND_INVALID: no runnable native verification command was discovered")
         if plan.requires_approval:
             return self._json({"error": "Discovery is uncertain; approve or narrow the proposed scope before modification", "discovery": plan.evidence()}, HTTPStatus.CONFLICT)
         editable = validate_editable(plan.editable_files)
@@ -164,7 +166,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
 def _run_mission(app_root, token, profile, objective, editable, commands, cap, discovery):
     control, store = open_control_plane(app_root)
     try:
-        dependency_path = Path(profile["repository"]) / "node_modules"
+        dependency_path = Path(profile["repository"]) / profile.get("package_root", ".") / "node_modules"
         policy = RunPolicy(allowed_write_globs=editable, verification_commands=commands, max_cost_usd=cap, dependency_node_path=str(dependency_path) if dependency_path.is_dir() else None, verification_write_regexes=profile.get("verification_write_regexes", []))
         codex = shutil.which("codex")
         if not codex:

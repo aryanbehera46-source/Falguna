@@ -23,7 +23,9 @@
     "id": "royal-table",
     "name": "Royal Table",
     "repository": "/Users/aryanbehera/Freelancing/restaurant-website",
-    "discovery_roots": ["server.js", "public", "tests", "scripts"],
+    "discovery_roots": ["admin.html", "ui.js", "server"],
+    "package_root": "server",
+    "verification_write_regexes": ["^/tmp/royal-table-[a-z0-9-]+[.]db.*$", "^/private/tmp/royal-table-[a-z0-9-]+[.]db.*$"],
     "default_budget_usd": 0.05,
     "risk": "Trusted local project; discovered scope only"
   },

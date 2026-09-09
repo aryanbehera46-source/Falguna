@@ -17,7 +17,14 @@ def classify_failure(run: dict) -> Optional[dict]:
     error = (run.get("error") or "").lower()
     if status not in {"FAILED", "QUARANTINED"}:
         return None
-    if status == "QUARANTINED":
+    explicit = next((name for name in (
+        "MODEL_UNSUPPORTED", "TRANSPORT_FAILURE", "PATCH_AMBIGUOUS", "PATCH_STALE", "PATCH_NOOP",
+        "CONTEXT_TOO_LARGE", "PROFILE_STALE", "VERIFY_COMMAND_INVALID", "SCOPE_EXPANSION_REQUIRED",
+        "REVIEW_FAILURE",
+    ) if name.lower() in error), None)
+    if explicit:
+        category = explicit
+    elif status == "QUARANTINED":
         category = "SECURITY_CONTAINMENT" if any(word in error for word in ("path", "write", "command", "network", "protected")) else "BUDGET_STOP"
     elif "definition of done" in error or "verification" in error:
         category = "VERIFICATION_FAILURE"
@@ -37,6 +44,16 @@ def classify_failure(run: dict) -> Optional[dict]:
         "MODEL_FAILURE": "Inspect worker/reviewer output; retry only within the bound.",
         "HUMAN_INPUT_REQUIRED": "Provide the missing bounded input.",
         "TOOL_FAILURE": "Repair the local tool or environment, then resume.",
+        "MODEL_UNSUPPORTED": "Select a supported authenticated runtime model; no mission retry is needed.",
+        "TRANSPORT_FAILURE": "Inspect the preserved stdout and stderr, repair transport, then resume.",
+        "PATCH_AMBIGUOUS": "Regenerate a patch with unique surrounding anchors.",
+        "PATCH_STALE": "Re-read the current file and regenerate the stale patch.",
+        "PATCH_NOOP": "Regenerate a patch that makes a concrete change.",
+        "CONTEXT_TOO_LARGE": "Narrow the bounded objective or approved file scope.",
+        "PROFILE_STALE": "Update the approved project profile to match the repository layout.",
+        "VERIFY_COMMAND_INVALID": "Repair the approved native verification binding before execution.",
+        "SCOPE_EXPANSION_REQUIRED": "Approve the newly required files before continuing.",
+        "REVIEW_FAILURE": "Inspect independent review findings and request a bounded repair.",
     }
     return {"category": category, "message": run.get("error"), "action": actions[category]}
 

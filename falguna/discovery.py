@@ -35,7 +35,8 @@ class ProjectDiscovery:
 
     def discover(self, objective: str) -> DiscoveryPlan:
         if not (self.repository / ".git").exists():
-            raise ValueError("approved project is not a Git repository")
+            raise ValueError("PROFILE_STALE: approved project is not a Git repository")
+        self._validate_profile_roots()
         status = subprocess.check_output(
             ["git", "-C", str(self.repository), "status", "--porcelain"], text=True
         )
@@ -63,7 +64,7 @@ class ProjectDiscovery:
         implementation = [path for _, path in scored if not self._is_test(path)][:1]
         tests = [path for _, path in scored if self._is_test(path)][:1]
         editable = implementation + tests
-        commands, sources = self._verification()
+        commands, sources = self._verification(tests[0] if tests else None)
         high_confidence = bool(implementation and tests and commands and scored[0][0] >= 3)
         rationale = [
             f"ranked {len(scored)} tracked text files using objective terms",
@@ -76,6 +77,20 @@ class ProjectDiscovery:
             rationale,
             requires_approval=not high_confidence,
         )
+
+    def _validate_profile_roots(self) -> None:
+        roots = self.profile.get("discovery_roots", ["."])
+        if not isinstance(roots, list) or not roots:
+            raise ValueError("PROFILE_STALE: discovery_roots must be a non-empty list")
+        for raw in roots:
+            path = Path(str(raw))
+            if not str(raw).strip() or path.is_absolute() or ".." in path.parts:
+                raise ValueError("PROFILE_STALE: discovery root escapes the approved project")
+            if path != Path(".") and not (self.repository / path).exists():
+                raise ValueError(f"PROFILE_STALE: approved discovery root does not exist: {raw}")
+        package_root = self._package_root()
+        if package_root != Path(".") and not (self.repository / package_root / "package.json").is_file():
+            raise ValueError(f"PROFILE_STALE: package root has no package.json: {package_root.as_posix()}")
 
     def _tracked_text_files(self) -> list[str]:
         output = subprocess.check_output(
@@ -104,17 +119,32 @@ class ProjectDiscovery:
         lower = relative.lower()
         return any(marker in lower for marker in TEST_MARKERS)
 
-    def _verification(self):
+    def _verification(self, selected_test=None):
         commands = []
         sources = []
-        package = self.repository / "package.json"
+        package_root = self._package_root()
+        package = self.repository / package_root / "package.json"
         if package.is_file():
             scripts = json.loads(package.read_text(encoding="utf-8")).get("scripts", {})
-            for name in ("test", "typecheck", "lint", "build"):
+            if not isinstance(scripts, dict):
+                raise ValueError("VERIFY_COMMAND_INVALID: package.json scripts must be an object")
+            invalid = [name for name, command in scripts.items() if not isinstance(command, str) or not command.strip()]
+            if invalid:
+                raise ValueError(f"VERIFY_COMMAND_INVALID: invalid npm script: {invalid[0]}")
+            matched_tests = []
+            if selected_test:
+                test_name = Path(selected_test).name
+                matched_tests = [name for name, command in scripts.items() if test_name in str(command)]
+            script_names = matched_tests or [name for name in ("test", "typecheck", "lint", "build") if name in scripts]
+            for name in script_names:
                 if name in scripts:
-                    commands.append(CommandSpec(["npm", "run", name], 600, f"npm-{name}", "loopback" if name == "test" else "deny"))
+                    argv = ["npm"]
+                    if package_root != Path("."):
+                        argv.extend(["--prefix", package_root.as_posix()])
+                    argv.extend(["run", name])
+                    commands.append(CommandSpec(argv, 600, f"npm-{name}", "loopback" if name.startswith("test") else "deny"))
             if commands:
-                sources.append("package.json scripts")
+                sources.append(f"{(package_root / 'package.json').as_posix()} scripts")
         pyproject = self.repository / "pyproject.toml"
         if not commands and pyproject.is_file() and (self.repository / "tests").is_dir():
             commands.append(CommandSpec(["python3", "-m", "unittest", "discover", "-s", "tests", "-v"], 600, "python-unittest"))
@@ -122,11 +152,19 @@ class ProjectDiscovery:
         return commands, sources
 
     def _package_entrypoint(self):
-        package = self.repository / "package.json"
+        package_root = self._package_root()
+        package = self.repository / package_root / "package.json"
         if not package.is_file():
             return None
         try:
             main = json.loads(package.read_text(encoding="utf-8")).get("main")
-            return str(main) if main else None
+            return (package_root / str(main)).as_posix() if main else None
         except (OSError, ValueError):
             return None
+
+    def _package_root(self) -> Path:
+        raw = str(self.profile.get("package_root", ".")).strip()
+        root = Path(raw)
+        if not raw or root.is_absolute() or ".." in root.parts:
+            raise ValueError("approved package_root must stay inside the project")
+        return root

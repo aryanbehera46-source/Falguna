@@ -5,7 +5,7 @@ import shlex
 import shutil
 from pathlib import Path
 
-from .codex_transport import CodexCliJSONTransport
+from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL
 from .gateway import OpenAICompatibleGateway
 from .models import CommandSpec, RunPolicy
 from .review import ModelSemanticReviewer
@@ -30,7 +30,7 @@ def main():
     run.add_argument("--objective", required=True)
     run.add_argument("--editable", action="append", required=True)
     run.add_argument("--test", action="append", required=True, help="Verification command; repeat for multiple checks")
-    run.add_argument("--model", default="gpt-5.4-mini")
+    run.add_argument("--model", default=DEFAULT_CODEX_MODEL)
     run.add_argument("--max-cost-usd", type=float, default=0.50)
     run.add_argument("--browser-url")
     run.add_argument("--codex", default=shutil.which("codex"))

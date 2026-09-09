@@ -4,21 +4,53 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
+SUPPORTED_CODEX_MODELS = frozenset({"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-5.5"})
+
+
+class ModelUnsupportedError(OSError):
+    pass
+
 
 class CodexCliJSONTransport:
     """Strict-JSON transport using an authenticated, read-only local Codex runtime."""
+
+    uses_workspace_context = True
 
     def __init__(self, executable: Path, codex_home: Path, timeout_seconds: int = 180, runner=None):
         self.executable = Path(executable).resolve()
         self.codex_home = Path(codex_home).resolve()
         self.timeout_seconds = timeout_seconds
         self.runner = runner or subprocess.run
+        self._compatible_models = set()
+
+    def preflight(self, model: str) -> None:
+        if model in self._compatible_models:
+            return
+        if model not in SUPPORTED_CODEX_MODELS:
+            raise ModelUnsupportedError(f"MODEL_UNSUPPORTED: authenticated Codex runtime does not support {model}")
+        self._compatible_models.add(model)
 
     def __call__(self, config, payload, timeout_seconds):
+        self.preflight(config["model"])
         schema = payload["response_format"]["json_schema"]["schema"]
         prompt = "\n\n".join(f"{item['role'].upper()}:\n{item['content']}" for item in payload["messages"])
         with tempfile.TemporaryDirectory(prefix="falguna-codex-transport-") as directory:
             root = Path(directory)
+            context_root = root / "context"
+            context_root.mkdir()
+            if config.get("_falguna_worktree"):
+                worktree = Path(config["_falguna_worktree"]).resolve()
+                if not worktree.is_dir():
+                    raise ValueError("Codex transport isolated worktree does not exist")
+                for relative in config.get("_falguna_editable_files", []):
+                    source = (worktree / relative).resolve()
+                    if source == worktree or worktree not in source.parents or not source.is_file():
+                        raise ValueError(f"Codex transport context path is not an approved file: {relative}")
+                    target = context_root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    context = config.get("_falguna_context_files", {}).get(relative)
+                    target.write_text(context, encoding="utf-8") if context is not None else target.write_bytes(source.read_bytes())
             schema_path = root / "schema.json"
             output_path = root / "result.json"
             schema_path.write_text(json.dumps(schema), encoding="utf-8")
@@ -32,11 +64,16 @@ class CodexCliJSONTransport:
                 str(self.executable), "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
                 "--skip-git-repo-check", "--sandbox", "read-only", "--model", config["model"],
                 "--output-schema", str(schema_path), "--output-last-message", str(output_path),
-                "--json", "-C", str(root), "-",
+                "--json", "-C", str(context_root), "-",
             ]
             completed = self.runner(argv, input=prompt, env=env, text=True, capture_output=True, timeout=min(timeout_seconds, self.timeout_seconds))
             if completed.returncode != 0:
-                raise OSError(f"Codex transport failed with exit {completed.returncode}: {completed.stderr[-1000:]}")
+                stdout = (completed.stdout or "")[-4000:]
+                stderr = (completed.stderr or "")[-4000:]
+                detail = f"stdout={stdout!r} stderr={stderr!r}"
+                if "model is not supported" in (stdout + stderr).lower():
+                    raise ModelUnsupportedError(f"MODEL_UNSUPPORTED: {detail}")
+                raise OSError(f"TRANSPORT_FAILURE: Codex transport exit {completed.returncode}: {detail}")
             content = output_path.read_text(encoding="utf-8")
             json.loads(content)
             usage = self._usage(completed.stdout)
