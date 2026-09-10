@@ -116,8 +116,9 @@ class ProjectDiscovery:
 
     @staticmethod
     def _is_test(relative: str) -> bool:
-        lower = relative.lower()
-        return any(marker in lower for marker in TEST_MARKERS)
+        path = Path(relative)
+        filename = path.name.lower()
+        return any(marker in filename for marker in TEST_MARKERS) or any(part.lower() in {"test", "tests", "__tests__"} for part in path.parts[:-1])
 
     def _verification(self, selected_test=None):
         commands = []

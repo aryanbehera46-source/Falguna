@@ -709,6 +709,10 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(browser_e2e_applicable("fix server validation", ["server.js"], profile))
         self.assertFalse(browser_e2e_applicable("fix responsive layout", ["public/app.js"], {}))
 
+    def test_browser_fixture_is_implementation_and_portable_spec_is_test(self):
+        self.assertFalse(ProjectDiscovery._is_test("browser-tests/fixture.html"))
+        self.assertTrue(ProjectDiscovery._is_test("browser-tests/portable-localhost.spec.js"))
+
     def test_mission_records_stage_timing_metrics(self):
         ids = self.control.create_mission("timing", "set value to 2", self.repo, self.policy)
         run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy)
