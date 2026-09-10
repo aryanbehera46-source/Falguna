@@ -116,7 +116,11 @@ class ControlPlane:
                 result = None
                 for attempt in range(1, policy.max_attempts + 1):
                     self.store.update("runs", run_id, attempt=attempt)
-                    result = worker.execute(worktree, requirement, run_id)
+                    try:
+                        result = worker.execute(worktree, requirement, run_id)
+                    except Exception as exc:
+                        from .models import WorkerResult
+                        result = WorkerResult(False, str(exc), 1)
                     self.audit.append("WORKER_ATTEMPT", {"run_id": run_id, "attempt": attempt, "success": result.success, "exit_code": result.exit_code})
                     for call in result.model_calls:
                         self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": call.get("purpose", "implementation"), "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})

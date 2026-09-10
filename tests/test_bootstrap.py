@@ -690,6 +690,19 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result["_falguna_metadata"]["routed_model"], "gpt-5.6-terra")
         self.assertEqual(fake.calls, ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-terra"])
 
+    def test_transport_timeout_is_actionable_and_bounded_retry_preserves_it(self):
+        calls = []
+        class TimeoutWorker:
+            def execute(self, *_):
+                calls.append(1)
+                raise OSError("TRANSPORT_FAILURE: timed out with stdout='progress' stderr=''")
+        ids = self.control.create_mission("timeout", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], TimeoutWorker(), "timeout", "none", self.policy)
+        run = self.store.get("runs", run_id)
+        self.assertEqual((run["status"], len(calls)), ("FAILED", self.policy.max_attempts))
+        self.assertIn("TRANSPORT_FAILURE", run["error"])
+        self.assertIn("stdout='progress'", run["error"])
+
     def test_browser_e2e_applicability_uses_intent_files_and_profile(self):
         profile = {"browser_base_url": "http://127.0.0.1:4173"}
         self.assertTrue(browser_e2e_applicable("fix responsive layout", ["public/app.js"], profile))

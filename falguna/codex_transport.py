@@ -67,7 +67,12 @@ class CodexCliJSONTransport:
                 "--output-schema", str(schema_path), "--output-last-message", str(output_path),
                 "--json", "-C", str(context_root), "-",
             ]
-            completed = self.runner(argv, input=prompt, env=env, text=True, capture_output=True, timeout=min(timeout_seconds, self.timeout_seconds))
+            try:
+                completed = self.runner(argv, input=prompt, env=env, text=True, capture_output=True, timeout=min(timeout_seconds, self.timeout_seconds))
+            except subprocess.TimeoutExpired as exc:
+                stdout = (exc.stdout or "")[-4000:]
+                stderr = (exc.stderr or "")[-4000:]
+                raise OSError(f"TRANSPORT_FAILURE: Codex transport timed out after {exc.timeout}s: stdout={stdout!r} stderr={stderr!r}") from exc
             if completed.returncode != 0:
                 stdout = (completed.stdout or "")[-4000:]
                 stderr = (completed.stderr or "")[-4000:]

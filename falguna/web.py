@@ -220,7 +220,7 @@ def _run_mission(app_root, token, profile, objective, editable, commands, cap, d
         gateway = OpenAICompatibleGateway(MODEL, "http://127.0.0.1:1/v1", "")
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
         transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=300))
-        worker = StructuredEditWorker(gateway, editable, transport=transport)
+        worker = StructuredEditWorker(gateway, editable, timeout_seconds=300, transport=transport)
         control.reviewer = ModelSemanticReviewer(gateway, timeout_seconds=300, transport=transport)
         ids = control.create_mission(objective[:80], objective, Path(profile["repository"]), policy)
         def created(run_id):
@@ -259,7 +259,7 @@ def _resume_mission(app_root, token, run_id):
         gateway = OpenAICompatibleGateway(run["model"], "http://127.0.0.1:1/v1", "")
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
         transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=300))
-        worker = StructuredEditWorker(gateway, policy.allowed_write_globs, transport=transport)
+        worker = StructuredEditWorker(gateway, policy.allowed_write_globs, timeout_seconds=300, transport=transport)
         control.reviewer = ModelSemanticReviewer(gateway, timeout_seconds=300, transport=transport)
         with _operations_lock:
             _operations[token] = {"state": "RUNNING", "run_id": run_id, "resumed": True}
