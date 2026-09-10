@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -45,19 +46,49 @@ class ControlPlane:
         return self._continue(run_id, worker, policy, force_stop_after)
 
     def resume(self, run_id: str, worker: WorkerAdapter, policy: RunPolicy) -> str:
+        run = self.store.get("runs", run_id)
         checkpoint = self.store.latest_checkpoint(run_id)
         if not checkpoint:
             raise ValueError("no checkpoint")
         self.audit.append("RUN_RESUMED", {"run_id": run_id, "stage": checkpoint["stage"]})
+        if run and run["status"] == RunStatus.PAUSED.value:
+            for control in self.store.list("run_controls", "run_id=? AND status=?", (run_id, "APPLIED")):
+                self.store.update("run_controls", control["id"], status="CLEARED")
         if hasattr(worker, "checkpoint") and worker.checkpoint is None:
             worker.checkpoint = lambda ordinal, summary: self._milestone_checkpoint(run_id, policy, ordinal, summary)
         return self._continue(run_id, worker, policy, None)
+
+    def request_control(self, run_id: str, action: str) -> None:
+        if action not in {"PAUSE", "CANCEL"}:
+            raise ValueError("control action must be PAUSE or CANCEL")
+        run = self.store.get("runs", run_id)
+        if not run or run["status"] in {RunStatus.DONE_CANDIDATE.value, RunStatus.CANCELLED.value}:
+            raise ValueError("run is not controllable")
+        self.store.create("run_controls", {"run_id": run_id, "action": action, "status": "REQUESTED", "detail_json": json.dumps({"mode": "safe-boundary"}), "created_at": utcnow(), "updated_at": utcnow()})
+        self.audit.append(f"RUN_{action}_REQUESTED", {"run_id": run_id, "mode": "safe-boundary"})
+
+    def _control_boundary(self, run_id: str, stage: str) -> bool:
+        pending = self.store.list("run_controls", "run_id=? AND status=?", (run_id, "REQUESTED"))
+        if not pending:
+            return False
+        control = pending[-1]
+        action = control["action"]
+        self._checkpoint(run_id, stage, safe_boundary=True, control=action, worktree=self.store.get("runs", run_id).get("worktree"))
+        self.store.update("run_controls", control["id"], status="APPLIED")
+        status = RunStatus.PAUSED.value if action == "PAUSE" else RunStatus.CANCELLED.value
+        self.store.update("runs", run_id, status=status, error=None)
+        self.audit.append(f"RUN_{action}D", {"run_id": run_id, "stage": stage, "partial_merge": False})
+        return True
+
+    def _timed(self, run_id: str, stage: str, started: float, **metadata) -> None:
+        self.store.create("mission_timings", {"run_id": run_id, "stage": stage, "duration_ms": max(0, round((time.monotonic() - started) * 1000)), "metadata_json": json.dumps(metadata, sort_keys=True), "created_at": utcnow()})
 
     def _checkpoint(self, run_id: str, stage: str, **payload):
         self.store.checkpoint(run_id, stage, payload)
         self.audit.append("CHECKPOINT", {"run_id": run_id, "stage": stage})
 
     def _continue(self, run_id: str, worker: WorkerAdapter, policy: RunPolicy, force_stop_after: Optional[str]) -> str:
+        total_started = time.monotonic()
         run = self.store.get("runs", run_id)
         task = self.store.get("tasks", run["task_id"])
         requirement = self.store.get("requirements", task["requirement_id"])["body"]
@@ -67,6 +98,8 @@ class ControlPlane:
         payload = json.loads(checkpoint["payload"]) if checkpoint else {}
         try:
             if stage == "CREATED":
+                if self._control_boundary(run_id, "CREATED"):
+                    return run_id
                 self.store.update("runs", run_id, status=RunStatus.PLANNING.value)
                 worktree = manager.create(run_id, task["base_ref"])
                 self.store.update("runs", run_id, worktree=str(worktree), head_sha=manager.head(worktree))
@@ -76,7 +109,10 @@ class ControlPlane:
                 stage, payload = "WORKTREE_READY", {"worktree": str(worktree)}
             worktree = Path(payload.get("worktree") or self.store.get("runs", run_id)["worktree"])
             if stage == "WORKTREE_READY":
+                if self._control_boundary(run_id, "WORKTREE_READY"):
+                    return run_id
                 self.store.update("runs", run_id, status=RunStatus.WORKING.value)
+                worker_started = time.monotonic()
                 result = None
                 for attempt in range(1, policy.max_attempts + 1):
                     self.store.update("runs", run_id, attempt=attempt)
@@ -91,8 +127,10 @@ class ControlPlane:
                     if result.success:
                         break
                 if not result or not result.success:
+                    self._timed(run_id, "worker", worker_started, attempts=self.store.get("runs", run_id)["attempt"], success=False)
                     detail = result.summary if result else "worker returned no result"
                     raise RuntimeError(f"worker failed within retry bound: {detail}")
+                self._timed(run_id, "worker", worker_started, attempts=self.store.get("runs", run_id)["attempt"], success=True)
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 worker_path = evidence_dir / "worker-output.txt"
@@ -103,8 +141,12 @@ class ControlPlane:
                     return run_id
                 stage = "WORKER_COMPLETE"
             if stage == "WORKER_COMPLETE":
+                if self._control_boundary(run_id, "WORKER_COMPLETE"):
+                    return run_id
                 self.store.update("runs", run_id, status=RunStatus.VERIFYING.value)
+                verification_started = time.monotonic()
                 passed, changed, results, browser, isolation, containment_probe = DefinitionOfDone(manager, policy).verify(worktree)
+                self._timed(run_id, "verification", verification_started, passed=passed, browser_applicable=policy.browser_applicable)
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 prior_attempts = sorted(evidence_dir.glob("verification-attempt-*.json"))
@@ -151,7 +193,10 @@ class ControlPlane:
                 self._checkpoint(run_id, "VERIFIED", worktree=str(worktree), changed_files=changed)
                 stage, payload = "VERIFIED", {"worktree": str(worktree), "changed_files": changed}
             if stage == "VERIFIED":
+                if self._control_boundary(run_id, "VERIFIED"):
+                    return run_id
                 self.store.update("runs", run_id, status=RunStatus.REVIEWING.value)
+                review_started = time.monotonic()
                 if self.calibration_cases:
                     calibration = ReviewerCalibrator(self.reviewer).run(self.calibration_cases)
                     evidence_dir = self.state_root / "evidence" / run_id
@@ -172,6 +217,7 @@ class ControlPlane:
                 verification_path = self.state_root / "evidence" / run_id / "verification.json"
                 verification_evidence = json.loads(verification_path.read_text())
                 review = self.reviewer.review(requirement, diff, changed, verification_evidence)
+                self._timed(run_id, "review", review_started, approved=review.approved)
                 evidence_dir = self.state_root / "evidence" / run_id
                 (evidence_dir / "diff.patch").write_text(diff)
                 (evidence_dir / "review.json").write_text(json.dumps(review.__dict__, indent=2, sort_keys=True))
@@ -190,6 +236,7 @@ class ControlPlane:
                 self.store.update("runs", run_id, status=RunStatus.DONE_CANDIDATE.value, error=None)
                 self._checkpoint(run_id, "DONE_CANDIDATE", worktree=str(worktree), approval_id=approval_id)
                 self.audit.append("DONE_CANDIDATE", {"run_id": run_id, "approval_id": approval_id})
+            self._timed(run_id, "total", total_started, terminal_status=self.store.get("runs", run_id)["status"])
             return run_id
         except PolicyViolation as exc:
             self.store.update("runs", run_id, status=RunStatus.QUARANTINED.value, error=str(exc))

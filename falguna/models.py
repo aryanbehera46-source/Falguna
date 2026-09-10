@@ -12,6 +12,8 @@ class RunStatus(str, Enum):
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
     DONE_CANDIDATE = "DONE_CANDIDATE"
     FAILED = "FAILED"
+    PAUSED = "PAUSED"
+    CANCELLED = "CANCELLED"
     QUARANTINED = "QUARANTINED"
 
 
@@ -38,6 +40,7 @@ class RunPolicy:
     browser_require_lockfile: bool = True
     browser_cached_install_allowed: bool = False
     browser_external_probe_required: bool = False
+    browser_applicable: bool = False
     max_memory_mb: int = 1024
     max_processes: int = 64
     dependency_node_path: Optional[str] = None

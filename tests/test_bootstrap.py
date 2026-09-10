@@ -14,7 +14,8 @@ from falguna.review import CalibrationCase, ModelSemanticReviewer, ReviewerCalib
 from falguna.runtime import open_control_plane
 from falguna.workers import ScriptedWorker, StructuredEditWorker
 from falguna.gateway import OpenAICompatibleGateway
-from falguna.codex_transport import CodexCliJSONTransport
+from falguna.codex_transport import CodexCliJSONTransport, ModelUnsupportedError, ResilientCodexTransport
+from falguna.continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
 from falguna.workers import AiderWorker
 from falguna.usability import evidence_summary, mission_view
 from falguna.web import INDEX_HTML, load_profiles, validate_editable
@@ -640,6 +641,80 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('"-m falguna"', stop)
         self.assertIn('/bin/kill -TERM "$pid"', stop)
         self.assertNotIn("kill -KILL", stop)
+
+    def test_project_understanding_cache_hits_and_invalidates_on_repo_change(self):
+        (self.repo / ".gitignore").write_text(".falguna/\n")
+        (self.repo / "package.json").write_text(json.dumps({"scripts": {"test": "python3 -m unittest"}}))
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "cache fixture"], check=True, capture_output=True)
+        profile = {"id": "fixture", "discovery_roots": ["falguna", "tests"]}
+        cache = ProjectUnderstandingCache(self.store)
+        _, first = cache.discover(self.repo, profile, "set feature value with test coverage")
+        _, second = cache.discover(self.repo, profile, "set feature value with test coverage")
+        self.assertEqual((first["status"], second["status"]), ("MISS", "HIT"))
+        (self.repo / "README.md").write_text("changed\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "invalidate"], check=True, capture_output=True)
+        _, third = cache.discover(self.repo, profile, "set feature value with test coverage")
+        self.assertEqual(third["status"], "INVALIDATED")
+
+    def test_pause_at_safe_boundary_then_resume(self):
+        ids = self.control.create_mission("pause", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.control.request_control(run_id, "PAUSE")
+        self.control.resume(run_id, self.worker(), self.policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "PAUSED")
+        self.control.resume(run_id, self.worker(), self.policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
+
+    def test_cancel_stops_cleanly_without_merge(self):
+        ids = self.control.create_mission("cancel", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.control.request_control(run_id, "CANCEL")
+        self.control.resume(run_id, self.worker(), self.policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "CANCELLED")
+        self.assertEqual(self.store.list("approvals", "run_id=?", (run_id,)), [])
+        self.assertTrue(Path(self.store.get("runs", run_id)["worktree"]).is_dir())
+
+    def test_model_preflight_cache_and_bounded_fallback(self):
+        class FakeTransport:
+            def __init__(self): self.calls = []
+            def __call__(self, config, payload, timeout):
+                self.calls.append(config["model"])
+                if config["model"] == "gpt-5.6-luna": raise ModelUnsupportedError("MODEL_UNSUPPORTED")
+                return {"_falguna_metadata": {}}
+        fake = FakeTransport()
+        routed = ResilientCodexTransport(fake, ("gpt-5.6-luna", "gpt-5.6-terra"))
+        result = routed({"model": "gpt-5.6-luna"}, {}, 10)
+        routed({"model": "gpt-5.6-luna"}, {}, 10)
+        self.assertEqual(result["_falguna_metadata"]["routed_model"], "gpt-5.6-terra")
+        self.assertEqual(fake.calls, ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-terra"])
+
+    def test_browser_e2e_applicability_uses_intent_files_and_profile(self):
+        profile = {"browser_base_url": "http://127.0.0.1:4173"}
+        self.assertTrue(browser_e2e_applicable("fix responsive layout", ["public/app.js"], profile))
+        self.assertFalse(browser_e2e_applicable("fix server validation", ["server.js"], profile))
+        self.assertFalse(browser_e2e_applicable("fix responsive layout", ["public/app.js"], {}))
+
+    def test_mission_records_stage_timing_metrics(self):
+        ids = self.control.create_mission("timing", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy)
+        timings = {item["stage"] for item in self.store.list("mission_timings", "run_id=?", (run_id,))}
+        self.assertTrue({"worker", "verification", "review", "total"}.issubset(timings))
+
+    def test_continuation_resolves_only_one_unfinished_project_run(self):
+        ids = self.control.create_mission("continue", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", run_id, status="PAUSED")
+        self.assertEqual(resolve_continuation(self.store, self.repo), run_id)
+        other = self.control.create_mission("other", "set value to 2", self.repo, self.policy)
+        other_run = self.control.start(other["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", other_run, status="FAILED")
+        self.assertIsNone(resolve_continuation(self.store, self.repo))
+
+    def test_v11_controls_are_available_in_responsive_ui(self):
+        for label in ("Pause safely", "Cancel", "Resume / Retry", "safe boundary", "v1.1 RELIABILITY + SPEED", "@media(max-width:850px)", "@media(max-width:520px)"):
+            self.assertIn(label, INDEX_HTML)
 
 
 if __name__ == "__main__":

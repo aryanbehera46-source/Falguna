@@ -95,6 +95,8 @@ def mission_view(store, state_root: Path, run_id: str) -> dict:
         "progress_events": progress_events,
         "attempt": run["attempt"],
         "failure": classify_failure(run),
+        "available_controls": (["Resume", "Retry", "Cancel"] if run["status"] in {"PAUSED", "FAILED"} else (["Pause", "Cancel"] if run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"} else [])),
+        "timings_ms": {item["stage"]: item["duration_ms"] for item in store.list("mission_timings", "run_id=?", (run_id,))},
     }
 
 
@@ -130,6 +132,8 @@ def evidence_summary(store, state_root: Path, audit, run_id: str) -> dict:
         "merge_approval": approvals[-1]["status"] if approvals else "NOT_REQUESTED",
         "available_actions": ["Approve Merge", "Reject", "Request Changes"] if run["status"] == "DONE_CANDIDATE" else [],
         "protected_main_merge_performed": False,
+        "timings_ms": view["timings_ms"],
+        "discovery_cache": discovery.get("cache", {}).get("status", "NOT_RECORDED"),
     }
 
 

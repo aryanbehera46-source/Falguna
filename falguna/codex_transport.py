@@ -6,6 +6,7 @@ from pathlib import Path
 
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 SUPPORTED_CODEX_MODELS = frozenset({"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-5.5"})
+FALLBACK_CODEX_MODELS = (DEFAULT_CODEX_MODEL, "gpt-5.6-terra", "gpt-5.6-sol")
 
 
 class ModelUnsupportedError(OSError):
@@ -101,3 +102,35 @@ class CodexCliJSONTransport:
             "completion_tokens": int(latest.get("output_tokens", latest.get("completion_tokens", 0)) or 0),
             "prompt_tokens_details": {"cached_tokens": int(latest.get("cached_input_tokens", 0) or 0)},
         }
+
+
+class ResilientCodexTransport:
+    """Session-cached supported-model routing with bounded unsupported fallback."""
+
+    uses_workspace_context = True
+
+    def __init__(self, transport: CodexCliJSONTransport, candidates=FALLBACK_CODEX_MODELS):
+        self.transport = transport
+        self.candidates = tuple(model for model in candidates if model in SUPPORTED_CODEX_MODELS)
+        self.compatibility = {}
+
+    def __call__(self, config, payload, timeout_seconds):
+        requested = config.get("model", DEFAULT_CODEX_MODEL)
+        candidates = [requested] + [model for model in self.candidates if model != requested]
+        errors = []
+        for model in candidates:
+            if self.compatibility.get(model) is False:
+                continue
+            cached = self.compatibility.get(model) is True
+            routed = dict(config, model=model)
+            try:
+                result = self.transport(routed, payload, timeout_seconds)
+                self.compatibility[model] = True
+                result.setdefault("_falguna_metadata", {})["requested_model"] = requested
+                result["_falguna_metadata"]["routed_model"] = model
+                result["_falguna_metadata"]["preflight_cache"] = "HIT" if cached else "MISS"
+                return result
+            except ModelUnsupportedError as exc:
+                self.compatibility[model] = False
+                errors.append(str(exc))
+        raise ModelUnsupportedError("MODEL_UNSUPPORTED: no configured authenticated model is compatible; " + " | ".join(errors))

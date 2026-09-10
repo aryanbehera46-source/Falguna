@@ -243,7 +243,8 @@ class StructuredEditWorker(WorkerAdapter):
         cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
         calculated_cost = max(0, prompt_tokens - cached_tokens) * 0.75e-6 + cached_tokens * 0.075e-6 + completion_tokens * 4.50e-6
         cost = float(decoded.get("_falguna_cost_usd", calculated_cost))
-        call = {"provider": decoded.get("_falguna_provider", "openai-compatible"), "model": config["model"], "purpose": "implementation", "input_tokens": prompt_tokens, "output_tokens": completion_tokens, "cost_usd": cost, "metadata": {"adapter": "structured-edit", "cached_input_tokens": cached_tokens, **decoded.get("_falguna_metadata", {})}}
+        metadata = decoded.get("_falguna_metadata", {})
+        call = {"provider": decoded.get("_falguna_provider", "openai-compatible"), "model": metadata.get("routed_model", config["model"]), "purpose": "implementation", "input_tokens": prompt_tokens, "output_tokens": completion_tokens, "cost_usd": cost, "metadata": {"adapter": "structured-edit", "cached_input_tokens": cached_tokens, **metadata}}
         return call, cost
 
     @staticmethod

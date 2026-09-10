@@ -35,6 +35,8 @@ class DefinitionOfDone:
             isolation.append(terminal.last_isolation_evidence.__dict__)
         browser_plan = BrowserDiscovery(worktree, self.policy).discover()
         browser = None
+        if self.policy.browser_applicable and browser_plan is None:
+            browser = {"passed": False, "applicability": "REQUIRED", "error": "browser verification was applicable but no approved local Playwright plan was found"}
         if browser_plan:
             browser_terminal = TerminalCapability(permissions)
             browser_result = BrowserCapability(browser_terminal).verify(browser_plan.command, browser_plan.base_url, browser_plan.browsers_path)
@@ -46,8 +48,9 @@ class DefinitionOfDone:
                 "localhost_verified": browser_result.returncode == 0,
                 "kernel_enforced": False,
             }
+            browser["passed"] = browser_result.returncode == 0 and (not self.policy.browser_external_probe_required or browser["network_boundary"]["external_probe_blocked"])
         containment_probe = ProcessIsolator(worktree, self.policy).harmless_prohibited_write_probe()
-        browser_passed = browser is None or (browser["exit_code"] == 0 and (not self.policy.browser_external_probe_required or browser["network_boundary"]["external_probe_blocked"]))
+        browser_passed = browser is None or (browser.get("exit_code") == 0 and (not self.policy.browser_external_probe_required or browser["network_boundary"]["external_probe_blocked"]))
         passed = bool(changed) and all(item["exit_code"] == 0 for item in results) and browser_passed and containment_probe["blocked"]
         return passed, changed, results, browser, isolation, containment_probe
 
