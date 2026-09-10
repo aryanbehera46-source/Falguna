@@ -161,6 +161,7 @@ class ControlPlane:
                     checkpoint_payload = json.loads(item["payload"])
                     if checkpoint_payload.get("completed_milestone_task"):
                         task_checks.append(checkpoint_payload)
+                task_checks = self._resolve_task_checks(task_checks, passed, changed)
                 verification_evidence = {"attempt": verification_attempt, "passed": passed, "changed_files": changed, "results": results, "browser": browser, "isolation": isolation, "containment_probe": containment_probe, "milestone_tasks": task_checks}
                 verification_path.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
                 self._record_artifact(run_id, "VERIFICATION_ATTEMPT", verification_path)
@@ -258,7 +259,28 @@ class ControlPlane:
         self._checkpoint(run_id, "WORKTREE_READY", worktree=str(worktree), completed_milestone_task=ordinal,
                          summary=summary, per_task_verification={"passed": passed, "changed_files": changed,
                          "results": results, "browser": browser, "isolation": isolation,
-                         "containment_probe": containment_probe})
+                                                                "containment_probe": containment_probe})
+
+    @staticmethod
+    def _resolve_task_checks(task_checks: list, final_passed: bool, final_changed: list) -> list:
+        if not final_passed:
+            return task_checks
+        final_files = set(final_changed)
+        for index, item in enumerate(task_checks):
+            check = item.get("per_task_verification", {})
+            failed_files = set(check.get("changed_files", []))
+            if check.get("passed") or not failed_files or not failed_files.issubset(final_files):
+                continue
+            for later in task_checks[index + 1:]:
+                later_check = later.get("per_task_verification", {})
+                if later_check.get("passed") and failed_files.issubset(set(later_check.get("changed_files", []))):
+                    check["resolution"] = {
+                        "status": "SUPERSEDED_BY_LATER_PASS",
+                        "resolved_by_milestone_task": later["completed_milestone_task"],
+                        "final_verification_passed": True,
+                    }
+                    break
+        return task_checks
     def _record_artifact(self, run_id: str, kind: str, path: Path) -> None:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         self.store.create("artifacts", {"run_id": run_id, "kind": kind, "path": str(path), "sha256": digest, "metadata_json": "{}", "created_at": utcnow()})

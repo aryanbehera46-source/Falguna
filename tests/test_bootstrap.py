@@ -310,6 +310,26 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(worker.execute(self.repo, "milestone", "run").success)
         self.assertEqual([item[0] for item in checkpoints], [1, 2])
 
+    def test_later_task_pass_supersedes_covered_intermediate_failure(self):
+        checks = [
+            {"completed_milestone_task": 1, "per_task_verification": {"passed": False, "changed_files": ["server.js"]}},
+            {"completed_milestone_task": 2, "per_task_verification": {"passed": True, "changed_files": ["server.js", "test.js"]}},
+        ]
+        resolved = self.control._resolve_task_checks(checks, True, ["server.js", "test.js"])
+        self.assertFalse(resolved[0]["per_task_verification"]["passed"])
+        self.assertEqual(resolved[0]["per_task_verification"]["resolution"], {
+            "status": "SUPERSEDED_BY_LATER_PASS", "resolved_by_milestone_task": 2, "final_verification_passed": True,
+        })
+
+    def test_intermediate_failure_is_not_superseded_without_coverage_and_final_pass(self):
+        checks = [
+            {"completed_milestone_task": 1, "per_task_verification": {"passed": False, "changed_files": ["server.js"]}},
+            {"completed_milestone_task": 2, "per_task_verification": {"passed": True, "changed_files": ["test.js"]}},
+        ]
+        self.assertNotIn("resolution", self.control._resolve_task_checks(checks, True, ["server.js", "test.js"])[0]["per_task_verification"])
+        covered = [{"completed_milestone_task": 1, "per_task_verification": {"passed": False, "changed_files": ["server.js"]}}, {"completed_milestone_task": 2, "per_task_verification": {"passed": True, "changed_files": ["server.js"]}}]
+        self.assertNotIn("resolution", self.control._resolve_task_checks(covered, False, ["server.js"])[0]["per_task_verification"])
+
     def test_scope_expansion_requires_approval(self):
         def response(config, payload, timeout):
             value = {"summary": "expand", "patches": [{"path": "outside.py", "old": "x", "new": "y"}]}
