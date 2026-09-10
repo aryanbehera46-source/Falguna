@@ -7,6 +7,7 @@
       "native": ["python3 -m unittest discover -s tests -v"]
     },
     "browser_base_url": "http://127.0.0.1:4173",
+    "discovery_roots": ["browser-tests"],
     "browser_project_roots": ["browser-tests"],
     "browser_cached_install_allowed": true,
     "browser_external_probe_required": true,
