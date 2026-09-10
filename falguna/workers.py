@@ -183,6 +183,8 @@ class StructuredEditWorker(WorkerAdapter):
                         for patch in response.get("patches", []):
                             grouped.setdefault(int(patch.get("task", 1)), []).append(patch)
                         tasks = [{"summary": f"milestone task {key}", "patches": grouped[key]} for key in sorted(grouped)]
+                    if not tasks:
+                        raise PatchTargetError("PATCH_NOOP: model returned no tasks or patches")
                     if not 1 <= len(tasks) <= 3:
                         raise ValueError("SCOPE_EXPANSION_REQUIRED: milestone must contain one to three related tasks")
                     for ordinal, task in enumerate(tasks, 1):

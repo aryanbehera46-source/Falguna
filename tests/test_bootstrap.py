@@ -280,6 +280,24 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("PATCH_NOOP", result.summary)
 
+    def test_empty_repair_output_replans_to_bounded_corrective_patch(self):
+        replies = iter([
+            {"summary": "verification needs repair", "patches": []},
+            {"summary": "repair syntax", "patches": [
+                {"path": "falguna/feature.py", "old": "VALUE = 1", "new": "VALUE = 2", "task": 1},
+            ]},
+        ])
+        prompts = []
+        def response(config, payload, timeout):
+            prompts.append(payload["messages"][-1]["content"])
+            return {"choices": [{"message": {"content": json.dumps(next(replies))}}]}
+        worker = StructuredEditWorker(OpenAICompatibleGateway("test-model", "http://127.0.0.1:1/v1", ""), ["falguna/feature.py"], transport=response)
+        result = worker.execute(self.repo, "repair the reported verification failure", "run")
+        self.assertTrue(result.success)
+        self.assertEqual((self.repo / "falguna" / "feature.py").read_text(), "VALUE = 2\n")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("model returned no tasks or patches", prompts[1])
+
     def test_milestone_checkpoints_between_up_to_three_tasks(self):
         checkpoints = []
         def response(config, payload, timeout):
