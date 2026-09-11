@@ -620,6 +620,60 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(plan.confidence, "UNCERTAIN")
         self.assertTrue(plan.requires_approval)
 
+    def test_feature_discovery_rejects_verification_only_scope(self):
+        (self.repo / "falguna/feature.py").unlink()
+        (self.repo / "falguna/__init__.py").unlink()
+        (self.repo / "tests/test_feature.py").write_text("live mission progress pause cancel resume timeline\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "verification only fixture"], check=True, capture_output=True)
+
+        plan = ProjectDiscovery(self.repo, {"discovery_roots": ["tests"]}).discover(
+            "Add live mission progress, pause, cancel, resume, and timeline behavior"
+        )
+
+        self.assertEqual(plan.diagnostic, "IMPLEMENTATION_SCOPE_UNRESOLVED")
+        self.assertEqual(plan.confidence, "UNCERTAIN")
+        self.assertTrue(plan.requires_approval)
+        self.assertEqual(plan.implementation_files, [])
+
+    def test_explicit_test_only_mission_allows_verification_scope(self):
+        (self.repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0'\n")
+        (self.repo / "tests/test_feature.py").write_text("add regression coverage for value behavior\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "test only fixture"], check=True, capture_output=True)
+
+        plan = ProjectDiscovery(self.repo, {"discovery_roots": ["tests"]}).discover(
+            "Test-only: add regression coverage for value behavior"
+        )
+
+        self.assertEqual(plan.objective_kind, "TEST_ONLY")
+        self.assertEqual(plan.confidence, "HIGH")
+        self.assertEqual(plan.editable_files, ["tests/test_feature.py"])
+        self.assertIsNone(plan.diagnostic)
+
+    def test_ui_feature_discovery_selects_implementation_and_verification(self):
+        (self.repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0'\n")
+        (self.repo / "falguna/web.py").write_text("live mission progress pause cancel resume timeline ui state\n")
+        (self.repo / "browser-tests").mkdir()
+        (self.repo / "browser-tests/mission.spec.js").write_text("live mission progress pause cancel resume timeline ui\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "ui fixture"], check=True, capture_output=True)
+
+        plan = ProjectDiscovery(self.repo, {"discovery_roots": ["falguna", "tests", "browser-tests"]}).discover(
+            "Improve live mission progress, pause, cancel, resume, and timeline UI"
+        )
+
+        self.assertEqual(plan.implementation_files, ["falguna/web.py"])
+        self.assertEqual(plan.verification_files, ["browser-tests/mission.spec.js"])
+        self.assertEqual(plan.editable_files, ["falguna/web.py", "browser-tests/mission.spec.js"])
+        self.assertEqual(plan.confidence, "HIGH")
+
+    def test_falguna_self_development_profile_includes_core_implementation(self):
+        profile = next(item for item in load_profiles(Path(__file__).parents[1]) if item["id"] == "falguna-engineering")
+        self.assertIn("falguna", profile["discovery_roots"])
+        self.assertIn("tests", profile["discovery_roots"])
+        self.assertIn("browser-tests", profile["discovery_roots"])
+
     def test_royal_table_nested_profile_discovers_admin_reservation_scope(self):
         (self.repo / "admin.html").write_text("admin reservation status update\n")
         (self.repo / "ui.js").write_text("reservation ui\n")
@@ -750,6 +804,7 @@ class BootstrapTests(unittest.TestCase):
     def test_browser_fixture_is_implementation_and_portable_spec_is_test(self):
         self.assertFalse(ProjectDiscovery._is_test("browser-tests/fixture.html"))
         self.assertTrue(ProjectDiscovery._is_test("browser-tests/portable-localhost.spec.js"))
+        self.assertTrue(ProjectDiscovery._is_verification("browser-tests/fixture.html"))
 
     def test_mission_records_stage_timing_metrics(self):
         ids = self.control.create_mission("timing", "set value to 2", self.repo, self.policy)

@@ -45,6 +45,8 @@ class RunPolicy:
     max_processes: int = 64
     dependency_node_path: Optional[str] = None
     verification_write_regexes: List[str] = field(default_factory=list)
+    require_implementation_change: bool = False
+    implementation_files: List[str] = field(default_factory=list)
 
 
 @dataclass

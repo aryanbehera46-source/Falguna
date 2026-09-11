@@ -22,6 +22,9 @@ class DefinitionOfDone:
         permissions.validate_changed_files(changed)
         terminal = TerminalCapability(permissions)
         results = []
+        implementation_changed = not self.policy.require_implementation_change or bool(set(changed).intersection(self.policy.implementation_files))
+        if not implementation_changed:
+            results.append({"label": "implementation-scope", "argv": [], "exit_code": 1, "stdout": "", "stderr": "IMPLEMENTATION_SCOPE_UNRESOLVED: feature/change mission changed only verification files"})
         isolation = []
         command_env = {"CI": "1"}
         if self.policy.dependency_node_path:
@@ -51,7 +54,7 @@ class DefinitionOfDone:
             browser["passed"] = browser_result.returncode == 0 and (not self.policy.browser_external_probe_required or browser["network_boundary"]["external_probe_blocked"])
         containment_probe = ProcessIsolator(worktree, self.policy).harmless_prohibited_write_probe()
         browser_passed = browser is None or (browser.get("exit_code") == 0 and (not self.policy.browser_external_probe_required or browser["network_boundary"]["external_probe_blocked"]))
-        passed = bool(changed) and all(item["exit_code"] == 0 for item in results) and browser_passed and containment_probe["blocked"]
+        passed = bool(changed) and implementation_changed and all(item["exit_code"] == 0 for item in results) and browser_passed and containment_probe["blocked"]
         return passed, changed, results, browser, isolation, containment_probe
 
 

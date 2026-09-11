@@ -10,6 +10,11 @@ from .models import CommandSpec
 SKIP_PARTS = {".git", "node_modules", "dist", "build", "coverage", ".falguna"}
 TEXT_SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".html", ".css", ".json", ".md"}
 TEST_MARKERS = ("test", "spec")
+TEST_ONLY_PATTERNS = (
+    r"\btests?[- ]only\b", r"\btest[- ]only\b", r"\bonly (?:add|change|update|fix|write) tests?\b",
+    r"\b(?:add|change|update|fix|write) (?:only )?(?:a )?(?:unit |integration |browser )?tests?\b",
+)
+DOC_ONLY_PATTERNS = (r"\bdocs?[- ]only\b", r"\bdocumentation[- ]only\b", r"\bonly (?:change|update|write) (?:docs?|documentation)\b")
 
 
 @dataclass(frozen=True)
@@ -19,9 +24,15 @@ class DiscoveryPlan:
     confidence: str
     rationale: list[str]
     requires_approval: bool = False
+    implementation_files: list[str] = None
+    verification_files: list[str] = None
+    objective_kind: str = "FEATURE_CHANGE"
+    diagnostic: str = None
 
     def evidence(self) -> dict:
         value = asdict(self)
+        value["implementation_files"] = self.implementation_files or []
+        value["verification_files"] = self.verification_files or []
         value["verification_commands"] = [asdict(command) for command in self.verification_commands]
         return value
 
@@ -59,16 +70,23 @@ class ProjectDiscovery:
             if score:
                 scored.append((score, relative))
         scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+        objective_kind = self._objective_kind(objective)
         # Start with one implementation file. If the worker discovers that a second
         # file is necessary, the mission must pause for explicit scope expansion.
-        implementation = [path for _, path in scored if not self._is_test(path)][:1]
-        tests = [path for _, path in scored if self._is_test(path)][:1]
-        editable = implementation + tests
+        implementation = [path for _, path in scored if not self._is_verification(path)][:1]
+        tests = [path for _, path in scored if self._is_verification(path)][:1]
+        implementation_required = objective_kind == "FEATURE_CHANGE"
+        editable = (implementation if implementation_required else []) + tests
+        if not editable and objective_kind == "DOCUMENTATION_ONLY":
+            editable = [path for _, path in scored if Path(path).suffix.lower() == ".md"][:1]
         commands, sources = self._verification(tests[0] if tests else None)
-        high_confidence = bool(implementation and tests and commands and scored[0][0] >= 3)
+        scope_resolved = bool(implementation) if implementation_required else bool(editable)
+        high_confidence = bool(scope_resolved and commands and scored and scored[0][0] >= 3)
+        diagnostic = None if scope_resolved else "IMPLEMENTATION_SCOPE_UNRESOLVED"
         rationale = [
             f"ranked {len(scored)} tracked text files using objective terms",
             f"verification derived from {', '.join(sources)}" if sources else "no supported native verification metadata found",
+            f"objective classified as {objective_kind}; implementation and verification files ranked separately",
         ]
         return DiscoveryPlan(
             editable,
@@ -76,6 +94,10 @@ class ProjectDiscovery:
             "HIGH" if high_confidence else "UNCERTAIN",
             rationale,
             requires_approval=not high_confidence,
+            implementation_files=implementation,
+            verification_files=tests,
+            objective_kind=objective_kind,
+            diagnostic=diagnostic,
         )
 
     def _validate_profile_roots(self) -> None:
@@ -119,6 +141,20 @@ class ProjectDiscovery:
         path = Path(relative)
         filename = path.name.lower()
         return any(marker in filename for marker in TEST_MARKERS) or any(part.lower() in {"test", "tests", "__tests__"} for part in path.parts[:-1])
+
+    @classmethod
+    def _is_verification(cls, relative: str) -> bool:
+        path = Path(relative)
+        return cls._is_test(relative) or "browser-tests" in {part.lower() for part in path.parts} or path.name.lower() in {"package-lock.json", "playwright.config.js"}
+
+    @staticmethod
+    def _objective_kind(objective: str) -> str:
+        lower = objective.lower()
+        if any(re.search(pattern, lower) for pattern in DOC_ONLY_PATTERNS):
+            return "DOCUMENTATION_ONLY"
+        if any(re.search(pattern, lower) for pattern in TEST_ONLY_PATTERNS):
+            return "TEST_ONLY"
+        return "FEATURE_CHANGE"
 
     def _verification(self, selected_test=None):
         commands = []

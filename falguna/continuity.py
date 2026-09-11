@@ -37,7 +37,7 @@ class ProjectUnderstandingCache:
             # Re-score only the objective-sensitive files while reusing validated structure and commands.
             fresh = ProjectDiscovery(repository, profile).discover(objective)
             cached_commands = [CommandSpec(**item) for item in cached["verification_commands"]]
-            plan = DiscoveryPlan(fresh.editable_files, cached_commands, fresh.confidence, fresh.rationale + ["validated project-understanding cache hit"], fresh.requires_approval)
+            plan = DiscoveryPlan(fresh.editable_files, cached_commands, fresh.confidence, fresh.rationale + ["validated project-understanding cache hit"], fresh.requires_approval, fresh.implementation_files, fresh.verification_files, fresh.objective_kind, fresh.diagnostic)
             return plan, {"status": "HIT", "fingerprint": fingerprint, "revalidated": ["git-head", "profile", "package-metadata"]}
         plan = ProjectDiscovery(repository, profile).discover(objective)
         payload = plan.evidence()
