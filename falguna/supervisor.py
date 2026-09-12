@@ -19,7 +19,9 @@ class AutonomySupervisor:
 
     def classify(self, error, status=RunStatus.FAILED.value):
         upper = str(error or "").upper()
-        category = next((name for name in ("MODEL_UNSUPPORTED", "TRANSPORT_FAILURE", "PATCH_AMBIGUOUS", "PATCH_STALE", "PATCH_NOOP", "CONTEXT_TOO_LARGE", "PROFILE_STALE", "VERIFY_COMMAND_INVALID", "SCOPE_EXPANSION_REQUIRED", "SCOPE_EXPANSION", "PERMISSION_INCREASE", "DESTRUCTIVE_ACTION", "SECRET_OR_PROD_REQUIRED", "AMBIGUOUS_CONTINUATION", "REVIEW_FAILURE", "BROWSER_VERIFICATION_FAILURE", "INTERNAL_ORCHESTRATION_ERROR") if name in upper), None)
+        prefix = upper.split(":", 1)[0].strip()
+        known = ("VERIFICATION_FAILURE", "BROWSER_VERIFICATION_FAILURE", "REVIEW_FAILURE", "MODEL_UNSUPPORTED", "TRANSPORT_FAILURE", "PATCH_AMBIGUOUS", "PATCH_STALE", "PATCH_NOOP", "CONTEXT_TOO_LARGE", "PROFILE_STALE", "VERIFY_COMMAND_INVALID", "SCOPE_EXPANSION_REQUIRED", "SCOPE_EXPANSION", "PERMISSION_INCREASE", "DESTRUCTIVE_ACTION", "SECRET_OR_PROD_REQUIRED", "AMBIGUOUS_CONTINUATION", "INTERNAL_ORCHESTRATION_ERROR")
+        category = prefix if prefix in known else next((name for name in known if name in upper[:1000]), None)
         if not category and status == RunStatus.QUARANTINED.value:
             category = "SECURITY_CONTAINMENT"
         if not category and "BROWSER" in upper and ("FAIL" in upper or "ERROR" in upper):

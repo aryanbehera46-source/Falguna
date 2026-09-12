@@ -926,6 +926,11 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("$('resume').onclick", INDEX_HTML)
         self.assertIn("d.action_disabled_reason", INDEX_HTML)
 
+    def test_verification_prefix_cannot_be_overridden_by_test_names_in_diagnostics(self):
+        supervisor = AutonomySupervisor(self.store, self.control.audit)
+        outcome, category = supervisor.classify("VERIFICATION_FAILURE: test_scope_expansion_enters_needs_aryan ... ok")
+        self.assertEqual((outcome, category), ("RECOVERABLE", "VERIFICATION_FAILURE"))
+
 
 if __name__ == "__main__":
     unittest.main()
