@@ -931,6 +931,22 @@ class BootstrapTests(unittest.TestCase):
         outcome, category = supervisor.classify("VERIFICATION_FAILURE: test_scope_expansion_enters_needs_aryan ... ok")
         self.assertEqual((outcome, category), ("RECOVERABLE", "VERIFICATION_FAILURE"))
 
+    def test_failed_bounded_repair_resume_returns_to_worker_with_diagnostics(self):
+        calls = []
+        def worker(worktree, requirement, run_id):
+            calls.append(requirement)
+            value = 2 if len(calls) == 3 else 3
+            (worktree / "falguna/feature.py").write_text(f"VALUE = {value}\n")
+            return WorkerResult(True, f"attempt {len(calls)}", 0)
+        ids = self.control.create_mission("resume repair", "set value to 2", self.repo, self.policy)
+        scripted = ScriptedWorker(worker)
+        run_id = self.control.start(ids["task_id"], scripted, "scripted", "none", self.policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "FAILED")
+        self.control.resume(run_id, scripted, self.policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
+        self.assertIn("Autonomy Supervisor retry", calls[2])
+        self.assertIn("Definition of Done failed", calls[2])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,9 @@ class ControlPlane:
         states = self.store.list("supervisor_states", "run_id=?", (run_id,))
         if run["status"] in {RunStatus.FAILED.value, RunStatus.QUARANTINED.value} and states and not states[-1]["resume_allowed"]:
             raise ValueError(states[-1]["eligibility_reason"])
+        if run["status"] == RunStatus.FAILED.value and states and states[-1]["resume_allowed"]:
+            diagnostics = json.loads(states[-1]["diagnostics_json"])
+            self._checkpoint(run_id, "WORKTREE_READY", worktree=run["worktree"], recovery_diagnostics=diagnostics, supervisor_retry=True)
         checkpoint = self.store.latest_checkpoint(run_id)
         if not checkpoint:
             raise ValueError("no checkpoint")
@@ -123,10 +126,13 @@ class ControlPlane:
                 self.store.update("runs", run_id, status=RunStatus.WORKING.value)
                 worker_started = time.monotonic()
                 result = None
+                worker_requirement = requirement
+                if payload.get("recovery_diagnostics"):
+                    worker_requirement += "\n\nAutonomy Supervisor retry. Preserve approved scope and correct the prior failure using these diagnostics:\n" + json.dumps(payload["recovery_diagnostics"], sort_keys=True)
                 for attempt in range(1, policy.max_attempts + 1):
                     self.store.update("runs", run_id, attempt=attempt)
                     try:
-                        result = worker.execute(worktree, requirement, run_id)
+                        result = worker.execute(worktree, worker_requirement, run_id)
                     except Exception as exc:
                         from .models import WorkerResult
                         result = WorkerResult(False, str(exc), 1)
