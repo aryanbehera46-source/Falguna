@@ -20,6 +20,7 @@ from falguna.workers import AiderWorker
 from falguna.usability import evidence_summary, mission_view
 from falguna.web import INDEX_HTML, load_profiles, validate_editable
 from falguna.discovery import ProjectDiscovery
+from falguna.supervisor import AutonomySupervisor
 
 
 def git(repo: Path, *args):
@@ -782,6 +783,18 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result["_falguna_metadata"]["routed_model"], "gpt-5.6-terra")
         self.assertEqual(fake.calls, ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-terra"])
 
+    def test_transport_exit_falls_back_within_configured_supported_models(self):
+        class FakeTransport:
+            def __init__(self): self.calls = []
+            def __call__(self, config, payload, timeout):
+                self.calls.append(config["model"])
+                if len(self.calls) == 1: raise OSError("TRANSPORT_FAILURE: runtime exit 1")
+                return {"_falguna_metadata": {}}
+        fake = FakeTransport()
+        routed = ResilientCodexTransport(fake, ("gpt-5.6-luna", "gpt-5.6-terra"))
+        result = routed({"model": "gpt-5.6-luna"}, {}, 10)
+        self.assertEqual((fake.calls, result["_falguna_metadata"]["routed_model"]), (["gpt-5.6-luna", "gpt-5.6-terra"], "gpt-5.6-terra"))
+
     def test_transport_timeout_is_actionable_and_bounded_retry_preserves_it(self):
         calls = []
         class TimeoutWorker:
@@ -825,6 +838,93 @@ class BootstrapTests(unittest.TestCase):
     def test_v11_controls_are_available_in_responsive_ui(self):
         for label in ("Pause safely", "Cancel", "Resume / Retry", "safe boundary", "v1.1 RELIABILITY + SPEED", "@media(max-width:850px)", "@media(max-width:520px)"):
             self.assertIn(label, INDEX_HTML)
+
+    def test_supervisor_preserves_verification_failure_and_enables_retry(self):
+        ids = self.control.create_mission("recoverable", "set value to 2", self.repo, self.policy)
+        failed = ScriptedWorker(lambda *_: WorkerResult(False, "VERIFICATION_FAILURE: exact assertion output", 1))
+        run_id = self.control.start(ids["task_id"], failed, "scripted", "none", self.policy)
+        view = mission_view(self.store, self.repo / ".falguna", run_id)
+        self.assertEqual(view["supervisor"]["outcome_class"], "RECOVERABLE")
+        self.assertIn("exact assertion output", view["supervisor"]["diagnostics"]["error"])
+        self.assertIn("Retry", view["available_controls"])
+
+    def test_review_failure_runs_one_bounded_correction_then_fresh_review(self):
+        calls = {"worker": 0, "review": 0}
+        def worker(worktree, requirement, run_id):
+            calls["worker"] += 1
+            (worktree / "falguna/feature.py").write_text("VALUE = 2\n")
+            return WorkerResult(True, "corrected review finding" if calls["worker"] > 1 else "initial", 0)
+        def review(requirement, diff, changed, verification):
+            calls["review"] += 1
+            dimensions = {
+                "requirement_satisfaction": {"passed": True, "evidence": "bounded diff"},
+                "scope_compliance": {"passed": True, "evidence": "approved file"},
+                "regression_evidence": {"passed": True, "evidence": "verification passed"},
+                "unresolved_uncertainty": {"passed": True, "evidence": "none"},
+            }
+            return ReviewResult(calls["review"] > 1, "review", [] if calls["review"] > 1 else ["add explicit evidence"], dimensions, [])
+        self.control.reviewer = ScriptedSemanticReviewer(review)
+        ids = self.control.create_mission("review recovery", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], ScriptedWorker(worker), "scripted", "none", self.policy)
+        run = self.store.get("runs", run_id)
+        self.assertEqual((run["status"], calls), ("DONE_CANDIDATE", {"worker": 2, "review": 2}), run["error"])
+        self.assertEqual(len(self.store.list("checkpoints", "run_id=? AND stage=?", (run_id, "REVIEW_REPAIR_COMPLETE"))), 1)
+
+    def test_terminal_state_disables_retry_with_reason(self):
+        ids = self.control.create_mission("terminal", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", run_id, status="FAILED", error="INTERNAL_ORCHESTRATION_ERROR: corrupt state")
+        self.control.supervisor.record(run_id, "INTERNAL_ORCHESTRATION_ERROR: corrupt state", retry_budget=2)
+        view = mission_view(self.store, self.repo / ".falguna", run_id)
+        self.assertEqual(view["supervisor"]["outcome_class"], "TERMINAL")
+        self.assertNotIn("Retry", view["available_controls"])
+        self.assertTrue(view["action_disabled_reason"])
+
+    def test_scope_expansion_enters_needs_aryan(self):
+        ids = self.control.create_mission("scope", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", run_id, status="FAILED")
+        state = self.control.supervisor.record(run_id, "SCOPE_EXPANSION_REQUIRED: config/secrets", retry_budget=2, decision_needed="Approve the additional file or stop.")
+        self.assertEqual((state["outcome_class"], state["phase"], state["retry_allowed"]), ("NEEDS_APPROVAL", "NEEDS_ARYAN", 0))
+
+    def test_retry_budget_exhaustion_enters_needs_aryan(self):
+        ids = self.control.create_mission("budget", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", run_id, status="FAILED")
+        state = self.control.supervisor.record(run_id, "TRANSPORT_FAILURE: timeout", retry_budget=2, attempts_used=2)
+        self.assertEqual((state["outcome_class"], state["retry_allowed"]), ("NEEDS_APPROVAL", 0))
+        self.assertIn("exhausted", state["eligibility_reason"].lower())
+
+    def test_supervisor_state_survives_store_restart(self):
+        ids = self.control.create_mission("restart", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", run_id, status="FAILED")
+        self.control.supervisor.record(run_id, "PATCH_STALE: anchor moved", retry_budget=2)
+        self.store.close()
+        self.control, self.store = open_control_plane(self.repo)
+        view = mission_view(self.store, self.repo / ".falguna", run_id)
+        self.assertEqual((view["supervisor"]["category"], view["supervisor"]["retry_allowed"]), ("PATCH_STALE", 1))
+
+    def test_cancelled_run_cannot_resume_after_restart(self):
+        ids = self.control.create_mission("cancel restart", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.control.request_control(run_id, "CANCEL")
+        self.control.resume(run_id, self.worker(), self.policy)
+        self.store.close()
+        self.control, self.store = open_control_plane(self.repo)
+        with self.assertRaisesRegex(ValueError, "cancelled missions"):
+            self.control.resume(run_id, self.worker(), self.policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "CANCELLED")
+
+    def test_browser_failure_is_recoverable_and_ui_exposes_clickable_retry(self):
+        ids = self.control.create_mission("browser", "fix browser layout", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", run_id, status="FAILED")
+        self.control.supervisor.record(run_id, "BROWSER_VERIFICATION_FAILURE: screenshot mismatch", retry_budget=2)
+        view = mission_view(self.store, self.repo / ".falguna", run_id)
+        self.assertIn("Retry", view["available_controls"])
+        self.assertIn("$('resume').onclick", INDEX_HTML)
+        self.assertIn("d.action_disabled_reason", INDEX_HTML)
 
 
 if __name__ == "__main__":

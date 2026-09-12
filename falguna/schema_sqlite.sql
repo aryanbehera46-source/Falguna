@@ -11,8 +11,10 @@ CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, run_id TEXT NOT NULL 
 CREATE TABLE IF NOT EXISTS run_controls (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), action TEXT NOT NULL, status TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS project_cache (id TEXT PRIMARY KEY, repository TEXT NOT NULL, profile_id TEXT NOT NULL, fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mission_timings (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), stage TEXT NOT NULL, duration_ms INTEGER NOT NULL, metadata_json TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS supervisor_states (id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE REFERENCES runs(id), outcome_class TEXT NOT NULL, category TEXT NOT NULL, phase TEXT NOT NULL, retry_allowed INTEGER NOT NULL, resume_allowed INTEGER NOT NULL, eligibility_reason TEXT NOT NULL, attempts_used INTEGER NOT NULL, retry_budget INTEGER NOT NULL, diagnostics_json TEXT NOT NULL, decision_needed TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_run ON checkpoints(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_controls_run ON run_controls(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cache_project ON project_cache(repository, profile_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_timings_run ON mission_timings(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_supervisor_run ON supervisor_states(run_id, created_at);

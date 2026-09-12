@@ -138,4 +138,9 @@ class ResilientCodexTransport:
             except ModelUnsupportedError as exc:
                 self.compatibility[model] = False
                 errors.append(str(exc))
+            except OSError as exc:
+                detail = str(exc)
+                errors.append(detail)
+                if "TRANSPORT_FAILURE" not in detail or "timed out" in detail.lower():
+                    raise
         raise ModelUnsupportedError("MODEL_UNSUPPORTED: no configured authenticated model is compatible; " + " | ".join(errors))

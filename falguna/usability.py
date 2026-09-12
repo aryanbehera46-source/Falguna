@@ -78,6 +78,8 @@ def mission_view(store, state_root: Path, run_id: str) -> dict:
     completed = [MILESTONES[item["stage"]] for item in checkpoints if item["stage"] in MILESTONES]
     current = MILESTONES.get(checkpoints[-1]["stage"], run["status"]) if checkpoints else run["status"]
     progress_events = []
+    supervisor_rows = store.list("supervisor_states", "run_id=?", (run_id,))
+    supervisor = supervisor_rows[-1] if supervisor_rows else None
     for item in checkpoints:
         payload = json.loads(item["payload"])
         label = PHASE_LABELS.get(item["stage"])
@@ -95,7 +97,9 @@ def mission_view(store, state_root: Path, run_id: str) -> dict:
         "progress_events": progress_events,
         "attempt": run["attempt"],
         "failure": classify_failure(run),
-        "available_controls": (["Resume", "Retry", "Cancel"] if run["status"] in {"PAUSED", "FAILED"} else (["Pause", "Cancel"] if run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"} else [])),
+        "available_controls": (["Resume", "Retry", "Cancel"] if run["status"] == "PAUSED" or (supervisor and supervisor["retry_allowed"]) else (["Pause", "Cancel"] if run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"} else [])),
+        "supervisor": ({**supervisor, "diagnostics": json.loads(supervisor["diagnostics_json"])} if supervisor else None),
+        "action_disabled_reason": None if (supervisor and supervisor["retry_allowed"]) else (supervisor["eligibility_reason"] if supervisor else None),
         "timings_ms": {item["stage"]: item["duration_ms"] for item in store.list("mission_timings", "run_id=?", (run_id,))},
     }
 

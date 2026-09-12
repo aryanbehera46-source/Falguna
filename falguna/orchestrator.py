@@ -12,6 +12,7 @@ from .store import StateStore, utcnow
 from .verification import DefinitionOfDone
 from .review import ReviewerCalibrator, SemanticIndependentReviewer
 from .workers import WorkerAdapter
+from .supervisor import AutonomySupervisor
 
 
 class ControlPlane:
@@ -21,6 +22,7 @@ class ControlPlane:
         self.state_root = Path(state_root)
         self.reviewer = reviewer or SemanticIndependentReviewer()
         self.calibration_cases = list(calibration_cases or [])
+        self.supervisor = AutonomySupervisor(store, audit)
 
     def create_mission(self, title: str, requirement: str, repository: Path, policy: RunPolicy) -> dict:
         now = utcnow()
@@ -47,6 +49,13 @@ class ControlPlane:
 
     def resume(self, run_id: str, worker: WorkerAdapter, policy: RunPolicy) -> str:
         run = self.store.get("runs", run_id)
+        if not run:
+            raise ValueError("run not found")
+        if run["status"] == RunStatus.CANCELLED.value:
+            raise ValueError("cancelled missions cannot be resumed")
+        states = self.store.list("supervisor_states", "run_id=?", (run_id,))
+        if run["status"] in {RunStatus.FAILED.value, RunStatus.QUARANTINED.value} and states and not states[-1]["resume_allowed"]:
+            raise ValueError(states[-1]["eligibility_reason"])
         checkpoint = self.store.latest_checkpoint(run_id)
         if not checkpoint:
             raise ValueError("no checkpoint")
@@ -172,6 +181,7 @@ class ControlPlane:
                         self._record_artifact(run_id, "VERIFICATION_FINAL", evidence_dir / "verification.json")
                         raise RuntimeError("Definition of Done failed after bounded repair")
                     failure_summary = json.dumps(results, sort_keys=True)[-6000:]
+                    self.supervisor.record(run_id, "VERIFICATION_FAILURE: " + failure_summary, retry_budget=policy.max_attempts, phase="REPAIRING_VERIFICATION")
                     repair_requirement = requirement + "\n\nThe control-plane verification failed. Diagnose and repair only the permitted files, then rerun tests. Verification evidence:\n" + failure_summary
                     repair_attempt = int(self.store.get("runs", run_id)["attempt"]) + 1
                     self.store.update("runs", run_id, status=RunStatus.WORKING.value, attempt=repair_attempt)
@@ -225,9 +235,11 @@ class ControlPlane:
                 self._timed(run_id, "review", review_started, approved=review.approved)
                 evidence_dir = self.state_root / "evidence" / run_id
                 (evidence_dir / "diff.patch").write_text(diff)
-                (evidence_dir / "review.json").write_text(json.dumps(review.__dict__, indent=2, sort_keys=True))
+                prior_reviews = sorted(evidence_dir.glob("review-attempt-*.json"))
+                review_path = evidence_dir / ("review.json" if review.approved else f"review-attempt-{len(prior_reviews) + 1}.json")
+                review_path.write_text(json.dumps(review.__dict__, indent=2, sort_keys=True))
                 self._record_artifact(run_id, "DIFF", evidence_dir / "diff.patch")
-                self._record_artifact(run_id, "REVIEW", evidence_dir / "review.json")
+                self._record_artifact(run_id, "REVIEW" if review.approved else "REVIEW_ATTEMPT", review_path)
                 for call in review.model_calls:
                     self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": call.get("purpose", "independent-semantic-review"), "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
                 if review.model_calls or review.cost_usd:
@@ -236,19 +248,42 @@ class ControlPlane:
                 if total_cost > policy.max_cost_usd:
                     raise PolicyViolation("cumulative run cost cap exceeded")
                 if not review.approved:
-                    raise RuntimeError("REVIEW_FAILURE: independent review rejected candidate: " + "; ".join(review.findings))
+                    prior = self.store.list("checkpoints", "run_id=? AND stage=?", (run_id, "REVIEW_REPAIR_COMPLETE"))
+                    if prior:
+                        raise RuntimeError("REVIEW_FAILURE: independent review rejected candidate after bounded correction: " + "; ".join(review.findings))
+                    correction = requirement + "\n\nIndependent review rejected the candidate. Correct only the approved scope, preserve passing verification, then allow fresh verification and review. Findings:\n" + "\n".join(f"- {finding}" for finding in review.findings)
+                    self.supervisor.record(run_id, "REVIEW_FAILURE: " + "; ".join(review.findings), retry_budget=policy.max_attempts, phase="ADDRESSING_REVIEW")
+                    repair_attempt = int(self.store.get("runs", run_id)["attempt"]) + 1
+                    self.store.update("runs", run_id, status=RunStatus.WORKING.value, attempt=repair_attempt)
+                    repair = worker.execute(worktree, correction, run_id)
+                    self.audit.append("REVIEW_REPAIR_ATTEMPT", {"run_id": run_id, "attempt": repair_attempt, "success": repair.success, "findings": review.findings})
+                    repair_path = evidence_dir / f"review-repair-output-{repair_attempt}.txt"
+                    repair_path.write_text(repair.summary)
+                    self._record_artifact(run_id, "REVIEW_REPAIR_OUTPUT", repair_path)
+                    if not repair.success:
+                        raise RuntimeError(f"REVIEW_FAILURE: corrective worker failed: {repair.summary}")
+                    self._checkpoint(run_id, "REVIEW_REPAIR_COMPLETE", worktree=str(worktree), findings=review.findings, repair_attempt=repair_attempt)
+                    self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree), preserved_review_findings=review.findings)
+                    return self._continue(run_id, worker, policy, None)
                 approval_id = self.store.create("approvals", {"run_id": run_id, "kind": "PROTECTED_BRANCH_MERGE", "status": "PENDING", "requested_at": utcnow(), "decided_at": None, "decided_by": None, "reason": None, "created_at": utcnow(), "updated_at": utcnow()})
                 self.store.update("runs", run_id, status=RunStatus.DONE_CANDIDATE.value, error=None)
+                states = self.store.list("supervisor_states", "run_id=?", (run_id,))
+                if states:
+                    self.store.update("supervisor_states", states[-1]["id"], phase="DONE_CANDIDATE", retry_allowed=0, resume_allowed=0, eligibility_reason="Mission completed; human merge approval remains pending.")
                 self._checkpoint(run_id, "DONE_CANDIDATE", worktree=str(worktree), approval_id=approval_id)
                 self.audit.append("DONE_CANDIDATE", {"run_id": run_id, "approval_id": approval_id})
             self._timed(run_id, "total", total_started, terminal_status=self.store.get("runs", run_id)["status"])
             return run_id
         except PolicyViolation as exc:
             self.store.update("runs", run_id, status=RunStatus.QUARANTINED.value, error=str(exc))
+            self.supervisor.record(run_id, str(exc), retry_budget=policy.max_attempts, attempts_used=self.store.get("runs", run_id)["attempt"], decision_needed="Review the blocked policy boundary; Falguna will not expand permissions itself.")
             self.audit.append("RUN_QUARANTINED", {"run_id": run_id, "error": str(exc)})
             return run_id
         except Exception as exc:
             self.store.update("runs", run_id, status=RunStatus.FAILED.value, error=str(exc))
+            prior_states = self.store.list("supervisor_states", "run_id=?", (run_id,))
+            attempts_used = (prior_states[-1]["attempts_used"] if prior_states else 0) + 1
+            self.supervisor.record(run_id, str(exc), retry_budget=policy.max_attempts, attempts_used=attempts_used)
             self.audit.append("RUN_FAILED", {"run_id": run_id, "error": str(exc)})
             return run_id
 
