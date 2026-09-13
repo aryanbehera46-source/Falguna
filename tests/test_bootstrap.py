@@ -946,6 +946,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
         self.assertIn("Autonomy Supervisor retry", calls[2])
         self.assertIn("Definition of Done failed", calls[2])
+        self.assertTrue(evidence_summary(self.store, self.repo / ".falguna", self.control.audit, run_id)["evidence_hashes_valid"])
 
     def test_review_correction_keeps_verification_attempt_artifacts_immutable(self):
         reviews = {"count": 0}

@@ -129,7 +129,9 @@ class ControlPlane:
                 worker_requirement = requirement
                 if payload.get("recovery_diagnostics"):
                     worker_requirement += "\n\nAutonomy Supervisor retry. Preserve approved scope and correct the prior failure using these diagnostics:\n" + json.dumps(payload["recovery_diagnostics"], sort_keys=True)
-                for attempt in range(1, policy.max_attempts + 1):
+                base_attempt = int(self.store.get("runs", run_id)["attempt"])
+                for local_attempt in range(1, policy.max_attempts + 1):
+                    attempt = base_attempt + local_attempt
                     self.store.update("runs", run_id, attempt=attempt)
                     try:
                         result = worker.execute(worktree, worker_requirement, run_id)
@@ -152,7 +154,7 @@ class ControlPlane:
                 self._timed(run_id, "worker", worker_started, attempts=self.store.get("runs", run_id)["attempt"], success=True)
                 evidence_dir = self.state_root / "evidence" / run_id
                 evidence_dir.mkdir(parents=True, exist_ok=True)
-                worker_path = evidence_dir / "worker-output.txt"
+                worker_path = evidence_dir / f"worker-output-attempt-{self.store.get('runs', run_id)['attempt']}.txt"
                 worker_path.write_text(result.summary)
                 self._record_artifact(run_id, "WORKER_OUTPUT", worker_path)
                 self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree))
@@ -238,11 +240,13 @@ class ControlPlane:
                 review = self.reviewer.review(requirement, diff, changed, verification_evidence)
                 self._timed(run_id, "review", review_started, approved=review.approved)
                 evidence_dir = self.state_root / "evidence" / run_id
-                (evidence_dir / "diff.patch").write_text(diff)
+                review_number = len(list(evidence_dir.glob("review-attempt-*.json"))) + 1
+                diff_path = evidence_dir / f"diff-attempt-{review_number}.patch"
+                diff_path.write_text(diff)
                 prior_reviews = sorted(evidence_dir.glob("review-attempt-*.json"))
                 review_path = evidence_dir / ("review.json" if review.approved else f"review-attempt-{len(prior_reviews) + 1}.json")
                 review_path.write_text(json.dumps(review.__dict__, indent=2, sort_keys=True))
-                self._record_artifact(run_id, "DIFF", evidence_dir / "diff.patch")
+                self._record_artifact(run_id, "DIFF", diff_path)
                 self._record_artifact(run_id, "REVIEW" if review.approved else "REVIEW_ATTEMPT", review_path)
                 for call in review.model_calls:
                     self.store.create("model_calls", {"run_id": run_id, "provider": call.get("provider", "unknown"), "model": call.get("model", self.store.get("runs", run_id)["model"]), "purpose": call.get("purpose", "independent-semantic-review"), "input_tokens": int(call.get("input_tokens", 0)), "output_tokens": int(call.get("output_tokens", 0)), "cost_usd": float(call.get("cost_usd", 0)), "metadata_json": json.dumps(call.get("metadata", {}), sort_keys=True), "created_at": utcnow()})
