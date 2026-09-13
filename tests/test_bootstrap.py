@@ -964,6 +964,16 @@ class BootstrapTests(unittest.TestCase):
         attempts = list((self.repo / ".falguna/evidence" / run_id).glob("verification-attempt-*.json"))
         self.assertEqual(len(attempts), 2)
 
+    def test_review_required_file_outside_scope_enters_needs_aryan(self):
+        self.control.reviewer = ScriptedSemanticReviewer(lambda *_: ReviewResult(False, "scope", ["Requirement needs falguna/supervisor.py but it is not approved."], {name: {"passed": True, "evidence": "checked"} for name in ("requirement_satisfaction", "scope_compliance", "regression_evidence", "unresolved_uncertainty")}, []))
+        policy = RunPolicy(allowed_write_globs=["falguna/feature.py", "tests/test_feature.py"])
+        ids = self.control.create_mission("review scope", "set value to 2", self.repo, policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", policy)
+        run = self.store.get("runs", run_id)
+        state = self.store.list("supervisor_states", "run_id=?", (run_id,))[-1]
+        self.assertIn("SCOPE_EXPANSION_REQUIRED", run["error"])
+        self.assertEqual((state["outcome_class"], state["phase"], state["retry_allowed"]), ("NEEDS_APPROVAL", "NEEDS_ARYAN", 0))
+
 
 if __name__ == "__main__":
     unittest.main()

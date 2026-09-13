@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -256,6 +257,10 @@ class ControlPlane:
                 if total_cost > policy.max_cost_usd:
                     raise PolicyViolation("cumulative run cost cap exceeded")
                 if not review.approved:
+                    mentioned_paths = set(re.findall(r"\b(?:falguna|tests|browser-tests)/[A-Za-z0-9_.\/-]+", "\n".join(review.findings)))
+                    outside_scope = sorted(path.rstrip(".,;:") for path in mentioned_paths if path.rstrip(".,;:") not in policy.allowed_write_globs)
+                    if outside_scope:
+                        raise RuntimeError("SCOPE_EXPANSION_REQUIRED: independent review requires files outside approved scope: " + ", ".join(outside_scope))
                     prior = self.store.list("checkpoints", "run_id=? AND stage=?", (run_id, "REVIEW_REPAIR_COMPLETE"))
                     if prior:
                         raise RuntimeError("REVIEW_FAILURE: independent review rejected candidate after bounded correction: " + "; ".join(review.findings))
