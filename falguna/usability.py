@@ -109,6 +109,9 @@ def evidence_summary(store, state_root: Path, audit, run_id: str) -> dict:
     run = store.get("runs", run_id)
     evidence_dir = Path(state_root) / "evidence" / run_id
     verification = _read_json(evidence_dir / "verification.json")
+    if not verification:
+        attempts = sorted(evidence_dir.glob("verification-attempt-*.json"))
+        verification = _read_json(attempts[-1]) if attempts else {}
     discovery = _read_json(evidence_dir / "discovery.json")
     review = _read_json(evidence_dir / "review.json")
     approvals = store.list("approvals", "run_id=? AND kind=?", (run_id, "PROTECTED_BRANCH_MERGE"))

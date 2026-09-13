@@ -947,6 +947,22 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("Autonomy Supervisor retry", calls[2])
         self.assertIn("Definition of Done failed", calls[2])
 
+    def test_review_correction_keeps_verification_attempt_artifacts_immutable(self):
+        reviews = {"count": 0}
+        def review(requirement, diff, changed, verification):
+            reviews["count"] += 1
+            approved = reviews["count"] == 2
+            dimensions = {name: {"passed": True, "evidence": "verified"} for name in ("requirement_satisfaction", "scope_compliance", "regression_evidence", "unresolved_uncertainty")}
+            return ReviewResult(approved, "review", [] if approved else ["correct once"], dimensions, [])
+        self.control.reviewer = ScriptedSemanticReviewer(review)
+        ids = self.control.create_mission("immutable review repair", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "DONE_CANDIDATE")
+        summary = evidence_summary(self.store, self.repo / ".falguna", self.control.audit, run_id)
+        self.assertTrue(summary["evidence_hashes_valid"])
+        attempts = list((self.repo / ".falguna/evidence" / run_id).glob("verification-attempt-*.json"))
+        self.assertEqual(len(attempts), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

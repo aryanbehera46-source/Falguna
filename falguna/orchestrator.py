@@ -183,8 +183,6 @@ class ControlPlane:
                 if not passed:
                     repairs = self.store.list("checkpoints", "run_id=? AND stage=?", (run_id, "REPAIR_COMPLETE"))
                     if repairs:
-                        (evidence_dir / "verification.json").write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
-                        self._record_artifact(run_id, "VERIFICATION_FINAL", evidence_dir / "verification.json")
                         raise RuntimeError("Definition of Done failed after bounded repair")
                     failure_summary = json.dumps(results, sort_keys=True)[-6000:]
                     self.supervisor.record(run_id, "VERIFICATION_FAILURE: " + failure_summary, retry_budget=policy.max_attempts, phase="REPAIRING_VERIFICATION")
@@ -208,9 +206,6 @@ class ControlPlane:
                     self._checkpoint(run_id, "REPAIR_COMPLETE", worktree=str(worktree), verification_attempt=verification_attempt, repair_attempt=repair_attempt)
                     self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree))
                     return self._continue(run_id, worker, policy, None)
-                canonical_verification = evidence_dir / "verification.json"
-                canonical_verification.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
-                self._record_artifact(run_id, "VERIFICATION_FINAL", canonical_verification)
                 self._checkpoint(run_id, "VERIFIED", worktree=str(worktree), changed_files=changed)
                 stage, payload = "VERIFIED", {"worktree": str(worktree), "changed_files": changed}
             if stage == "VERIFIED":
@@ -235,7 +230,10 @@ class ControlPlane:
                         raise RuntimeError(f"independent reviewer failed calibration: {calibration['false_accepts']} false accepts, {calibration['false_rejects']} false rejects")
                 changed = payload.get("changed_files") or manager.changed_files(worktree)
                 diff = manager.diff(worktree)
-                verification_path = self.state_root / "evidence" / run_id / "verification.json"
+                verification_attempts = sorted((self.state_root / "evidence" / run_id).glob("verification-attempt-*.json"))
+                if not verification_attempts:
+                    raise RuntimeError("INTERNAL_ORCHESTRATION_ERROR: verified checkpoint has no verification attempt evidence")
+                verification_path = verification_attempts[-1]
                 verification_evidence = json.loads(verification_path.read_text())
                 review = self.reviewer.review(requirement, diff, changed, verification_evidence)
                 self._timed(run_id, "review", review_started, approved=review.approved)
@@ -271,6 +269,9 @@ class ControlPlane:
                     self._checkpoint(run_id, "REVIEW_REPAIR_COMPLETE", worktree=str(worktree), findings=review.findings, repair_attempt=repair_attempt)
                     self._checkpoint(run_id, "WORKER_COMPLETE", worktree=str(worktree), preserved_review_findings=review.findings)
                     return self._continue(run_id, worker, policy, None)
+                canonical_verification = evidence_dir / "verification.json"
+                canonical_verification.write_text(json.dumps(verification_evidence, indent=2, sort_keys=True))
+                self._record_artifact(run_id, "VERIFICATION_FINAL", canonical_verification)
                 approval_id = self.store.create("approvals", {"run_id": run_id, "kind": "PROTECTED_BRANCH_MERGE", "status": "PENDING", "requested_at": utcnow(), "decided_at": None, "decided_by": None, "reason": None, "created_at": utcnow(), "updated_at": utcnow()})
                 self.store.update("runs", run_id, status=RunStatus.DONE_CANDIDATE.value, error=None)
                 states = self.store.list("supervisor_states", "run_id=?", (run_id,))
