@@ -92,6 +92,12 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             run_id = path.rsplit("/", 1)[-1]
             control, store = open_control_plane(self.app_root)
             try:
+                run = store.get("runs", run_id)
+                if run:
+                    task = store.get("tasks", run["task_id"])
+                    raw = json.loads(task["policy_json"])
+                    raw["verification_commands"] = [CommandSpec(**item) for item in raw.get("verification_commands", [])]
+                    control.reconcile_recovery_state(run_id, RunPolicy(**raw))
                 view = mission_view(store, self.app_root / ".falguna", run_id)
                 if view["status"] in {"DONE_CANDIDATE", "FAILED", "QUARANTINED", "CANCELLED"}:
                     view = evidence_summary(store, self.app_root / ".falguna", control.audit, run_id)

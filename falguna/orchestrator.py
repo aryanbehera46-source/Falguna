@@ -54,12 +54,13 @@ class ControlPlane:
             raise ValueError("run not found")
         if run["status"] == RunStatus.CANCELLED.value:
             raise ValueError("cancelled missions cannot be resumed")
+        self.reconcile_recovery_state(run_id, policy)
         states = self.store.list("supervisor_states", "run_id=?", (run_id,))
         if run["status"] in {RunStatus.FAILED.value, RunStatus.QUARANTINED.value} and states and not states[-1]["resume_allowed"]:
             raise ValueError(states[-1]["eligibility_reason"])
         if run["status"] == RunStatus.FAILED.value and states and states[-1]["resume_allowed"]:
             diagnostics = json.loads(states[-1]["diagnostics_json"])
-            self._checkpoint(run_id, "WORKTREE_READY", worktree=run["worktree"], recovery_diagnostics=diagnostics, supervisor_retry=True)
+            self._checkpoint(run_id, "WORKTREE_READY", worktree=run["worktree"], recovery_diagnostics=diagnostics, supervisor_retry=True, recovery_attempts=1)
         checkpoint = self.store.latest_checkpoint(run_id)
         if not checkpoint:
             raise ValueError("no checkpoint")
@@ -70,6 +71,37 @@ class ControlPlane:
         if hasattr(worker, "checkpoint") and worker.checkpoint is None:
             worker.checkpoint = lambda ordinal, summary: self._milestone_checkpoint(run_id, policy, ordinal, summary)
         return self._continue(run_id, worker, policy, None)
+
+    def reconcile_recovery_state(self, run_id: str, policy: RunPolicy) -> Optional[dict]:
+        """Fail-closed recovery for legacy/interrupted failed runs missing a supervisor row."""
+        run = self.store.get("runs", run_id)
+        if not run:
+            raise ValueError("run not found")
+        states = self.store.list("supervisor_states", "run_id=?", (run_id,))
+        if states or run["status"] not in {RunStatus.FAILED.value, RunStatus.QUARANTINED.value}:
+            return states[-1] if states else None
+        error = str(run.get("error") or "INTERNAL_ORCHESTRATION_ERROR: failed run has no diagnostics")
+        evidence_dir = self.state_root / "evidence" / run_id
+        attempts = sorted(evidence_dir.glob("verification-attempt-*.json"))
+        if attempts:
+            try:
+                verification = json.loads(attempts[-1].read_text())
+            except (OSError, ValueError, TypeError):
+                verification = None
+            if verification and verification.get("passed") is False:
+                exact = json.dumps(verification.get("results", []), sort_keys=True)
+                error = "VERIFICATION_FAILURE: " + exact
+        # A missing durable decision is treated conservatively as having consumed
+        # all but one recovery slot. This restores one bounded corrective attempt,
+        # never an unbounded reset of the mission's budget.
+        attempts_used = max(0, int(policy.max_attempts) - 1)
+        return self.supervisor.record(
+            run_id,
+            error,
+            retry_budget=policy.max_attempts,
+            attempts_used=attempts_used,
+            phase="REPAIRING_VERIFICATION" if error.startswith("VERIFICATION_FAILURE:") else None,
+        )
 
     def request_control(self, run_id: str, action: str) -> None:
         if action not in {"PAUSE", "CANCEL"}:
@@ -131,7 +163,8 @@ class ControlPlane:
                 if payload.get("recovery_diagnostics"):
                     worker_requirement += "\n\nAutonomy Supervisor retry. Preserve approved scope and correct the prior failure using these diagnostics:\n" + json.dumps(payload["recovery_diagnostics"], sort_keys=True)
                 base_attempt = int(self.store.get("runs", run_id)["attempt"])
-                for local_attempt in range(1, policy.max_attempts + 1):
+                max_local_attempts = int(payload.get("recovery_attempts") or policy.max_attempts)
+                for local_attempt in range(1, max_local_attempts + 1):
                     attempt = base_attempt + local_attempt
                     self.store.update("runs", run_id, attempt=attempt)
                     try:

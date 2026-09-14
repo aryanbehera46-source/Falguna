@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -904,6 +905,55 @@ class BootstrapTests(unittest.TestCase):
         self.control, self.store = open_control_plane(self.repo)
         view = mission_view(self.store, self.repo / ".falguna", run_id)
         self.assertEqual((view["supervisor"]["category"], view["supervisor"]["retry_allowed"]), ("PATCH_STALE", 1))
+
+    def test_missing_supervisor_state_is_rebuilt_from_immutable_verification(self):
+        calls = []
+        def worker(worktree, requirement, run_id):
+            calls.append(requirement)
+            (worktree / "falguna/feature.py").write_text("VALUE = 2\n")
+            return WorkerResult(True, "corrected", 0)
+        ids = self.control.create_mission("restart recovery", "set value to 2", self.repo, self.policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        evidence_dir = self.repo / ".falguna/evidence" / run_id
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        failed = {"attempt": 1, "passed": False, "results": [{"label": "python-unittest", "exit_code": 1, "stdout": "FAIL: exact output", "stderr": "AssertionError: exact stderr"}]}
+        attempt_path = evidence_dir / "verification-attempt-1.json"
+        attempt_path.write_text(json.dumps(failed))
+        original_hash = hashlib.sha256(attempt_path.read_bytes()).hexdigest()
+        self.store.update("runs", run_id, status="FAILED", error="Definition of Done failed after bounded repair", attempt=2)
+        self.store.close()
+        self.control, self.store = open_control_plane(self.repo)
+
+        state = self.control.reconcile_recovery_state(run_id, self.policy)
+        view = mission_view(self.store, self.repo / ".falguna", run_id)
+        self.assertEqual((state["outcome_class"], state["category"], state["retry_allowed"], state["resume_allowed"]), ("RECOVERABLE", "VERIFICATION_FAILURE", 1, 1))
+        self.assertIn("exact output", view["supervisor"]["diagnostics"]["error"])
+        self.assertIn("exact stderr", view["supervisor"]["diagnostics"]["error"])
+        self.assertIn("Resume", view["available_controls"])
+
+        dimensions = {name: {"passed": True, "evidence": "verified"} for name in ("requirement_satisfaction", "scope_compliance", "regression_evidence", "unresolved_uncertainty")}
+        self.control.reviewer = ScriptedSemanticReviewer(lambda *_: ReviewResult(True, "review", [], dimensions, []))
+        self.control.resume(run_id, ScriptedWorker(worker), self.policy)
+        resumed = self.store.get("runs", run_id)
+        self.assertEqual(resumed["status"], "DONE_CANDIDATE", resumed["error"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("exact stderr", calls[0])
+        self.assertEqual(hashlib.sha256(attempt_path.read_bytes()).hexdigest(), original_hash)
+
+    def test_missing_supervisor_state_stays_disabled_for_cancelled_or_terminal_failure(self):
+        ids = self.control.create_mission("cancelled recovery", "set value to 2", self.repo, self.policy)
+        cancelled = self.control.start(ids["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", cancelled, status="CANCELLED", error="VERIFICATION_FAILURE: stale")
+        self.assertIsNone(self.control.reconcile_recovery_state(cancelled, self.policy))
+        with self.assertRaisesRegex(ValueError, "cancelled missions"):
+            self.control.resume(cancelled, self.worker(), self.policy)
+
+        other = self.control.create_mission("terminal recovery", "set value to 2", self.repo, self.policy)
+        terminal = self.control.start(other["task_id"], self.worker(), "scripted", "none", self.policy, force_stop_after="WORKTREE_READY")
+        self.store.update("runs", terminal, status="FAILED", error="INTERNAL_ORCHESTRATION_ERROR: corrupt state")
+        state = self.control.reconcile_recovery_state(terminal, self.policy)
+        self.assertEqual((state["outcome_class"], state["retry_allowed"], state["resume_allowed"]), ("TERMINAL", 0, 0))
+        self.assertTrue(state["eligibility_reason"])
 
     def test_cancelled_run_cannot_resume_after_restart(self):
         ids = self.control.create_mission("cancel restart", "set value to 2", self.repo, self.policy)
