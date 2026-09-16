@@ -191,8 +191,10 @@ def search_missions(store: StateStore, query: str, limit: int = 25) -> List[dict
     return hits
 
 
-def _model_call(decoded: dict, config: dict) -> dict:
-    """Same cost/usage accounting as StructuredEditWorker._model_call, purpose='chat'."""
+def _model_call(decoded: dict, config: dict, purpose: str = "chat") -> dict:
+    """Same cost/usage accounting as StructuredEditWorker._model_call.
+    `purpose` records which surface made the call (chat/research/...) for
+    audit and cost-reporting; it does not change how the cost is computed."""
     usage = decoded.get("usage", {})
     prompt_tokens = int(usage.get("prompt_tokens", 0))
     completion_tokens = int(usage.get("completion_tokens", 0))
@@ -203,11 +205,11 @@ def _model_call(decoded: dict, config: dict) -> dict:
     return {
         "provider": decoded.get("_falguna_provider", "openai-compatible"),
         "model": metadata.get("routed_model", config["model"]),
-        "purpose": "chat",
+        "purpose": purpose,
         "input_tokens": prompt_tokens,
         "output_tokens": completion_tokens,
         "cost_usd": cost,
-        "metadata": {"adapter": "chat", **metadata},
+        "metadata": {"adapter": purpose, **metadata},
     }
 
 

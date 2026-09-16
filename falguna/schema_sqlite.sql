@@ -27,6 +27,15 @@ CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(status, up
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_handoffs_conversation ON conversation_handoffs(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_handoffs_run ON conversation_handoffs(run_id);
+CREATE TABLE IF NOT EXISTS research_queries (id TEXT PRIMARY KEY, query TEXT NOT NULL, answer TEXT, suggested_objective TEXT, provider TEXT NOT NULL, project_id TEXT, conversation_id TEXT, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS research_sources (id TEXT PRIMARY KEY, research_id TEXT NOT NULL REFERENCES research_queries(id), rank INTEGER NOT NULL, title TEXT, url TEXT NOT NULL, domain TEXT, published_at TEXT, retrieved_at TEXT NOT NULL, snippet TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS research_citations (id TEXT PRIMARY KEY, research_id TEXT NOT NULL REFERENCES research_queries(id), source_id TEXT NOT NULL REFERENCES research_sources(id), claim TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS research_handoffs (id TEXT PRIMARY KEY, research_id TEXT NOT NULL REFERENCES research_queries(id), run_id TEXT NOT NULL REFERENCES runs(id), objective TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_research_updated ON research_queries(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_research_sources_research ON research_sources(research_id, rank);
+CREATE INDEX IF NOT EXISTS idx_research_citations_research ON research_citations(research_id);
+CREATE INDEX IF NOT EXISTS idx_research_handoffs_research ON research_handoffs(research_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_research_handoffs_run ON research_handoffs(run_id);
 -- TTT HQ: Boardroom, Master Vision Backlog, Needs Aryan (PASS 1 consolidation)
 CREATE TABLE IF NOT EXISTS boardroom_topics (id TEXT PRIMARY KEY, title TEXT NOT NULL, summary TEXT NOT NULL, proposed_category TEXT, proposed_phase TEXT, proposed_priority TEXT, proposed_revenue_impact TEXT, status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS boardroom_contributions (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES boardroom_topics(id), perspective TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);

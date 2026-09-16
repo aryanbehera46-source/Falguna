@@ -15,14 +15,22 @@ from .continuity import ProjectUnderstandingCache, browser_e2e_applicable, resol
 from .discovery import ProjectDiscovery
 from .gateway import OpenAICompatibleGateway
 from .models import CommandSpec, RunPolicy
+from .research import ResearchError, ResearchResponder, ResearchStore, rank_sources
 from .review import ModelSemanticReviewer
 from .runtime import open_control_plane
+from .search_providers import DuckDuckGoHTMLSearchProvider
 from .store import utcnow
 from .usability import evidence_summary, mission_view
 from .workers import StructuredEditWorker
 
 
 MODEL = DEFAULT_CODEX_MODEL
+# Falguna Search's default provider. Swappable in one line -- research.py's
+# abstraction (SearchProvider/ProviderResult/SourceResult) never imports or
+# knows about this concrete class, so replacing DuckDuckGoHTMLSearchProvider
+# with a paid web-search API, browser-based retrieval, a provider-native
+# search tool, or a self-hosted index touches only this one assignment.
+SEARCH_PROVIDER = DuckDuckGoHTMLSearchProvider()
 _operations = {}
 _operations_lock = threading.Lock()
 
@@ -86,6 +94,11 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         if path == "/api/search":
             query = parse_qs(parsed.query).get("q", [""])[0]
             return self._search(query)
+        if path == "/api/research":
+            return self._list_research()
+        if path.startswith("/api/research/"):
+            research_id = path.rsplit("/", 1)[-1]
+            return self._get_research(research_id)
         if path == "/api/conversations":
             return self._list_conversations()
         if path.startswith("/api/conversations/"):
@@ -124,6 +137,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 if view["status"] in {"DONE_CANDIDATE", "FAILED", "QUARANTINED", "CANCELLED"}:
                     view = evidence_summary(store, self.app_root / ".falguna", control.audit, run_id)
                 view["conversation_handoffs"] = ConversationStore(store).handoffs_for_run(run_id)
+                view["research_handoffs"] = ResearchStore(store).handoffs_for_run(run_id)
                 return self._json(view)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
@@ -149,6 +163,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 "Hash-chained append-only audit log",
                 "Human-only merge decision -- Falguna never merges or deploys",
                 "Chat has no tools and cannot edit a repository; only a human handoff can start a mission",
+                "Search treats retrieved web content as untrusted data, never as instructions; only http(s) sources are ever kept",
             ],
         })
 
@@ -158,6 +173,29 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             chat = ConversationStore(store)
             results = chat.search_conversations(query) + search_missions(store, query)
             return self._json({"query": query, "results": results})
+        finally:
+            store.close()
+
+    def _list_research(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json({"research": ResearchStore(store).list_queries()})
+        finally:
+            store.close()
+
+    def _get_research(self, research_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            rs = ResearchStore(store)
+            query = rs.get_query(research_id)
+            if not query:
+                return self._json({"error": "research query not found"}, HTTPStatus.NOT_FOUND)
+            return self._json({
+                "research": query,
+                "sources": rs.get_sources(research_id),
+                "citations": rs.get_citations(research_id),
+                "handoffs": rs.list_handoffs(research_id),
+            })
         finally:
             store.close()
 
@@ -235,6 +273,12 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 return self._rename_conversation(path.split("/")[3], body)
             if path.startswith("/api/conversations/") and path.endswith("/handoff"):
                 return self._handoff(path.split("/")[3], body)
+            if path == "/api/research":
+                return self._run_research(body)
+            if path.startswith("/api/research/") and path.endswith("/continue-chat"):
+                return self._research_to_chat(path.split("/")[3], body)
+            if path.startswith("/api/research/") and path.endswith("/handoff"):
+                return self._research_to_work(path.split("/")[3], body)
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except DiscoveryUncertain as exc:
             return self._json({"error": str(exc), "discovery": exc.evidence}, HTTPStatus.CONFLICT)
@@ -245,11 +289,12 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         token = self._launch(body.get("project"), body.get("objective", ""), body.get("max_cost_usd"))
         return self._json({"operation": token, "state": "STARTING"}, HTTPStatus.ACCEPTED)
 
-    def _launch(self, project_id, objective, max_cost_usd, conversation_id=None):
-        """Shared by /api/runs and Chat -> Work handoff. Both paths go through the
-        identical discovery/policy/worktree pipeline -- handoff cannot skip discovery,
-        widen scope, or start a run without it. conversation_id only ever gets attached
-        to a run that this same call produced through the real control plane."""
+    def _launch(self, project_id, objective, max_cost_usd, conversation_id=None, research_id=None):
+        """Shared by /api/runs, Chat -> Work handoff, and Search -> Work handoff. All
+        three paths go through the identical discovery/policy/worktree pipeline --
+        a handoff cannot skip discovery, widen scope, or start a run without it.
+        conversation_id/research_id only ever get attached to a run that this same
+        call produced through the real control plane."""
         profiles = {item["id"]: item for item in load_profiles(self.app_root)}
         profile = profiles.get(project_id)
         if not profile:
@@ -282,7 +327,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             _operations[token]["discovery"] = discovery
         thread = threading.Thread(
             target=_run_mission,
-            args=(self.app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id),
+            args=(self.app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id, research_id),
             daemon=True,
         )
         thread.start()
@@ -351,6 +396,91 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         token = self._launch(project_id, body.get("objective", ""), body.get("max_cost_usd"), conversation_id=conversation_id)
         return self._json({"operation": token, "state": "STARTING", "conversation_id": conversation_id}, HTTPStatus.ACCEPTED)
 
+    def _run_research(self, body):
+        """Runs one research query synchronously (mirrors _post_message's shape:
+        no worktree, no isolation needed -- this never touches a repository).
+        Retrieval and synthesis are two separate steps: SEARCH_PROVIDER only
+        ever returns source metadata (never executed), and ResearchResponder
+        only ever sees that metadata as clearly-labeled, untrusted data."""
+        query_text = str(body.get("query", "")).strip()
+        if len(query_text) < 3:
+            raise ValueError("Provide a research query")
+        project_id = body.get("project_id")
+        conversation_id = body.get("conversation_id")
+        if project_id:
+            profiles = {item["id"] for item in load_profiles(self.app_root)}
+            if project_id not in profiles:
+                raise ValueError("Select an approved project")
+        control, store = open_control_plane(self.app_root)
+        try:
+            if conversation_id and not ConversationStore(store).get_conversation(conversation_id):
+                raise ValueError("conversation not found")
+            rs = ResearchStore(store)
+            research_id = rs.create_query(query_text, SEARCH_PROVIDER.name, project_id, conversation_id)
+            try:
+                provider_result = SEARCH_PROVIDER.search(query_text, max_results=6)
+                sources = rank_sources(provider_result.sources)
+                codex = shutil.which("codex")
+                if sources and not codex:
+                    raise ResearchError("MODEL_UNAVAILABLE: authenticated Codex executable not found")
+                if codex:
+                    gateway = OpenAICompatibleGateway(MODEL, "http://127.0.0.1:1/v1", "")
+                    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+                    transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=60))
+                else:
+                    gateway = transport = None  # only reachable when sources is empty; reply() never touches these in that case
+                outcome = ResearchResponder(gateway, transport, MODEL, timeout_seconds=60).reply(query_text, sources)
+                rs.save_result(research_id, outcome["answer"], sources, outcome["citations"], outcome["suggested_objective"])
+            except ResearchError as exc:
+                rs.save_failure(research_id, str(exc))
+            record = rs.get_query(research_id)
+            return self._json({
+                "research": record,
+                "sources": rs.get_sources(research_id),
+                "citations": rs.get_citations(research_id),
+            }, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _research_to_chat(self, research_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            rs = ResearchStore(store)
+            research = rs.get_query(research_id)
+            if not research:
+                return self._json({"error": "research query not found"}, HTTPStatus.NOT_FOUND)
+            chat = ConversationStore(store)
+            conversation_id = body.get("conversation_id") or research.get("conversation_id")
+            if conversation_id and not chat.get_conversation(conversation_id):
+                conversation_id = None
+            if not conversation_id:
+                conversation_id = chat.create_conversation(f"Research: {research['query'][:80]}", research.get("project_id"))
+            chat.add_message(conversation_id, "user", f"Continue from Search: {research['query']}")
+            sources = rs.get_sources(research_id)
+            citation_note = ""
+            if sources:
+                citation_note = "\n\nSources:\n" + "\n".join(
+                    f"[{i + 1}] {s['title'] or s['url']} — {s['url']}" for i, s in enumerate(sources)
+                )
+            chat.add_message(conversation_id, "assistant", (research.get("answer") or "") + citation_note)
+            if research.get("conversation_id") != conversation_id:
+                store.update("research_queries", research_id, conversation_id=conversation_id)
+            return self._json({"conversation_id": conversation_id}, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _research_to_work(self, research_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            research = ResearchStore(store).get_query(research_id)
+        finally:
+            store.close()
+        if not research:
+            return self._json({"error": "research query not found"}, HTTPStatus.NOT_FOUND)
+        project_id = body.get("project_id") or research.get("project_id")
+        token = self._launch(project_id, body.get("objective", ""), body.get("max_cost_usd"), research_id=research_id)
+        return self._json({"operation": token, "state": "STARTING", "research_id": research_id}, HTTPStatus.ACCEPTED)
+
     def _body(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length > 65536:
@@ -377,7 +507,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def _run_mission(app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id=None):
+def _run_mission(app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id=None, research_id=None):
     control, store = open_control_plane(app_root)
     try:
         dependency_path = Path(profile["repository"]) / profile.get("package_root", ".") / "node_modules"
@@ -402,6 +532,8 @@ def _run_mission(app_root, token, profile, objective, editable, commands, cap, d
             control.audit.append("DISCOVERY_APPROVED", {"run_id": run_id, "confidence": discovery["confidence"], "editable_files": discovery["editable_files"]})
             if conversation_id:
                 ConversationStore(store).record_handoff(conversation_id, run_id, objective)
+            if research_id:
+                ResearchStore(store).record_handoff(research_id, run_id, objective)
             with _operations_lock:
                 _operations[token] = {"state": "RUNNING", "run_id": run_id, "discovery": discovery}
         run_id = control.start(ids["task_id"], worker, "structured-codex", MODEL, policy, on_run_created=created)
@@ -627,6 +759,23 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
 .details span{color:var(--muted-dim);display:block;font-size:10.5px}
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}
 
+/* ---------- Search / Research view ---------- */
+.research-detail-view{max-width:760px;margin:0 auto;padding:34px 0 60px}
+.answer-card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px}
+.answer-card .q{color:var(--muted-dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:9px;font-weight:650}
+.answer-card .a{font-size:14px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.answer-card .a.error{color:var(--bad)}
+.source-list{display:grid;gap:8px;margin-top:12px}
+.source-card{border:1px solid var(--line);background:var(--soft);border-radius:11px;padding:11px 13px;display:block;text-decoration:none;color:inherit;transition:border-color .12s,background .12s}
+.source-card:hover{border-color:#4a3d28;background:var(--soft2)}
+.source-card .idx{display:inline-grid;place-items:center;width:17px;height:17px;border-radius:6px;background:var(--accent-soft);color:var(--accent-hi);font-size:10px;font-weight:700;margin-right:7px;vertical-align:middle}
+.source-card .s-title{font-weight:600;font-size:13px}
+.source-card .s-meta{color:var(--muted-dim);font-size:11px;margin-top:4px;overflow-wrap:anywhere}
+.disclosure{margin-top:14px;border-top:1px solid var(--line);padding-top:14px}
+.disclosure summary{cursor:pointer;color:var(--muted);font-size:12.5px;font-weight:600;list-style:none}
+.disclosure summary::-webkit-details-marker{display:none}
+.research-actions{display:flex;gap:9px;margin-top:16px;flex-wrap:wrap}
+
 @media(max-width:850px){
   .app{grid-template-columns:1fr}
   .workspace{grid-column:1}
@@ -724,7 +873,7 @@ async function router(){
   try{
     if(view==='chat'){await renderSideChats();return renderChatView(id)}
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
-    if(view==='search'){hideSideList();return renderSearchView(id)}
+    if(view==='search'){await renderSideResearch();return renderSearchView(id)}
     if(view==='projects'){hideSideList();return renderProjectsView()}
     if(view==='history'){hideSideList();return renderHistoryView()}
     if(view==='settings'){hideSideList();return renderSettingsView()}
@@ -780,6 +929,18 @@ async function renderSideMissions(){
   $('sideList').innerHTML=list.length?list.map(r=>`<button data-open="#/work/${esc(r.run_id)}" class="${r.run_id===activeId?'active':''}" title="${esc(r.title)}"><span class="row-title">${esc(r.title)}</span><span class="row-sub">${esc(String(r.status||'unknown').replaceAll('_',' '))}</span></button>`).join(''):'<div class="side-empty">No missions yet.</div>';
   wireSideList();
 }
+async function renderSideResearch(){
+  $('sideListTitle').textContent='Recent research';
+  const {research}=await api('/api/research');
+  const {id:activeId}=currentRoute();
+  const list=research||[];
+  if(!list.length){$('sideList').innerHTML='<div class="side-empty">No research yet.</div>';return}
+  const statusLabel={DONE:'Answered',FAILED:'Failed',PENDING:'Pending'};
+  $('sideList').innerHTML=groupByRecency(list,'updated_at').map(([label,rows])=>
+    `<div class="side-group-label">${esc(label)}</div>`+rows.map(r=>`<button data-open="#/search/${esc(r.id)}" class="${r.id===activeId?'active':''}" title="${esc(r.query)}"><span class="row-title">${esc(r.query)}</span><span class="row-sub">${esc(statusLabel[r.status]||r.status)}</span></button>`).join('')
+  ).join('');
+  wireSideList();
+}
 function wireSideList(){
   document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{go(b.dataset.open);closeSidebar()});
 }
@@ -809,7 +970,7 @@ async function renderChatView(id){
         <div class="chat-scroll"><div class="chat-welcome">
           <div class="glow">${icon('spark',24)}</div>
           <h1>How can I help?</h1>
-          <p>Ask a question, think something through, or describe what you're working on.</p>
+          <p>Ask a question, think something through, or describe what you're working on. Need current information from the web? Try <a href="#/search">Search</a>.</p>
           <div class="chip-row">${STARTERS.map(([ic,label])=>`<button class="chip" data-starter="${esc(label)}">${icon(ic,13)}${esc(label)}</button>`).join('')}</div>
         </div></div>
         ${composerHtml('Start chat')}
@@ -974,7 +1135,10 @@ async function refreshWork(runId){
 function renderWorkThread(runId,d){
   const wt=$('workThread');
   const handoffs=d.conversation_handoffs||[];
-  const origin=handoffs.length?`<div class="origin-banner"><span>Started from a Chat handoff</span><a href="#/chat/${esc(handoffs[0].conversation_id)}">Open the conversation</a></div>`:'';
+  const researchHandoffs=d.research_handoffs||[];
+  const origin=handoffs.length
+    ?`<div class="origin-banner"><span>Started from a Chat handoff</span><a href="#/chat/${esc(handoffs[0].conversation_id)}">Open the conversation</a></div>`
+    :researchHandoffs.length?`<div class="origin-banner"><span>Started from a Search handoff</span><a href="#/search/${esc(researchHandoffs[0].research_id)}">Open the research</a></div>`:'';
   const terminal=['DONE_CANDIDATE','FAILED','QUARANTINED','PAUSED','CANCELLED'].includes(d.status);
   wt.innerHTML=`${origin}<div class="work-header">
       <div class="objective">${esc(d.objective||d.mission||'')}</div>
@@ -1038,25 +1202,118 @@ async function watchOperation(token,onRunId){
 
 /* ------------------------------------------------------------- Search view */
 
-async function renderSearchView(query){
+async function renderSearchView(id){
+  await loadProfiles();
   const vp=$('viewport');
-  vp.innerHTML=`<div class="page"><h1>Search</h1><p class="lede">Search across chats and Work missions.</p>
-    <div class="searchbar"><input id="q" placeholder="Search chats and missions&hellip;" value="${esc(query||'')}"><button id="go">Search</button></div>
-    <div class="result-list" id="results"></div></div>`;
-  const run=async()=>{
-    const q=$('q').value.trim();
-    history.replaceState(null,'','#/search/'+encodeURIComponent(q));
-    if(!q){$('results').innerHTML='<div class="empty-state">Type to search.</div>';return}
-    const {results}=await api('/api/search?q='+encodeURIComponent(q));
-    $('results').innerHTML=results.length?results.map(r=>r.type==='conversation'
-      ?`<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
-      :`<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work &middot; ${esc(String(r.status||'').replaceAll('_',' '))}</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.repository||'')}</div></button>`
-    ).join(''):'<div class="empty-state">No matches.</div>';
-    document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
+  if(!id){
+    vp.innerHTML=`<div class="page" style="max-width:680px">
+      <div class="chat-welcome" style="margin-top:6vh">
+        <div class="glow">${icon('search',22)}</div>
+        <h1>Research anything</h1>
+        <p>Falguna searches the web, keeps citations, and lets you continue the findings into Chat or hand them to Work.</p>
+      </div>
+      <form class="mission-form" id="researchForm" style="max-width:560px;margin:24px auto 0;text-align:left">
+        <label>What do you want to research?</label>
+        <textarea id="researchQuery" required placeholder="e.g. research this company, compare these two libraries, find current documentation for..."></textarea>
+        <label>Attach to a project (optional)</label>
+        <select id="researchProject"><option value="">No project</option>${profileList.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}</select>
+        <div class="handoff-actions"><button class="action" id="researchGo" type="submit">${icon('search',13)}Research</button></div>
+      </form>
+      <details class="disclosure" style="max-width:560px;margin:24px auto 0">
+        <summary>Find an existing chat or mission instead</summary>
+        <div class="searchbar" style="margin-top:12px"><input id="quickQ" placeholder="Search chats and missions&hellip;"><button id="quickGo" type="button">Search</button></div>
+        <div class="result-list" id="quickResults"></div>
+      </details>
+    </div>`;
+    $('researchForm').addEventListener('submit',async e=>{
+      e.preventDefault();
+      const query=$('researchQuery').value.trim();
+      if(query.length<3)return;
+      $('researchGo').disabled=true;$('researchGo').textContent='Researching…';
+      try{
+        const out=await api('/api/research',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,project_id:$('researchProject').value||undefined})});
+        go('#/search/'+out.research.id);
+      }catch(err){
+        $('researchGo').disabled=false;$('researchGo').innerHTML=icon('search',13)+'Research';
+        alert(err.message);
+      }
+    });
+    const runQuick=async()=>{
+      const q=$('quickQ').value.trim();
+      if(!q){$('quickResults').innerHTML='';return}
+      const {results}=await api('/api/search?q='+encodeURIComponent(q));
+      $('quickResults').innerHTML=results.length?results.map(r=>r.type==='conversation'
+        ?`<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
+        :`<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work &middot; ${esc(String(r.status||'').replaceAll('_',' '))}</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.repository||'')}</div></button>`
+      ).join(''):'<div class="empty-state">No matches.</div>';
+      document.querySelectorAll('#quickResults [data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
+    };
+    $('quickGo').onclick=runQuick;
+    $('quickQ').addEventListener('keydown',e=>{if(e.key==='Enter')runQuick()});
+    return;
+  }
+  vp.innerHTML=`<div class="research-detail-view" id="researchDetail"><div class="empty-state">Loading research&hellip;</div></div>`;
+  let data;
+  try{
+    data=await api('/api/research/'+id);
+  }catch(err){
+    $('researchDetail').innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;
+    return;
+  }
+  renderResearchDetail(id,data);
+}
+
+function renderResearchDetail(id,data){
+  const {research,sources,citations,handoffs}=data;
+  document.title='Falguna · '+research.query;
+  const mount=$('researchDetail');
+  const failed=research.status==='FAILED';
+  const citeBySource={};
+  (citations||[]).forEach(c=>{(citeBySource[c.source_id]=citeBySource[c.source_id]||[]).push(c.claim)});
+  const sourceCards=(sources||[]).map((s,i)=>`
+    <a class="source-card" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">
+      <div><span class="idx">${i+1}</span><span class="s-title">${esc(s.title||s.url)}</span></div>
+      <div class="s-meta">${esc(s.domain||'')}${s.published_at?' &middot; published '+esc(s.published_at):''} &middot; retrieved ${esc(timeAgo(s.retrieved_at))}</div>
+      ${(citeBySource[s.id]||[]).length?`<div class="s-meta">Cited for: ${esc(citeBySource[s.id].join('; '))}</div>`:''}
+    </a>`).join('');
+  const priorRuns=(handoffs||[]).map(h=>`<a href="#/work/${esc(h.run_id)}">${esc(new Date(h.created_at).toLocaleString())}</a>`).join(' &middot; ');
+  mount.innerHTML=`
+    <div class="answer-card">
+      <div class="q">${esc(research.query)}</div>
+      <div class="a${failed?' error':''}">${failed?esc(research.error||'This research failed.'):esc(research.answer||'')}</div>
+      ${sources&&sources.length?`<details class="disclosure" open><summary>Sources (${sources.length})</summary><div class="source-list">${sourceCards}</div></details>`:''}
+    </div>
+    ${failed?'':`<div class="research-actions"><button class="action secondary" id="continueChatBtn">${icon('chat',13)}Continue in Chat</button></div>
+    <div class="handoff-panel" style="margin-top:16px">
+      <h3>${icon('handoff',15)}Turn into Work</h3>
+      <div class="sub">Search can't touch a repository itself. Work runs in an isolated worktree with verification, review, and a human approval gate.${priorRuns?` Already started: ${priorRuns}`:''}</div>
+      <label>Approved project</label>
+      <select id="researchHandoffProject">${profileList.map(p=>`<option value="${esc(p.id)}" ${p.id===research.project_id?'selected':''}>${esc(p.name)}</option>`).join('')}</select>
+      <label>Bounded objective for Work</label>
+      <textarea id="researchHandoffObjective" placeholder="Describe one small, testable outcome.">${esc(research.suggested_objective||'')}</textarea>
+      <div class="handoff-actions"><button class="action" id="researchHandoffBtn" type="button">Start Work mission</button></div>
+    </div>`}`;
+  if(failed)return;
+  $('continueChatBtn').onclick=async()=>{
+    $('continueChatBtn').disabled=true;
+    try{
+      const out=await api(`/api/research/${id}/continue-chat`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      go('#/chat/'+out.conversation_id);
+    }catch(err){$('continueChatBtn').disabled=false;alert(err.message)}
   };
-  $('go').onclick=run;
-  $('q').addEventListener('keydown',e=>{if(e.key==='Enter')run()});
-  if(query)run();
+  $('researchHandoffBtn').onclick=async()=>{
+    const project_id=$('researchHandoffProject').value;
+    const objective=$('researchHandoffObjective').value.trim();
+    if(!project_id||objective.length<12){alert('Choose a project and describe a bounded objective (12+ characters).');return}
+    $('researchHandoffBtn').disabled=true;$('researchHandoffBtn').textContent='Starting…';
+    try{
+      const out=await api(`/api/research/${id}/handoff`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id,objective})});
+      watchOperation(out.operation,runId=>go('#/work/'+runId));
+    }catch(err){
+      $('researchHandoffBtn').disabled=false;$('researchHandoffBtn').textContent='Start Work mission';
+      alert(err.message+(err.data&&err.data.discovery?' -- discovery needs a narrower objective.':''));
+    }
+  };
 }
 
 /* ----------------------------------------------------------- Projects view */
@@ -1087,16 +1344,18 @@ async function renderProjectsView(){
 
 async function renderHistoryView(){
   const vp=$('viewport');
-  vp.innerHTML=`<div class="page"><h1>History</h1><p class="lede">Every chat and mission, most recent first.</p><div class="result-list" id="historyList"></div></div>`;
-  const [{conversations},{runs}]=await Promise.all([api('/api/conversations'),api('/api/runs')]);
+  vp.innerHTML=`<div class="page"><h1>History</h1><p class="lede">Every chat, search, and mission, most recent first.</p><div class="result-list" id="historyList"></div></div>`;
+  const [{conversations},{runs},{research}]=await Promise.all([api('/api/conversations'),api('/api/runs'),api('/api/research')]);
   const items=[
     ...(conversations||[]).map(c=>({type:'conversation',id:c.id,title:c.title,updated_at:c.updated_at})),
     ...(runs||[]).map(r=>({type:'mission',run_id:r.run_id,title:r.title,status:r.status,updated_at:r.updated_at,repository:r.repository})),
+    ...(research||[]).map(r=>({type:'research',id:r.id,title:r.query,status:r.status,updated_at:r.updated_at})),
   ].sort((a,b)=>new Date(b.updated_at)-new Date(a.updated_at));
-  $('historyList').innerHTML=items.length?items.map(r=>r.type==='conversation'
-    ?`<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
-    :`<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
-  ).join(''):'<div class="empty-state">Nothing yet. Start a chat or a mission.</div>';
+  $('historyList').innerHTML=items.length?items.map(r=>{
+    if(r.type==='conversation')return `<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+    if(r.type==='research')return `<button class="result-row" data-open="#/search/${esc(r.id)}"><div class="kind">Search · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+    return `<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+  }).join(''):'<div class="empty-state">Nothing yet. Start a chat, a search, or a mission.</div>';
   document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
 }
 

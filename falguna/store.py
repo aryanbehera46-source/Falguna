@@ -36,7 +36,7 @@ class StateStore:
             raise
 
     def create(self, table: str, values: Dict[str, Any], record_id: Optional[str] = None) -> str:
-        allowed = {"missions", "requirements", "tasks", "task_steps", "runs", "checkpoints", "approvals", "model_calls", "cost_events", "artifacts", "run_controls", "project_cache", "mission_timings", "supervisor_states", "boardroom_topics", "boardroom_contributions", "boardroom_decisions", "backlog_items", "backlog_history", "needs_aryan_items", "conversations", "chat_messages", "conversation_handoffs"}
+        allowed = {"missions", "requirements", "tasks", "task_steps", "runs", "checkpoints", "approvals", "model_calls", "cost_events", "artifacts", "run_controls", "project_cache", "mission_timings", "supervisor_states", "boardroom_topics", "boardroom_contributions", "boardroom_decisions", "backlog_items", "backlog_history", "needs_aryan_items", "conversations", "chat_messages", "conversation_handoffs", "research_queries", "research_sources", "research_citations", "research_handoffs"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())
