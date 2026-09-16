@@ -13,6 +13,7 @@ from .runtime import open_control_plane
 from .usability import evidence_summary, mission_view
 from .workers import StructuredEditWorker
 from .web import serve
+from .hq_web import serve_hq
 
 
 def main():
@@ -23,6 +24,10 @@ def main():
     web = sub.add_parser("web")
     web.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
     web.add_argument("--port", type=int, default=8765)
+    hq = sub.add_parser("hq")
+    hq.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
+    hq.add_argument("--port", type=int, default=8766)
+    hq.add_argument("--falguna-url", default="http://127.0.0.1:8765")
     create = sub.add_parser("create-mission")
     create.add_argument("--title", required=True)
     create.add_argument("--requirement", required=True)
@@ -50,6 +55,10 @@ def main():
         if args.command == "web":
             store.close()
             serve(root, args.host, args.port)
+            return
+        if args.command == "hq":
+            store.close()
+            serve_hq(root, args.host, args.port, args.falguna_url)
             return
         if args.command == "init":
             print(json.dumps({"status": "initialized", "root": str(root)}))

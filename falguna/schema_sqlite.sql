@@ -18,3 +18,16 @@ CREATE INDEX IF NOT EXISTS idx_controls_run ON run_controls(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cache_project ON project_cache(repository, profile_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_timings_run ON mission_timings(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_supervisor_run ON supervisor_states(run_id, created_at);
+
+-- TTT HQ: Boardroom, Master Vision Backlog, Needs Aryan (PASS 1 consolidation)
+CREATE TABLE IF NOT EXISTS boardroom_topics (id TEXT PRIMARY KEY, title TEXT NOT NULL, summary TEXT NOT NULL, proposed_category TEXT, proposed_phase TEXT, proposed_priority TEXT, proposed_revenue_impact TEXT, status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS boardroom_contributions (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES boardroom_topics(id), perspective TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS boardroom_decisions (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES boardroom_topics(id), action TEXT NOT NULL, note TEXT, decided_by TEXT NOT NULL, backlog_item_id TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS backlog_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT, phase TEXT, priority TEXT, dependency TEXT, revenue_impact TEXT, status TEXT NOT NULL, source_boardroom_topic_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS backlog_history (id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES backlog_items(id), field TEXT NOT NULL, old_value TEXT, new_value TEXT, actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS needs_aryan_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, ref_type TEXT, ref_id TEXT, title TEXT NOT NULL, what_is_needed TEXT NOT NULL, recommendation TEXT, rationale TEXT, risk TEXT, expected_value TEXT, status TEXT NOT NULL, decision_note TEXT, decided_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, decided_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_boardroom_contrib_topic ON boardroom_contributions(topic_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_boardroom_decision_topic ON boardroom_decisions(topic_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_backlog_status ON backlog_items(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_backlog_history_item ON backlog_history(item_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_needs_aryan_status ON needs_aryan_items(status, created_at);

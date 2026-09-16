@@ -1,0 +1,62 @@
+#!/bin/zsh
+
+set -u
+
+APP_DIR="${0:A:h:h:h}"
+ROOT_DIR="${APP_DIR:h:h}"
+STATE_DIR="$HOME/Library/Application Support/TTT HQ"
+PID_FILE="$STATE_DIR/server.pid"
+LOG_FILE="$STATE_DIR/server.log"
+URL="http://127.0.0.1:8766"
+
+mkdir -p "$STATE_DIR"
+
+is_hq_ready() {
+  /usr/bin/curl -fsS --max-time 1 "$URL/api/config" 2>/dev/null |
+    /usr/bin/grep -q '"product": "Twenty Two Technologies HQ"'
+}
+
+show_error() {
+  /usr/bin/osascript -e "display alert \"Twenty Two Technologies could not start\" message \"$1\" as critical" >/dev/null 2>&1 || true
+}
+
+if is_hq_ready; then
+  /usr/bin/open "$URL"
+  exit 0
+fi
+
+if /usr/sbin/lsof -nP -iTCP:8766 -sTCP:LISTEN >/dev/null 2>&1; then
+  show_error "Local port 8766 is already used by another app. Stop that app, then open Twenty Two Technologies again."
+  exit 1
+fi
+
+# Finder apps receive a minimal PATH. Include normal macOS locations, matching
+# the Falguna launcher, so Python resolves the same way for both apps.
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Library/Apple/usr/bin"
+
+cd "$ROOT_DIR" || {
+  show_error "The Falguna repository could not be found beside the launcher folder."
+  exit 1
+}
+
+# This launcher never starts or stops the Falguna Engineering server (port
+# 8765) -- it only opens the same shared repository in a second, independent
+# local server on a different port, for a different surface.
+/usr/bin/nohup /usr/bin/python3 -m falguna --root "$ROOT_DIR" hq --host 127.0.0.1 --port 8766 >>"$LOG_FILE" 2>&1 &
+server_pid=$!
+print -r -- "$server_pid" >"$PID_FILE"
+
+for _ in {1..80}; do
+  if is_hq_ready; then
+    /usr/bin/open "$URL"
+    exit 0
+  fi
+  if ! /bin/kill -0 "$server_pid" 2>/dev/null; then
+    show_error "The local server exited early. Details are in $LOG_FILE."
+    exit 1
+  fi
+  /bin/sleep 0.25
+done
+
+show_error "The local server did not become ready. Details are in $LOG_FILE."
+exit 1
