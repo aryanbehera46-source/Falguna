@@ -19,6 +19,14 @@ CREATE INDEX IF NOT EXISTS idx_cache_project ON project_cache(repository, profil
 CREATE INDEX IF NOT EXISTS idx_timings_run ON mission_timings(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_supervisor_run ON supervisor_states(run_id, created_at);
 
+-- Falguna Chat: persistent conversations that can hand off into Work missions
+CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, project_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), role TEXT NOT NULL, content TEXT NOT NULL, model_call_json TEXT, error TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS conversation_handoffs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), run_id TEXT NOT NULL REFERENCES runs(id), objective TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_conversation ON conversation_handoffs(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_run ON conversation_handoffs(run_id);
 -- TTT HQ: Boardroom, Master Vision Backlog, Needs Aryan (PASS 1 consolidation)
 CREATE TABLE IF NOT EXISTS boardroom_topics (id TEXT PRIMARY KEY, title TEXT NOT NULL, summary TEXT NOT NULL, proposed_category TEXT, proposed_phase TEXT, proposed_priority TEXT, proposed_revenue_impact TEXT, status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS boardroom_contributions (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES boardroom_topics(id), perspective TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);

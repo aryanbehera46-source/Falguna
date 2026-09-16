@@ -53,7 +53,7 @@ class HTMLSeparationTests(unittest.TestCase):
     def test_falguna_html_is_otherwise_unchanged(self):
         # Sanity check against the same labels test_bootstrap.py already checks,
         # so a broken revert would fail loudly here too, not just there.
-        for label in ("Falguna", "Engineering work mode", "Approve", "Reject", "Request Changes"):
+        for label in ("Falguna", "Chat", "Work", "Approve", "Reject", "Request Changes"):
             self.assertIn(label, INDEX_HTML)
 
 

@@ -573,16 +573,30 @@ class BootstrapTests(unittest.TestCase):
             self.skipTest("host has no native filesystem sandbox; degraded mode is documented")
 
     def test_local_web_shell_exposes_required_operator_controls(self):
+        # v1 UI + Chat pass: the shell is now a Chat/Work/Search/Projects/History/
+        # Settings product, not a single mission composer -- these labels prove
+        # every one of those surfaces, plus the original operator controls, is
+        # actually present in the served page.
         for label in (
             "Falguna", "internal alpha", "Approved projects", "Recent missions",
-            "Run mission", "Engineering work mode", "Needs approval",
+            "Recent chats", "Run mission", "Chat", "Work", "Search", "Projects",
+            "History", "Settings", "Needs approval",
             "Approve", "Reject", "Request Changes", "Resume",
-            "What should we build?", "Human approval stays required",
-            "history-empty", "project-dot", "Open navigation",
-            "min-height:80px", "overflow-y:auto", "closeSidebar",
+            "How can I help?", "Human approval stays required",
+            "side-empty", "nav-icon", "Open navigation",
+            "min-height:60px", "overflow-y:auto", "closeSidebar",
             "flex:0 0 auto",
         ):
             self.assertIn(label, INDEX_HTML)
+
+    def test_chat_and_work_are_both_present_and_distinct_surfaces(self):
+        # Chat and Work must be genuinely separate views wired together by a
+        # handoff, not the same composer relabeled.
+        self.assertIn("renderChatView", INDEX_HTML)
+        self.assertIn("renderWorkView", INDEX_HTML)
+        self.assertIn("/handoff", INDEX_HTML)
+        self.assertIn("Hand off to Work", INDEX_HTML)
+        self.assertIn("Chat can't touch a repository itself", INDEX_HTML)
 
     def test_web_editable_scope_rejects_paths_outside_project(self):
         self.assertEqual(validate_editable(["falguna/web.py", "tests/*.py"]), ["falguna/web.py", "tests/*.py"])
@@ -837,7 +851,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertIsNone(resolve_continuation(self.store, self.repo))
 
     def test_v11_controls_are_available_in_responsive_ui(self):
-        for label in ("Pause safely", "Cancel", "Resume / Retry", "safe boundary", "v1.1 RELIABILITY + SPEED", "@media(max-width:850px)", "@media(max-width:520px)"):
+        for label in ("Pause safely", "Cancel", "Resume / Retry", "safe boundary", "model-pill", "@media(max-width:850px)", "@media(max-width:520px)"):
             self.assertIn(label, INDEX_HTML)
 
     def test_supervisor_preserves_verification_failure_and_enables_retry(self):
@@ -973,7 +987,7 @@ class BootstrapTests(unittest.TestCase):
         self.control.supervisor.record(run_id, "BROWSER_VERIFICATION_FAILURE: screenshot mismatch", retry_budget=2)
         view = mission_view(self.store, self.repo / ".falguna", run_id)
         self.assertIn("Retry", view["available_controls"])
-        self.assertIn("$('resume').onclick", INDEX_HTML)
+        self.assertIn("resumeBtn.onclick", INDEX_HTML)
         self.assertIn("d.action_disabled_reason", INDEX_HTML)
 
     def test_verification_prefix_cannot_be_overridden_by_test_names_in_diagnostics(self):

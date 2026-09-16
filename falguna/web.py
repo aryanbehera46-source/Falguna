@@ -7,8 +7,9 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from .chat import ChatError, ChatResponder, ConversationStore, search_missions
 from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL, ResilientCodexTransport
 from .continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
 from .discovery import ProjectDiscovery
@@ -24,6 +25,14 @@ from .workers import StructuredEditWorker
 MODEL = DEFAULT_CODEX_MODEL
 _operations = {}
 _operations_lock = threading.Lock()
+
+
+class DiscoveryUncertain(ValueError):
+    """Discovery could not confidently bound the change; carries evidence for the 409 response."""
+
+    def __init__(self, message, evidence):
+        super().__init__(message)
+        self.evidence = evidence
 
 
 def load_profiles(app_root: Path) -> list:
@@ -53,7 +62,7 @@ def validate_editable(values: list) -> list:
 
 
 class FalgunaHandler(BaseHTTPRequestHandler):
-    server_version = "FalgunaLocal/1.1"
+    server_version = "FalgunaLocal/1.2"
 
     def log_message(self, format, *args):
         return
@@ -62,13 +71,26 @@ class FalgunaHandler(BaseHTTPRequestHandler):
     def app_root(self):
         return self.server.app_root
 
+    # ------------------------------------------------------------------ GET
+
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/":
             return self._html(INDEX_HTML)
         if path == "/api/config":
             profiles = load_profiles(self.app_root)
             return self._json({"product": "Falguna Engineering", "stage": "internal alpha", "profiles": profiles, "model": MODEL})
+        if path == "/api/settings":
+            return self._settings()
+        if path == "/api/search":
+            query = parse_qs(parsed.query).get("q", [""])[0]
+            return self._search(query)
+        if path == "/api/conversations":
+            return self._list_conversations()
+        if path.startswith("/api/conversations/"):
+            conversation_id = path.rsplit("/", 1)[-1]
+            return self._get_conversation(conversation_id)
         if path == "/api/runs":
             control, store = open_control_plane(self.app_root)
             try:
@@ -101,12 +123,67 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 view = mission_view(store, self.app_root / ".falguna", run_id)
                 if view["status"] in {"DONE_CANDIDATE", "FAILED", "QUARANTINED", "CANCELLED"}:
                     view = evidence_summary(store, self.app_root / ".falguna", control.audit, run_id)
+                view["conversation_handoffs"] = ConversationStore(store).handoffs_for_run(run_id)
                 return self._json(view)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             finally:
                 store.close()
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def _settings(self):
+        profiles = load_profiles(self.app_root)
+        return self._json({
+            "product": "Falguna Engineering",
+            "model": MODEL,
+            "profiles": [
+                {"id": p["id"], "name": p["name"], "repository": p["repository"], "risk": p.get("risk", ""), "default_budget_usd": p.get("default_budget_usd", 0)}
+                for p in profiles
+            ],
+            "boundaries": [
+                "Isolated Git worktree per mission; repository-root filesystem boundary enforced",
+                "Deny-by-default write and command policy; protected paths cannot be edited",
+                "Native verification, plus optional localhost-only browser verification",
+                "Independent semantic review before a mission can reach DONE_CANDIDATE",
+                "Durable checkpoint/resume; a forced interruption recovers safely",
+                "Hash-chained append-only audit log",
+                "Human-only merge decision -- Falguna never merges or deploys",
+                "Chat has no tools and cannot edit a repository; only a human handoff can start a mission",
+            ],
+        })
+
+    def _search(self, query):
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            results = chat.search_conversations(query) + search_missions(store, query)
+            return self._json({"query": query, "results": results})
+        finally:
+            store.close()
+
+    def _list_conversations(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json({"conversations": ConversationStore(store).list_conversations()})
+        finally:
+            store.close()
+
+    def _get_conversation(self, conversation_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            conversation = chat.get_conversation(conversation_id)
+            if not conversation:
+                return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+            return self._json({
+                "conversation": conversation,
+                "messages": chat.list_messages(conversation_id),
+                "handoffs": chat.list_handoffs(conversation_id),
+            })
+        finally:
+            store.close()
+
+    # ----------------------------------------------------------------- POST
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -150,16 +227,34 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                     return self._json({"run_id": run_id})
                 finally:
                     store.close()
+            if path == "/api/conversations":
+                return self._create_conversation(body)
+            if path.startswith("/api/conversations/") and path.endswith("/messages"):
+                return self._post_message(path.split("/")[3], body)
+            if path.startswith("/api/conversations/") and path.endswith("/rename"):
+                return self._rename_conversation(path.split("/")[3], body)
+            if path.startswith("/api/conversations/") and path.endswith("/handoff"):
+                return self._handoff(path.split("/")[3], body)
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except DiscoveryUncertain as exc:
+            return self._json({"error": str(exc), "discovery": exc.evidence}, HTTPStatus.CONFLICT)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def _start(self, body):
+        token = self._launch(body.get("project"), body.get("objective", ""), body.get("max_cost_usd"))
+        return self._json({"operation": token, "state": "STARTING"}, HTTPStatus.ACCEPTED)
+
+    def _launch(self, project_id, objective, max_cost_usd, conversation_id=None):
+        """Shared by /api/runs and Chat -> Work handoff. Both paths go through the
+        identical discovery/policy/worktree pipeline -- handoff cannot skip discovery,
+        widen scope, or start a run without it. conversation_id only ever gets attached
+        to a run that this same call produced through the real control plane."""
         profiles = {item["id"]: item for item in load_profiles(self.app_root)}
-        profile = profiles.get(body.get("project"))
+        profile = profiles.get(project_id)
         if not profile:
             raise ValueError("Select an approved project")
-        objective = str(body.get("objective", "")).strip()
+        objective = str(objective or "").strip()
         if len(objective) < 12:
             raise ValueError("Provide a bounded engineering objective")
         discovery_started = time.monotonic()
@@ -173,10 +268,10 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             raise ValueError("VERIFY_COMMAND_INVALID: no runnable native verification command was discovered")
         if plan.requires_approval:
             error = plan.diagnostic or "DISCOVERY_SCOPE_UNCERTAIN"
-            return self._json({"error": f"{error}: Discovery is uncertain; approve or narrow the proposed scope before modification", "discovery": plan.evidence()}, HTTPStatus.CONFLICT)
+            raise DiscoveryUncertain(f"{error}: Discovery is uncertain; approve or narrow the proposed scope before modification", plan.evidence())
         editable = validate_editable(plan.editable_files)
         commands = plan.verification_commands
-        cap = float(body.get("max_cost_usd", profile["default_budget_usd"]))
+        cap = float(max_cost_usd if max_cost_usd is not None else profile["default_budget_usd"])
         if cap < 0 or cap > float(profile["default_budget_usd"]):
             raise ValueError("Cost cap exceeds the approved project-profile maximum")
         token = secrets.token_urlsafe(16)
@@ -185,9 +280,76 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         discovery = {**plan.evidence(), "cache": cache, "duration_ms": discovery_ms}
         with _operations_lock:
             _operations[token]["discovery"] = discovery
-        thread = threading.Thread(target=_run_mission, args=(self.app_root, token, profile, objective, editable, commands, cap, discovery), daemon=True)
+        thread = threading.Thread(
+            target=_run_mission,
+            args=(self.app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id),
+            daemon=True,
+        )
         thread.start()
-        return self._json({"operation": token, "state": "STARTING"}, HTTPStatus.ACCEPTED)
+        return token
+
+    def _create_conversation(self, body):
+        profiles = {item["id"] for item in load_profiles(self.app_root)}
+        project_id = body.get("project_id")
+        if project_id and project_id not in profiles:
+            raise ValueError("Select an approved project")
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            conversation_id = chat.create_conversation(body.get("title", ""), project_id)
+            return self._json(chat.get_conversation(conversation_id), HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _rename_conversation(self, conversation_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            chat.rename_conversation(conversation_id, body.get("title", ""))
+            return self._json(chat.get_conversation(conversation_id))
+        finally:
+            store.close()
+
+    def _post_message(self, conversation_id, body):
+        content = str(body.get("content", "")).strip()
+        if not content:
+            raise ValueError("Message cannot be empty")
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            conversation = chat.get_conversation(conversation_id)
+            if not conversation:
+                return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+            user_message = chat.add_message(conversation_id, "user", content)
+            history = [{"role": m["role"], "content": m["content"]} for m in chat.list_messages(conversation_id) if m["role"] in {"user", "assistant"}]
+            try:
+                codex = shutil.which("codex")
+                if not codex:
+                    raise ChatError("MODEL_UNAVAILABLE: authenticated Codex executable not found")
+                gateway = OpenAICompatibleGateway(MODEL, "http://127.0.0.1:1/v1", "")
+                codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+                transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=60))
+                outcome = ChatResponder(gateway, transport, MODEL, timeout_seconds=60).reply(history)
+                assistant_message = chat.add_message(conversation_id, "assistant", outcome["reply"], model_call=outcome["model_call"])
+                assistant_message["suggested_objective"] = outcome["suggested_objective"]
+            except ChatError as exc:
+                assistant_message = chat.add_message(conversation_id, "assistant", "", error=str(exc))
+                assistant_message["suggested_objective"] = None
+            return self._json({"message": user_message, "assistant": assistant_message})
+        finally:
+            store.close()
+
+    def _handoff(self, conversation_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            conversation = ConversationStore(store).get_conversation(conversation_id)
+        finally:
+            store.close()
+        if not conversation:
+            return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+        project_id = body.get("project_id") or conversation.get("project_id")
+        token = self._launch(project_id, body.get("objective", ""), body.get("max_cost_usd"), conversation_id=conversation_id)
+        return self._json({"operation": token, "state": "STARTING", "conversation_id": conversation_id}, HTTPStatus.ACCEPTED)
 
     def _body(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -215,7 +377,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def _run_mission(app_root, token, profile, objective, editable, commands, cap, discovery):
+def _run_mission(app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id=None):
     control, store = open_control_plane(app_root)
     try:
         dependency_path = Path(profile["repository"]) / profile.get("package_root", ".") / "node_modules"
@@ -238,6 +400,8 @@ def _run_mission(app_root, token, profile, objective, editable, commands, cap, d
             control._record_artifact(run_id, "DISCOVERY", discovery_path)
             store.create("mission_timings", {"run_id": run_id, "stage": "discovery", "duration_ms": int(discovery.get("duration_ms", 0)), "metadata_json": json.dumps({"cache": discovery.get("cache", {})}, sort_keys=True), "created_at": utcnow()})
             control.audit.append("DISCOVERY_APPROVED", {"run_id": run_id, "confidence": discovery["confidence"], "editable_files": discovery["editable_files"]})
+            if conversation_id:
+                ConversationStore(store).record_handoff(conversation_id, run_id, objective)
             with _operations_lock:
                 _operations[token] = {"state": "RUNNING", "run_id": run_id, "discovery": discovery}
         run_id = control.start(ids["task_id"], worker, "structured-codex", MODEL, policy, on_run_created=created)
@@ -291,54 +455,669 @@ def serve(root: Path, host="127.0.0.1", port=8765):
 
 INDEX_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Falguna Engineering</title><style>
-:root{color-scheme:dark;--bg:#0a0d12;--panel:#121720;--line:#293243;--text:#edf2f7;--muted:#99a6b8;--accent:#7be0b8;--warn:#ffc66d;--bad:#ff8585}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,sans-serif}.shell{max-width:980px;margin:auto;padding:32px 20px 64px}header{display:flex;justify-content:space-between;gap:20px;align-items:start;margin-bottom:26px}h1{margin:0;font-size:30px}h2{font-size:18px;margin:0 0 18px}.tag{border:1px solid var(--line);border-radius:999px;padding:6px 10px;color:var(--accent)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}.wide{grid-column:1/-1}label{display:block;color:var(--muted);font-size:13px;margin:14px 0 6px}input,select,textarea,button{font:inherit}input,select,textarea{width:100%;color:var(--text);background:#0d1118;border:1px solid var(--line);border-radius:8px;padding:10px}textarea{min-height:110px;resize:vertical}button{border:0;border-radius:8px;padding:10px 15px;font-weight:650;cursor:pointer;background:var(--accent);color:#082018}button.secondary{background:#273142;color:var(--text)}button.danger{background:#542b33;color:#ffdfe3}button:disabled{opacity:.5;cursor:not-allowed}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}.muted{color:var(--muted)}.status{font-size:22px;color:var(--accent)}.milestones{display:flex;gap:8px;flex-wrap:wrap;padding:0}.milestones li{list-style:none;border:1px solid var(--line);border-radius:999px;padding:5px 9px}.facts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.fact{background:#0d1118;border-radius:8px;padding:12px}.fact span{display:block;color:var(--muted);font-size:12px}.error{color:var(--bad)}.hidden{display:none}@media(max-width:700px){.grid{grid-template-columns:1fr}.facts{grid-template-columns:1fr 1fr}header{display:block}.tag{display:inline-block;margin-top:10px}}
-</style></head><body><main class="shell"><header><div><h1>Falguna Engineering</h1><div class="muted">Local engineering control plane</div></div><span class="tag">internal alpha</span></header>
-<div class="grid"><section class="card"><h2>New Project Mission</h2><form id="mission"><label>Approved project</label><select id="project" required></select><label>Bounded engineering objective</label><textarea id="objective" required placeholder="Describe one small, testable problem. Falguna will discover the files and native checks."></textarea><label>Optional hard cost cap (USD)</label><input id="cost" type="number" min="0" step="0.01"><div class="muted" id="risk"></div><button id="run" type="submit" style="margin-top:18px">Discover &amp; Run Mission</button></form><p class="muted">Falguna pauses before editing when discovery is uncertain or scope must expand.</p></section>
-<section class="card"><h2>Mission Status</h2><div id="empty" class="muted">Submit a task to see live milestones.</div><div id="status" class="hidden"><div class="status" id="state"></div><div class="muted" id="missionTitle"></div><ul class="milestones" id="milestones"></ul><div id="failure" class="error"></div></div></section>
-<section class="card wide hidden" id="evidence"><h2>Final Evidence</h2><div class="facts" id="facts"></div><label>Files changed</label><div id="files"></div><label>Unresolved issues</label><div id="issues"></div><div class="actions"><button class="secondary hidden" id="resume">Resume from Checkpoint</button><span id="decisions"><button data-action="approve">Approve Merge</button><button class="danger" data-action="reject">Reject</button><button class="secondary" data-action="request-changes">Request Changes</button></span></div><p class="muted">A decision records human intent only. This app cannot merge or deploy.</p></section></div></main>
-<script>
-const $=id=>document.getElementById(id);let runId=null,poll=null,profiles={};
-async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw new Error(j.error||'Request failed');return j}
-async function boot(){const c=await api('/api/config');c.profiles.forEach(p=>profiles[p.id]=p);$('project').innerHTML=c.profiles.map(p=>`<option value="${p.id}">${p.name}</option>`).join('');selectProject();const saved=new URLSearchParams(location.search).get('run');if(saved){runId=saved;$('empty').classList.add('hidden');$('status').classList.remove('hidden');await refresh()}}
-function selectProject(){const p=profiles[$('project').value];if(!p)return;$('cost').value=p.default_budget_usd;$('cost').max=p.default_budget_usd;$('risk').textContent='Risk: '+p.risk}
-$('project').addEventListener('change',selectProject);$('mission').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('empty').classList.add('hidden');$('status').classList.remove('hidden');$('state').textContent='Discovering safe scope…';$('evidence').classList.add('hidden');try{const out=await api('/api/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:$('project').value,objective:$('objective').value,max_cost_usd:Number($('cost').value)})});watchOperation(out.operation)}catch(err){showError(err.message);$('run').disabled=false}});
-async function watchOperation(token){try{const op=await api('/api/operations/'+token);if(op.run_id){runId=op.run_id;await refresh()}if(op.state==='FAILED'){showError(op.error);$('run').disabled=false;return}if(op.state!=='COMPLETE')setTimeout(()=>watchOperation(token),700);else{$('run').disabled=false;await refresh()}}catch(err){showError(err.message);$('run').disabled=false}}
-async function refresh(){if(!runId)return;const d=await api('/api/runs/'+runId);$('state').textContent=d.status;$('missionTitle').textContent=d.mission+' · Attempt '+d.attempt;$('milestones').innerHTML=(d.completed_milestones||[]).map(x=>`<li>${x}</li>`).join('');$('failure').textContent=d.failure?`${d.failure.category}: ${d.failure.message} — ${d.failure.action}`:'';if(['DONE_CANDIDATE','FAILED','QUARANTINED'].includes(d.status))showEvidence(d)}
-function showEvidence(d){$('evidence').classList.remove('hidden');const items=[['Requirements',d.requirement_coverage||'—'],['Native tests',(d.native_tests||[]).length?d.native_tests.filter(x=>x.passed).length+'/'+d.native_tests.length:'—'],['Browser/E2E',d.browser_e2e||'—'],['Independent review',d.independent_review||'—'],['Cost','$'+Number(d.cost_usd||0).toFixed(4)],['Risk',d.risk||'—'],['Evidence hashes',d.evidence_hashes_valid?'VALID':'NOT PROVEN'],['Audit chain',d.audit_chain_valid?'VALID':'NOT PROVEN'],['Merge approval',d.merge_approval||'—']];$('facts').innerHTML=items.map(x=>`<div class="fact"><span>${x[0]}</span>${x[1]}</div>`).join('');$('files').textContent=(d.files_changed||[]).join(', ')||'None';$('issues').textContent=(d.unresolved_issues||[]).join('; ')||'None';$('resume').classList.toggle('hidden',!['FAILED','QUARANTINED'].includes(d.status));$('decisions').classList.toggle('hidden',d.status!=='DONE_CANDIDATE'||d.merge_approval!=='PENDING')}
-function showError(message){$('state').textContent='Unable to continue';$('failure').textContent=message}
-document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',async()=>{const action=b.dataset.action;const reason=prompt('Reason for this decision:');if(!reason)return;await api(`/api/runs/${runId}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reason})});await refresh()}));boot().catch(e=>showError(e.message));
-$('resume').addEventListener('click',async()=>{const out=await api(`/api/runs/${runId}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});$('resume').disabled=true;watchOperation(out.operation)});
-</script></body></html>'''
-
-# Work-ready daily-use shell. Kept self-contained so the localhost launcher has no asset build step.
-INDEX_HTML = r'''<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Falguna</title><style>
-:root{color-scheme:dark;--bg:#080a0e;--side:#0d1016;--panel:#121720;--soft:#171d27;--line:#252d3a;--text:#f1f4f8;--muted:#929eae;--accent:#79e2b7;--warn:#ffc66d;--bad:#ff8c96}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}.app{height:100dvh;display:grid;grid-template-columns:272px minmax(0,1fr);overflow:hidden}aside{background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 18px;font-weight:750;font-size:17px;flex:none}.mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#062018;font-weight:900}.new{width:100%;flex:none;border:1px solid var(--line);background:var(--soft);color:var(--text);border-radius:10px;padding:10px 12px;text-align:left;cursor:pointer}.side-title{flex:none;padding:20px 8px 7px;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}.projects{display:grid;gap:2px;flex:none}.project{display:flex;align-items:center;gap:9px;width:100%;border:0;background:transparent;padding:7px 8px;border-radius:8px;color:#c9d1dc;text-align:left;cursor:pointer}.project:hover,.project.selected{background:var(--soft);color:var(--text)}.project-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px #79e2b71a;flex:none}.history{flex:1;min-height:80px;overflow-x:hidden;overflow-y:auto;display:flex;flex-direction:column;gap:3px;padding-right:3px;scrollbar-width:thin;scrollbar-color:#303949 transparent}.history button{display:block;flex:0 0 auto;width:100%;min-width:0;border:0;background:transparent;color:var(--text);padding:8px;border-radius:8px;text-align:left;cursor:pointer;overflow:hidden}.history button:hover,.history button.active{background:var(--soft)}.history .mission-title,.history small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.history small{color:var(--muted);font-size:11px;text-transform:capitalize}.history-empty{color:var(--muted);padding:8px;font-size:12px}.boundary{flex:none;border-top:1px solid var(--line);padding:13px 8px 2px;color:var(--muted);font-size:12px;background:var(--side)}.workspace{min-width:0;min-height:0;display:grid;grid-template-rows:58px minmax(0,1fr) auto;overflow:hidden}.topbar{border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 22px}.topbar-title{display:flex;align-items:center;gap:10px}.menu-button{display:none;border:0;background:transparent;color:var(--text);padding:6px;border-radius:7px;cursor:pointer;font-size:18px}.badge{border:1px solid #285845;color:var(--accent);border-radius:999px;padding:4px 9px;font-size:11px}.conversation{min-height:0;overflow:auto;padding:34px max(22px,calc((100vw - 272px - 850px)/2))}.welcome{max-width:720px;margin:11vh auto 0;text-align:center}.welcome h1{font-size:30px;margin:0 0 9px}.welcome p{color:var(--muted);font-size:16px}.thread{max-width:850px;margin:auto;display:grid;gap:18px}.bubble{border:1px solid var(--line);background:var(--panel);border-radius:16px;padding:18px;overflow-wrap:anywhere}.bubble.user{margin-left:12%;background:#151b24}.eyebrow{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}.status-line{font-size:21px;font-weight:700;margin:4px 0}.error{color:var(--bad);overflow-wrap:anywhere}.timeline{display:flex;gap:7px;flex-wrap:wrap;margin-top:13px}.step{border:1px solid var(--line);border-radius:999px;padding:5px 9px;color:#cbd4df}.step:last-child{border-color:#326a55;color:var(--accent)}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:14px}.card{background:var(--soft);border:1px solid var(--line);border-radius:11px;padding:12px;min-width:0}.card span{display:block;color:var(--muted);font-size:11px;margin-bottom:3px}.card b{overflow-wrap:anywhere}.details{margin-top:13px;display:grid;gap:10px}.details div{padding:11px 12px;border:1px solid var(--line);border-radius:10px;overflow-wrap:anywhere}.details span{color:var(--muted);display:block;font-size:11px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}button.action{border:0;border-radius:9px;padding:9px 13px;font-weight:700;cursor:pointer;background:var(--accent);color:#062018}button.action.secondary{background:#293342;color:var(--text)}button.action.danger{background:#542c34;color:#ffe0e4}button:disabled{opacity:.5;cursor:not-allowed}.composer-wrap{padding:14px max(18px,calc((100vw - 272px - 850px)/2)) 18px;background:linear-gradient(transparent,var(--bg) 18%)}.composer{max-width:850px;margin:auto;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:11px;box-shadow:0 15px 45px #0008}.composer:focus-within{border-color:#3b4a5e}.composer textarea{display:block;width:100%;min-height:54px;max-height:160px;resize:vertical;border:0;outline:0;background:transparent;color:var(--text);padding:7px}.compose-row{display:flex;align-items:center;gap:9px}.compose-row select,.compose-row input{background:var(--soft);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 9px;min-width:0}.compose-row select{flex:1}.compose-row input{width:88px}.send{border:0;background:var(--accent);color:#062018;border-radius:9px;padding:8px 13px;font-weight:750;cursor:pointer;white-space:nowrap}.hint{max-width:850px;margin:6px auto 0;text-align:center;color:var(--muted);font-size:11px}.scrim{display:none}.hidden{display:none!important}@media(max-width:850px){.app{grid-template-columns:1fr}.workspace{grid-column:1}.menu-button{display:inline-grid;place-items:center}aside{display:flex;position:fixed;inset:0 auto 0 0;width:min(86vw,300px);z-index:20;transform:translateX(-102%);transition:transform .18s ease;box-shadow:20px 0 50px #000a}aside.open{transform:translateX(0)}.scrim{position:fixed;inset:0;background:#0009;z-index:15}.scrim.open{display:block}.conversation,.composer-wrap{padding-left:15px;padding-right:15px}.cards{grid-template-columns:1fr 1fr}.topbar{padding:0 15px}}@media(max-width:520px){.badge{font-size:10px}.cards{grid-template-columns:1fr}.compose-row{flex-wrap:wrap}.compose-row select{flex-basis:calc(100% - 97px)}.compose-row input{width:88px}.send{width:100%}.bubble.user{margin-left:0}.conversation{padding-top:20px}.welcome{margin-top:5vh}.hint{display:none}}
-</style></head><body><div class="app"><aside id="sidebar" aria-label="Mission navigation"><div class="brand"><span class="mark">F</span>Falguna</div><button class="new" id="newMission">＋ New mission</button><div class="side-title">Approved projects</div><div class="projects" id="projects"></div><div class="side-title">Recent missions</div><div class="history" id="history"><div class="history-empty">Loading missions…</div></div><div class="boundary">Localhost-only internal alpha<br>No automatic merge or deploy</div></aside><div class="scrim" id="scrim"></div><main class="workspace"><header class="topbar"><div class="topbar-title"><button class="menu-button" id="menuButton" aria-label="Open navigation" aria-expanded="false">☰</button><strong>Engineering work mode</strong></div><span class="badge">v1.1 RELIABILITY + SPEED</span></header><section class="conversation" id="conversation"><div class="welcome" id="welcome"><h1>What should we build?</h1><p>Choose an approved project and describe the outcome. Falguna discovers the safe file scope and native verification.</p></div><div class="thread hidden" id="thread"><article class="bubble user"><div class="eyebrow">You</div><div id="objectiveText"></div></article><article class="bubble"><div class="eyebrow">Falguna · Work mode</div><div class="status-line" id="state">Preparing mission…</div><div id="failure" class="error"></div><div class="timeline" id="timeline"></div><div class="cards hidden" id="cards"></div><div class="details hidden" id="details"></div><div class="actions hidden" id="actions"><button class="action secondary" id="pause">Pause safely</button><button class="action danger" id="cancel">Cancel</button><button class="action secondary" id="resume">Resume / Retry</button><button class="action" data-action="approve">Approve</button><button class="action danger" data-action="reject">Reject</button><button class="action secondary" data-action="request-changes">Request Changes</button></div></article></div></section><footer class="composer-wrap"><form class="composer" id="mission"><textarea id="objective" required placeholder="Describe a bounded client-work requirement…"></textarea><div class="compose-row"><select id="project" required aria-label="Approved project"></select><input id="cost" type="number" min="0" step="0.01" aria-label="Cost cap"><button class="send" id="run" type="submit">Run mission</button></div></form><div class="hint">Pause and cancel take effect at a safe boundary. Human approval stays required; no merge or deploy.</div></footer></main></div>
+:root{
+  color-scheme:dark;
+  --bg:#161310;--side:#1b1712;--panel:#211c15;--soft:#2a231a;--soft2:#332b1e;
+  --line:#3c3325;--text:#f7f0e3;--muted:#ab9c86;--muted-dim:#7c7060;
+  --accent:#e8a33d;--accent-hi:#f4bd63;--accent-ink:#2a1707;--accent-dim:#4d3a1e;--accent-soft:#332818;
+  --warn:#f0c752;--bad:#ff8f78;--bad-dim:#4a2c25;
+  --user-bg:#2c2519;--user-ink:#e9dcc6;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:radial-gradient(120% 140% at 18% -10%,#241d12 0%,var(--bg) 46%);color:var(--text);font:14.5px/1.6 "Inter var",Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font:inherit;color:inherit}
+a{color:var(--accent-hi)}
+svg{display:block}
+.app{height:100dvh;display:grid;grid-template-columns:264px minmax(0,1fr);overflow:hidden}
+
+/* ---------- sidebar ---------- */
+aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10px;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
+.brand{display:flex;align-items:center;gap:9px;padding:6px 8px 16px;font-weight:700;font-size:15.5px;letter-spacing:.01em;flex:none}
+.mark{display:grid;place-items:center;width:26px;height:26px;border-radius:8px;background:linear-gradient(155deg,var(--accent-hi),var(--accent));color:var(--accent-ink);font-weight:800;font-size:13px}
+.new-chat{width:100%;flex:none;border:1px solid var(--line);background:var(--soft);color:var(--text);border-radius:11px;padding:9px 12px;text-align:left;cursor:pointer;font-weight:600;font-size:13px;display:flex;align-items:center;gap:9px;transition:background .12s,border-color .12s}
+.new-chat:hover{background:var(--soft2);border-color:#4a3d28}
+.new-chat svg{color:var(--accent)}
+.nav{display:grid;gap:1px;flex:none;margin-top:16px}
+.nav-item{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:7px 9px;border-radius:8px;color:#cdbfa9;text-align:left;cursor:pointer;font-size:13px;transition:background .12s,color .12s}
+.nav-item:hover{background:var(--soft);color:var(--text)}
+.nav-item.active{background:var(--accent-soft);color:var(--accent-hi);font-weight:650}
+.nav-icon{width:16px;height:16px;display:grid;place-items:center;color:var(--muted-dim);flex:none}
+.nav-item:hover .nav-icon{color:var(--muted)}
+.nav-item.active .nav-icon{color:var(--accent)}
+.side-title{flex:none;padding:20px 9px 6px;color:var(--muted-dim);font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.09em}
+.side-list{flex:1;min-height:60px;overflow-x:hidden;overflow-y:auto;display:flex;flex-direction:column;gap:1px;padding-right:2px;scrollbar-width:thin;scrollbar-color:#4a3d28 transparent}
+.side-group-label{padding:10px 9px 3px;color:var(--muted-dim);font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.07em}
+.side-list button{display:block;flex:0 0 auto;width:100%;min-width:0;border:0;background:transparent;color:var(--text);padding:7px 9px;border-radius:8px;text-align:left;cursor:pointer;overflow:hidden}
+.side-list button:hover,.side-list button.active{background:var(--soft)}
+.side-list button.active{color:var(--accent-hi)}
+.side-list .row-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12.5px;font-weight:550}
+.side-list .row-sub{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted-dim);font-size:11px;margin-top:1px}
+.side-empty{color:var(--muted-dim);padding:9px;font-size:12px}
+.boundary{flex:none;border-top:1px solid var(--line);padding:12px 9px 2px;color:var(--muted-dim);font-size:11px;background:var(--side);line-height:1.5}
+
+/* ---------- shell ---------- */
+.workspace{min-width:0;min-height:0;display:grid;grid-template-rows:54px minmax(0,1fr);overflow:hidden}
+.topbar{border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 22px;background:linear-gradient(180deg,#1a1610,transparent)}
+.topbar-title{display:flex;align-items:center;gap:10px;min-width:0}
+.topbar-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650;font-size:14px;color:#e7dcc7}
+.menu-button{display:none;border:0;background:transparent;color:var(--text);padding:6px;border-radius:7px;cursor:pointer}
+.model-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:5px 11px 5px 9px;font-size:11.5px;white-space:nowrap}
+.model-pill .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.viewport{min-height:0;overflow:auto;display:flex;flex-direction:column}
+.scrim{display:none}
+.hidden{display:none!important}
+::selection{background:var(--accent-dim);color:var(--text)}
+
+/* ---------- generic page chrome (Search / Projects / History / Settings) ---------- */
+.page{max-width:880px;margin:0 auto;padding:34px 24px 60px;width:100%}
+.page h1{font-size:21px;margin:0 0 4px;font-weight:650;letter-spacing:-.01em}
+.page .lede{color:var(--muted);margin:0 0 24px;font-size:13.5px}
+.searchbar{display:flex;gap:8px;margin-bottom:22px}
+.searchbar input{flex:1;background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:11px;padding:11px 14px}
+.searchbar input:focus{outline:none;border-color:var(--accent-dim)}
+.searchbar button{border:0;background:var(--accent);color:var(--accent-ink);border-radius:11px;padding:11px 18px;font-weight:700;cursor:pointer}
+.result-list,.card-list{display:grid;gap:8px}
+.result-row,.list-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px;cursor:pointer;text-align:left;transition:border-color .12s,background .12s}
+.result-row:hover,.list-card:hover{border-color:#4a3d28;background:var(--soft)}
+.result-row .kind{color:var(--muted-dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px;font-weight:650}
+.result-row .title,.list-card .title{font-weight:600;font-size:13.5px}
+.result-row .meta,.list-card .meta{color:var(--muted);font-size:12px;margin-top:4px}
+.empty-state{color:var(--muted);padding:36px 0;text-align:center;font-size:13px}
+.project-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
+.project-card .title{font-size:15px;font-weight:650;display:flex;align-items:center;gap:9px}
+.project-card .path{color:var(--muted-dim);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;margin-top:5px;overflow-wrap:anywhere}
+.project-card .risk{margin-top:11px;font-size:12.5px;color:var(--muted)}
+.project-card .risk b{color:var(--text);font-weight:600}
+.project-actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+.pill-btn{border:1px solid var(--line);background:var(--soft);color:var(--text);border-radius:999px;padding:7px 13px;font-size:12px;cursor:pointer}
+.pill-btn:hover{background:var(--soft2);border-color:#4a3d28}
+.settings-list{display:grid;gap:7px;margin:14px 0 28px}
+.settings-list div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 14px;font-size:12.5px;color:#d8cbb4}
+.settings-note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:12px 15px;color:var(--muted);font-size:12.5px;margin-bottom:22px}
+.section-label{font-size:12.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted-dim);font-weight:700;margin:26px 0 4px}
+.status-pill{display:inline-block;border-radius:999px;padding:2px 9px;font-size:10.5px;text-transform:capitalize;border:1px solid var(--line)}
+.status-pill.done{color:var(--accent-hi);border-color:var(--accent-dim)}
+.status-pill.failed,.status-pill.quarantined{color:var(--bad);border-color:#5c332c}
+.status-pill.pending,.status-pill.working,.status-pill.reviewing,.status-pill.verifying,.status-pill.planning{color:var(--warn);border-color:#5c4c2a}
+
+/* ---------- Chat view ---------- */
+.chat-view{display:grid;grid-template-rows:minmax(0,1fr) auto;min-height:0;height:100%}
+.chat-scroll{min-height:0;overflow:auto;padding:0 max(22px,calc((100vw - 264px - 760px)/2))}
+.chat-welcome{max-width:600px;margin:9vh auto 0;text-align:center}
+.chat-welcome .glow{width:54px;height:54px;margin:0 auto 20px;border-radius:16px;background:linear-gradient(155deg,var(--accent-hi),var(--accent));display:grid;place-items:center;box-shadow:0 18px 44px -14px #e8a33d55}
+.chat-welcome .glow svg{color:var(--accent-ink);width:26px;height:26px}
+.chat-welcome h1{font-size:26px;margin:0 0 8px;font-weight:650;letter-spacing:-.015em;color:#f7f0e3}
+.chat-welcome p{color:var(--muted);font-size:14px;margin:0 0 26px}
+.chip-row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 15px;cursor:pointer;color:#d8cbb4;font-size:12.5px;display:inline-flex;align-items:center;gap:7px;transition:border-color .12s,background .12s}
+.chip:hover{border-color:#4a3d28;background:var(--soft)}
+.chip svg{width:13px;height:13px;color:var(--muted-dim)}
+.thread{max-width:760px;margin:0 auto;padding:26px 0 8px;display:grid;gap:18px}
+.msg{display:flex;gap:11px}
+.msg .avatar{width:25px;height:25px;border-radius:8px;display:grid;place-items:center;font-size:11px;font-weight:750;flex:none;margin-top:3px}
+.msg.user .avatar{background:var(--user-bg);color:var(--user-ink)}
+.msg.assistant .avatar{background:linear-gradient(155deg,var(--accent-hi),var(--accent));color:var(--accent-ink)}
+.msg .bubble{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:12px 15px;overflow-wrap:anywhere;min-width:0;flex:1;font-size:13.5px}
+.msg.user .bubble{background:var(--user-bg);border-color:#463a27}
+.msg .bubble.error{border-color:#5c332c;background:var(--bad-dim);color:#ffd4c9}
+.msg .who{color:var(--muted-dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;font-weight:650}
+.thinking{color:var(--muted);font-style:italic;display:flex;align-items:center;gap:6px}
+.thinking .tdot{width:5px;height:5px;border-radius:50%;background:var(--accent);animation:tpulse 1.1s ease-in-out infinite}
+.thinking .tdot:nth-child(2){animation-delay:.15s}.thinking .tdot:nth-child(3){animation-delay:.3s}
+@keyframes tpulse{0%,60%,100%{opacity:.25}30%{opacity:1}}
+
+/* ---------- composer ---------- */
+.composer-wrap{padding:10px max(18px,calc((100vw - 264px - 760px)/2)) 20px;flex:none}
+.composer{max-width:760px;margin:auto;background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:6px 8px 8px;box-shadow:0 20px 50px -20px #000c}
+.composer:focus-within{border-color:#4a3d28}
+.composer textarea{display:block;width:100%;min-height:46px;max-height:180px;resize:none;border:0;outline:0;background:transparent;color:var(--text);padding:9px 8px 4px;font-size:14px}
+.composer textarea::placeholder{color:var(--muted-dim)}
+.compose-row{display:flex;align-items:center;gap:6px;padding:0 2px}
+.icon-btn{border:1px solid transparent;background:transparent;color:var(--muted);width:30px;height:30px;border-radius:9px;display:grid;place-items:center;cursor:pointer}
+.icon-btn:hover{background:var(--soft);color:var(--text)}
+.mode-chip{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--soft);color:var(--muted);border-radius:999px;padding:5px 10px 5px 8px;font-size:11.5px;cursor:default}
+.mode-chip svg{width:12px;height:12px;color:var(--accent)}
+.compose-spacer{flex:1}
+.send-btn{border:0;background:var(--accent);color:var(--accent-ink);border-radius:10px;width:32px;height:32px;display:grid;place-items:center;cursor:pointer;transition:background .12s,transform .1s}
+.send-btn:hover{background:var(--accent-hi)}
+.send-btn:disabled{opacity:.4;cursor:not-allowed}
+.compose-foot{max-width:760px;margin:7px auto 0;text-align:center;color:var(--muted-dim);font-size:10.5px}
+
+/* ---------- handoff panel ---------- */
+.handoff-panel{max-width:760px;margin:0 auto 16px;background:var(--panel);border:1px solid var(--accent-dim);border-radius:14px;padding:16px}
+.handoff-panel h3{margin:0 0 3px;font-size:13.5px;display:flex;align-items:center;gap:7px}
+.handoff-panel h3 svg{width:14px;height:14px;color:var(--accent)}
+.handoff-panel .sub{color:var(--muted-dim);font-size:11.5px;margin:0 0 12px}
+.handoff-panel label{display:block;color:var(--muted);font-size:11.5px;margin:10px 0 5px;font-weight:600}
+.handoff-panel input,.handoff-panel select,.handoff-panel textarea{width:100%;color:var(--text);background:#120e08;border:1px solid var(--line);border-radius:9px;padding:9px 10px}
+.handoff-panel textarea{min-height:60px;resize:vertical}
+.handoff-actions{display:flex;gap:9px;margin-top:13px;flex-wrap:wrap}
+button.action{border:0;border-radius:9px;padding:9px 14px;font-weight:650;cursor:pointer;background:var(--accent);color:var(--accent-ink);font-size:13px}
+button.action.secondary{background:var(--soft2);color:var(--text)}
+button.action.danger{background:var(--bad-dim);color:#ffd9cf}
+button.action:disabled{opacity:.5;cursor:not-allowed}
+
+/* ---------- Work view ---------- */
+.work-view{padding:32px max(22px,calc((100vw - 264px - 820px)/2)) 60px}
+.work-empty{max-width:680px;margin:7vh auto 0;text-align:center}
+.work-empty h1{font-size:24px;margin:0 0 9px;font-weight:650}
+.work-empty p{color:var(--muted);font-size:14px;margin:0 0 24px}
+.mission-form{max-width:600px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;text-align:left}
+.mission-form label{display:block;color:var(--muted);font-size:11.5px;margin:12px 0 5px;font-weight:600}
+.mission-form input,.mission-form select,.mission-form textarea{width:100%;color:var(--text);background:#120e08;border:1px solid var(--line);border-radius:9px;padding:10px}
+.mission-form textarea{min-height:92px;resize:vertical}
+.mission-form .risk-note{margin-top:8px;color:var(--muted-dim);font-size:11.5px}
+.work-thread{max-width:820px;margin:auto}
+.origin-banner{border:1px solid var(--accent-dim);background:var(--accent-soft);border-radius:11px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#e8dcc6;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+.work-header{border:1px solid var(--line);background:var(--panel);border-radius:16px;padding:19px;margin-bottom:16px}
+.work-header .objective{color:var(--muted);font-size:12.5px;margin-bottom:10px}
+.status-line{font-size:19px;font-weight:700;margin:2px 0 8px;text-transform:capitalize}
+.error{color:var(--bad);overflow-wrap:anywhere;font-size:13px}
+.timeline{display:flex;gap:7px;flex-wrap:wrap;margin-top:6px}
+.step{border:1px solid var(--line);border-radius:999px;padding:5px 10px;color:#cbbea4;font-size:11.5px}
+.step:last-child{border-color:var(--accent-dim);color:var(--accent-hi)}
+.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:14px}
+.card{background:var(--soft);border:1px solid var(--line);border-radius:11px;padding:12px;min-width:0}
+.card span{display:block;color:var(--muted-dim);font-size:10.5px;margin-bottom:3px}
+.card b{overflow-wrap:anywhere;font-size:13px}
+.details{margin-top:13px;display:grid;gap:9px}
+.details div{padding:11px 13px;border:1px solid var(--line);border-radius:10px;overflow-wrap:anywhere;background:var(--panel);font-size:12.5px}
+.details span{color:var(--muted-dim);display:block;font-size:10.5px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}
+
+@media(max-width:850px){
+  .app{grid-template-columns:1fr}
+  .workspace{grid-column:1}
+  .menu-button{display:inline-grid;place-items:center}
+  aside{display:flex;position:fixed;inset:0 auto 0 0;width:min(86vw,290px);z-index:20;transform:translateX(-102%);transition:transform .18s ease;box-shadow:20px 0 50px #000a}
+  aside.open{transform:translateX(0)}
+  .scrim{position:fixed;inset:0;background:#0009;z-index:15}
+  .scrim.open{display:block}
+  .chat-scroll,.composer-wrap,.work-view{padding-left:15px;padding-right:15px}
+  .cards{grid-template-columns:1fr 1fr}
+  .topbar{padding:0 15px}
+}
+@media(max-width:520px){
+  .cards{grid-template-columns:1fr}
+  .msg.user{margin-left:0}
+  .compose-foot{display:none}
+  .work-header,.mission-form,.handoff-panel{padding:14px}
+  .model-pill span.label{display:none}
+}
+</style></head><body>
+<div class="app">
+  <aside id="sidebar" aria-label="Falguna navigation">
+    <div class="brand"><span class="mark">F</span>Falguna</div>
+    <button class="new-chat" id="newChatBtn"></button>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-title" id="sideListTitle">Recent chats</div>
+    <div class="side-list" id="sideList"><div class="side-empty">Loading&hellip;</div></div>
+    <div class="boundary">Localhost-only internal alpha<br>No automatic merge or deploy</div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+  <main class="workspace">
+    <header class="topbar">
+      <div class="topbar-title"><button class="menu-button" id="menuButton" aria-label="Open navigation" aria-expanded="false"></button><strong id="viewTitle">Chat</strong></div>
+      <div class="model-pill" id="modelPill"><span class="dot"></span><span class="label">Falguna</span></div>
+    </header>
+    <section class="viewport" id="viewport"></section>
+  </main>
+</div>
 <script>
-const $=id=>document.getElementById(id);let runId=null,profiles={},operationTimer=null;
-async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
+const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function boot(){const [c,recent]=await Promise.all([api('/api/config'),api('/api/runs')]);c.profiles.forEach(p=>profiles[p.id]=p);$('project').innerHTML=c.profiles.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');$('projects').innerHTML=c.profiles.map(p=>`<button class="project" data-project="${esc(p.id)}"><span class="project-dot"></span><span>${esc(p.name)}</span></button>`).join('');document.querySelectorAll('[data-project]').forEach(b=>b.onclick=()=>{$('project').value=b.dataset.project;selectProject();closeSidebar();$('objective').focus()});renderHistory(recent.runs);selectProject();const saved=new URLSearchParams(location.search).get('run');if(saved)await openRun(saved)}
-function renderHistory(runs){const list=(runs||[]).slice(0,20);$('history').innerHTML=list.length?list.map(r=>`<button data-run="${esc(r.run_id)}" title="${esc(r.title)}"><span class="mission-title">${esc(r.title)}</span><small>${esc(String(r.status||'unknown').replaceAll('_',' '))}</small></button>`).join(''):'<div class="history-empty">No missions yet.</div>';document.querySelectorAll('[data-run]').forEach(b=>b.onclick=()=>{openRun(b.dataset.run);closeSidebar()})}
-function selectProject(){const p=profiles[$('project').value];if(!p)return;$('cost').value=p.default_budget_usd;$('cost').max=p.default_budget_usd;document.querySelectorAll('[data-project]').forEach(b=>b.classList.toggle('selected',b.dataset.project===p.id))}
+async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
+let profiles={};
+let profileList=[];
+let settingsModel='';
+
+/* ------------------------------------------------------------------ icons */
+const ICON={
+  chat:'<path d="M3 5.5A2.5 2.5 0 0 1 5.5 3h9A2.5 2.5 0 0 1 17 5.5v6A2.5 2.5 0 0 1 14.5 14H9l-4 3v-3H5.5A2.5 2.5 0 0 1 3 11.5v-6Z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linejoin="round"/>',
+  work:'<path d="M10 3.5v2M10 14.5v2M4.6 5.6l1.4 1.4M14 13l1.4 1.4M3.5 10h2M14.5 10h2M4.6 14.4 6 13M14 7l1.4-1.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="10" cy="10" r="3.2" stroke="currentColor" stroke-width="1.4" fill="none"/>',
+  search:'<circle cx="8.7" cy="8.7" r="5" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="m16 16-3.8-3.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  projects:'<path d="M3 6.2A1.2 1.2 0 0 1 4.2 5h3.6l1.4 1.6h6.6A1.2 1.2 0 0 1 17 7.8v6.8A1.4 1.4 0 0 1 15.6 16H4.4A1.4 1.4 0 0 1 3 14.6V6.2Z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linejoin="round"/>',
+  history:'<circle cx="10" cy="10.5" r="6.3" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M10 7v3.6l2.4 1.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M7.3 3.6 5.6 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  settings:'<circle cx="10" cy="10" r="2.6" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M10 3.6v1.7M10 14.7v1.7M16.4 10h-1.7M5.3 10H3.6M14.6 5.4l-1.2 1.2M6.6 13.4l-1.2 1.2M14.6 14.6l-1.2-1.2M6.6 6.6 5.4 5.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  plus:'<path d="M9 3.5v11M3.5 9h11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+  send:'<path d="M3 10 16 4l-4.6 12.5-2.6-5.6L3 10Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="currentColor" fill-opacity=".08"/>',
+  clip:'<path d="M13.2 6.4 7.8 11.8a2 2 0 0 0 2.8 2.8l5.1-5.1a3.4 3.4 0 0 0-4.8-4.8L5.8 9.8a4.7 4.7 0 0 0 6.6 6.6l5-5" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/>',
+  spark:'<path d="M10 2.5c.6 3 1.8 4.4 4.8 5-3 .6-4.2 2-4.8 5-.6-3-1.8-4.4-4.8-5 3-.6 4.2-2 4.8-5Z" stroke="currentColor" stroke-width="1.1" fill="currentColor" fill-opacity=".18" stroke-linejoin="round"/>',
+  menu:'<path d="M3 5.5h14M3 10h14M3 14.5h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
+  handoff:'<path d="M4 10h9M9 5.5 13.5 10 9 14.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+};
+const icon=(name,size=16)=>`<svg width="${size}" height="${size}" viewBox="0 0 20 20" fill="none">${ICON[name]||''}</svg>`;
+
+$('newChatBtn').innerHTML=icon('plus',15)+'New chat';
+$('menuButton').innerHTML=icon('menu',17);
+$('nav').innerHTML=[
+  ['chat','Chat'],['work','Work'],['search','Search'],['projects','Projects'],['history','History'],['settings','Settings'],
+].map(([id,label])=>`<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`).join('');
+
 function closeSidebar(){$('sidebar').classList.remove('open');$('scrim').classList.remove('open');$('menuButton').setAttribute('aria-expanded','false')}
 function toggleSidebar(){const open=!$('sidebar').classList.contains('open');$('sidebar').classList.toggle('open',open);$('scrim').classList.toggle('open',open);$('menuButton').setAttribute('aria-expanded',String(open))}
-function beginThread(objective){$('welcome').classList.add('hidden');$('thread').classList.remove('hidden');$('objectiveText').textContent=objective;$('state').textContent='Planning and discovering safe scope…';$('failure').textContent='';$('timeline').innerHTML='';$('cards').classList.add('hidden');$('details').classList.add('hidden');$('actions').classList.add('hidden')}
-async function openRun(id){runId=id;const d=await api('/api/runs/'+id);history.replaceState(null,'','?run='+id);beginThread(d.objective||d.mission);renderRun(d)}
-$('project').addEventListener('change',selectProject);$('menuButton').onclick=toggleSidebar;$('scrim').onclick=closeSidebar;window.addEventListener('keydown',e=>{if(e.key==='Escape')closeSidebar()});$('newMission').onclick=()=>{runId=null;history.replaceState(null,'','/');$('thread').classList.add('hidden');$('welcome').classList.remove('hidden');$('objective').value='';closeSidebar();$('objective').focus()};
-$('mission').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;beginThread($('objective').value.trim());try{const out=await api('/api/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:$('project').value,objective:$('objective').value,max_cost_usd:Number($('cost').value)})});watchOperation(out.operation)}catch(err){showError(err.message);$('run').disabled=false}});
-async function watchOperation(token){clearTimeout(operationTimer);try{const op=await api('/api/operations/'+token);if(op.run_id){runId=op.run_id;history.replaceState(null,'','?run='+runId);await refresh()}if(op.state==='FAILED'){showError(op.error);$('run').disabled=false;return}if(op.state!=='COMPLETE')operationTimer=setTimeout(()=>watchOperation(token),800);else{$('run').disabled=false;await refresh();const recent=await api('/api/runs');renderHistory(recent.runs)}}catch(err){showError(err.message);$('run').disabled=false}}
-async function refresh(){if(!runId)return;renderRun(await api('/api/runs/'+runId))}
-function renderRun(d){$('state').textContent=(d.supervisor?.phase||d.current_milestone||d.status).replaceAll('_',' ');$('failure').textContent=d.failure?`${d.failure.category}: ${d.failure.message}. ${d.failure.action}${d.action_disabled_reason?' Action unavailable: '+d.action_disabled_reason:''}`:'';$('timeline').innerHTML=(d.progress_events||[]).map(x=>`<span class="step">${esc(x.label)}</span>`).join('');const terminal=['DONE_CANDIDATE','FAILED','QUARANTINED','PAUSED','CANCELLED'].includes(d.status);if(terminal)renderEvidence(d);else{$('cards').classList.add('hidden');$('details').classList.add('hidden');$('actions').classList.remove('hidden');renderControls(d)}}
-function renderControls(d){const controls=d.available_controls||[];$('pause').classList.toggle('hidden',!controls.includes('Pause'));$('cancel').classList.toggle('hidden',!controls.includes('Cancel'));$('resume').classList.toggle('hidden',!controls.some(x=>['Resume','Retry'].includes(x)));document.querySelectorAll('[data-action]').forEach(b=>b.classList.toggle('hidden',d.status!=='DONE_CANDIDATE'||d.merge_approval!=='PENDING'))}
-function renderEvidence(d){const values=[['Status',d.status],['Needs approval',d.merge_approval||'No'],['Tests',(d.native_tests||[]).length?d.native_tests.filter(x=>x.passed).length+'/'+d.native_tests.length:'Not run'],['Review',d.independent_review||'Not run'],['Cost','$'+Number(d.cost_usd||0).toFixed(4)],['Cache',d.discovery_cache||'Not recorded'],['Total time',((d.timings_ms||{}).total||0)+' ms'],['Evidence',d.evidence_hashes_valid?'Valid':'Not proven']];$('cards').innerHTML=values.map(x=>`<div class="card"><span>${esc(x[0])}</span><b>${esc(x[1])}</b></div>`).join('');$('cards').classList.remove('hidden');$('details').innerHTML=`<div><span>Files changed</span>${esc((d.files_changed||[]).join(', ')||'None')}</div><div><span>Native verification</span>${esc((d.native_tests||[]).map(x=>x.label+': '+(x.passed?'passed':'failed')).join(' · ')||'Not run')}</div><div><span>Stage timings</span>${esc(Object.entries(d.timings_ms||{}).map(x=>x[0]+': '+x[1]+' ms').join(' · ')||'Not recorded')}</div><div><span>Independent review / audit</span>${esc(d.independent_review||'Not run')} · audit ${d.audit_chain_valid?'valid':'not proven'} · protected-main merges 0</div><div><span>Unresolved issues</span>${esc((d.unresolved_issues||[]).join('; ')||'None')}</div>`;$('details').classList.remove('hidden');$('actions').classList.remove('hidden');renderControls(d)}
-function showError(message){$('state').textContent='Blocked';$('failure').textContent=message}
-document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for this decision:');if(!reason)return;await api(`/api/runs/${runId}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,reason})});await refresh()});
-$('resume').onclick=async()=>{const out=await api(`/api/runs/${runId}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});$('resume').disabled=true;watchOperation(out.operation)};
-$('pause').onclick=async()=>{await api(`/api/runs/${runId}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refresh()};
-$('cancel').onclick=async()=>{await api(`/api/runs/${runId}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refresh()};
-boot().catch(e=>showError(e.message));
-</script></body></html>'''
+$('menuButton').onclick=toggleSidebar;$('scrim').onclick=closeSidebar;
+window.addEventListener('keydown',e=>{if(e.key==='Escape')closeSidebar()});
+$('newChatBtn').onclick=()=>{location.hash='#/chat';closeSidebar()};
+
+/* ---------------------------------------------------------------- router */
+
+function currentRoute(){
+  const raw=(location.hash||'#/chat').replace(/^#\/?/,'');
+  const parts=raw.split('/');
+  return {view:parts[0]||'chat', id:parts[1]?decodeURIComponent(parts[1]):null};
+}
+function go(hash){location.hash=hash}
+function setActiveNav(view){
+  document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
+  const titles={chat:'Chat',work:'Work',search:'Search',projects:'Projects',history:'History',settings:'Settings'};
+  $('viewTitle').textContent=titles[view]||'Falguna';
+}
+document.querySelectorAll('.nav-item').forEach(b=>b.onclick=()=>{go('#/'+b.dataset.view);closeSidebar()});
+
+async function router(){
+  const {view,id}=currentRoute();
+  setActiveNav(view);
+  const vp=$('viewport');
+  try{
+    if(view==='chat'){await renderSideChats();return renderChatView(id)}
+    if(view==='work'){await renderSideMissions();return renderWorkView(id)}
+    if(view==='search'){hideSideList();return renderSearchView(id)}
+    if(view==='projects'){hideSideList();return renderProjectsView()}
+    if(view==='history'){hideSideList();return renderHistoryView()}
+    if(view==='settings'){hideSideList();return renderSettingsView()}
+    go('#/chat');
+  }catch(err){
+    vp.innerHTML=`<div class="page"><div class="empty-state error">${esc(err.message)}</div></div>`;
+  }
+}
+window.addEventListener('hashchange',router);
+
+function hideSideList(){$('sideListTitle').textContent='';$('sideList').innerHTML=''}
+
+async function loadProfiles(){
+  if(profileList.length)return;
+  const c=await api('/api/config');
+  profileList=c.profiles;
+  settingsModel=c.model;
+  c.profiles.forEach(p=>profiles[p.id]=p);
+  $('modelPill').innerHTML=`<span class="dot"></span><span class="label">${esc(settingsModel||'Falguna')}</span>`;
+}
+loadProfiles().catch(()=>{});
+
+/* ------------------------------------------------------------ sidebar lists */
+
+function groupByRecency(items,dateKey){
+  const now=Date.now(),groups={Today:[],Yesterday:[],'Previous 7 days':[],Older:[]};
+  for(const item of items){
+    const days=(now-new Date(item[dateKey]).getTime())/86400000;
+    if(days<1)groups.Today.push(item);
+    else if(days<2)groups.Yesterday.push(item);
+    else if(days<7)groups['Previous 7 days'].push(item);
+    else groups.Older.push(item);
+  }
+  return Object.entries(groups).filter(([,v])=>v.length);
+}
+
+async function renderSideChats(){
+  $('sideListTitle').textContent='Recent chats';
+  const {conversations}=await api('/api/conversations');
+  const {id:activeId}=currentRoute();
+  const list=conversations||[];
+  if(!list.length){$('sideList').innerHTML='<div class="side-empty">No chats yet.</div>';return}
+  $('sideList').innerHTML=groupByRecency(list,'updated_at').map(([label,rows])=>
+    `<div class="side-group-label">${esc(label)}</div>`+rows.map(c=>`<button data-open="#/chat/${esc(c.id)}" class="${c.id===activeId?'active':''}" title="${esc(c.title)}"><span class="row-title">${esc(c.title)}</span>${c.last_message_preview?`<span class="row-sub">${esc(c.last_message_preview)}</span>`:''}</button>`).join('')
+  ).join('');
+  wireSideList();
+}
+async function renderSideMissions(){
+  $('sideListTitle').textContent='Recent missions';
+  const {runs}=await api('/api/runs');
+  const {id:activeId}=currentRoute();
+  const list=(runs||[]).slice(0,20);
+  $('sideList').innerHTML=list.length?list.map(r=>`<button data-open="#/work/${esc(r.run_id)}" class="${r.run_id===activeId?'active':''}" title="${esc(r.title)}"><span class="row-title">${esc(r.title)}</span><span class="row-sub">${esc(String(r.status||'unknown').replaceAll('_',' '))}</span></button>`).join(''):'<div class="side-empty">No missions yet.</div>';
+  wireSideList();
+}
+function wireSideList(){
+  document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{go(b.dataset.open);closeSidebar()});
+}
+function timeAgo(iso){
+  if(!iso)return'';
+  const diff=(Date.now()-new Date(iso).getTime())/1000;
+  if(diff<60)return'just now';
+  if(diff<3600)return Math.floor(diff/60)+'m ago';
+  if(diff<86400)return Math.floor(diff/3600)+'h ago';
+  return Math.floor(diff/86400)+'d ago';
+}
+
+/* --------------------------------------------------------------- Chat view */
+
+const STARTERS=[
+  ['spark','Help me think something through'],
+  ['chat','Summarize my recent Work missions'],
+  ['handoff','Turn an idea into a Work objective'],
+];
+
+async function renderChatView(id){
+  await loadProfiles();
+  const vp=$('viewport');
+  if(!id){
+    vp.innerHTML=`
+      <div class="chat-view">
+        <div class="chat-scroll"><div class="chat-welcome">
+          <div class="glow">${icon('spark',24)}</div>
+          <h1>How can I help?</h1>
+          <p>Ask a question, think something through, or describe what you're working on.</p>
+          <div class="chip-row">${STARTERS.map(([ic,label])=>`<button class="chip" data-starter="${esc(label)}">${icon(ic,13)}${esc(label)}</button>`).join('')}</div>
+        </div></div>
+        ${composerHtml('Start chat')}
+      </div>`;
+    wireComposerChrome();
+    document.querySelectorAll('[data-starter]').forEach(b=>b.onclick=()=>{$('composerInput').value=b.dataset.starter;$('composerInput').focus()});
+    $('composer').addEventListener('submit',async e=>{
+      e.preventDefault();
+      const content=$('composerInput').value.trim();
+      if(!content)return;
+      $('sendBtn').disabled=true;
+      try{
+        const conv=await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:content.slice(0,60)})});
+        await api(`/api/conversations/${conv.id}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});
+        go('#/chat/'+conv.id);
+      }catch(err){$('sendBtn').disabled=false;alert(err.message)}
+    });
+    return;
+  }
+  vp.innerHTML=`<div class="chat-view"><div class="chat-scroll"><div class="thread" id="thread"><div class="empty-state">Loading conversation&hellip;</div></div></div><div id="handoffMount"></div>${composerHtml('Send')}</div>`;
+  wireComposerChrome();
+  let data;
+  try{
+    data=await api('/api/conversations/'+id);
+  }catch(err){
+    $('thread').innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;
+    return;
+  }
+  renderThread(data);
+  $('composer').addEventListener('submit',async e=>{
+    e.preventDefault();
+    const content=$('composerInput').value.trim();
+    if(!content)return;
+    $('composerInput').value='';
+    $('sendBtn').disabled=true;
+    appendOptimisticUserBubble(content);
+    try{
+      await api(`/api/conversations/${id}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});
+      data=await api('/api/conversations/'+id);
+      renderThread(data);
+      renderSideChats();
+    }catch(err){
+      appendErrorBubble(err.message);
+    }finally{
+      $('sendBtn').disabled=false;
+    }
+  });
+}
+function composerHtml(sendLabel){
+  return `<div class="composer-wrap"><form class="composer" id="composer">
+    <textarea id="composerInput" required placeholder="Message Falguna&hellip;" rows="1"></textarea>
+    <div class="compose-row">
+      <button type="button" class="icon-btn" id="attachBtn" title="Attachments (coming soon)">${icon('clip',16)}</button>
+      <span class="mode-chip">${icon('chat',12)}Chat</span>
+      <div class="compose-spacer"></div>
+      <button class="send-btn" id="sendBtn" type="submit" aria-label="${esc(sendLabel)}">${icon('send',14)}</button>
+    </div>
+  </form><div class="compose-foot">Falguna can be wrong. Hand off to Work for changes that need to be verified.</div></div>`;
+}
+function wireComposerChrome(){
+  const ta=$('composerInput');
+  ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,180)+'px'});
+  ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit()}});
+  const attach=$('attachBtn');
+  if(attach)attach.onclick=()=>alert('Attachments are not part of this release yet.');
+}
+function appendOptimisticUserBubble(content){
+  const t=$('thread');
+  t.insertAdjacentHTML('beforeend',`<div class="msg user"><div class="avatar">Y</div><div class="bubble">${esc(content)}</div></div><div class="msg assistant" id="thinkingRow"><div class="avatar">F</div><div class="bubble thinking"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></div></div>`);
+  $('thread').closest('.chat-scroll').scrollTop=9e6;
+}
+function appendErrorBubble(message){
+  const row=$('thinkingRow');
+  if(row)row.remove();
+  $('thread').insertAdjacentHTML('beforeend',`<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">${esc(message)}</div></div>`);
+}
+function renderThread(data){
+  const {conversation,messages,handoffs}=data;
+  document.title='Falguna · '+conversation.title;
+  const t=$('thread');
+  if(!messages.length){
+    t.innerHTML='<div class="empty-state">Say something to get started.</div>';
+  }else{
+    t.innerHTML=messages.map(m=>{
+      if(m.role==='user')return `<div class="msg user"><div class="avatar">Y</div><div class="bubble">${esc(m.content)}</div></div>`;
+      if(m.error)return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">${esc(m.error)}</div></div>`;
+      return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble">${esc(m.content)}</div></div>`;
+    }).join('');
+  }
+  const last=messages[messages.length-1];
+  const suggestion=last&&last.role==='assistant'&&last.suggested_objective;
+  renderHandoffPanel(conversation,suggestion||'',handoffs);
+  $('thread').closest('.chat-scroll').scrollTop=9e6;
+}
+function renderHandoffPanel(conversation,suggested,handoffs){
+  const mount=$('handoffMount');
+  const openOptions=profileList.map(p=>`<option value="${esc(p.id)}" ${p.id===conversation.project_id?'selected':''}>${esc(p.name)}</option>`).join('');
+  const priorRuns=(handoffs||[]).map(h=>`<a href="#/work/${esc(h.run_id)}">${esc(new Date(h.created_at).toLocaleString())}</a>`).join(' · ');
+  mount.innerHTML=`<div class="handoff-panel">
+    <h3>${icon('handoff',15)}Hand off to Work</h3>
+    <div class="sub">Chat can't touch a repository itself. Work runs in an isolated worktree with verification, review, and a human approval gate.${priorRuns?` Already started: ${priorRuns}`:''}</div>
+    <label>Approved project</label>
+    <select id="handoffProject">${openOptions}</select>
+    <label>Bounded objective for Work</label>
+    <textarea id="handoffObjective" placeholder="Describe one small, testable outcome.">${esc(suggested)}</textarea>
+    <div class="handoff-actions"><button class="action" id="handoffBtn" type="button">Start Work mission</button></div>
+  </div>`;
+  $('handoffBtn').onclick=async()=>{
+    const project_id=$('handoffProject').value;
+    const objective=$('handoffObjective').value.trim();
+    if(!project_id||objective.length<12){alert('Choose a project and describe a bounded objective (12+ characters).');return}
+    $('handoffBtn').disabled=true;$('handoffBtn').textContent='Starting…';
+    try{
+      const {id}=currentRoute();
+      const out=await api(`/api/conversations/${id}/handoff`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id,objective})});
+      watchOperation(out.operation,runId=>go('#/work/'+runId));
+    }catch(err){
+      $('handoffBtn').disabled=false;$('handoffBtn').textContent='Start Work mission';
+      alert(err.message+(err.data&&err.data.discovery?' -- discovery needs a narrower objective.':''));
+    }
+  };
+}
+
+/* --------------------------------------------------------------- Work view */
+
+async function renderWorkView(runId){
+  await loadProfiles();
+  const vp=$('viewport');
+  if(!runId){
+    vp.innerHTML=`<div class="work-view"><div class="work-empty">
+      <h1>Start a new mission</h1>
+      <p>Falguna discovers the safe file scope and native verification, then works in an isolated worktree.</p>
+      <form class="mission-form" id="mission">
+        <label>Approved project</label><select id="project" required></select>
+        <label>Bounded engineering objective</label><textarea id="objective" required placeholder="Describe one small, testable problem."></textarea>
+        <label>Optional hard cost cap (USD)</label><input id="cost" type="number" min="0" step="0.01">
+        <div class="risk-note" id="risk"></div>
+        <div class="handoff-actions"><button class="action" id="run" type="submit">Run mission</button></div>
+      </form>
+      <p class="compose-foot" style="margin-top:16px">Falguna pauses before editing when discovery is uncertain or scope must expand. Prefer scoping the idea in Chat first, then hand it off here. Pause and cancel take effect at a safe boundary. Human approval stays required; no merge or deploy.</p>
+    </div></div>`;
+    $('project').innerHTML=profileList.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+    const selectProject=()=>{const p=profiles[$('project').value];if(!p)return;$('cost').value=p.default_budget_usd;$('cost').max=p.default_budget_usd;$('risk').textContent='Risk: '+p.risk};
+    $('project').addEventListener('change',selectProject);selectProject();
+    $('mission').addEventListener('submit',async e=>{
+      e.preventDefault();$('run').disabled=true;
+      try{
+        const out=await api('/api/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:$('project').value,objective:$('objective').value,max_cost_usd:Number($('cost').value)})});
+        watchOperation(out.operation,id=>go('#/work/'+id));
+      }catch(err){$('run').disabled=false;alert(err.message)}
+    });
+    return;
+  }
+  vp.innerHTML=`<div class="work-view"><div class="work-thread" id="workThread"><div class="empty-state">Loading mission&hellip;</div></div></div>`;
+  await refreshWork(runId);
+}
+async function refreshWork(runId){
+  let d;
+  try{d=await api('/api/runs/'+runId)}catch(err){$('workThread').innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
+  renderWorkThread(runId,d);
+}
+function renderWorkThread(runId,d){
+  const wt=$('workThread');
+  const handoffs=d.conversation_handoffs||[];
+  const origin=handoffs.length?`<div class="origin-banner"><span>Started from a Chat handoff</span><a href="#/chat/${esc(handoffs[0].conversation_id)}">Open the conversation</a></div>`:'';
+  const terminal=['DONE_CANDIDATE','FAILED','QUARANTINED','PAUSED','CANCELLED'].includes(d.status);
+  wt.innerHTML=`${origin}<div class="work-header">
+      <div class="objective">${esc(d.objective||d.mission||'')}</div>
+      <div class="status-line">${esc((d.supervisor&&d.supervisor.phase||d.current_milestone||d.status||'').toString().replaceAll('_',' '))}</div>
+      <div class="error">${d.failure?esc(`${d.failure.category}: ${d.failure.message}. ${d.failure.action}${d.action_disabled_reason?' Action unavailable: '+d.action_disabled_reason:''}`):''}</div>
+      <div class="timeline">${(d.progress_events||[]).map(x=>`<span class="step">${esc(x.label)}</span>`).join('')}</div>
+    </div>
+    <div class="cards hidden" id="cards"></div>
+    <div class="details hidden" id="details"></div>
+    <div class="actions hidden" id="actions">
+      <button class="action secondary" id="pause">Pause safely</button>
+      <button class="action danger" id="cancel">Cancel</button>
+      <button class="action secondary" id="resume">Resume / Retry</button>
+      <button class="action" data-action="approve">Approve</button>
+      <button class="action danger" data-action="reject">Reject</button>
+      <button class="action secondary" data-action="request-changes">Request Changes</button>
+    </div>`;
+  if(terminal){renderEvidence(runId,d)}else{$('actions').classList.remove('hidden');renderControls(runId,d)}
+  wireWorkActions(runId);
+}
+function renderControls(runId,d){
+  const controls=d.available_controls||[];
+  $('pause').classList.toggle('hidden',!controls.includes('Pause'));
+  $('cancel').classList.toggle('hidden',!controls.includes('Cancel'));
+  $('resume').classList.toggle('hidden',!controls.some(x=>['Resume','Retry'].includes(x)));
+  document.querySelectorAll('[data-action]').forEach(b=>b.classList.toggle('hidden',d.status!=='DONE_CANDIDATE'||d.merge_approval!=='PENDING'));
+}
+function renderEvidence(runId,d){
+  const values=[['Status',d.status],['Needs approval',d.merge_approval||'No'],['Tests',(d.native_tests||[]).length?d.native_tests.filter(x=>x.passed).length+'/'+d.native_tests.length:'Not run'],['Review',d.independent_review||'Not run'],['Cost','$'+Number(d.cost_usd||0).toFixed(4)],['Cache',d.discovery_cache||'Not recorded'],['Total time',((d.timings_ms||{}).total||0)+' ms'],['Evidence',d.evidence_hashes_valid?'Valid':'Not proven']];
+  $('cards').innerHTML=values.map(x=>`<div class="card"><span>${esc(x[0])}</span><b>${esc(x[1])}</b></div>`).join('');
+  $('cards').classList.remove('hidden');
+  $('details').innerHTML=`<div><span>Files changed</span>${esc((d.files_changed||[]).join(', ')||'None')}</div><div><span>Native verification</span>${esc((d.native_tests||[]).map(x=>x.label+': '+(x.passed?'passed':'failed')).join(' · ')||'Not run')}</div><div><span>Stage timings</span>${esc(Object.entries(d.timings_ms||{}).map(x=>x[0]+': '+x[1]+' ms').join(' · ')||'Not recorded')}</div><div><span>Independent review / audit</span>${esc(d.independent_review||'Not run')} · audit ${d.audit_chain_valid?'valid':'not proven'} · protected-main merges 0</div><div><span>Unresolved issues</span>${esc((d.unresolved_issues||[]).join('; ')||'None')}</div>`;
+  $('details').classList.remove('hidden');
+  $('actions').classList.remove('hidden');
+  renderControls(runId,d);
+}
+function wireWorkActions(runId){
+  document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{
+    const reason=prompt('Reason for this decision:');if(!reason)return;
+    await api(`/api/runs/${runId}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,reason})});
+    await refreshWork(runId);
+  });
+  const resumeBtn=$('resume');
+  if(resumeBtn)resumeBtn.onclick=async()=>{const out=await api(`/api/runs/${runId}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});resumeBtn.disabled=true;watchOperation(out.operation,()=>refreshWork(runId))};
+  const pauseBtn=$('pause');
+  if(pauseBtn)pauseBtn.onclick=async()=>{await api(`/api/runs/${runId}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refreshWork(runId)};
+  const cancelBtn=$('cancel');
+  if(cancelBtn)cancelBtn.onclick=async()=>{await api(`/api/runs/${runId}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refreshWork(runId)};
+}
+let operationTimer=null;
+async function watchOperation(token,onRunId){
+  clearTimeout(operationTimer);
+  try{
+    const op=await api('/api/operations/'+token);
+    if(op.run_id&&onRunId){onRunId(op.run_id);onRunId=null}
+    if(op.state==='FAILED'){alert(op.error);return}
+    if(op.state!=='COMPLETE')operationTimer=setTimeout(()=>watchOperation(token,onRunId),800);
+    else{renderSideMissions()}
+  }catch(err){alert(err.message)}
+}
+
+/* ------------------------------------------------------------- Search view */
+
+async function renderSearchView(query){
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="page"><h1>Search</h1><p class="lede">Search across chats and Work missions.</p>
+    <div class="searchbar"><input id="q" placeholder="Search chats and missions&hellip;" value="${esc(query||'')}"><button id="go">Search</button></div>
+    <div class="result-list" id="results"></div></div>`;
+  const run=async()=>{
+    const q=$('q').value.trim();
+    history.replaceState(null,'','#/search/'+encodeURIComponent(q));
+    if(!q){$('results').innerHTML='<div class="empty-state">Type to search.</div>';return}
+    const {results}=await api('/api/search?q='+encodeURIComponent(q));
+    $('results').innerHTML=results.length?results.map(r=>r.type==='conversation'
+      ?`<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
+      :`<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work &middot; ${esc(String(r.status||'').replaceAll('_',' '))}</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.repository||'')}</div></button>`
+    ).join(''):'<div class="empty-state">No matches.</div>';
+    document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
+  };
+  $('go').onclick=run;
+  $('q').addEventListener('keydown',e=>{if(e.key==='Enter')run()});
+  if(query)run();
+}
+
+/* ----------------------------------------------------------- Projects view */
+
+async function renderProjectsView(){
+  await loadProfiles();
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="page"><h1>Projects</h1><p class="lede">Approved projects only. The browser cannot supply an arbitrary repository.</p>
+    <div class="card-list" id="projectCards"></div></div>`;
+  $('projectCards').innerHTML=profileList.map(p=>`
+    <div class="project-card">
+      <div class="title"><span class="mark" style="width:22px;height:22px;font-size:11px;border-radius:7px">${esc(p.name[0]||'P')}</span>${esc(p.name)}</div>
+      <div class="path">${esc(p.repository)}</div>
+      <div class="risk">${esc(p.risk||'—')} &middot; budget cap <b>$${esc(p.default_budget_usd)}</b></div>
+      <div class="project-actions">
+        <button class="pill-btn" data-newchat="${esc(p.id)}">New chat for this project</button>
+        <button class="pill-btn" data-newmission="${esc(p.id)}">New mission in Work</button>
+      </div>
+    </div>`).join('') || '<div class="empty-state">No approved projects found.</div>';
+  document.querySelectorAll('[data-newchat]').forEach(b=>b.onclick=async()=>{
+    const conv=await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'New chat',project_id:b.dataset.newchat})});
+    go('#/chat/'+conv.id);
+  });
+  document.querySelectorAll('[data-newmission]').forEach(b=>b.onclick=()=>go('#/work'));
+}
+
+/* ------------------------------------------------------------ History view */
+
+async function renderHistoryView(){
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="page"><h1>History</h1><p class="lede">Every chat and mission, most recent first.</p><div class="result-list" id="historyList"></div></div>`;
+  const [{conversations},{runs}]=await Promise.all([api('/api/conversations'),api('/api/runs')]);
+  const items=[
+    ...(conversations||[]).map(c=>({type:'conversation',id:c.id,title:c.title,updated_at:c.updated_at})),
+    ...(runs||[]).map(r=>({type:'mission',run_id:r.run_id,title:r.title,status:r.status,updated_at:r.updated_at,repository:r.repository})),
+  ].sort((a,b)=>new Date(b.updated_at)-new Date(a.updated_at));
+  $('historyList').innerHTML=items.length?items.map(r=>r.type==='conversation'
+    ?`<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
+    :`<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
+  ).join(''):'<div class="empty-state">Nothing yet. Start a chat or a mission.</div>';
+  document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
+}
+
+/* ----------------------------------------------------------- Settings view */
+
+async function renderSettingsView(){
+  const vp=$('viewport');
+  const s=await api('/api/settings');
+  vp.innerHTML=`<div class="page"><h1>Settings</h1><p class="lede">Informational only in this release &mdash; nothing here can change Falguna's safety policy from the browser.</p>
+    <div class="settings-note">Approval boundaries, verification, review, isolation, and audit are enforced in the control plane and are not editable from the UI.</div>
+    <div class="settings-list">
+      <div><span style="color:var(--muted-dim)">Model:</span> ${esc(s.model)}</div>
+      <div><span style="color:var(--muted-dim)">Approved projects:</span> ${esc(s.profiles.length)}</div>
+    </div>
+    <div class="section-label">Safety boundaries preserved in this release</div>
+    <div class="settings-list">${s.boundaries.map(b=>`<div>${esc(b)}</div>`).join('')}</div>
+    <div class="section-label">Approved projects</div>
+    <div class="settings-list">${s.profiles.map(p=>`<div><b>${esc(p.name)}</b> &middot; ${esc(p.repository)} &middot; cap $${esc(p.default_budget_usd)}</div>`).join('')}</div>
+  </div>`;
+}
+
+router().catch(e=>{$('viewport').innerHTML=`<div class="page"><div class="empty-state error">${esc(e.message)}</div></div>`});
+</script></body></html>
+'''
