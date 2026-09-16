@@ -33,7 +33,7 @@ fi
 # Finder apps receive a minimal PATH. Include normal macOS locations and the
 # installed Codex runtime so browser missions retain the v0.6 command path.
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Library/Apple/usr/bin"
-for candidate in /Applications/Codex.app/Contents/Resources/codex /Applications/ChatGPT*.app/Contents/Resources/codex; do
+for candidate in /Applications/Codex.app/Contents/Resources/codex /Applications/ChatGPT*.app/Contents/Resources/codex(N); do
   if [[ -x "$candidate" ]]; then
     export PATH="${candidate:h}:$PATH"
     break

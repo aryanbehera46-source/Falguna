@@ -179,6 +179,26 @@ class TTTHQTests(unittest.TestCase):
         self.assertEqual(approval["status"], "APPROVED")
         self.assertEqual(approval["decided_by"], "Aryan")
 
+    def test_needs_aryan_stops_listing_a_run_once_its_merge_decision_is_recorded(self):
+        # Regression test: decide_merge only writes to the `approvals` table --
+        # it never touches `supervisor_states` (that's Falguna's own existing
+        # behavior, and this queue must not assume otherwise). Before this fix,
+        # a decided item kept showing up here as PENDING forever, because the
+        # underlying supervisor_state row doesn't change until the run itself
+        # resumes.
+        audit = AuditLog(self.state_dir / "audit.jsonl")
+        queue = NeedsAryanQueue(self.store, audit, control=self.control)
+        run_id = self._seed_run_needing_approval(category="FINAL_MERGE")
+        self.store.create("approvals", {
+            "run_id": run_id, "kind": "PROTECTED_BRANCH_MERGE", "status": "PENDING",
+            "requested_at": "2026-01-01T00:00:00+00:00", "decided_at": None, "decided_by": None,
+            "reason": None, "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00",
+        })
+        self.assertTrue(any(i["id"] == f"run:{run_id}" for i in queue.list_pending()))
+        queue.decide(f"run:{run_id}", "approve", "Aryan")
+        remaining = [i for i in queue.list_pending() if i["id"] == f"run:{run_id}"]
+        self.assertEqual(remaining, [], "a decided run must not linger in the pending queue")
+
     def _seed_run_needing_approval(self, category: str) -> str:
         mission_id = self.control.create_mission("Seed mission", "Seed requirement", self.repo, RunPolicy())["mission_id"]
         requirement_id = self.store.list("requirements", "mission_id=?", (mission_id,))[0]["id"]

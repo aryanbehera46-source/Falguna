@@ -239,6 +239,15 @@ class NeedsAryanQueue:
             run = self.store.get("runs", state["run_id"])
             if not run:
                 continue
+            merge_decisions = self.store.list("approvals", "run_id=? AND kind=?", (run["id"], "PROTECTED_BRANCH_MERGE"))
+            if merge_decisions and merge_decisions[-1]["status"] != "PENDING":
+                # Aryan already decided the merge for this run through the real
+                # decide_merge path (here or in Falguna Engineering directly).
+                # The underlying supervisor_state only changes when the run
+                # itself resumes -- that's Falguna's own behavior, untouched --
+                # so without this check a decided item would linger here
+                # showing PENDING even though it was already acted on.
+                continue
             task = self.store.get("tasks", run["task_id"])
             requirement = self.store.get("requirements", task["requirement_id"]) if task else None
             mission = self.store.get("missions", requirement["mission_id"]) if requirement else None

@@ -31,6 +31,13 @@ class HTMLSeparationTests(unittest.TestCase):
         ):
             self.assertIn(label, HQ_INDEX_HTML)
 
+    def test_hq_html_has_a_responsive_breakpoint(self):
+        # Regression: the first version of this page shipped with zero @media
+        # rules while Falguna Engineering's page has two -- a real gap on
+        # narrow viewports (fixed 250px sidebar, no collapse).
+        self.assertIn("@media", HQ_INDEX_HTML)
+        self.assertIn("grid-template-columns:1fr", HQ_INDEX_HTML)
+
     def test_hq_html_does_not_contain_falguna_engineering_mission_ui(self):
         # TTT HQ must not feel like Falguna with an extra tab: none of Falguna
         # Engineering's own mission-composer elements should appear here.
