@@ -199,12 +199,43 @@ class TTTHQTests(unittest.TestCase):
         remaining = [i for i in queue.list_pending() if i["id"] == f"run:{run_id}"]
         self.assertEqual(remaining, [], "a decided run must not linger in the pending queue")
 
-    def _seed_run_needing_approval(self, category: str) -> str:
+    def test_needs_aryan_excludes_a_run_that_has_already_terminally_failed(self):
+        # QA regression: found on the real production database during an
+        # independent verification pass -- a run whose supervisor_state was
+        # never cleaned up after the run itself moved to a terminal status
+        # (with no pending merge decision) stayed in this queue forever,
+        # showing as "pending" when there was nothing anyone could ever do
+        # about it. Nothing about the run/supervisor_state/audit trail
+        # changes here -- only whether it's *listed* as pending.
+        audit = AuditLog(self.state_dir / "audit.jsonl")
+        queue = NeedsAryanQueue(self.store, audit, control=self.control)
+        for terminal_status in ("FAILED", "DONE_CANDIDATE", "CANCELLED", "QUARANTINED"):
+            run_id = self._seed_run_needing_approval(category="VERIFICATION_FAILURE", run_status=terminal_status)
+            pending = queue.list_pending()
+            self.assertFalse(
+                any(item["id"] == f"run:{run_id}" for item in pending),
+                f"a {terminal_status} run with no pending merge must not clutter the Needs Aryan queue",
+            )
+
+    def test_needs_aryan_still_surfaces_a_non_terminal_run_with_no_pending_merge(self):
+        # The fix above must not become overly broad: a run that is simply
+        # not yet at the merge gate (e.g. still AWAITING_APPROVAL) is real,
+        # active, unresolved work and must keep showing up as inspect-only,
+        # exactly as test_needs_aryan_surfaces_engineering_mission_as_inspect_only_when_not_at_merge_gate
+        # already covers for one status -- this checks PAUSED too, since
+        # Falguna Engineering treats paused runs as resumable, not dead.
+        audit = AuditLog(self.state_dir / "audit.jsonl")
+        queue = NeedsAryanQueue(self.store, audit, control=self.control)
+        run_id = self._seed_run_needing_approval(category="SCOPE_EXPANSION", run_status="PAUSED")
+        pending = queue.list_pending()
+        self.assertTrue(any(item["id"] == f"run:{run_id}" for item in pending), "a resumable PAUSED run must still surface")
+
+    def _seed_run_needing_approval(self, category: str, run_status: str = "AWAITING_APPROVAL") -> str:
         mission_id = self.control.create_mission("Seed mission", "Seed requirement", self.repo, RunPolicy())["mission_id"]
         requirement_id = self.store.list("requirements", "mission_id=?", (mission_id,))[0]["id"]
         task_id = self.store.list("tasks", "requirement_id=?", (requirement_id,))[0]["id"]
         run_id = self.store.create("runs", {
-            "task_id": task_id, "status": "AWAITING_APPROVAL", "attempt": 1, "worker": "test", "model": "test",
+            "task_id": task_id, "status": run_status, "attempt": 1, "worker": "test", "model": "test",
             "worktree": None, "head_sha": None, "error": None, "created_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-01T00:00:00+00:00",
         })

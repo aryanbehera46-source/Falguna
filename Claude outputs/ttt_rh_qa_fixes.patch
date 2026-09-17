@@ -1,0 +1,365 @@
+diff --git a/falguna/hq_web.py b/falguna/hq_web.py
+index 33f55f3..a1eca1a 100644
+--- a/falguna/hq_web.py
++++ b/falguna/hq_web.py
+@@ -212,6 +212,15 @@ class TTTHQHandler(BaseHTTPRequestHandler):
+                     job_id = ActiveJobStore(store, control.audit).create_from_won_opportunity(opportunity_id, actor=body.get("actor", "Aryan"))
+                     return self._json({"active_job_id": job_id}, HTTPStatus.CREATED)
+ 
++                if path.startswith("/api/rh/opportunities/") and len(path.split("/")) == 5:
++                    # Bare edit route -- distinct from the action-suffixed routes above
++                    # (.../qualify, .../stage, .../won, ...), which all have 6 path
++                    # segments and are matched first, so they always take priority.
++                    opportunity_id = path.split("/")[4]
++                    actor = body.pop("actor", "Aryan")
++                    opportunity = OpportunityStore(store, control.audit).update(opportunity_id, actor, **body)
++                    return self._json(opportunity)
++
+                 if path.startswith("/api/rh/active-jobs/") and path.endswith("/handoff"):
+                     active_job_id = path.split("/")[4]
+                     result = ActiveJobStore(store, control.audit).trigger_handoff(
+@@ -447,6 +456,7 @@ const RH_STAGES=["New","Qualified","Proposal Ready","Applied/Sent","Replied","Me
+ const PROPOSAL_KINDS=["short","detailed","upwork","email_pitch","follow_up"];
+ const FOLLOWUP_KINDS=["proposal_followup","response_followup","negotiation_followup","payment_followup","repeat_business_followup"];
+ let rhOpenId=null;
++let rhEditId=null;
+ if($('rhStageFilter').children.length<2)RH_STAGES.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;$('rhStageFilter').appendChild(o)});
+ $('rhMode').onchange=()=>{const m=$('rhMode').value;$('rhModeManual').style.display=m==='manual'?'':'none';$('rhModePasteJd').style.display=m==='paste_jd'?'':'none';$('rhModeUrl').style.display=m==='url'?'':'none';$('rhModeCsv').style.display=m==='csv_json'?'':'none'};
+ $('rhStageFilter').onchange=()=>loadRhOpportunities();
+@@ -463,8 +473,11 @@ async function loadRhOpportunities(){const stage=$('rhStageFilter').value;const
+ function rhCard(o){return `<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div><div class="actions"><button class="secondary rhOpen" data-id="${esc(o.id)}">Open</button></div></div>`}
+ function renderRhOpportunities(items){$('rhOpportunityList').innerHTML=items.length?items.map(o=>rhOpenId===o.id?rhDetailCard(o):rhCard(o)).join(''):'<div class="empty">No opportunities yet.</div>';wireRhList()}
+ function wireRhList(){
+-document.querySelectorAll('.rhOpen').forEach(b=>b.onclick=async()=>{rhOpenId=b.dataset.id;await loadRhOpportunities()});
+-document.querySelectorAll('.rhClose').forEach(b=>b.onclick=async()=>{rhOpenId=null;await loadRhOpportunities()});
++document.querySelectorAll('.rhOpen').forEach(b=>b.onclick=async()=>{rhOpenId=b.dataset.id;rhEditId=null;await loadRhOpportunities()});
++document.querySelectorAll('.rhClose').forEach(b=>b.onclick=async()=>{rhOpenId=null;rhEditId=null;await loadRhOpportunities()});
++document.querySelectorAll('.rhEditToggle').forEach(b=>b.onclick=async()=>{rhEditId=rhEditId===b.dataset.id?null:b.dataset.id;await loadRhOpportunities()});
++document.querySelectorAll('.rhEditCancel').forEach(b=>b.onclick=async()=>{rhEditId=null;await loadRhOpportunities()});
++document.querySelectorAll('.rhEditSave').forEach(b=>b.onclick=async()=>{const id=b.dataset.id;const title=$(`rhEditTitle_${id}`).value.trim();if(!title)return alert('Title cannot be blank.');const body={title,client_name:$(`rhEditClient_${id}`).value||null,description:$(`rhEditDescription_${id}`).value||null,budget_rate:$(`rhEditBudget_${id}`).value||null,required_skills:$(`rhEditSkills_${id}`).value||null,deadline:$(`rhEditDeadline_${id}`).value||null,contract_type:$(`rhEditContractType_${id}`).value||null,location_timezone:$(`rhEditLocation_${id}`).value||null,urgency:$(`rhEditUrgency_${id}`).value||null};try{await api(`/api/rh/opportunities/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});rhEditId=null;await loadRhOpportunities()}catch(e){alert(e.message)}});
+ document.querySelectorAll('.rhQualify').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/qualify`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadRhOpportunities()}catch(e){alert(e.message)}});
+ document.querySelectorAll('.rhStageBtn').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/stage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to_stage:b.dataset.stage})});await loadRhOpportunities()}catch(e){alert(e.message)}});
+ document.querySelectorAll('.rhWon').forEach(b=>b.onclick=async()=>{const price=prompt('Final price (optional):');try{await api(`/api/rh/opportunities/${b.dataset.id}/won`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({final_price:price?Number(price):null})});await loadRhOpportunities()}catch(e){alert(e.message)}});
+@@ -479,9 +492,18 @@ const q=o.qualification;
+ return `<div class="item">
+ <h3>${esc(o.title)}</h3>
+ <div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div>
+-${o.description?`<div>${esc(o.description)}</div>`:''}
++${o.description&&rhEditId!==o.id?`<div>${esc(o.description)}</div>`:''}
++${rhEditId===o.id?`<div class="form">
++<div class="row"><input id="rhEditTitle_${esc(o.id)}" placeholder="Title" value="${esc(o.title||'')}"><input id="rhEditClient_${esc(o.id)}" placeholder="Client name" value="${esc(o.client_name||'')}"></div>
++<textarea id="rhEditDescription_${esc(o.id)}" placeholder="Description">${esc(o.description||'')}</textarea>
++<div class="row"><input id="rhEditBudget_${esc(o.id)}" placeholder="Budget/rate" value="${esc(o.budget_rate||'')}"><input id="rhEditSkills_${esc(o.id)}" placeholder="Required skills" value="${esc(o.required_skills||'')}"></div>
++<div class="row"><input id="rhEditDeadline_${esc(o.id)}" placeholder="Deadline" value="${esc(o.deadline||'')}"><input id="rhEditContractType_${esc(o.id)}" placeholder="Contract type" value="${esc(o.contract_type||'')}"></div>
++<div class="row"><input id="rhEditLocation_${esc(o.id)}" placeholder="Location/timezone" value="${esc(o.location_timezone||'')}"><input id="rhEditUrgency_${esc(o.id)}" placeholder="Urgency" value="${esc(o.urgency||'')}"></div>
++<div class="actions"><button class="rhEditSave" data-id="${esc(o.id)}">Save changes</button><button class="secondary rhEditCancel" data-id="${esc(o.id)}">Cancel</button></div>
++</div>`:''}
+ <div class="contrib"><b>Qualification:</b> ${q?`fit ${q.fit_score}/100, budget ${esc(q.budget_quality)}, <b>${esc(q.recommendation)}</b>, price ${esc(q.suggested_price)}, timeline ${esc(q.suggested_timeline)}${q.risk_flags?`, risks: ${esc(q.risk_flags)}`:''}`:'not qualified yet'}</div>
+ <div class="actions">
++<button class="secondary rhEditToggle" data-id="${esc(o.id)}">${rhEditId===o.id?'Hide edit':'Edit'}</button>
+ ${!q?`<button class="rhQualify" data-id="${esc(o.id)}">Qualify</button>`:''}
+ ${RH_STAGES.map(s=>`<button class="secondary rhStageBtn" data-id="${esc(o.id)}" data-stage="${s}">${s}</button>`).join('')}
+ ${o.stage!=='Won'&&o.stage!=='Lost'?`<button class="rhWon" data-id="${esc(o.id)}">Won</button><button class="danger rhLost" data-id="${esc(o.id)}">Lost</button>`:''}
+@@ -504,7 +526,7 @@ async function loadRhClients(){const d=await api('/api/rh/opportunities');const
+ const rows=Object.entries(byClient);
+ $('rhClientsList').innerHTML=rows.length?rows.map(([client,opps])=>{const won=opps.filter(o=>o.stage==='Won');const revenue=won.reduce((sum,o)=>sum+(o.final_price||0),0);return `<div class="item"><h3>${esc(client)}</h3><div class="meta"><span>${opps.length} opportunit${opps.length===1?'y':'ies'}</span><span>${won.length} won</span><span>$${revenue} revenue</span></div></div>`}).join(''):'<div class="empty">No clients yet.</div>'}
+ async function loadRhActiveJobs(){const d=await api('/api/rh/active-jobs');renderRhActiveJobs(d.items||[])}
+-function renderRhActiveJobs(items){$('rhActiveJobsList').innerHTML=items.length?items.map(j=>`<div class="item"><h3>Active Job ${esc(j.id)}</h3><div class="meta"><span>${esc(j.handoff_status)}</span>${j.mission_id?`<span>mission ${esc(j.mission_id)}</span>`:''}</div>${j.handoff_status!=='HANDED_OFF'?`<div class="form"><input class="rhRepoInput" data-id="${esc(j.id)}" placeholder="Local git repository path for the target job"><div class="actions"><button class="secondary rhHandoff" data-id="${esc(j.id)}">Trigger Falguna handoff</button></div></div>`:''}</div>`).join(''):'<div class="empty">No Active Jobs yet -- create one from a Won opportunity.</div>';
++function renderRhActiveJobs(items){$('rhActiveJobsList').innerHTML=items.length?items.map(j=>{let p={};try{p=JSON.parse(j.job_payload_json||'{}')}catch(e){}return `<div class="item"><h3>${esc(p.title||('Active Job '+j.id))}</h3><div class="meta"><span>${esc(j.handoff_status)}</span>${j.mission_id?`<span>mission ${esc(j.mission_id)}</span>`:''}${p.client_name?`<span>${esc(p.client_name)}</span>`:''}${p.price!=null?`<span>$${esc(String(p.price))}</span>`:''}${p.deadline?`<span>due ${esc(p.deadline)}</span>`:''}</div>${p.requirement?`<div class="contrib"><b>Scope:</b> ${esc(p.requirement)}</div>`:''}${p.deliverables?`<div class="contrib"><b>Deliverables:</b> ${esc(p.deliverables)}</div>`:''}${p.notes?`<div class="contrib"><b>Notes:</b> ${esc(p.notes)}</div>`:''}${j.handoff_status!=='HANDED_OFF'?`<div class="form"><input class="rhRepoInput" data-id="${esc(j.id)}" placeholder="Local git repository path for the target job"><div class="actions"><button class="secondary rhHandoff" data-id="${esc(j.id)}">Trigger Falguna handoff</button></div></div>`:''}</div>`}).join(''):'<div class="empty">No Active Jobs yet -- create one from a Won opportunity.</div>';
+ document.querySelectorAll('.rhHandoff').forEach(b=>b.onclick=async()=>{const repo=document.querySelector(`.rhRepoInput[data-id="${b.dataset.id}"]`).value.trim();if(!repo)return alert('Enter the target repository path first.');try{await api(`/api/rh/active-jobs/${b.dataset.id}/handoff`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repository:repo})});await loadRhActiveJobs()}catch(e){alert(e.message)}})}
+ async function loadRhRevenue(){const a=await api('/api/rh/analytics');$('rhAnalytics').innerHTML=`<div class="item"><div class="meta">
+ <span>Added: ${a.opportunities_added}</span><span>Qualified: ${a.qualified}</span><span>Proposals: ${a.proposals_created}</span><span>Sent: ${a.proposals_sent}</span>
+diff --git a/falguna/revenue_hunter.py b/falguna/revenue_hunter.py
+index 4fadf76..d438099 100644
+--- a/falguna/revenue_hunter.py
++++ b/falguna/revenue_hunter.py
+@@ -663,14 +663,44 @@ class ActiveJobStore:
+             raise ActiveJobError("opportunity not found")
+         if opportunity["stage"] != "Won":
+             raise ActiveJobError("opportunity must be marked Won before an Active Job can be created")
++        # QA finding (independent verification pass): calling this twice for
++        # the same opportunity (e.g. a double click, or Won being triggered
++        # again) used to create a second, independent rh_active_jobs row --
++        # the checklist explicitly calls out that duplicate Won actions must
++        # not create duplicate jobs. This is idempotent: an opportunity that
++        # already has an Active Job returns that same job's id rather than
++        # creating another one.
++        existing = self.store.list("rh_active_jobs", "opportunity_id=?", (opportunity_id,))
++        if existing:
++            return existing[-1]["id"]
+         approved_proposals = self.store.list("rh_proposals", "opportunity_id=? AND status=?", (opportunity_id, "APPROVED"))
+         requirement = approved_proposals[-1]["content"] if approved_proposals else (opportunity.get("description") or opportunity["title"])
++        # QA finding (independent verification pass): the job payload used to
++        # carry only title/requirement/client/price -- the deadline, and any
++        # deliverables/notes context the opportunity had, were silently
++        # dropped on the Won -> Active Job transition even though they were
++        # already sitting on the opportunity record. Nothing here is
++        # fabricated: deadline comes straight from the opportunity's own
++        # field, deliverables is the real approved-proposal scope when one
++        # exists (there is no separate structured deliverables list in
++        # Revenue Hunter yet, so this is honestly None rather than invented
++        # when no proposal was approved), and notes summarizes only the
++        # free-text context fields the opportunity actually has.
++        note_parts = [
++            f"urgency: {opportunity['urgency']}" if opportunity.get("urgency") else None,
++            f"contract type: {opportunity['contract_type']}" if opportunity.get("contract_type") else None,
++            f"location/timezone: {opportunity['location_timezone']}" if opportunity.get("location_timezone") else None,
++        ]
++        notes = "; ".join(p for p in note_parts if p) or None
+         payload = {
+             "title": opportunity["title"],
+             "requirement": requirement,
+             "source_opportunity_id": opportunity_id,
+             "client_name": opportunity.get("client_name"),
+             "price": opportunity.get("final_price"),
++            "deadline": opportunity.get("deadline"),
++            "deliverables": approved_proposals[-1]["content"] if approved_proposals else None,
++            "notes": notes,
+         }
+         now = utcnow()
+         job_id = self.store.create("rh_active_jobs", {
+diff --git a/falguna/ttt_hq.py b/falguna/ttt_hq.py
+index 99ae78e..e607d82 100644
+--- a/falguna/ttt_hq.py
++++ b/falguna/ttt_hq.py
+@@ -34,6 +34,9 @@ NEEDS_ARYAN_KINDS = {
+     "outreach_approval", "negotiation_response_approval",
+ }
+ NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
++# A run in one of these statuses cannot become actionable again through
++# Falguna Engineering's own resume path -- it is dead, not merely paused.
++TERMINAL_RUN_STATUSES = {"FAILED", "DONE_CANDIDATE", "CANCELLED", "QUARANTINED"}
+ 
+ 
+ class BoardroomStore:
+@@ -256,6 +259,20 @@ class NeedsAryanQueue:
+             requirement = self.store.get("requirements", task["requirement_id"]) if task else None
+             mission = self.store.get("missions", requirement["mission_id"]) if requirement else None
+             pending_merge = self.store.list("approvals", "run_id=? AND kind=? AND status=?", (run["id"], "PROTECTED_BRANCH_MERGE", "PENDING"))
++            if not pending_merge and run["status"] in TERMINAL_RUN_STATUSES:
++                # QA finding (independent verification pass): a run that has
++                # already terminally FAILED/DONE_CANDIDATE/CANCELLED/
++                # QUARANTINED, with no pending merge decision, can never
++                # become actionable again -- Falguna Engineering's own resume
++                # path is the only thing that would change its
++                # supervisor_state, and a dead run is never resumed. Before
++                # this fix such a run stayed in this "pending" list forever,
++                # permanently cluttering Needs Aryan with nothing anyone can
++                # do about it. This only changes what is *listed* here --
++                # nothing is deleted, and supervisor_states/runs/audit are
++                # completely untouched, so the real history stays intact and
++                # inspectable directly in Falguna Engineering.
++                continue
+             items.append({
+                 "id": f"run:{run['id']}",
+                 "kind": "final_delivery_approval" if pending_merge else "risky_action",
+diff --git a/tests/test_revenue_hunter.py b/tests/test_revenue_hunter.py
+index 695b83b..4b2882d 100644
+--- a/tests/test_revenue_hunter.py
++++ b/tests/test_revenue_hunter.py
+@@ -233,6 +233,64 @@ class OpportunityLifecycleTests(_RepoCase):
+         self.assertEqual(len(self.store.list("missions")), before, "an invalid handoff must never create a partial/fake mission")
+         self.assertEqual(jobs.get(job_id)["handoff_status"], "PENDING")
+ 
++    def test_active_job_payload_carries_deadline_deliverables_and_notes(self):
++        # QA finding (independent verification pass): the item 6 checklist
++        # ("client; opportunity; scope; price; deadline; deliverables;
++        # notes") caught that deadline/deliverables/notes were silently
++        # dropped on Won -> Active Job even though the opportunity already
++        # had some of this data.
++        opportunities = OpportunityStore(self.store, self.audit)
++        opportunity_id = opportunities.create({
++            "title": "Deadline test job", "client_name": "Acme", "deadline": "2026-12-01",
++            "urgency": "high", "contract_type": "fixed", "location_timezone": "PST",
++        }, source="manual")
++        needs_aryan = NeedsAryanQueue(self.store, self.audit, self.control)
++        proposal_result = ProposalStore(self.store, self.audit, needs_aryan).generate(opportunity_id, "short")
++        from falguna.revenue_hunter import apply_decision_side_effect
++        item = self.store.get("needs_aryan_items", proposal_result["needs_aryan_id"])
++        needs_aryan.decide(proposal_result["needs_aryan_id"], "approve", "Aryan")
++        apply_decision_side_effect(self.store, self.audit, dict(item), "APPROVED", "Aryan")
++        opportunities.mark_won(opportunity_id, "Aryan", final_price=500)
++
++        jobs = ActiveJobStore(self.store, self.audit)
++        job_id = jobs.create_from_won_opportunity(opportunity_id)
++        payload = json.loads(jobs.get(job_id)["job_payload_json"])
++        self.assertEqual(payload["client_name"], "Acme")
++        self.assertEqual(payload["source_opportunity_id"], opportunity_id)
++        self.assertEqual(payload["price"], 500)
++        self.assertEqual(payload["deadline"], "2026-12-01")
++        self.assertIsNotNone(payload["deliverables"], "an approved proposal exists -- deliverables must not be dropped")
++        self.assertIn("high", payload["notes"])
++        self.assertIn("fixed", payload["notes"])
++        self.assertIn("PST", payload["notes"])
++
++    def test_active_job_payload_leaves_deliverables_and_notes_honestly_empty_when_absent(self):
++        # The fix above must not fabricate data that doesn't exist.
++        opportunities = OpportunityStore(self.store, self.audit)
++        opportunity_id = opportunities.create({"title": "No extra context"}, source="manual")
++        opportunities.mark_won(opportunity_id, "Aryan")
++        jobs = ActiveJobStore(self.store, self.audit)
++        job_id = jobs.create_from_won_opportunity(opportunity_id)
++        payload = json.loads(jobs.get(job_id)["job_payload_json"])
++        self.assertIsNone(payload["deadline"])
++        self.assertIsNone(payload["deliverables"], "no approved proposal exists -- must not invent one")
++        self.assertIsNone(payload["notes"])
++
++    def test_duplicate_won_actions_do_not_create_duplicate_active_jobs(self):
++        # QA finding (independent verification pass): checklist item 6
++        # explicitly requires this. Calling create_from_won_opportunity
++        # twice for the same opportunity must return the SAME job, not a
++        # second independent row.
++        opportunities = OpportunityStore(self.store, self.audit)
++        opportunity_id = opportunities.create({"title": "Dup job test"}, source="manual")
++        opportunities.mark_won(opportunity_id, "Aryan")
++        jobs = ActiveJobStore(self.store, self.audit)
++        job_id_1 = jobs.create_from_won_opportunity(opportunity_id)
++        job_id_2 = jobs.create_from_won_opportunity(opportunity_id)
++        self.assertEqual(job_id_1, job_id_2, "a second call must return the existing job, not create a new one")
++        all_jobs = self.store.list("rh_active_jobs", "opportunity_id=?", (opportunity_id,))
++        self.assertEqual(len(all_jobs), 1)
++
+     def test_active_job_requires_won_stage(self):
+         opportunities = OpportunityStore(self.store, self.audit)
+         opportunity_id = opportunities.create({"title": "Not won yet"}, source="manual")
+@@ -258,6 +316,38 @@ class OpportunityLifecycleTests(_RepoCase):
+         with self.assertRaises(ValueError):
+             followups.mark_sent(followup_id, "Aryan")  # cannot double-send
+ 
++    def test_update_edits_allowed_fields_and_persists(self):
++        # QA regression: OpportunityStore.update() existed but was never wired
++        # to an HTTP route, so opportunity editing shipped completely broken.
++        opportunities = OpportunityStore(self.store, self.audit)
++        opportunity_id = opportunities.create({"title": "Original title", "budget_rate": "$1000"}, source="manual")
++        updated = opportunities.update(opportunity_id, "Aryan", title="New title", budget_rate="$1500", client_name="New Client")
++        self.assertEqual(updated["title"], "New title")
++        self.assertEqual(updated["budget_rate"], "$1500")
++        self.assertEqual(updated["client_name"], "New Client")
++        # Re-fetching independently must show the same persisted values, not
++        # just the value handed back from update() itself.
++        refetched = opportunities.get(opportunity_id)
++        self.assertEqual(refetched["title"], "New title")
++        self.assertEqual(refetched["budget_rate"], "$1500")
++
++    def test_update_rejects_unknown_fields(self):
++        opportunities = OpportunityStore(self.store, self.audit)
++        opportunity_id = opportunities.create({"title": "T"}, source="manual")
++        with self.assertRaises(OpportunityError):
++            opportunities.update(opportunity_id, "Aryan", stage="Won")
++
++    def test_update_rejects_blank_title(self):
++        opportunities = OpportunityStore(self.store, self.audit)
++        opportunity_id = opportunities.create({"title": "T"}, source="manual")
++        with self.assertRaises(OpportunityError):
++            opportunities.update(opportunity_id, "Aryan", title="   ")
++
++    def test_update_raises_for_unknown_opportunity(self):
++        opportunities = OpportunityStore(self.store, self.audit)
++        with self.assertRaises(OpportunityError):
++            opportunities.update("does-not-exist", "Aryan", title="X")
++
+     def test_opportunity_and_qualification_survive_a_simulated_restart(self):
+         opportunities = OpportunityStore(self.store, self.audit)
+         opportunity_id = opportunities.create({"title": "Restart check", "description": "React app.", "required_skills": "React", "budget_rate": "$1000"}, source="manual")
+@@ -465,6 +555,51 @@ class RevenueHunterHttpTests(_LiveHQServerCase):
+             self.assertIn(label, html)
+         self.assertNotIn('data-view="rhOpportunities" disabled', html)
+ 
++    def test_edit_route_persists_changes_via_real_http(self):
++        # QA regression: POST /api/rh/opportunities/<id> (bare, no action
++        # suffix) previously returned 404 and did nothing -- edits never
++        # reached OpportunityStore.update() at all.
++        status, out = self._post("/api/rh/opportunities", {"import_mode": "manual", "title": "Original", "budget_rate": "$3200"})
++        self.assertEqual(status, 201)
++        opportunity_id = out["opportunity_id"]
++
++        status, updated = self._post(f"/api/rh/opportunities/{opportunity_id}", {"budget_rate": "$3500", "client_name": "Aurelia Studio"})
++        self.assertEqual(status, 200)
++        self.assertEqual(updated["budget_rate"], "$3500")
++        self.assertEqual(updated["client_name"], "Aurelia Studio")
++
++        status, opp = self._get(f"/api/rh/opportunities/{opportunity_id}")
++        self.assertEqual(status, 200)
++        self.assertEqual(opp["budget_rate"], "$3500", "the edit must actually persist, not just echo back")
++        self.assertEqual(opp["client_name"], "Aurelia Studio")
++
++        # Must not collide with the action-suffixed routes: qualify still works.
++        status, qual = self._post(f"/api/rh/opportunities/{opportunity_id}/qualify", {})
++        self.assertEqual(status, 201)
++
++        result = self._post_raises(f"/api/rh/opportunities/{opportunity_id}", {"stage": "Won"})
++        self.assertEqual(result[0], 400, "editing an unknown/disallowed field must be rejected, not silently accepted")
++
++    def test_active_jobs_list_route_exposes_full_payload_for_the_ui(self):
++        # UI check finding: the Active Jobs card only ever showed the job id
++        # and handoff status -- client/price/deadline/scope/deliverables/
++        # notes were computed and stored but never reached the UI. Confirm
++        # the list route returns job_payload_json so the UI can parse it.
++        status, out = self._post("/api/rh/opportunities", {"import_mode": "manual", "title": "UI payload check", "client_name": "Acme", "deadline": "2026-11-01"})
++        self.assertEqual(status, 201)
++        opportunity_id = out["opportunity_id"]
++        self._post(f"/api/rh/opportunities/{opportunity_id}/won", {"final_price": 750})
++        status, job = self._post(f"/api/rh/opportunities/{opportunity_id}/active-job", {})
++        self.assertEqual(status, 201)
++
++        status, jobs = self._get("/api/rh/active-jobs")
++        self.assertEqual(status, 200)
++        found = [j for j in jobs["items"] if j["id"] == job["active_job_id"]][0]
++        payload = json.loads(found["job_payload_json"])
++        self.assertEqual(payload["client_name"], "Acme")
++        self.assertEqual(payload["price"], 750)
++        self.assertEqual(payload["deadline"], "2026-11-01")
++
+     def test_needs_aryan_new_kinds_are_accepted(self):
+         for kind in ("outreach_approval", "negotiation_response_approval"):
+             status, out = self._post("/api/needs-aryan", {"kind": kind, "title": "T", "what_is_needed": "W"})
+diff --git a/tests/test_ttt_hq.py b/tests/test_ttt_hq.py
+index 355885d..190436f 100644
+--- a/tests/test_ttt_hq.py
++++ b/tests/test_ttt_hq.py
+@@ -199,12 +199,43 @@ class TTTHQTests(unittest.TestCase):
+         remaining = [i for i in queue.list_pending() if i["id"] == f"run:{run_id}"]
+         self.assertEqual(remaining, [], "a decided run must not linger in the pending queue")
+ 
+-    def _seed_run_needing_approval(self, category: str) -> str:
++    def test_needs_aryan_excludes_a_run_that_has_already_terminally_failed(self):
++        # QA regression: found on the real production database during an
++        # independent verification pass -- a run whose supervisor_state was
++        # never cleaned up after the run itself moved to a terminal status
++        # (with no pending merge decision) stayed in this queue forever,
++        # showing as "pending" when there was nothing anyone could ever do
++        # about it. Nothing about the run/supervisor_state/audit trail
++        # changes here -- only whether it's *listed* as pending.
++        audit = AuditLog(self.state_dir / "audit.jsonl")
++        queue = NeedsAryanQueue(self.store, audit, control=self.control)
++        for terminal_status in ("FAILED", "DONE_CANDIDATE", "CANCELLED", "QUARANTINED"):
++            run_id = self._seed_run_needing_approval(category="VERIFICATION_FAILURE", run_status=terminal_status)
++            pending = queue.list_pending()
++            self.assertFalse(
++                any(item["id"] == f"run:{run_id}" for item in pending),
++                f"a {terminal_status} run with no pending merge must not clutter the Needs Aryan queue",
++            )
++
++    def test_needs_aryan_still_surfaces_a_non_terminal_run_with_no_pending_merge(self):
++        # The fix above must not become overly broad: a run that is simply
++        # not yet at the merge gate (e.g. still AWAITING_APPROVAL) is real,
++        # active, unresolved work and must keep showing up as inspect-only,
++        # exactly as test_needs_aryan_surfaces_engineering_mission_as_inspect_only_when_not_at_merge_gate
++        # already covers for one status -- this checks PAUSED too, since
++        # Falguna Engineering treats paused runs as resumable, not dead.
++        audit = AuditLog(self.state_dir / "audit.jsonl")
++        queue = NeedsAryanQueue(self.store, audit, control=self.control)
++        run_id = self._seed_run_needing_approval(category="SCOPE_EXPANSION", run_status="PAUSED")
++        pending = queue.list_pending()
++        self.assertTrue(any(item["id"] == f"run:{run_id}" for item in pending), "a resumable PAUSED run must still surface")
++
++    def _seed_run_needing_approval(self, category: str, run_status: str = "AWAITING_APPROVAL") -> str:
+         mission_id = self.control.create_mission("Seed mission", "Seed requirement", self.repo, RunPolicy())["mission_id"]
+         requirement_id = self.store.list("requirements", "mission_id=?", (mission_id,))[0]["id"]
+         task_id = self.store.list("tasks", "requirement_id=?", (requirement_id,))[0]["id"]
+         run_id = self.store.create("runs", {
+-            "task_id": task_id, "status": "AWAITING_APPROVAL", "attempt": 1, "worker": "test", "model": "test",
++            "task_id": task_id, "status": run_status, "attempt": 1, "worker": "test", "model": "test",
+             "worktree": None, "head_sha": None, "error": None, "created_at": "2026-01-01T00:00:00+00:00",
+             "updated_at": "2026-01-01T00:00:00+00:00",
+         })

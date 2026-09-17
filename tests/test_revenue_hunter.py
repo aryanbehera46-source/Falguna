@@ -233,6 +233,64 @@ class OpportunityLifecycleTests(_RepoCase):
         self.assertEqual(len(self.store.list("missions")), before, "an invalid handoff must never create a partial/fake mission")
         self.assertEqual(jobs.get(job_id)["handoff_status"], "PENDING")
 
+    def test_active_job_payload_carries_deadline_deliverables_and_notes(self):
+        # QA finding (independent verification pass): the item 6 checklist
+        # ("client; opportunity; scope; price; deadline; deliverables;
+        # notes") caught that deadline/deliverables/notes were silently
+        # dropped on Won -> Active Job even though the opportunity already
+        # had some of this data.
+        opportunities = OpportunityStore(self.store, self.audit)
+        opportunity_id = opportunities.create({
+            "title": "Deadline test job", "client_name": "Acme", "deadline": "2026-12-01",
+            "urgency": "high", "contract_type": "fixed", "location_timezone": "PST",
+        }, source="manual")
+        needs_aryan = NeedsAryanQueue(self.store, self.audit, self.control)
+        proposal_result = ProposalStore(self.store, self.audit, needs_aryan).generate(opportunity_id, "short")
+        from falguna.revenue_hunter import apply_decision_side_effect
+        item = self.store.get("needs_aryan_items", proposal_result["needs_aryan_id"])
+        needs_aryan.decide(proposal_result["needs_aryan_id"], "approve", "Aryan")
+        apply_decision_side_effect(self.store, self.audit, dict(item), "APPROVED", "Aryan")
+        opportunities.mark_won(opportunity_id, "Aryan", final_price=500)
+
+        jobs = ActiveJobStore(self.store, self.audit)
+        job_id = jobs.create_from_won_opportunity(opportunity_id)
+        payload = json.loads(jobs.get(job_id)["job_payload_json"])
+        self.assertEqual(payload["client_name"], "Acme")
+        self.assertEqual(payload["source_opportunity_id"], opportunity_id)
+        self.assertEqual(payload["price"], 500)
+        self.assertEqual(payload["deadline"], "2026-12-01")
+        self.assertIsNotNone(payload["deliverables"], "an approved proposal exists -- deliverables must not be dropped")
+        self.assertIn("high", payload["notes"])
+        self.assertIn("fixed", payload["notes"])
+        self.assertIn("PST", payload["notes"])
+
+    def test_active_job_payload_leaves_deliverables_and_notes_honestly_empty_when_absent(self):
+        # The fix above must not fabricate data that doesn't exist.
+        opportunities = OpportunityStore(self.store, self.audit)
+        opportunity_id = opportunities.create({"title": "No extra context"}, source="manual")
+        opportunities.mark_won(opportunity_id, "Aryan")
+        jobs = ActiveJobStore(self.store, self.audit)
+        job_id = jobs.create_from_won_opportunity(opportunity_id)
+        payload = json.loads(jobs.get(job_id)["job_payload_json"])
+        self.assertIsNone(payload["deadline"])
+        self.assertIsNone(payload["deliverables"], "no approved proposal exists -- must not invent one")
+        self.assertIsNone(payload["notes"])
+
+    def test_duplicate_won_actions_do_not_create_duplicate_active_jobs(self):
+        # QA finding (independent verification pass): checklist item 6
+        # explicitly requires this. Calling create_from_won_opportunity
+        # twice for the same opportunity must return the SAME job, not a
+        # second independent row.
+        opportunities = OpportunityStore(self.store, self.audit)
+        opportunity_id = opportunities.create({"title": "Dup job test"}, source="manual")
+        opportunities.mark_won(opportunity_id, "Aryan")
+        jobs = ActiveJobStore(self.store, self.audit)
+        job_id_1 = jobs.create_from_won_opportunity(opportunity_id)
+        job_id_2 = jobs.create_from_won_opportunity(opportunity_id)
+        self.assertEqual(job_id_1, job_id_2, "a second call must return the existing job, not create a new one")
+        all_jobs = self.store.list("rh_active_jobs", "opportunity_id=?", (opportunity_id,))
+        self.assertEqual(len(all_jobs), 1)
+
     def test_active_job_requires_won_stage(self):
         opportunities = OpportunityStore(self.store, self.audit)
         opportunity_id = opportunities.create({"title": "Not won yet"}, source="manual")
@@ -257,6 +315,38 @@ class OpportunityLifecycleTests(_RepoCase):
         self.assertEqual(self.store.get("rh_followups", followup_id)["status"], "SENT")
         with self.assertRaises(ValueError):
             followups.mark_sent(followup_id, "Aryan")  # cannot double-send
+
+    def test_update_edits_allowed_fields_and_persists(self):
+        # QA regression: OpportunityStore.update() existed but was never wired
+        # to an HTTP route, so opportunity editing shipped completely broken.
+        opportunities = OpportunityStore(self.store, self.audit)
+        opportunity_id = opportunities.create({"title": "Original title", "budget_rate": "$1000"}, source="manual")
+        updated = opportunities.update(opportunity_id, "Aryan", title="New title", budget_rate="$1500", client_name="New Client")
+        self.assertEqual(updated["title"], "New title")
+        self.assertEqual(updated["budget_rate"], "$1500")
+        self.assertEqual(updated["client_name"], "New Client")
+        # Re-fetching independently must show the same persisted values, not
+        # just the value handed back from update() itself.
+        refetched = opportunities.get(opportunity_id)
+        self.assertEqual(refetched["title"], "New title")
+        self.assertEqual(refetched["budget_rate"], "$1500")
+
+    def test_update_rejects_unknown_fields(self):
+        opportunities = OpportunityStore(self.store, self.audit)
+        opportunity_id = opportunities.create({"title": "T"}, source="manual")
+        with self.assertRaises(OpportunityError):
+            opportunities.update(opportunity_id, "Aryan", stage="Won")
+
+    def test_update_rejects_blank_title(self):
+        opportunities = OpportunityStore(self.store, self.audit)
+        opportunity_id = opportunities.create({"title": "T"}, source="manual")
+        with self.assertRaises(OpportunityError):
+            opportunities.update(opportunity_id, "Aryan", title="   ")
+
+    def test_update_raises_for_unknown_opportunity(self):
+        opportunities = OpportunityStore(self.store, self.audit)
+        with self.assertRaises(OpportunityError):
+            opportunities.update("does-not-exist", "Aryan", title="X")
 
     def test_opportunity_and_qualification_survive_a_simulated_restart(self):
         opportunities = OpportunityStore(self.store, self.audit)
@@ -464,6 +554,51 @@ class RevenueHunterHttpTests(_LiveHQServerCase):
         for label in ("Today", "Opportunities", "Sales Pipeline", "Clients", "Active Jobs", "Revenue"):
             self.assertIn(label, html)
         self.assertNotIn('data-view="rhOpportunities" disabled', html)
+
+    def test_edit_route_persists_changes_via_real_http(self):
+        # QA regression: POST /api/rh/opportunities/<id> (bare, no action
+        # suffix) previously returned 404 and did nothing -- edits never
+        # reached OpportunityStore.update() at all.
+        status, out = self._post("/api/rh/opportunities", {"import_mode": "manual", "title": "Original", "budget_rate": "$3200"})
+        self.assertEqual(status, 201)
+        opportunity_id = out["opportunity_id"]
+
+        status, updated = self._post(f"/api/rh/opportunities/{opportunity_id}", {"budget_rate": "$3500", "client_name": "Aurelia Studio"})
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["budget_rate"], "$3500")
+        self.assertEqual(updated["client_name"], "Aurelia Studio")
+
+        status, opp = self._get(f"/api/rh/opportunities/{opportunity_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(opp["budget_rate"], "$3500", "the edit must actually persist, not just echo back")
+        self.assertEqual(opp["client_name"], "Aurelia Studio")
+
+        # Must not collide with the action-suffixed routes: qualify still works.
+        status, qual = self._post(f"/api/rh/opportunities/{opportunity_id}/qualify", {})
+        self.assertEqual(status, 201)
+
+        result = self._post_raises(f"/api/rh/opportunities/{opportunity_id}", {"stage": "Won"})
+        self.assertEqual(result[0], 400, "editing an unknown/disallowed field must be rejected, not silently accepted")
+
+    def test_active_jobs_list_route_exposes_full_payload_for_the_ui(self):
+        # UI check finding: the Active Jobs card only ever showed the job id
+        # and handoff status -- client/price/deadline/scope/deliverables/
+        # notes were computed and stored but never reached the UI. Confirm
+        # the list route returns job_payload_json so the UI can parse it.
+        status, out = self._post("/api/rh/opportunities", {"import_mode": "manual", "title": "UI payload check", "client_name": "Acme", "deadline": "2026-11-01"})
+        self.assertEqual(status, 201)
+        opportunity_id = out["opportunity_id"]
+        self._post(f"/api/rh/opportunities/{opportunity_id}/won", {"final_price": 750})
+        status, job = self._post(f"/api/rh/opportunities/{opportunity_id}/active-job", {})
+        self.assertEqual(status, 201)
+
+        status, jobs = self._get("/api/rh/active-jobs")
+        self.assertEqual(status, 200)
+        found = [j for j in jobs["items"] if j["id"] == job["active_job_id"]][0]
+        payload = json.loads(found["job_payload_json"])
+        self.assertEqual(payload["client_name"], "Acme")
+        self.assertEqual(payload["price"], 750)
+        self.assertEqual(payload["deadline"], "2026-11-01")
 
     def test_needs_aryan_new_kinds_are_accepted(self):
         for kind in ("outreach_approval", "negotiation_response_approval"):

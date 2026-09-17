@@ -34,6 +34,9 @@ NEEDS_ARYAN_KINDS = {
     "outreach_approval", "negotiation_response_approval",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
+# A run in one of these statuses cannot become actionable again through
+# Falguna Engineering's own resume path -- it is dead, not merely paused.
+TERMINAL_RUN_STATUSES = {"FAILED", "DONE_CANDIDATE", "CANCELLED", "QUARANTINED"}
 
 
 class BoardroomStore:
@@ -256,6 +259,20 @@ class NeedsAryanQueue:
             requirement = self.store.get("requirements", task["requirement_id"]) if task else None
             mission = self.store.get("missions", requirement["mission_id"]) if requirement else None
             pending_merge = self.store.list("approvals", "run_id=? AND kind=? AND status=?", (run["id"], "PROTECTED_BRANCH_MERGE", "PENDING"))
+            if not pending_merge and run["status"] in TERMINAL_RUN_STATUSES:
+                # QA finding (independent verification pass): a run that has
+                # already terminally FAILED/DONE_CANDIDATE/CANCELLED/
+                # QUARANTINED, with no pending merge decision, can never
+                # become actionable again -- Falguna Engineering's own resume
+                # path is the only thing that would change its
+                # supervisor_state, and a dead run is never resumed. Before
+                # this fix such a run stayed in this "pending" list forever,
+                # permanently cluttering Needs Aryan with nothing anyone can
+                # do about it. This only changes what is *listed* here --
+                # nothing is deleted, and supervisor_states/runs/audit are
+                # completely untouched, so the real history stays intact and
+                # inspectable directly in Falguna Engineering.
+                continue
             items.append({
                 "id": f"run:{run['id']}",
                 "kind": "final_delivery_approval" if pending_merge else "risky_action",

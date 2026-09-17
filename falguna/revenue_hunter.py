@@ -663,14 +663,44 @@ class ActiveJobStore:
             raise ActiveJobError("opportunity not found")
         if opportunity["stage"] != "Won":
             raise ActiveJobError("opportunity must be marked Won before an Active Job can be created")
+        # QA finding (independent verification pass): calling this twice for
+        # the same opportunity (e.g. a double click, or Won being triggered
+        # again) used to create a second, independent rh_active_jobs row --
+        # the checklist explicitly calls out that duplicate Won actions must
+        # not create duplicate jobs. This is idempotent: an opportunity that
+        # already has an Active Job returns that same job's id rather than
+        # creating another one.
+        existing = self.store.list("rh_active_jobs", "opportunity_id=?", (opportunity_id,))
+        if existing:
+            return existing[-1]["id"]
         approved_proposals = self.store.list("rh_proposals", "opportunity_id=? AND status=?", (opportunity_id, "APPROVED"))
         requirement = approved_proposals[-1]["content"] if approved_proposals else (opportunity.get("description") or opportunity["title"])
+        # QA finding (independent verification pass): the job payload used to
+        # carry only title/requirement/client/price -- the deadline, and any
+        # deliverables/notes context the opportunity had, were silently
+        # dropped on the Won -> Active Job transition even though they were
+        # already sitting on the opportunity record. Nothing here is
+        # fabricated: deadline comes straight from the opportunity's own
+        # field, deliverables is the real approved-proposal scope when one
+        # exists (there is no separate structured deliverables list in
+        # Revenue Hunter yet, so this is honestly None rather than invented
+        # when no proposal was approved), and notes summarizes only the
+        # free-text context fields the opportunity actually has.
+        note_parts = [
+            f"urgency: {opportunity['urgency']}" if opportunity.get("urgency") else None,
+            f"contract type: {opportunity['contract_type']}" if opportunity.get("contract_type") else None,
+            f"location/timezone: {opportunity['location_timezone']}" if opportunity.get("location_timezone") else None,
+        ]
+        notes = "; ".join(p for p in note_parts if p) or None
         payload = {
             "title": opportunity["title"],
             "requirement": requirement,
             "source_opportunity_id": opportunity_id,
             "client_name": opportunity.get("client_name"),
             "price": opportunity.get("final_price"),
+            "deadline": opportunity.get("deadline"),
+            "deliverables": approved_proposals[-1]["content"] if approved_proposals else None,
+            "notes": notes,
         }
         now = utcnow()
         job_id = self.store.create("rh_active_jobs", {

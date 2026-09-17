@@ -212,6 +212,15 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     job_id = ActiveJobStore(store, control.audit).create_from_won_opportunity(opportunity_id, actor=body.get("actor", "Aryan"))
                     return self._json({"active_job_id": job_id}, HTTPStatus.CREATED)
 
+                if path.startswith("/api/rh/opportunities/") and len(path.split("/")) == 5:
+                    # Bare edit route -- distinct from the action-suffixed routes above
+                    # (.../qualify, .../stage, .../won, ...), which all have 6 path
+                    # segments and are matched first, so they always take priority.
+                    opportunity_id = path.split("/")[4]
+                    actor = body.pop("actor", "Aryan")
+                    opportunity = OpportunityStore(store, control.audit).update(opportunity_id, actor, **body)
+                    return self._json(opportunity)
+
                 if path.startswith("/api/rh/active-jobs/") and path.endswith("/handoff"):
                     active_job_id = path.split("/")[4]
                     result = ActiveJobStore(store, control.audit).trigger_handoff(
@@ -447,6 +456,7 @@ const RH_STAGES=["New","Qualified","Proposal Ready","Applied/Sent","Replied","Me
 const PROPOSAL_KINDS=["short","detailed","upwork","email_pitch","follow_up"];
 const FOLLOWUP_KINDS=["proposal_followup","response_followup","negotiation_followup","payment_followup","repeat_business_followup"];
 let rhOpenId=null;
+let rhEditId=null;
 if($('rhStageFilter').children.length<2)RH_STAGES.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;$('rhStageFilter').appendChild(o)});
 $('rhMode').onchange=()=>{const m=$('rhMode').value;$('rhModeManual').style.display=m==='manual'?'':'none';$('rhModePasteJd').style.display=m==='paste_jd'?'':'none';$('rhModeUrl').style.display=m==='url'?'':'none';$('rhModeCsv').style.display=m==='csv_json'?'':'none'};
 $('rhStageFilter').onchange=()=>loadRhOpportunities();
@@ -463,8 +473,11 @@ async function loadRhOpportunities(){const stage=$('rhStageFilter').value;const 
 function rhCard(o){return `<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div><div class="actions"><button class="secondary rhOpen" data-id="${esc(o.id)}">Open</button></div></div>`}
 function renderRhOpportunities(items){$('rhOpportunityList').innerHTML=items.length?items.map(o=>rhOpenId===o.id?rhDetailCard(o):rhCard(o)).join(''):'<div class="empty">No opportunities yet.</div>';wireRhList()}
 function wireRhList(){
-document.querySelectorAll('.rhOpen').forEach(b=>b.onclick=async()=>{rhOpenId=b.dataset.id;await loadRhOpportunities()});
-document.querySelectorAll('.rhClose').forEach(b=>b.onclick=async()=>{rhOpenId=null;await loadRhOpportunities()});
+document.querySelectorAll('.rhOpen').forEach(b=>b.onclick=async()=>{rhOpenId=b.dataset.id;rhEditId=null;await loadRhOpportunities()});
+document.querySelectorAll('.rhClose').forEach(b=>b.onclick=async()=>{rhOpenId=null;rhEditId=null;await loadRhOpportunities()});
+document.querySelectorAll('.rhEditToggle').forEach(b=>b.onclick=async()=>{rhEditId=rhEditId===b.dataset.id?null:b.dataset.id;await loadRhOpportunities()});
+document.querySelectorAll('.rhEditCancel').forEach(b=>b.onclick=async()=>{rhEditId=null;await loadRhOpportunities()});
+document.querySelectorAll('.rhEditSave').forEach(b=>b.onclick=async()=>{const id=b.dataset.id;const title=$(`rhEditTitle_${id}`).value.trim();if(!title)return alert('Title cannot be blank.');const body={title,client_name:$(`rhEditClient_${id}`).value||null,description:$(`rhEditDescription_${id}`).value||null,budget_rate:$(`rhEditBudget_${id}`).value||null,required_skills:$(`rhEditSkills_${id}`).value||null,deadline:$(`rhEditDeadline_${id}`).value||null,contract_type:$(`rhEditContractType_${id}`).value||null,location_timezone:$(`rhEditLocation_${id}`).value||null,urgency:$(`rhEditUrgency_${id}`).value||null};try{await api(`/api/rh/opportunities/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});rhEditId=null;await loadRhOpportunities()}catch(e){alert(e.message)}});
 document.querySelectorAll('.rhQualify').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/qualify`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadRhOpportunities()}catch(e){alert(e.message)}});
 document.querySelectorAll('.rhStageBtn').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/stage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to_stage:b.dataset.stage})});await loadRhOpportunities()}catch(e){alert(e.message)}});
 document.querySelectorAll('.rhWon').forEach(b=>b.onclick=async()=>{const price=prompt('Final price (optional):');try{await api(`/api/rh/opportunities/${b.dataset.id}/won`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({final_price:price?Number(price):null})});await loadRhOpportunities()}catch(e){alert(e.message)}});
@@ -479,9 +492,18 @@ const q=o.qualification;
 return `<div class="item">
 <h3>${esc(o.title)}</h3>
 <div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div>
-${o.description?`<div>${esc(o.description)}</div>`:''}
+${o.description&&rhEditId!==o.id?`<div>${esc(o.description)}</div>`:''}
+${rhEditId===o.id?`<div class="form">
+<div class="row"><input id="rhEditTitle_${esc(o.id)}" placeholder="Title" value="${esc(o.title||'')}"><input id="rhEditClient_${esc(o.id)}" placeholder="Client name" value="${esc(o.client_name||'')}"></div>
+<textarea id="rhEditDescription_${esc(o.id)}" placeholder="Description">${esc(o.description||'')}</textarea>
+<div class="row"><input id="rhEditBudget_${esc(o.id)}" placeholder="Budget/rate" value="${esc(o.budget_rate||'')}"><input id="rhEditSkills_${esc(o.id)}" placeholder="Required skills" value="${esc(o.required_skills||'')}"></div>
+<div class="row"><input id="rhEditDeadline_${esc(o.id)}" placeholder="Deadline" value="${esc(o.deadline||'')}"><input id="rhEditContractType_${esc(o.id)}" placeholder="Contract type" value="${esc(o.contract_type||'')}"></div>
+<div class="row"><input id="rhEditLocation_${esc(o.id)}" placeholder="Location/timezone" value="${esc(o.location_timezone||'')}"><input id="rhEditUrgency_${esc(o.id)}" placeholder="Urgency" value="${esc(o.urgency||'')}"></div>
+<div class="actions"><button class="rhEditSave" data-id="${esc(o.id)}">Save changes</button><button class="secondary rhEditCancel" data-id="${esc(o.id)}">Cancel</button></div>
+</div>`:''}
 <div class="contrib"><b>Qualification:</b> ${q?`fit ${q.fit_score}/100, budget ${esc(q.budget_quality)}, <b>${esc(q.recommendation)}</b>, price ${esc(q.suggested_price)}, timeline ${esc(q.suggested_timeline)}${q.risk_flags?`, risks: ${esc(q.risk_flags)}`:''}`:'not qualified yet'}</div>
 <div class="actions">
+<button class="secondary rhEditToggle" data-id="${esc(o.id)}">${rhEditId===o.id?'Hide edit':'Edit'}</button>
 ${!q?`<button class="rhQualify" data-id="${esc(o.id)}">Qualify</button>`:''}
 ${RH_STAGES.map(s=>`<button class="secondary rhStageBtn" data-id="${esc(o.id)}" data-stage="${s}">${s}</button>`).join('')}
 ${o.stage!=='Won'&&o.stage!=='Lost'?`<button class="rhWon" data-id="${esc(o.id)}">Won</button><button class="danger rhLost" data-id="${esc(o.id)}">Lost</button>`:''}
@@ -504,7 +526,7 @@ async function loadRhClients(){const d=await api('/api/rh/opportunities');const 
 const rows=Object.entries(byClient);
 $('rhClientsList').innerHTML=rows.length?rows.map(([client,opps])=>{const won=opps.filter(o=>o.stage==='Won');const revenue=won.reduce((sum,o)=>sum+(o.final_price||0),0);return `<div class="item"><h3>${esc(client)}</h3><div class="meta"><span>${opps.length} opportunit${opps.length===1?'y':'ies'}</span><span>${won.length} won</span><span>$${revenue} revenue</span></div></div>`}).join(''):'<div class="empty">No clients yet.</div>'}
 async function loadRhActiveJobs(){const d=await api('/api/rh/active-jobs');renderRhActiveJobs(d.items||[])}
-function renderRhActiveJobs(items){$('rhActiveJobsList').innerHTML=items.length?items.map(j=>`<div class="item"><h3>Active Job ${esc(j.id)}</h3><div class="meta"><span>${esc(j.handoff_status)}</span>${j.mission_id?`<span>mission ${esc(j.mission_id)}</span>`:''}</div>${j.handoff_status!=='HANDED_OFF'?`<div class="form"><input class="rhRepoInput" data-id="${esc(j.id)}" placeholder="Local git repository path for the target job"><div class="actions"><button class="secondary rhHandoff" data-id="${esc(j.id)}">Trigger Falguna handoff</button></div></div>`:''}</div>`).join(''):'<div class="empty">No Active Jobs yet -- create one from a Won opportunity.</div>';
+function renderRhActiveJobs(items){$('rhActiveJobsList').innerHTML=items.length?items.map(j=>{let p={};try{p=JSON.parse(j.job_payload_json||'{}')}catch(e){}return `<div class="item"><h3>${esc(p.title||('Active Job '+j.id))}</h3><div class="meta"><span>${esc(j.handoff_status)}</span>${j.mission_id?`<span>mission ${esc(j.mission_id)}</span>`:''}${p.client_name?`<span>${esc(p.client_name)}</span>`:''}${p.price!=null?`<span>$${esc(String(p.price))}</span>`:''}${p.deadline?`<span>due ${esc(p.deadline)}</span>`:''}</div>${p.requirement?`<div class="contrib"><b>Scope:</b> ${esc(p.requirement)}</div>`:''}${p.deliverables?`<div class="contrib"><b>Deliverables:</b> ${esc(p.deliverables)}</div>`:''}${p.notes?`<div class="contrib"><b>Notes:</b> ${esc(p.notes)}</div>`:''}${j.handoff_status!=='HANDED_OFF'?`<div class="form"><input class="rhRepoInput" data-id="${esc(j.id)}" placeholder="Local git repository path for the target job"><div class="actions"><button class="secondary rhHandoff" data-id="${esc(j.id)}">Trigger Falguna handoff</button></div></div>`:''}</div>`}).join(''):'<div class="empty">No Active Jobs yet -- create one from a Won opportunity.</div>';
 document.querySelectorAll('.rhHandoff').forEach(b=>b.onclick=async()=>{const repo=document.querySelector(`.rhRepoInput[data-id="${b.dataset.id}"]`).value.trim();if(!repo)return alert('Enter the target repository path first.');try{await api(`/api/rh/active-jobs/${b.dataset.id}/handoff`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repository:repo})});await loadRhActiveJobs()}catch(e){alert(e.message)}})}
 async function loadRhRevenue(){const a=await api('/api/rh/analytics');$('rhAnalytics').innerHTML=`<div class="item"><div class="meta">
 <span>Added: ${a.opportunities_added}</span><span>Qualified: ${a.qualified}</span><span>Proposals: ${a.proposals_created}</span><span>Sent: ${a.proposals_sent}</span>
