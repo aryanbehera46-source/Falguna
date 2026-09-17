@@ -37,6 +37,11 @@ NEEDS_ARYAN_KINDS = {
     # external publish/send, and an unexpected cost -- surfaced through the
     # same queue, not a parallel approval system.
     "workforce_action_approval", "publish_approval", "cost_approval",
+    # Added for the Command Center / CEO Intelligence + Finance / Capital
+    # Engine v1: financial-control decisions that must be an owner call,
+    # never an automatic action -- see Section 18 of that phase's spec.
+    "budget_override", "capital_allocation_execution", "reserve_policy_change",
+    "financial_writeoff", "financial_refund", "large_financial_commitment", "risk_escalation",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 # A run in one of these statuses cannot become actionable again through

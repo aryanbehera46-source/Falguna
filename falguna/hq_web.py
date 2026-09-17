@@ -39,6 +39,14 @@ from .account_management import AccountManagementError, AccountManagerService
 from .analytics_growth import AnalyticsError, AnalyticsStore, GrowthAgent, GrowthExperimentStore
 from .application_executor import ApplicationExecutor, ApplicationExecutorError
 from .billing import BillingError, BillingStore, CompletionError, CompletionService, RetentionError, RetentionStore
+from .command_center import CEOBriefStore, command_center_snapshot, kpi_snapshot
+from .department_performance import ai_workforce_performance, department_performance
+from .goals import GoalError, GoalStore
+from .finance_ledger import LedgerError, LedgerStore, cash_and_runway, client_profitability
+from .capital_and_risk import (
+    BudgetStore, CapitalRiskError, ReservePolicyStore, RiskRegisterStore,
+    allowed_experimental_capital, budget_status, recommend_allocation,
+)
 from .conversations import ConversationError, ConversationStore
 from .documents import DocumentError, DocumentStore
 from .email_admin import EmailError, EmailStore
@@ -139,6 +147,63 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 return self._json({"items": BacklogStore(store, control.audit).list_items()})
             if path == "/api/needs-aryan":
                 return self._json({"items": NeedsAryanQueue(store, control.audit, control).list_pending()})
+            if path == "/api/cc/snapshot":
+                return self._json(command_center_snapshot(store))
+            if path == "/api/cc/ceo-brief/latest":
+                brief = CEOBriefStore(store, control.audit).latest()
+                return self._json(brief or {"error": "no brief generated yet"}, HTTPStatus.OK if brief else HTTPStatus.NOT_FOUND)
+            if path == "/api/cc/ceo-brief":
+                return self._json({"items": CEOBriefStore(store, control.audit).list()})
+            if path == "/api/cc/kpis":
+                return self._json(kpi_snapshot(store))
+            if path == "/api/cc/goals":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                department = (query.get("department") or [None])[0]
+                return self._json({"items": GoalStore(store, control.audit).list(status, department)})
+            if path.startswith("/api/cc/goals/") and path.endswith("/recommended-actions"):
+                goal_id = path.split("/")[4]
+                return self._json({"actions": GoalStore(store, control.audit).recommended_actions(goal_id)})
+            if path.startswith("/api/cc/goals/"):
+                goal_id = path.rsplit("/", 1)[-1]
+                goal = GoalStore(store, control.audit).get(goal_id)
+                return self._json(goal or {"error": "goal not found"}, HTTPStatus.OK if goal else HTTPStatus.NOT_FOUND)
+            if path == "/api/cc/ledger":
+                query = parse_qs(urlparse(self.path).query)
+                entry_type = (query.get("entry_type") or [None])[0]
+                category = (query.get("category") or [None])[0]
+                client_id = (query.get("client_id") or [None])[0]
+                status_filter = (query.get("status") or ["RECORDED"])[0]
+                return self._json({"items": LedgerStore(store, control.audit).list(entry_type, category, client_id=client_id, status=status_filter)})
+            if path == "/api/cc/cash-runway":
+                return self._json(cash_and_runway(store))
+            if path.startswith("/api/cc/clients/") and path.endswith("/profitability"):
+                client_id = path.split("/")[4]
+                return self._json(client_profitability(store, client_id))
+            if path == "/api/cc/budgets":
+                query = parse_qs(urlparse(self.path).query)
+                status_filter = (query.get("status") or ["ACTIVE"])[0]
+                return self._json({"items": BudgetStore(store, control.audit).list(status_filter)})
+            if path.startswith("/api/cc/budgets/") and path.endswith("/status"):
+                budget_id = path.split("/")[4]
+                budget = BudgetStore(store, control.audit).get(budget_id)
+                if not budget:
+                    return self._json({"error": "budget not found"}, HTTPStatus.NOT_FOUND)
+                needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                return self._json(budget_status(store, budget, needs_aryan=needs_aryan))
+            if path == "/api/cc/reserve-policy":
+                return self._json(ReservePolicyStore(store).get())
+            if path == "/api/cc/experimental-capital":
+                return self._json(allowed_experimental_capital(store))
+            if path == "/api/cc/risks":
+                query = parse_qs(urlparse(self.path).query)
+                status_filter = (query.get("status") or [None])[0]
+                category_filter = (query.get("category") or [None])[0]
+                return self._json({"items": RiskRegisterStore(store, control.audit).list(status_filter, category_filter)})
+            if path == "/api/cc/department-performance":
+                return self._json(department_performance(store))
+            if path == "/api/cc/ai-workforce-performance":
+                return self._json(ai_workforce_performance(store))
             if path == "/api/rh/opportunities":
                 query = parse_qs(urlparse(self.path).query)
                 stage = (query.get("stage") or [None])[0]
@@ -367,6 +432,62 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     reason = body.pop("reason", None)
                     item = BacklogStore(store, control.audit).update_item(item_id, actor, reason=reason, **body)
                     return self._json(item)
+                if path == "/api/cc/ceo-brief/generate":
+                    brief = CEOBriefStore(store, control.audit).generate(actor=body.get("actor", "Aryan"), period_start=body.get("period_start"))
+                    return self._json(brief, HTTPStatus.CREATED)
+                if path == "/api/cc/goals":
+                    goal_id = GoalStore(store, control.audit).create(
+                        body.get("title", ""), body.get("target"), body.get("unit", ""),
+                        actor=body.get("actor", "Aryan"), start_date=body.get("start_date"), deadline=body.get("deadline"),
+                        owner=body.get("owner"), department=body.get("department"),
+                        linked_kpis=body.get("linked_kpis"), linked_actions=body.get("linked_actions"),
+                    )
+                    return self._json({"goal_id": goal_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cc/goals/") and path.endswith("/progress"):
+                    goal_id = path.split("/")[4]
+                    goal = GoalStore(store, control.audit).update_progress(goal_id, body.get("value"), body.get("actor", "Aryan"), note=body.get("note"))
+                    return self._json(goal)
+                if path.startswith("/api/cc/goals/") and path.endswith("/status"):
+                    goal_id = path.split("/")[4]
+                    goal = GoalStore(store, control.audit).set_status(goal_id, body.get("status", ""), body.get("actor", "Aryan"), reason=body.get("reason"))
+                    return self._json(goal)
+                if path == "/api/cc/ledger":
+                    entry_id = LedgerStore(store, control.audit).record(
+                        body.get("entry_type", ""), body.get("category", ""), body.get("amount"),
+                        body.get("evidence"), actor=body.get("actor", "Aryan"), currency=body.get("currency", "INR"),
+                        business_unit=body.get("business_unit"), client_id=body.get("client_id"),
+                        project_ref=body.get("project_ref"), occurred_on=body.get("occurred_on"), note=body.get("note"),
+                    )
+                    return self._json({"entry_id": entry_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cc/ledger/") and path.endswith("/void"):
+                    entry_id = path.split("/")[4]
+                    entry = LedgerStore(store, control.audit).void(entry_id, body.get("actor", "Aryan"), body.get("reason", ""))
+                    return self._json(entry)
+                if path == "/api/cc/budgets":
+                    budget_id = BudgetStore(store, control.audit).create(
+                        body.get("department", ""), body.get("monthly_budget"), actor=body.get("actor", "Aryan"),
+                        currency=body.get("currency", "INR"), limit_kind=body.get("limit_kind", "SOFT"),
+                        warning_threshold_pct=body.get("warning_threshold_pct", 0.8),
+                    )
+                    return self._json({"budget_id": budget_id}, HTTPStatus.CREATED)
+                if path == "/api/cc/capital-allocation/recommend":
+                    result = recommend_allocation(store, body.get("available_amount"), actor=body.get("actor", "Aryan"))
+                    return self._json(result, HTTPStatus.CREATED)
+                if path == "/api/cc/reserve-policy":
+                    policy = ReservePolicyStore(store).save(body)
+                    return self._json(policy)
+                if path == "/api/cc/risks":
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    risk_id = RiskRegisterStore(store, control.audit, needs_aryan=needs_aryan).create(
+                        body.get("title", ""), body.get("category", ""), body.get("severity", ""),
+                        actor=body.get("actor", "Aryan"), likelihood_band=body.get("likelihood_band", "unknown"),
+                        owner=body.get("owner"), mitigation=body.get("mitigation"), evidence=body.get("evidence"),
+                    )
+                    return self._json({"risk_id": risk_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cc/risks/") and path.endswith("/status"):
+                    risk_id = path.split("/")[4]
+                    risk = RiskRegisterStore(store, control.audit).update_status(risk_id, body.get("status", ""), body.get("actor", "Aryan"), note=body.get("note"))
+                    return self._json(risk)
                 if path == "/api/needs-aryan":
                     item_id = NeedsAryanQueue(store, control.audit, control).create_item(
                         body.get("kind", ""), body.get("title", ""), body.get("what_is_needed", ""),
@@ -851,12 +972,23 @@ def serve_hq(root, host: str = "127.0.0.1", port: int = 8766, falguna_url: str =
 HQ_INDEX_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Twenty Two Technologies</title><style>
-:root{color-scheme:dark;--bg:#0b0908;--side:#100c0a;--panel:#181310;--soft:#201a16;--line:#332a23;--text:#f7f3ef;--muted:#a89c8f;--accent:#e2a15c;--warn:#ffc66d;--bad:#ff8c96}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}.app{height:100dvh;display:grid;grid-template-columns:250px minmax(0,1fr);overflow:hidden}aside{background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;overflow:hidden}.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 20px;font-weight:750;font-size:16px}.mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#221202;font-weight:900}.navsec{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:16px 8px 6px}.navitem{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text);padding:8px 8px;border-radius:8px;cursor:pointer;font-size:13px}.navitem:hover,.navitem.active{background:var(--soft)}.navitem.disabled{color:#5b5148;cursor:default}.navitem.disabled:hover{background:transparent}.boundary{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px 2px;border-top:1px solid var(--line)}main{min-width:0;overflow-y:auto;padding:28px max(24px,calc((100vw - 250px - 860px)/2))}.col{max-width:860px;margin:0 auto;display:grid;gap:20px}h1{font-size:22px;margin:0 0 2px}.pageintro{color:var(--muted);font-size:13px;margin-bottom:6px}.view{display:none}.view.active{display:block}.section{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:18px;margin-bottom:18px}.section h2{margin:0 0 4px;font-size:17px}.sub{color:var(--muted);font-size:12px;margin-bottom:14px}.list{display:grid;gap:10px}.item{border:1px solid var(--line);background:var(--soft);border-radius:11px;padding:13px}.item h3{margin:0 0 4px;font-size:14px}.meta{color:var(--muted);font-size:11px;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}.meta span{border:1px solid var(--line);border-radius:999px;padding:2px 8px}.empty{color:var(--muted);font-size:12px;padding:6px 0}.form{display:grid;gap:8px;margin-top:12px;border-top:1px solid var(--line);padding-top:12px}.form input,.form select,.form textarea{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}.form textarea{min-height:50px;resize:vertical}.row{display:flex;gap:8px}.row>*{flex:1}.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.actions button{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;cursor:pointer;background:var(--accent);color:#221202}.actions button.secondary{background:#2c241d;color:var(--text)}.actions button.danger{background:#542c34;color:#ffe0e4}.contrib{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin-top:6px;font-size:12px}.contrib b{color:var(--accent)}.badge-actionable{color:var(--accent)}.badge-inspect{color:var(--warn)}.badge{color:var(--warn);font-weight:700;border-color:var(--warn)!important}
+:root{color-scheme:dark;--bg:#0b0908;--side:#100c0a;--panel:#181310;--soft:#201a16;--line:#332a23;--text:#f7f3ef;--muted:#a89c8f;--accent:#e2a15c;--warn:#ffc66d;--bad:#ff8c96}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}.app{height:100dvh;display:grid;grid-template-columns:250px minmax(0,1fr);overflow:hidden}aside{background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;min-height:0;overflow-y:auto;overflow-x:hidden}.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 20px;font-weight:750;font-size:16px}.mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#221202;font-weight:900}.navsec{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:16px 8px 6px}.navitem{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text);padding:8px 8px;border-radius:8px;cursor:pointer;font-size:13px}.navitem:hover,.navitem.active{background:var(--soft)}.navitem.disabled{color:#5b5148;cursor:default}.navitem.disabled:hover{background:transparent}.boundary{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px 2px;border-top:1px solid var(--line)}main{min-width:0;overflow-y:auto;padding:28px max(24px,calc((100vw - 250px - 860px)/2))}.col{max-width:860px;margin:0 auto;display:grid;gap:20px}h1{font-size:22px;margin:0 0 2px}.pageintro{color:var(--muted);font-size:13px;margin-bottom:6px}.view{display:none}.view.active{display:block}.section{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:18px;margin-bottom:18px}.section h2{margin:0 0 4px;font-size:17px}.sub{color:var(--muted);font-size:12px;margin-bottom:14px}.list{display:grid;gap:10px}.item{border:1px solid var(--line);background:var(--soft);border-radius:11px;padding:13px}.item h3{margin:0 0 4px;font-size:14px}.meta{color:var(--muted);font-size:11px;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}.meta span{border:1px solid var(--line);border-radius:999px;padding:2px 8px}.empty{color:var(--muted);font-size:12px;padding:6px 0}.form{display:grid;gap:8px;margin-top:12px;border-top:1px solid var(--line);padding-top:12px}.form input,.form select,.form textarea{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}.form textarea{min-height:50px;resize:vertical}.row{display:flex;gap:8px}.row>*{flex:1}.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.actions button{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;cursor:pointer;background:var(--accent);color:#221202}.actions button.secondary{background:#2c241d;color:var(--text)}.actions button.danger{background:#542c34;color:#ffe0e4}.contrib{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin-top:6px;font-size:12px}.contrib b{color:var(--accent)}.badge-actionable{color:var(--accent)}.badge-inspect{color:var(--warn)}.badge{color:var(--warn);font-weight:700;border-color:var(--warn)!important}
 @media(max-width:820px){.app{grid-template-columns:1fr;height:auto;min-height:100dvh}aside{flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}aside .brand{width:100%;padding:2px 4px 10px}aside .navsec,aside .boundary{display:none}aside .navitem{padding:6px 10px;font-size:12px}main{padding:20px 16px}.row{flex-direction:column}}
 </style></head><body><div class="app"><aside>
 <div class="brand"><span class="mark">TT</span>Twenty Two Technologies</div>
+<div class="navsec">Command Center</div>
+<button class="navitem active" data-view="commandCenter">Command Center</button>
+<div class="navsec">CEO Intelligence / Finance</div>
+<button class="navitem" data-view="ccGoals">Goals</button>
+<button class="navitem" data-view="ccKpis">KPIs</button>
+<button class="navitem" data-view="ccLedger">Finance Ledger</button>
+<button class="navitem" data-view="ccCash">Cash &amp; Runway</button>
+<button class="navitem" data-view="ccBudgets">Budgets</button>
+<button class="navitem" data-view="ccCapital">Capital Allocation</button>
+<button class="navitem" data-view="ccDeptPerf">Department Performance</button>
+<button class="navitem" data-view="ccRiskRegister">Risk Register</button>
 <div class="navsec">Company</div>
-<button class="navitem active" data-view="boardroom">Boardroom</button>
+<button class="navitem" data-view="boardroom">Boardroom</button>
 <button class="navitem" data-view="backlog">Master Vision Backlog</button>
 <button class="navitem" data-view="needsAryan">Needs Aryan</button>
 <div class="navsec">Revenue Hunter</div>
@@ -883,7 +1015,139 @@ HQ_INDEX_HTML = r'''<!doctype html>
 </aside>
 <main>
 <div class="col">
-<div class="view active" id="view-boardroom">
+<div class="view active" id="view-commandCenter">
+<h1>Command Center</h1>
+<div class="pageintro">What the company is doing right now -- sourced live from Revenue Hunter, billing, Digital Workforce, and Media/Growth. No vanity metrics; every card below is a real, sourced read.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="ccWonRevenue">$0</h2><div class="sub">Lifetime won revenue</div></div>
+<div class="section" style="flex:1"><h2 id="ccCashIn">$0</h2><div class="sub">Cash in to date (invoice payments, inflow-only)</div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="ccOutstanding">$0</h2><div class="sub">Receivables outstanding</div></div>
+<div class="section" style="flex:1"><h2 id="ccOverdue">$0</h2><div class="sub">Receivables overdue</div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="ccPipeline">0</h2><div class="sub">Active pipeline (<span id="ccNegotiating">0</span> negotiating)</div></div>
+<div class="section" style="flex:1"><h2 id="ccClients">0</h2><div class="sub">Clients</div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="ccActiveJobs">0</h2><div class="sub">Active delivery jobs</div></div>
+<div class="section" style="flex:1"><h2 id="ccNeedsAryan">0</h2><div class="sub">Needs Aryan pending</div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="ccWfAttention">0</h2><div class="sub">Workforce tasks needing attention</div></div>
+<div class="section" style="flex:1"><h2 id="ccMediaFailures">0</h2><div class="sub">Media publishing failures</div></div>
+</div>
+<div class="section"><h2>Risk signals</h2><div class="list" id="ccRisks"></div></div>
+<div class="section"><h2>Upcoming obligations</h2><div class="list" id="ccUpcoming"></div></div>
+<div class="section"><h2>Key opportunities</h2><div class="list" id="ccKeyOpps"></div></div>
+<div class="section">
+<h2>CEO Brief</h2>
+<div class="sub" id="ccBriefMeta">No brief generated yet.</div>
+<div class="actions"><button id="ccGenerateBrief" type="button">Generate CEO Brief</button></div>
+<div class="list" id="ccBriefFacts"></div>
+<div class="list" id="ccBriefRecs"></div>
+</div>
+</div>
+<div class="view" id="view-ccGoals">
+<h1>Goals</h1>
+<div class="pageintro">Persistent company goals with a target, unit, owner, department, and linked KPIs/actions. Progress is only ever moved forward explicitly -- never inferred.</div>
+<div class="list" id="ccGoalsList"></div>
+<div class="form">
+<input id="glTitle" placeholder="Goal title">
+<div class="row"><input id="glTarget" type="number" step="any" placeholder="Target"><input id="glUnit" placeholder="Unit (e.g. USD, clients, %)"></div>
+<div class="row"><input id="glOwner" placeholder="Owner (optional)"><input id="glDepartment" placeholder="Department (optional)"></div>
+<div class="row"><input id="glStartDate" type="date"><input id="glDeadline" type="date"></div>
+<div class="actions"><button id="glCreate" type="button">Create goal</button></div>
+</div>
+</div>
+<div class="view" id="view-ccKpis">
+<h1>KPIs</h1>
+<div class="pageintro">Sales / Delivery / Workforce / Media / Finance -- every metric computed live from existing tables for a trailing 30-day window. A null value with a source means the codebase has no data model for that metric yet, never a guess.</div>
+<div class="list" id="ccKpisList"></div>
+</div>
+<div class="view" id="view-ccLedger">
+<h1>Finance Ledger</h1>
+<div class="pageintro">Every inflow/outflow requires evidence. Nothing here is a full accounting system -- it is a sourced, auditable record. Voiding preserves history; nothing is ever hard-deleted.</div>
+<div class="list" id="ccLedgerList"></div>
+<div class="form">
+<div class="row">
+<select id="leType"><option value="OUTFLOW">OUTFLOW</option><option value="INFLOW">INFLOW</option></select>
+<select id="leCategory"><option value="client_revenue">client_revenue</option><option value="subscription_api_cost">subscription_api_cost</option><option value="software_tooling">software_tooling</option><option value="hosting">hosting</option><option value="contractor">contractor</option><option value="marketing">marketing</option><option value="hardware">hardware</option><option value="tax_reserve">tax_reserve</option><option value="owner_contribution">owner_contribution</option><option value="other">other</option></select>
+</div>
+<div class="row"><input id="leAmount" type="number" step="any" placeholder="Amount"><input id="leCurrency" placeholder="Currency" value="INR"></div>
+<input id="leBusinessUnit" placeholder="Business unit (e.g. Sales, Delivery, Digital Workforce, Media/Growth)">
+<input id="leEvidence" placeholder="Evidence (required -- receipt/invoice reference, description)">
+<div class="row"><input id="leOccurredOn" type="date"><input id="leProjectRef" placeholder="Project ref (optional)"></div>
+<textarea id="leNote" placeholder="Note (optional)"></textarea>
+<div class="actions"><button id="leCreate" type="button">Record entry</button></div>
+</div>
+</div>
+<div class="view" id="view-ccCash">
+<h1>Cash &amp; Runway</h1>
+<div class="pageintro">Actual, expected, and projected are always kept separate -- never blended into one number.</div>
+<div class="section"><h2>Actual</h2><div class="list" id="ccCashActual"></div></div>
+<div class="section"><h2>Expected</h2><div class="list" id="ccCashExpected"></div></div>
+<div class="section"><h2>Projected</h2><div class="list" id="ccCashProjected"></div></div>
+<div class="section"><h2>Runway</h2><div class="list" id="ccCashRunway"></div></div>
+</div>
+<div class="view" id="view-ccBudgets">
+<h1>Budgets</h1>
+<div class="pageintro">Spend-to-date is always computed live from the Finance Ledger, never stored. A HARD limit breach escalates to Needs Aryan automatically; a SOFT limit only warns.</div>
+<div class="list" id="ccBudgetsList"></div>
+<div class="form">
+<div class="row"><input id="bgDepartment" placeholder="Department"><input id="bgMonthlyBudget" type="number" step="any" placeholder="Monthly budget"></div>
+<div class="row"><select id="bgLimitKind"><option value="SOFT">SOFT</option><option value="HARD">HARD</option></select><input id="bgCurrency" placeholder="Currency" value="INR"></div>
+<input id="bgWarningPct" type="number" step="any" placeholder="Warning threshold (0-1, default 0.8)">
+<div class="actions"><button id="bgCreate" type="button">Create budget</button></div>
+</div>
+</div>
+<div class="view" id="view-ccCapital">
+<h1>Capital Allocation</h1>
+<div class="pageintro">Recommendations only -- this never moves money automatically. Reserve policy structurally separates experimental capital from client funds, tax reserve, operating runway, and the emergency reserve.</div>
+<div class="section"><h2>Reserve policy</h2><div class="list" id="ccReservePolicy"></div>
+<div class="form">
+<div class="row"><input id="rpOperating" type="number" step="any" placeholder="Operating reserve %"><input id="rpTax" type="number" step="any" placeholder="Tax reserve %"></div>
+<div class="row"><input id="rpEmergency" type="number" step="any" placeholder="Emergency reserve %"><input id="rpReinvestment" type="number" step="any" placeholder="Reinvestment pool %"></div>
+<div class="row"><input id="rpOwnerDist" type="number" step="any" placeholder="Owner distribution %"><input id="rpExperimental" type="number" step="any" placeholder="Experimental capital %"></div>
+<div class="actions"><button id="rpSave" type="button">Save reserve policy</button></div>
+</div>
+</div>
+<div class="section"><h2 id="ccExpCapital">$0</h2><div class="sub">Available experimental capital (owner_contribution inflows minus spend -- never client funds)</div></div>
+<div class="section"><h2>Recommend allocation</h2>
+<div class="form">
+<input id="caAvailable" type="number" step="any" placeholder="Available amount to allocate">
+<div class="actions"><button id="caRecommend" type="button">Get recommendations</button></div>
+</div>
+<div class="list" id="ccCapitalRecs"></div>
+</div>
+</div>
+<div class="view" id="view-ccDeptPerf">
+<h1>Department Performance</h1>
+<div class="pageintro">Output / failures / blocked work / cost / business impact, read straight from each department's own system. No composite score -- a plain, sourced breakdown to read and judge.</div>
+<div class="list" id="ccDeptPerfList"></div>
+<h1 style="margin-top:24px">AI Workforce Performance</h1>
+<div class="pageintro">Per-worker success/failure/retry/intervention rate and approximate cost. Every rate is a real ratio of real counts -- null, not zero, when there's no data yet.</div>
+<div class="list" id="ccWorkforcePerfList"></div>
+</div>
+<div class="view" id="view-ccRiskRegister">
+<h1>Risk Register</h1>
+<div class="pageintro">Severity and likelihood band are plain labels, never a fabricated numerical probability. High/critical severity escalates to Needs Aryan automatically.</div>
+<div class="list" id="ccRiskRegisterList"></div>
+<div class="form">
+<input id="rkTitle" placeholder="Risk title">
+<div class="row">
+<select id="rkCategory"><option value="revenue_risk">revenue_risk</option><option value="client_risk">client_risk</option><option value="delivery_risk">delivery_risk</option><option value="finance_risk">finance_risk</option><option value="security_risk">security_risk</option><option value="infrastructure_risk">infrastructure_risk</option><option value="legal_compliance_risk">legal_compliance_risk</option><option value="concentration_risk">concentration_risk</option></select>
+<select id="rkSeverity"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="critical">critical</option></select>
+<select id="rkLikelihood"><option value="unknown">unknown</option><option value="unlikely">unlikely</option><option value="possible">possible</option><option value="likely">likely</option><option value="near_certain">near_certain</option></select>
+</div>
+<input id="rkOwner" placeholder="Owner (optional)">
+<textarea id="rkMitigation" placeholder="Mitigation plan (optional)"></textarea>
+<textarea id="rkEvidence" placeholder="Evidence (optional)"></textarea>
+<div class="actions"><button id="rkCreate" type="button">Log risk</button></div>
+</div>
+</div>
+<div class="view" id="view-boardroom">
 <h1>Boardroom</h1>
 <div class="pageintro">Strategy / Technology / Revenue / Finance-Risk / Operations -- discuss, then decide. Decisions persist and are never in-memory only.</div>
 <div class="list" id="boardroomList"></div>
@@ -1110,9 +1374,104 @@ const $=id=>document.getElementById(id);
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments};
+const rhLoaders={commandCenter:loadCommandCenter,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
-async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
+async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadCommandCenter(),loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
+async function loadCommandCenter(){
+const d=await api('/api/cc/snapshot');
+$('ccWonRevenue').textContent='$'+d.revenue.won_revenue_lifetime;
+$('ccCashIn').textContent='$'+d.cash.cash_in_to_date;
+$('ccOutstanding').textContent='$'+d.receivables.outstanding_total;
+$('ccOverdue').textContent='$'+d.receivables.overdue_total;
+$('ccPipeline').textContent=d.pipeline.active_count;
+$('ccNegotiating').textContent=d.pipeline.negotiating_count;
+$('ccClients').textContent=d.clients.total;
+$('ccActiveJobs').textContent=d.delivery.active_jobs_total;
+$('ccNeedsAryan').textContent=d.needs_aryan.pending_count;
+$('ccWfAttention').textContent=d.workforce.needs_attention_count;
+$('ccMediaFailures').textContent=d.media.publishing_failures_count;
+$('ccRisks').innerHTML=(d.risk_signals||[]).length?d.risk_signals.map(r=>`<div class="item"><h3>${esc(r.summary)}</h3><div class="meta"><span>${esc(r.category)}</span><span>${esc(r.severity)}</span></div></div>`).join(''):'<div class="empty">No active risk signals.</div>';
+$('ccUpcoming').innerHTML=(d.upcoming_obligations||[]).length?d.upcoming_obligations.map(o=>`<div class="item"><h3>${esc(o.kind)}</h3><div class="meta"><span>due ${esc(o.due_date||'')}</span></div></div>`).join(''):'<div class="empty">Nothing due soon.</div>';
+$('ccKeyOpps').innerHTML=(d.pipeline.key_opportunities||[]).length?d.pipeline.key_opportunities.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span><span>${esc(o.client_name||'')}</span></div></div>`).join(''):'<div class="empty">No active opportunities.</div>';
+try{const b=await api('/api/cc/ceo-brief/latest');if(!b.error){renderCeoBrief(b)}}catch(e){}
+}
+function renderCeoBrief(b){
+$('ccBriefMeta').textContent=`Covers ${b.period_start} to ${b.period_end}`;
+const facts=JSON.parse(b.confirmed_facts_json);
+$('ccBriefFacts').innerHTML=`<div class="item"><h3>Confirmed facts</h3><div class="meta"><span>deals won ${facts.deals_won}</span><span>new opportunities ${facts.new_opportunities}</span><span>client replies ${facts.client_replies}</span><span>payments received $${facts.payments_received_total}</span><span>workforce failures ${facts.workforce_failures}</span></div></div>`;
+const recs=JSON.parse(b.recommendations_json);
+const priorities=JSON.parse(b.top_priorities_json);
+const estimates=JSON.parse(b.estimates_json);
+$('ccBriefRecs').innerHTML=`<div class="item"><h3>Top priorities</h3><div class="meta">${priorities.map(p=>`<span>${esc(p)}</span>`).join('')||'<span>None</span>'}</div></div>`+recs.map(r=>`<div class="item">${esc(r)}</div>`).join('')+estimates.map(e=>`<div class="item">${esc(e)}</div>`).join('');
+}
+function renderMetric(label,m){if(!m)return'';return `<div class="item"><h3>${esc(label)}: ${m.value===null||m.value===undefined?'—':esc(m.value)}</h3><div class="meta"><span>${esc(m.source||'')}</span></div></div>`}
+async function loadCcGoals(){const d=await api('/api/cc/goals');const items=d.items||[];$('ccGoalsList').innerHTML=items.length?items.map(g=>`<div class="item">
+<h3>${esc(g.title)} <span style="color:var(--muted);font-weight:400">(${esc(g.status)})</span></h3>
+<div class="meta"><span>${esc(g.current_value)} / ${esc(g.target)} ${esc(g.unit)}</span><span>${g.progress===null?'progress n/a':(g.progress*100).toFixed(1)+'%'}</span>${g.at_risk?'<span class="badge">at risk</span>':''}${g.owner?`<span>owner ${esc(g.owner)}</span>`:''}${g.department?`<span>${esc(g.department)}</span>`:''}${g.deadline?`<span>due ${esc(g.deadline)}</span>`:''}</div>
+<div class="actions">
+<button class="secondary progress" data-id="${esc(g.id)}">Update progress</button>
+<button class="secondary achieve" data-id="${esc(g.id)}">Mark achieved</button>
+<button class="secondary pause" data-id="${esc(g.id)}">Pause</button>
+<button class="danger cancel" data-id="${esc(g.id)}">Cancel</button>
+</div>
+</div>`).join(''):'<div class="empty">No goals yet.</div>';
+document.querySelectorAll('#ccGoalsList .progress').forEach(b=>b.onclick=async()=>{const v=prompt('New current value:');if(v===null||v==='')return;await api(`/api/cc/goals/${b.dataset.id}/progress`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:parseFloat(v),actor:'Aryan'})});await loadCcGoals()});
+document.querySelectorAll('#ccGoalsList .achieve').forEach(b=>b.onclick=async()=>{await api(`/api/cc/goals/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'ACHIEVED',actor:'Aryan'})});await loadCcGoals()});
+document.querySelectorAll('#ccGoalsList .pause').forEach(b=>b.onclick=async()=>{await api(`/api/cc/goals/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'PAUSED',actor:'Aryan'})});await loadCcGoals()});
+document.querySelectorAll('#ccGoalsList .cancel').forEach(b=>b.onclick=async()=>{await api(`/api/cc/goals/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'CANCELLED',actor:'Aryan'})});await loadCcGoals()});
+}
+$('glCreate').onclick=async()=>{const title=$('glTitle').value.trim();const target=parseFloat($('glTarget').value);const unit=$('glUnit').value.trim();if(!title||isNaN(target)||!unit)return alert('Title, target, and unit are required.');await api('/api/cc/goals',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,target,unit,owner:$('glOwner').value||null,department:$('glDepartment').value||null,start_date:$('glStartDate').value||null,deadline:$('glDeadline').value||null,actor:'Aryan'})});$('glTitle').value='';$('glTarget').value='';$('glUnit').value='';$('glOwner').value='';$('glDepartment').value='';await loadCcGoals()};
+async function loadCcKpis(){const d=await api('/api/cc/kpis');const groups=[['Sales',d.sales],['Delivery',d.delivery],['Workforce',d.workforce],['Media',d.media],['Finance',d.finance]];
+$('ccKpisList').innerHTML=groups.map(([name,metrics])=>`<div class="section"><h2>${esc(name)}</h2><div class="list">${Object.entries(metrics).map(([k,m])=>renderMetric(k,m)).join('')}</div></div>`).join('');
+}
+async function loadCcLedger(){const d=await api('/api/cc/ledger');const items=d.items||[];$('ccLedgerList').innerHTML=items.length?items.map(e=>`<div class="item">
+<h3>${esc(e.entry_type)} ${esc(e.currency)} ${esc(e.amount)} -- ${esc(e.category)}</h3>
+<div class="meta"><span>${esc(e.business_unit||'unassigned')}</span><span>${esc(e.occurred_on)}</span><span>${esc(e.status)}</span></div>
+<div>${esc(e.evidence)}</div>
+${e.status==='RECORDED'?`<div class="actions"><button class="danger void" data-id="${esc(e.id)}">Void</button></div>`:''}
+</div>`).join(''):'<div class="empty">No ledger entries yet.</div>';
+document.querySelectorAll('#ccLedgerList .void').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for voiding this entry:');if(!reason)return;await api(`/api/cc/ledger/${b.dataset.id}/void`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason,actor:'Aryan'})});await loadCcLedger()});
+}
+$('leCreate').onclick=async()=>{const amount=parseFloat($('leAmount').value);const evidence=$('leEvidence').value.trim();if(isNaN(amount)||!evidence)return alert('Amount and evidence are required.');await api('/api/cc/ledger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry_type:$('leType').value,category:$('leCategory').value,amount,evidence,currency:$('leCurrency').value||'INR',business_unit:$('leBusinessUnit').value||null,occurred_on:$('leOccurredOn').value||null,project_ref:$('leProjectRef').value||null,note:$('leNote').value||null,actor:'Aryan'})});$('leAmount').value='';$('leEvidence').value='';$('leBusinessUnit').value='';$('leNote').value='';await loadCcLedger()};
+async function loadCcCash(){const d=await api('/api/cc/cash-runway');
+$('ccCashActual').innerHTML=`<div class="item"><h3>Invoice cash in: $${esc(d.actual.invoice_cash_in_to_date)}</h3></div><div class="item"><h3>Ledger inflows: $${esc(d.actual.ledger_inflows_recorded)}</h3></div><div class="item"><h3>Ledger outflows: $${esc(d.actual.ledger_outflows_recorded)}</h3></div><div class="item"><h3>Combined cash estimate: $${esc(d.actual.combined_cash_estimate)}</h3><div class="meta"><span>${esc(d.actual.source)}</span></div></div>`;
+$('ccCashExpected').innerHTML=`<div class="item"><h3>Receivables outstanding: $${esc(d.expected.receivables_outstanding)}</h3></div><div class="item"><h3>Receivables overdue: $${esc(d.expected.receivables_overdue)}</h3></div><div class="item"><h3>Due within ${esc(d.expected.receivables_due_within_days)} days: $${esc(d.expected.receivables_due_soon)}</h3></div>`;
+$('ccCashProjected').innerHTML=`<div class="item"><h3>Near-term cash: $${esc(d.projected.near_term_cash)}</h3><div class="meta"><span>${esc(d.projected.note)}</span></div></div>`;
+$('ccCashRunway').innerHTML=`<div class="item"><h3>Monthly burn rate: ${d.runway.monthly_burn_rate===null?'—':'$'+esc(d.runway.monthly_burn_rate)}</h3></div><div class="item"><h3>Runway: ${d.runway.runway_months===null?'—':esc(d.runway.runway_months)+' months'}</h3><div class="meta"><span>${esc(d.runway.note)}</span></div></div>`;
+}
+async function loadCcBudgets(){const d=await api('/api/cc/budgets');const items=d.items||[];$('ccBudgetsList').innerHTML=items.length?items.map(b=>`<div class="item">
+<h3>${esc(b.department)} -- ${esc(b.currency)} ${esc(b.monthly_budget)}/mo (${esc(b.limit_kind)})</h3>
+<div class="meta"><span>warning at ${(b.warning_threshold_pct*100).toFixed(0)}%</span></div>
+<div class="actions"><button class="secondary status" data-id="${esc(b.id)}">Check status</button></div>
+<div class="list" id="budget-status-${esc(b.id)}"></div>
+</div>`).join(''):'<div class="empty">No budgets yet.</div>';
+document.querySelectorAll('#ccBudgetsList .status').forEach(b=>b.onclick=async()=>{const s=await api(`/api/cc/budgets/${b.dataset.id}/status`);const el=$('budget-status-'+b.dataset.id);el.innerHTML=`<div class="item"><div class="meta"><span>spend to date ${esc(s.spend_to_date)}</span><span>remaining ${esc(s.remaining_budget)}</span>${s.warning?'<span class="badge">warning</span>':''}${s.over_limit?'<span class="badge">over limit</span>':''}${s.escalated_needs_aryan_id?'<span class="badge">escalated to Needs Aryan</span>':''}</div></div>`});
+}
+$('bgCreate').onclick=async()=>{const department=$('bgDepartment').value.trim();const monthly_budget=parseFloat($('bgMonthlyBudget').value);if(!department||isNaN(monthly_budget))return alert('Department and monthly budget are required.');const warn=$('bgWarningPct').value;await api('/api/cc/budgets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department,monthly_budget,limit_kind:$('bgLimitKind').value,currency:$('bgCurrency').value||'INR',warning_threshold_pct:warn?parseFloat(warn):0.8,actor:'Aryan'})});$('bgDepartment').value='';$('bgMonthlyBudget').value='';$('bgWarningPct').value='';await loadCcBudgets()};
+async function loadCcCapital(){const p=await api('/api/cc/reserve-policy');
+$('ccReservePolicy').innerHTML=p.configured?`<div class="item"><div class="meta"><span>operating ${(p.operating_reserve_pct*100).toFixed(0)}%</span><span>tax ${(p.tax_reserve_pct*100).toFixed(0)}%</span><span>emergency ${(p.emergency_reserve_pct*100).toFixed(0)}%</span><span>reinvestment ${(p.reinvestment_pool_pct*100).toFixed(0)}%</span><span>owner dist. ${(p.owner_distribution_pct*100).toFixed(0)}%</span><span>experimental ${(p.experimental_capital_pct*100).toFixed(0)}%</span></div></div>`:'<div class="empty">Reserve policy not configured yet -- all percentages default to 0.</div>';
+const ec=await api('/api/cc/experimental-capital');$('ccExpCapital').textContent='$'+ec.available;
+}
+$('rpSave').onclick=async()=>{const pct=v=>v===''?0:parseFloat(v)/100;await api('/api/cc/reserve-policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operating_reserve_pct:pct($('rpOperating').value),tax_reserve_pct:pct($('rpTax').value),emergency_reserve_pct:pct($('rpEmergency').value),reinvestment_pool_pct:pct($('rpReinvestment').value),owner_distribution_pct:pct($('rpOwnerDist').value),experimental_capital_pct:pct($('rpExperimental').value)})});await loadCcCapital()};
+$('caRecommend').onclick=async()=>{const amount=parseFloat($('caAvailable').value);if(isNaN(amount))return alert('Enter an available amount first.');const r=await api('/api/cc/capital-allocation/recommend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({available_amount:amount,actor:'Aryan'})});$('ccCapitalRecs').innerHTML=(r.recommendations||[]).length?r.recommendations.map(rec=>`<div class="item"><h3>${esc(rec.category)}: $${esc(rec.amount)}</h3><div class="meta"><span>confidence ${esc(rec.confidence)}</span><span>${esc(rec.risk)}</span></div><div>${esc(rec.reason)}</div><div class="meta"><span>${esc(rec.expected_benefit)}</span></div><div class="meta"><span>alternative: ${esc(rec.alternative)}</span></div></div>`).join(''):'<div class="empty">No recommendations for the current state.</div>'};
+async function loadCcDeptPerf(){const dp=await api('/api/cc/department-performance');const depts=[['Sales',dp.sales],['Delivery',dp.delivery],['Digital Workforce',dp.digital_workforce],['Media/Growth',dp.media_growth],['Falguna Engineering',dp.falguna_engineering]];
+$('ccDeptPerfList').innerHTML=depts.map(([name,m])=>`<div class="section"><h2>${esc(name)}</h2><div class="list">${Object.entries(m).map(([k,v])=>renderMetric(k,v)).join('')}</div></div>`).join('');
+const wf=await api('/api/cc/ai-workforce-performance');const workers=Object.entries(wf.by_worker||{});
+$('ccWorkforcePerfList').innerHTML=workers.length?workers.map(([name,w])=>`<div class="item"><h3>${esc(name)}</h3><div class="meta"><span>tasks ${esc(w.tasks_total)}</span><span>success ${w.success_rate===null?'—':(w.success_rate*100).toFixed(1)+'%'}</span><span>failure ${w.failure_rate===null?'—':(w.failure_rate*100).toFixed(1)+'%'}</span><span>retry ${w.retry_rate===null?'—':(w.retry_rate*100).toFixed(1)+'%'}</span><span>intervention ${w.intervention_rate===null?'—':(w.intervention_rate*100).toFixed(1)+'%'}</span><span>avg duration ${w.average_duration_seconds===null?'—':esc(w.average_duration_seconds)+'s'}</span><span>cost ${w.approximate_cost===null?'—':'$'+esc(w.approximate_cost)}</span></div></div>`).join(''):'<div class="empty">No workforce tasks yet.</div>';
+}
+async function loadCcRiskRegister(){const d=await api('/api/cc/risks');const items=d.items||[];$('ccRiskRegisterList').innerHTML=items.length?items.map(r=>`<div class="item">
+<h3>${esc(r.title)} <span style="color:var(--muted);font-weight:400">(${esc(r.status)})</span></h3>
+<div class="meta"><span>${esc(r.category)}</span><span>severity ${esc(r.severity)}</span><span>likelihood ${esc(r.likelihood_band)}</span>${r.owner?`<span>owner ${esc(r.owner)}</span>`:''}</div>
+${r.mitigation?`<div>${esc(r.mitigation)}</div>`:''}
+<div class="actions">
+<button class="secondary mitigating" data-id="${esc(r.id)}">Mitigating</button>
+<button class="secondary monitoring" data-id="${esc(r.id)}">Monitoring</button>
+<button class="danger closed" data-id="${esc(r.id)}">Closed</button>
+</div>
+</div>`).join(''):'<div class="empty">No risks logged yet.</div>';
+['mitigating','monitoring','closed'].forEach(cls=>{document.querySelectorAll('#ccRiskRegisterList .'+cls).forEach(b=>b.onclick=async()=>{await api(`/api/cc/risks/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:cls.toUpperCase(),actor:'Aryan'})});await loadCcRiskRegister()})});
+}
+$('rkCreate').onclick=async()=>{const title=$('rkTitle').value.trim();if(!title)return alert('Title is required.');await api('/api/cc/risks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,category:$('rkCategory').value,severity:$('rkSeverity').value,likelihood_band:$('rkLikelihood').value,owner:$('rkOwner').value||null,mitigation:$('rkMitigation').value||null,evidence:$('rkEvidence').value||null,actor:'Aryan'})});$('rkTitle').value='';$('rkOwner').value='';$('rkMitigation').value='';$('rkEvidence').value='';await loadCcRiskRegister()};
 async function loadBoardroom(){const d=await api('/api/boardroom');renderBoardroom(d.topics||[])}
 function renderBoardroom(topics){$('boardroomList').innerHTML=topics.length?topics.map(t=>`<div class="item" data-topic="${esc(t.id)}">
 <h3>${esc(t.title)}</h3>
@@ -1136,6 +1495,7 @@ document.querySelectorAll('.addc').forEach(b=>b.onclick=async()=>{const item=b.c
 document.querySelectorAll('.dec[data-topic]').forEach(b=>b.onclick=async()=>{const note=prompt('Note for this decision (optional):')||'';await api(`/api/boardroom/${b.dataset.topic}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadBoardroom();await loadBacklog()})}
 async function loadTopicHistory(id){try{const t=await api('/api/boardroom/'+id);const el=$('contribs-'+id);if(!el)return;el.innerHTML=(t.contributions||[]).map(c=>`<div class="contrib"><b>${esc(c.perspective)}:</b> ${esc(c.content)}</div>`).join('')+(t.decisions||[]).map(d=>`<div class="contrib"><b>${esc(d.action)}</b> by ${esc(d.decided_by)}${d.note?': '+esc(d.note):''}</div>`).join('')}catch(e){}}
 $('brCreate').onclick=async()=>{const title=$('brTitle').value.trim();const summary=$('brSummary').value.trim();if(!title||!summary)return alert('Title and summary are required.');await api('/api/boardroom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,summary,actor:'Aryan',proposed_category:$('brCategory').value||null,proposed_priority:$('brPriority').value||null})});$('brTitle').value='';$('brSummary').value='';await loadBoardroom()};
+$('ccGenerateBrief').onclick=async()=>{const b=await api('/api/cc/ceo-brief/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});renderCeoBrief(b)};
 async function loadBacklog(){const d=await api('/api/backlog');renderBacklog(d.items||[])}
 function renderBacklog(items){$('backlogList').innerHTML=items.length?items.map(i=>`<div class="item">
 <h3>${esc(i.title)}</h3>

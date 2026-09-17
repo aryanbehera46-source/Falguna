@@ -38,6 +38,36 @@ class HTMLSeparationTests(unittest.TestCase):
         self.assertIn("@media", HQ_INDEX_HTML)
         self.assertIn("grid-template-columns:1fr", HQ_INDEX_HTML)
 
+    def test_hq_sidebar_scrolls_independently_of_main_content(self):
+        # Regression: the Command Center / Finance nav sections made the
+        # sidebar's real content (28+ nav buttons) taller than the viewport
+        # on shorter screens. The sidebar's `overflow:hidden` silently
+        # clipped the lower nav items instead of letting them scroll, while
+        # main content scrolled fine on its own. Fixed by giving `aside` its
+        # own vertical scroll region; `min-height:0` is required because
+        # `aside` is a flex column inside a grid item and would otherwise
+        # refuse to shrink below its content's natural height.
+        import re
+        m = re.search(r"aside\{[^}]*\}", HQ_INDEX_HTML)
+        self.assertIsNotNone(m, "base `aside` CSS rule not found")
+        aside_rule = m.group(0)
+        self.assertIn("overflow-y:auto", aside_rule)
+        self.assertIn("overflow-x:hidden", aside_rule)
+        self.assertIn("min-height:0", aside_rule)
+        # Structure/spacing/layout must be untouched: still a fixed-place
+        # flex column, not redesigned.
+        self.assertIn("display:flex", aside_rule)
+        self.assertIn("flex-direction:column", aside_rule)
+        self.assertIn("padding:18px 12px", aside_rule)
+        # Main content's own independent scrolling must be unaffected.
+        main_rule = re.search(r"main\{[^}]*\}", HQ_INDEX_HTML)
+        self.assertIsNotNone(main_rule, "base `main` CSS rule not found")
+        self.assertIn("overflow-y:auto", main_rule.group(0))
+        # The footer boundary text stays part of the sidebar, pinned to the
+        # bottom when there's room, scrollable into view when there isn't.
+        self.assertIn('<div class="boundary">', HQ_INDEX_HTML)
+        self.assertIn("margin-top:auto", HQ_INDEX_HTML)
+
     def test_hq_html_does_not_contain_falguna_engineering_mission_ui(self):
         # TTT HQ must not feel like Falguna with an extra tab: none of Falguna
         # Engineering's own mission-composer elements should appear here.
@@ -214,6 +244,158 @@ class WorkforceMediaHQServerTests(TTTHQServerTests):
         status, result = self._post(self.hq_port, f"/api/wf/tasks/{task_id}/execute", {"actor": "Aryan"})
         self.assertEqual(status, 200)
         self.assertEqual(result["status"], "NEEDS_ARYAN")
+
+    def test_command_center_snapshot_and_ceo_brief_over_http(self):
+        # Real data through the real HTTP layer: a won opportunity, an
+        # overdue invoice, and a pending Needs Aryan item should all show
+        # up, sourced, in the Command Center snapshot and a generated brief.
+        status, opp_out = self._post(self.hq_port, "/api/rh/opportunities", {
+            "title": "HTTP CC Test Deal", "client_name": "HTTP Client",
+        })
+        self.assertEqual(status, 201)
+        opportunity_id = opp_out["opportunity_id"]
+        status, _ = self._post(self.hq_port, f"/api/rh/opportunities/{opportunity_id}/won", {"final_price": 1500.0})
+        self.assertEqual(status, 200)
+
+        status, snapshot = self._get(self.hq_port, "/api/cc/snapshot")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(snapshot["revenue"]["won_revenue_lifetime"], 1500.0)
+        self.assertIn("source", snapshot["revenue"])
+        self.assertIn("risk_signals", snapshot)
+
+        code = self._get_raises(self.hq_port, "/api/cc/ceo-brief/latest")
+        self.assertEqual(code, 404)
+
+        status, brief = self._post(self.hq_port, "/api/cc/ceo-brief/generate", {"actor": "Aryan"})
+        self.assertEqual(status, 201)
+        self.assertIn("confirmed_facts_json", brief)
+
+        status, latest = self._get(self.hq_port, "/api/cc/ceo-brief/latest")
+        self.assertEqual(status, 200)
+        self.assertEqual(latest["id"], brief["id"])
+
+        status, listing = self._get(self.hq_port, "/api/cc/ceo-brief")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(b["id"] == brief["id"] for b in listing["items"]))
+
+    def test_goals_and_kpis_over_http(self):
+        status, out = self._post(self.hq_port, "/api/cc/goals", {
+            "title": "Reach 1L/month", "target": 100000.0, "unit": "INR", "department": "Sales", "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        goal_id = out["goal_id"]
+
+        status, goal = self._get(self.hq_port, f"/api/cc/goals/{goal_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(goal["status"], "ACTIVE")
+        self.assertEqual(goal["progress"], 0.0)
+
+        status, updated = self._post(self.hq_port, f"/api/cc/goals/{goal_id}/progress", {"value": 100000.0, "actor": "Aryan"})
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["status"], "ACHIEVED")
+
+        status, listing = self._get(self.hq_port, "/api/cc/goals")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(g["id"] == goal_id for g in listing["items"]))
+
+        status, actions = self._get(self.hq_port, f"/api/cc/goals/{goal_id}/recommended-actions")
+        self.assertEqual(status, 200)
+        self.assertEqual(actions["actions"], [])  # achieved -- nothing left to recommend
+
+        status, kpis = self._get(self.hq_port, "/api/cc/kpis")
+        self.assertEqual(status, 200)
+        for group in ("sales", "delivery", "workforce", "media", "finance"):
+            self.assertIn(group, kpis)
+
+    def test_finance_ledger_and_cash_runway_over_http(self):
+        status, _ = self._post(self.hq_port, "/api/rh/sales-policy", {})  # calling save() at all marks it configured
+        self.assertEqual(status, 200)
+
+        status, opp_out = self._post(self.hq_port, "/api/rh/opportunities", {
+            "title": "HTTP Ledger Deal", "client_name": "HTTP Ledger Client",
+        })
+        self.assertEqual(status, 201)
+        opportunity_id = opp_out["opportunity_id"]
+        status, close_out = self._post(self.hq_port, f"/api/rh/opportunities/{opportunity_id}/close", {
+            "client_name": "HTTP Ledger Client", "final_price": 800.0, "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        client_id = close_out["client_id"]
+
+        status, entry_out = self._post(self.hq_port, "/api/cc/ledger", {
+            "entry_type": "OUTFLOW", "category": "hosting", "amount": 150.0,
+            "evidence": "AWS invoice #77", "client_id": client_id, "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        entry_id = entry_out["entry_id"]
+
+        status, listing = self._get(self.hq_port, "/api/cc/ledger")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(e["id"] == entry_id for e in listing["items"]))
+
+        status, cash = self._get(self.hq_port, "/api/cc/cash-runway")
+        self.assertEqual(status, 200)
+        self.assertEqual(cash["actual"]["ledger_outflows_recorded"], 150.0)
+
+        status, prof = self._get(self.hq_port, f"/api/cc/clients/{client_id}/profitability")
+        self.assertEqual(status, 200)
+        self.assertEqual(prof["direct_costs"], 150.0)
+        self.assertEqual(prof["completeness"], "estimated_from_recorded_costs")
+
+        status, voided = self._post(self.hq_port, f"/api/cc/ledger/{entry_id}/void", {"actor": "Aryan", "reason": "test cleanup"})
+        self.assertEqual(status, 200)
+        self.assertEqual(voided["status"], "VOID")
+
+    def test_budgets_capital_reserves_risk_over_http(self):
+        status, budget_out = self._post(self.hq_port, "/api/cc/budgets", {
+            "department": "Media/Growth", "monthly_budget": 100.0, "limit_kind": "HARD", "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        budget_id = budget_out["budget_id"]
+
+        status, entry_out = self._post(self.hq_port, "/api/cc/ledger", {
+            "entry_type": "OUTFLOW", "category": "marketing", "amount": 500.0,
+            "evidence": "ad spend receipt", "business_unit": "Media/Growth", "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+
+        status, budget_status_out = self._get(self.hq_port, f"/api/cc/budgets/{budget_id}/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(budget_status_out["over_limit"])
+        self.assertIsNotNone(budget_status_out["escalated_needs_aryan_id"])
+
+        status, alloc = self._post(self.hq_port, "/api/cc/capital-allocation/recommend", {"available_amount": 1000.0, "actor": "Aryan"})
+        self.assertEqual(status, 201)
+        self.assertIn("recommendations", alloc)
+
+        status, reserve = self._post(self.hq_port, "/api/cc/reserve-policy", {"tax_reserve_pct": 0.15})
+        self.assertEqual(status, 200)
+        self.assertTrue(reserve["configured"])
+
+        status, exp_cap = self._get(self.hq_port, "/api/cc/experimental-capital")
+        self.assertEqual(status, 200)
+        self.assertEqual(exp_cap["available"], 0)
+
+        status, risk_out = self._post(self.hq_port, "/api/cc/risks", {
+            "title": "Single client concentration", "category": "concentration_risk", "severity": "high", "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        status, risks_listing = self._get(self.hq_port, "/api/cc/risks")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(r["id"] == risk_out["risk_id"] for r in risks_listing["items"]))
+
+    def test_department_and_ai_workforce_performance_over_http(self):
+        status, dept = self._get(self.hq_port, "/api/cc/department-performance")
+        self.assertEqual(status, 200)
+        for section in ("sales", "delivery", "digital_workforce", "media_growth", "falguna_engineering"):
+            self.assertIn(section, dept)
+            for metric in dept[section].values():
+                self.assertIn("source", metric)
+
+        status, wf_perf = self._get(self.hq_port, "/api/cc/ai-workforce-performance")
+        self.assertEqual(status, 200)
+        self.assertIn("by_worker", wf_perf)
+        self.assertIn("source", wf_perf)
 
     def test_recurring_workflow_create_and_run_due_over_http(self):
         status, out = self._post(self.hq_port, "/api/wf/recurring-workflows", {

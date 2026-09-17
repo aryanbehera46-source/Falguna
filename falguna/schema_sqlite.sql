@@ -170,3 +170,15 @@ CREATE INDEX IF NOT EXISTS idx_rh_completion_records_opportunity ON rh_completio
 CREATE INDEX IF NOT EXISTS idx_rh_retention_items_client ON rh_retention_items(client_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_rh_outbound_leads_status ON rh_outbound_leads(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_rh_outreach_drafts_lead ON rh_outreach_drafts(lead_id);
+CREATE TABLE IF NOT EXISTS cc_ceo_briefs (id TEXT PRIMARY KEY, period_start TEXT NOT NULL, period_end TEXT NOT NULL, confirmed_facts_json TEXT NOT NULL, estimates_json TEXT NOT NULL, recommendations_json TEXT NOT NULL, top_priorities_json TEXT NOT NULL, risks_json TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_cc_ceo_briefs_period_end ON cc_ceo_briefs(period_end);
+CREATE TABLE IF NOT EXISTS cc_goals (id TEXT PRIMARY KEY, title TEXT NOT NULL, target REAL NOT NULL, unit TEXT NOT NULL, start_date TEXT, deadline TEXT, current_value REAL NOT NULL DEFAULT 0, owner TEXT, department TEXT, status TEXT NOT NULL, linked_kpis_json TEXT, linked_actions_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cc_goal_progress_events (id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES cc_goals(id), from_value REAL, to_value REAL NOT NULL, actor TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_cc_goal_progress_events_goal ON cc_goal_progress_events(goal_id, created_at);
+CREATE TABLE IF NOT EXISTS cc_ledger_entries (id TEXT PRIMARY KEY, entry_type TEXT NOT NULL, category TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL, business_unit TEXT, client_id TEXT, project_ref TEXT, occurred_on TEXT NOT NULL, evidence TEXT NOT NULL, note TEXT, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_cc_ledger_entries_client ON cc_ledger_entries(client_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cc_ledger_entries_type_status ON cc_ledger_entries(entry_type, status, created_at);
+CREATE TABLE IF NOT EXISTS cc_budgets (id TEXT PRIMARY KEY, department TEXT NOT NULL, monthly_budget REAL NOT NULL, currency TEXT NOT NULL, limit_kind TEXT NOT NULL, warning_threshold_pct REAL, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cc_risks (id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, likelihood_band TEXT NOT NULL, owner TEXT, mitigation TEXT, evidence TEXT, status TEXT NOT NULL, needs_aryan_id TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_cc_budgets_department ON cc_budgets(department, status);
+CREATE INDEX IF NOT EXISTS idx_cc_risks_status ON cc_risks(status, severity);
