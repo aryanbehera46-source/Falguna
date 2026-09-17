@@ -359,7 +359,17 @@ def workforce_media_today_signals(store: StateStore, content_due_within_days: in
     """
     from datetime import datetime, timezone
 
-    blocked_tasks = store.list("wf_tasks", "status=?", ("BLOCKED",)) + store.list("wf_tasks", "status=?", ("NEEDS_ARYAN",))
+    # FAILED only rests at persistence once a task's retry budget is
+    # exhausted (a mid-retry FAILED is immediately transitioned back to
+    # READY within the same execute() call, so it is never the row's
+    # resting status) -- so these are exactly the exhausted-retry failures
+    # WorkforceOrchestrator.execute() escalates, and they belong in the
+    # same attention bucket as blocked/needs-Aryan tasks.
+    blocked_tasks = (
+        store.list("wf_tasks", "status=?", ("BLOCKED",))
+        + store.list("wf_tasks", "status=?", ("NEEDS_ARYAN",))
+        + store.list("wf_tasks", "status=?", ("FAILED",))
+    )
 
     media_pending_approval = [
         item for item in store.list("needs_aryan_items", "status=?", ("PENDING",))

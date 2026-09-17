@@ -288,13 +288,35 @@ class WorkforceOrchestrator:
             self.audit.append("WF_TASK_BLOCKED", {"task_id": task_id, "worker": worker.name, "blockers": result.blockers, "actor": actor})
             return self.tasks.get(task_id)
 
-        # FAILED -- bounded retry, then stop (never loop forever).
+        # FAILED -- bounded retry, then stop (never loop forever). Once
+        # retries are exhausted the task is terminal: escalate exactly once
+        # (guarded by the task's own needs_aryan_id, the same idempotency
+        # marker plan()/BLOCKED already use) so a human is notified, rather
+        # than leaving an exhausted-retry task silently stuck in FAILED.
         retries = (task.get("retries") or 0)
+        exhausted = retries >= self.max_retries
+        needs_aryan_id = task.get("needs_aryan_id") if exhausted else None
+        if exhausted and needs_aryan_id is None and self.needs_aryan is not None:
+            needs_aryan_id = self.needs_aryan.create_item(
+                "workforce_action_approval",
+                f"Workforce task failed after {self.max_retries} retries: {task['objective']}",
+                (result.next_action or "Review the failure evidence and decide how to proceed -- retry "
+                                         "manually with different inputs, reassign, or cancel this task."),
+                actor=actor, rationale=(result.next_action or "worker reported failure"),
+                risk="workforce task exhausted its retry budget and is stuck in FAILED",
+                ref_type="wf_task", ref_id=task_id,
+            )
+        fail_fields = {"error": (result.next_action or "worker reported failure")}
+        if exhausted:
+            fail_fields["needs_aryan_id"] = needs_aryan_id
         self.tasks.transition(
             task_id, "FAILED", actor, reason="worker execution failed",
-            error=(result.next_action or "worker reported failure"), evidence=result.evidence,
+            evidence=result.evidence, **fail_fields,
         )
-        self.audit.append("WF_TASK_FAILED", {"task_id": task_id, "worker": worker.name, "retries": retries, "actor": actor})
-        if retries < self.max_retries:
+        self.audit.append("WF_TASK_FAILED", {
+            "task_id": task_id, "worker": worker.name, "retries": retries, "actor": actor,
+            "exhausted": exhausted, "needs_aryan_id": needs_aryan_id,
+        })
+        if not exhausted:
             self.tasks.transition(task_id, "READY", actor, reason="retrying after failure", retries=retries + 1)
         return self.tasks.get(task_id)

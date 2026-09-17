@@ -14,7 +14,7 @@ from pathlib import Path
 
 from falguna.audit import AuditLog
 from falguna.store import StateStore
-from falguna.ttt_hq import NeedsAryanQueue
+from falguna.ttt_hq import NeedsAryanQueue, workforce_media_today_signals
 from falguna.workforce import (
     ALLOWED_TASK_TRANSITIONS,
     TASK_STATUSES,
@@ -53,7 +53,7 @@ class AlwaysFailWorker(WorkforceWorker):
         return task_type == "fail_type"
 
     def execute(self, task):
-        return WorkerResult(status="FAILED", next_action="simulated failure")
+        return WorkerResult(status="FAILED", next_action="simulated failure", evidence={"attempted": True, "reason": "simulated failure"})
 
 
 class WorkforceTestBase(unittest.TestCase):
@@ -189,12 +189,83 @@ class OrchestratorTests(WorkforceTestBase):
         r1 = orch.execute(task_id)
         self.assertEqual(r1["status"], "READY")
         self.assertEqual(r1["retries"], 1)
+        self.assertIsNone(r1["needs_aryan_id"])  # not exhausted yet -- no escalation
         r2 = orch.execute(task_id)
         self.assertEqual(r2["status"], "READY")
         self.assertEqual(r2["retries"], 2)
+        self.assertIsNone(r2["needs_aryan_id"])  # not exhausted yet -- no escalation
         r3 = orch.execute(task_id)
         self.assertEqual(r3["status"], "FAILED")  # max_retries=2 exhausted, stops here
         self.assertIsNotNone(r3["error"])
+        # Failure evidence and terminal state are preserved (in the task's
+        # own durable event history, the same place every other transition
+        # -- including the pre-existing BLOCKED/NEEDS_ARYAN paths -- already
+        # records it), and retries do not continue indefinitely, while the
+        # exhausted task is escalated.
+        failed_events = [e for e in self.tasks.history(task_id) if e["to_status"] == "FAILED"]
+        self.assertTrue(failed_events)
+        self.assertIsNotNone(failed_events[-1]["evidence_json"])
+        self.assertEqual(json.loads(failed_events[-1]["evidence_json"]), {"attempted": True, "reason": "simulated failure"})
+        self.assertIsNotNone(r3["needs_aryan_id"])
+        item = self.store.get("needs_aryan_items", r3["needs_aryan_id"])
+        self.assertEqual(item["kind"], "workforce_action_approval")
+        self.assertEqual(item["status"], "PENDING")
+        self.assertEqual(item["ref_type"], "wf_task")
+        self.assertEqual(item["ref_id"], task_id)
+
+    def test_failed_exhausted_creates_exactly_one_needs_aryan_item(self):
+        orch = self._orch(AlwaysFailWorker())
+        task_id = self.tasks.create("media", "Doomed task", "fail_type", actor="Aryan")
+        orch.execute(task_id)  # retries=1, READY
+        orch.execute(task_id)  # retries=2, READY
+        result = orch.execute(task_id)  # exhausted -> FAILED, escalated
+        self.assertEqual(result["status"], "FAILED")
+        escalations = [
+            item for item in self.store.list("needs_aryan_items")
+            if item["ref_type"] == "wf_task" and item["ref_id"] == task_id
+        ]
+        self.assertEqual(len(escalations), 1)
+
+    def test_repeated_execute_after_exhaustion_does_not_duplicate_escalation(self):
+        orch = self._orch(AlwaysFailWorker())
+        task_id = self.tasks.create("media", "Doomed task", "fail_type", actor="Aryan")
+        orch.execute(task_id)
+        orch.execute(task_id)
+        exhausted = orch.execute(task_id)
+        first_needs_aryan_id = exhausted["needs_aryan_id"]
+        self.assertIsNotNone(first_needs_aryan_id)
+
+        # Re-inspecting (GET) the terminal task repeatedly must never create
+        # a second escalation or otherwise mutate it.
+        for _ in range(3):
+            reinspected = self.tasks.get(task_id)
+            self.assertEqual(reinspected["status"], "FAILED")
+            self.assertEqual(reinspected["needs_aryan_id"], first_needs_aryan_id)
+
+        # A terminal FAILED task can no longer be re-executed (it is not
+        # READY), so reprocessing it raises rather than silently re-running
+        # the exhausted-retry escalation path a second time.
+        with self.assertRaises(WorkforceError):
+            orch.execute(task_id)
+
+        escalations = [
+            item for item in self.store.list("needs_aryan_items")
+            if item["ref_type"] == "wf_task" and item["ref_id"] == task_id
+        ]
+        self.assertEqual(len(escalations), 1)
+        self.assertEqual(escalations[0]["id"], first_needs_aryan_id)
+
+    def test_today_dashboard_surfaces_exhausted_retry_failure(self):
+        orch = self._orch(AlwaysFailWorker())
+        task_id = self.tasks.create("media", "Doomed task", "fail_type", actor="Aryan")
+        orch.execute(task_id)
+        orch.execute(task_id)
+        result = orch.execute(task_id)
+        self.assertEqual(result["status"], "FAILED")
+
+        signals = workforce_media_today_signals(self.store)
+        blocked_ids = [t["id"] for t in signals["workforce_blocked_tasks"]]
+        self.assertIn(task_id, blocked_ids)
 
     def test_unroutable_task_type_escalates_instead_of_raising(self):
         orch = self._orch(EchoWorker())  # only supports "echo"
@@ -246,6 +317,36 @@ class PersistenceTests(WorkforceTestBase):
         self.assertEqual(json.loads(task["outputs_json"]), {"echo": "Say hi"})
         history = reopened_tasks.history(task_id)
         self.assertGreaterEqual(len(history), 3)  # CREATED, PLANNING, READY, EXECUTING, VERIFYING, COMPLETED
+        self.store = reopened_store  # let tearDown close this live handle instead of the already-closed one
+
+    def test_exhausted_retry_failure_and_escalation_survive_restart(self):
+        orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        orch.register_worker(AlwaysFailWorker())
+        task_id = self.tasks.create("media", "Doomed task", "fail_type", actor="Aryan")
+        orch.execute(task_id)
+        orch.execute(task_id)
+        exhausted = orch.execute(task_id)
+        self.assertEqual(exhausted["status"], "FAILED")
+        needs_aryan_id = exhausted["needs_aryan_id"]
+        self.assertIsNotNone(needs_aryan_id)
+        self.store.close()
+
+        reopened_store = StateStore(self.root / "state.db")
+        reopened_store.migrate()
+        reopened_tasks = WorkforceTaskStore(reopened_store, self.audit)
+        task = reopened_tasks.get(task_id)
+        self.assertEqual(task["status"], "FAILED")  # preserved, not silently retried again
+        self.assertEqual(task["needs_aryan_id"], needs_aryan_id)
+        failed_events = [e for e in reopened_tasks.history(task_id) if e["to_status"] == "FAILED"]
+        self.assertTrue(failed_events)
+        self.assertIsNotNone(failed_events[-1]["evidence_json"])  # failure evidence preserved across restart
+        item = reopened_store.get("needs_aryan_items", needs_aryan_id)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["status"], "PENDING")
+
+        signals = workforce_media_today_signals(reopened_store)
+        self.assertIn(task_id, [t["id"] for t in signals["workforce_blocked_tasks"]])
+
         self.store = reopened_store  # let tearDown close this live handle instead of the already-closed one
 
 
