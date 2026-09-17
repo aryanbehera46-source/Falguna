@@ -2,9 +2,15 @@
 
 Hierarchy: Aryan -> Twenty Two Technologies Pvt. Ltd. -> Falguna + other TTT
 products. This module is the "Twenty Two Technologies" surface: it owns
-Boardroom, the Master Vision Backlog, and the Needs Aryan queue today, with
-Opportunities / Sales Pipeline / Clients / Active Jobs / Revenue / Ventures
-listed as future scope (not built here -- this pass is separation only).
+Boardroom, the Master Vision Backlog, the Needs Aryan queue, and (PASS 2)
+Revenue Hunter -- Opportunities, the pipeline, proposals, follow-ups, Active
+Jobs, and revenue analytics. Ventures / Company Ops remains future scope.
+
+Revenue Hunter never sends anything to a client on its own: proposal and
+follow-up generation always produce a DRAFT row; a proposal only becomes
+APPROVED through the existing Needs Aryan queue (an owner decision), and a
+follow-up only becomes SENT when the owner explicitly calls mark-sent after
+actually sending it themselves.
 
 Integration boundary with Falguna Engineering (falguna/web.py):
   TTT HQ manages/decides -> Falguna executes -> Falguna returns evidence ->
@@ -26,8 +32,13 @@ HTML, and vice versa.
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+from .revenue_hunter import (
+    ActiveJobError, ActiveJobStore, AnalyticsService, DashboardService, FollowupError,
+    FollowupStore, OpportunityError, OpportunityStore, ProposalError, ProposalStore,
+    QualificationStore, apply_decision_side_effect, extract_fields_from_text, extract_from_csv_rows,
+)
 from .runtime import open_control_plane
 from .ttt_hq import BacklogStore, BoardroomStore, NeedsAryanQueue, hq_overview
 
@@ -64,6 +75,21 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 return self._json({"items": BacklogStore(store, control.audit).list_items()})
             if path == "/api/needs-aryan":
                 return self._json({"items": NeedsAryanQueue(store, control.audit, control).list_pending()})
+            if path == "/api/rh/opportunities":
+                query = parse_qs(urlparse(self.path).query)
+                stage = (query.get("stage") or [None])[0]
+                return self._json({"items": OpportunityStore(store, control.audit).list(stage)})
+            if path.startswith("/api/rh/opportunities/"):
+                opportunity_id = path.rsplit("/", 1)[-1]
+                opportunity = OpportunityStore(store, control.audit).get(opportunity_id)
+                return self._json(opportunity or {"error": "opportunity not found"}, HTTPStatus.OK if opportunity else HTTPStatus.NOT_FOUND)
+            if path == "/api/rh/active-jobs":
+                return self._json({"items": ActiveJobStore(store, control.audit).list()})
+            if path == "/api/rh/dashboard":
+                pending = NeedsAryanQueue(store, control.audit, control).list_pending()
+                return self._json(DashboardService(store).today(pending))
+            if path == "/api/rh/analytics":
+                return self._json(AnalyticsService(store).summary())
         finally:
             store.close()
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -114,8 +140,86 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     return self._json({"item_id": item_id}, HTTPStatus.CREATED)
                 if path.startswith("/api/needs-aryan/") and path.endswith("/decision"):
                     item_id = unquote(path.split("/")[3])
-                    result = NeedsAryanQueue(store, control.audit, control).decide(item_id, body.get("action", ""), body.get("actor", "Aryan"), note=body.get("note"))
+                    queue = NeedsAryanQueue(store, control.audit, control)
+                    before = store.get("needs_aryan_items", item_id)  # captured pre-decision for the side-effect hook below
+                    result = queue.decide(item_id, body.get("action", ""), body.get("actor", "Aryan"), note=body.get("note"))
+                    if before is not None and result.get("action"):
+                        apply_decision_side_effect(store, control.audit, dict(before), result["action"], body.get("actor", "Aryan"))
                     return self._json(result)
+
+                if path == "/api/rh/opportunities":
+                    opportunities = OpportunityStore(store, control.audit)
+                    import_mode = body.get("import_mode", "manual")
+                    if import_mode == "paste_jd":
+                        fields = extract_fields_from_text(body.get("text", ""))
+                        fields.update({k: v for k, v in body.items() if k in {"title", "client_name", "source_url"} and v})
+                        if not fields.get("title"):
+                            raise ValueError("title is required (the JD text alone doesn't reliably contain one)")
+                        opportunity_id = opportunities.create(fields, actor=body.get("actor", "Aryan"), source="paste_jd")
+                        return self._json({"opportunity_id": opportunity_id}, HTTPStatus.CREATED)
+                    if import_mode == "url":
+                        url = body.get("url", "")
+                        if not url.startswith(("http://", "https://")):
+                            raise ValueError("url must start with http:// or https://")
+                        fields = {"title": body.get("title", ""), "description": body.get("description"), "source_url": url}
+                        opportunity_id = opportunities.create(fields, actor=body.get("actor", "Aryan"), source="url")
+                        return self._json({"opportunity_id": opportunity_id}, HTTPStatus.CREATED)
+                    if import_mode == "csv_json":
+                        rows = extract_from_csv_rows(body.get("rows", []))
+                        created = [opportunities.create(row, actor=body.get("actor", "Aryan"), source="csv_json") for row in rows]
+                        return self._json({"opportunity_ids": created}, HTTPStatus.CREATED)
+                    opportunity_id = opportunities.create(body, actor=body.get("actor", "Aryan"), source="manual")
+                    return self._json({"opportunity_id": opportunity_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/qualify"):
+                    opportunity_id = path.split("/")[4]
+                    result = QualificationStore(store, control.audit).qualify(opportunity_id, actor=body.get("actor", "Aryan"))
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/stage"):
+                    opportunity_id = path.split("/")[4]
+                    opportunity = OpportunityStore(store, control.audit).move_stage(opportunity_id, body.get("to_stage", ""), body.get("actor", "Aryan"), note=body.get("note"))
+                    return self._json(opportunity)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/proposals"):
+                    opportunity_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    result = ProposalStore(store, control.audit, needs_aryan).generate(opportunity_id, body.get("kind", ""), actor=body.get("actor", "Aryan"))
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/followups"):
+                    opportunity_id = path.split("/")[4]
+                    followup_id = FollowupStore(store, control.audit).generate(opportunity_id, body.get("kind", ""), due_at=body.get("due_at"))
+                    return self._json({"followup_id": followup_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/followups/") and path.endswith("/sent"):
+                    followup_id = path.split("/")[4]
+                    FollowupStore(store, control.audit).mark_sent(followup_id, body.get("actor", "Aryan"))
+                    return self._json({"followup_id": followup_id, "status": "SENT"})
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/won"):
+                    opportunity_id = path.split("/")[4]
+                    opportunity = OpportunityStore(store, control.audit).mark_won(opportunity_id, body.get("actor", "Aryan"), final_price=body.get("final_price"))
+                    return self._json(opportunity)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/lost"):
+                    opportunity_id = path.split("/")[4]
+                    opportunity = OpportunityStore(store, control.audit).mark_lost(opportunity_id, body.get("actor", "Aryan"), reason=body.get("reason"))
+                    return self._json(opportunity)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/active-job"):
+                    opportunity_id = path.split("/")[4]
+                    job_id = ActiveJobStore(store, control.audit).create_from_won_opportunity(opportunity_id, actor=body.get("actor", "Aryan"))
+                    return self._json({"active_job_id": job_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/active-jobs/") and path.endswith("/handoff"):
+                    active_job_id = path.split("/")[4]
+                    result = ActiveJobStore(store, control.audit).trigger_handoff(
+                        active_job_id, body.get("repository", ""), control,
+                        actor=body.get("actor", "Aryan"), policy_overrides=body.get("policy_overrides"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             finally:
                 store.close()
@@ -170,12 +274,14 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <button class="navitem active" data-view="boardroom">Boardroom</button>
 <button class="navitem" data-view="backlog">Master Vision Backlog</button>
 <button class="navitem" data-view="needsAryan">Needs Aryan</button>
+<div class="navsec">Revenue Hunter</div>
+<button class="navitem" data-view="rhToday">Today</button>
+<button class="navitem" data-view="rhOpportunities">Opportunities</button>
+<button class="navitem" data-view="rhPipeline">Sales Pipeline</button>
+<button class="navitem" data-view="rhClients">Clients</button>
+<button class="navitem" data-view="rhActiveJobs">Active Jobs</button>
+<button class="navitem" data-view="rhRevenue">Revenue</button>
 <div class="navsec">Coming soon</div>
-<button class="navitem disabled" disabled>Opportunities</button>
-<button class="navitem disabled" disabled>Sales Pipeline</button>
-<button class="navitem disabled" disabled>Clients</button>
-<button class="navitem disabled" disabled>Active Jobs</button>
-<button class="navitem disabled" disabled>Revenue</button>
 <button class="navitem disabled" disabled>Ventures / Company Ops</button>
 <div class="boundary">TTT HQ decides · Falguna executes<br>Local-only, no automatic merge or deploy</div>
 </aside>
@@ -215,6 +321,68 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="pageintro">Every pending decision in one place -- business approvals and Falguna Engineering missions awaiting a merge decision.</div>
 <div class="list" id="needsAryanList"></div>
 </div>
+<div class="view" id="view-rhToday">
+<h1>Today</h1>
+<div class="pageintro">What should I do today? Highest-priority Revenue Hunter actions, in one place.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="rhPipelineValue">$0</h2><div class="sub">Pipeline value</div></div>
+<div class="section" style="flex:1"><h2 id="rhWonRevenue">$0</h2><div class="sub">Won revenue</div></div>
+</div>
+<div class="section"><h2>Next actions</h2><div class="list" id="rhNextActions"></div></div>
+</div>
+<div class="view" id="view-rhOpportunities">
+<h1>Opportunities</h1>
+<div class="pageintro">Add an opportunity from a pasted job description, a URL, a manual form, or CSV/JSON import. Nothing here is ever sent automatically.</div>
+<div class="form">
+<select id="rhMode"><option value="manual">Manual form</option><option value="paste_jd">Paste job description</option><option value="url">Paste URL</option><option value="csv_json">CSV/JSON import</option></select>
+<div id="rhModeManual">
+<input id="rhTitle" placeholder="Title">
+<input id="rhClient" placeholder="Client / company (optional)">
+<textarea id="rhDescription" placeholder="Description"></textarea>
+<div class="row"><input id="rhBudget" placeholder="Budget/rate"><input id="rhDeadline" placeholder="Deadline"></div>
+<div class="row"><input id="rhSkills" placeholder="Required skills (comma-separated)"><input id="rhContractType" placeholder="Contract type"></div>
+<div class="row"><input id="rhLocation" placeholder="Location/timezone"><input id="rhUrgency" placeholder="Urgency"></div>
+</div>
+<div id="rhModePasteJd" style="display:none">
+<input id="rhJdTitle" placeholder="Title (the JD text alone often doesn't have a clean one)">
+<input id="rhJdClient" placeholder="Client / company (optional)">
+<textarea id="rhJdText" placeholder="Paste the full job description here" style="min-height:110px"></textarea>
+</div>
+<div id="rhModeUrl" style="display:none">
+<input id="rhUrlTitle" placeholder="Title">
+<input id="rhUrlValue" placeholder="https://...">
+<textarea id="rhUrlDescription" placeholder="Description (Revenue Hunter never fetches the page itself -- paste what you see)"></textarea>
+</div>
+<div id="rhModeCsv" style="display:none">
+<textarea id="rhCsvJson" placeholder='JSON array, e.g. [{"title":"Landing page","client_name":"Acme","budget_rate":"$500"}]' style="min-height:90px"></textarea>
+</div>
+<div class="actions"><button id="rhCreate" type="button">Add opportunity</button></div>
+</div>
+<div class="row" style="margin:6px 0">
+<select id="rhStageFilter"><option value="">All stages</option></select>
+</div>
+<div class="list" id="rhOpportunityList"></div>
+</div>
+<div class="view" id="view-rhPipeline">
+<h1>Sales Pipeline</h1>
+<div class="pageintro">opportunity &middot; value &middot; client &middot; next action &middot; last activity &middot; deadline, grouped by stage.</div>
+<div id="rhPipelineBoard"></div>
+</div>
+<div class="view" id="view-rhClients">
+<h1>Clients</h1>
+<div class="pageintro">Opportunities grouped by client.</div>
+<div class="list" id="rhClientsList"></div>
+</div>
+<div class="view" id="view-rhActiveJobs">
+<h1>Active Jobs</h1>
+<div class="pageintro">Won opportunities that became Active Jobs. Handoff to Falguna Engineering is always owner-triggered, with a real target repository.</div>
+<div class="list" id="rhActiveJobsList"></div>
+</div>
+<div class="view" id="view-rhRevenue">
+<h1>Revenue</h1>
+<div class="pageintro">Lean analytics on the acquisition funnel.</div>
+<div class="list" id="rhAnalytics"></div>
+</div>
 </div>
 </main>
 </div>
@@ -223,7 +391,8 @@ const $=id=>document.getElementById(id);
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active')});
+const rhLoaders={rhToday:loadRhToday,rhOpportunities:loadRhOpportunities,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue};
+document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
 async function loadBoardroom(){const d=await api('/api/boardroom');renderBoardroom(d.topics||[])}
 function renderBoardroom(topics){$('boardroomList').innerHTML=topics.length?topics.map(t=>`<div class="item" data-topic="${esc(t.id)}">
@@ -272,5 +441,76 @@ ${i.source==='falguna_engineering'?`<a class="secondary" style="border:0;border-
 </div>
 </div>`).join(''):'<div class="empty">Nothing needs Aryan right now.</div>';
 document.querySelectorAll('.na').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadNeedsAryan()}catch(e){alert(e.message)}})}
+
+// ---------- Revenue Hunter ----------
+const RH_STAGES=["New","Qualified","Proposal Ready","Applied/Sent","Replied","Meeting","Negotiating","Won","Lost"];
+const PROPOSAL_KINDS=["short","detailed","upwork","email_pitch","follow_up"];
+const FOLLOWUP_KINDS=["proposal_followup","response_followup","negotiation_followup","payment_followup","repeat_business_followup"];
+let rhOpenId=null;
+if($('rhStageFilter').children.length<2)RH_STAGES.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;$('rhStageFilter').appendChild(o)});
+$('rhMode').onchange=()=>{const m=$('rhMode').value;$('rhModeManual').style.display=m==='manual'?'':'none';$('rhModePasteJd').style.display=m==='paste_jd'?'':'none';$('rhModeUrl').style.display=m==='url'?'':'none';$('rhModeCsv').style.display=m==='csv_json'?'':'none'};
+$('rhStageFilter').onchange=()=>loadRhOpportunities();
+$('rhCreate').onclick=async()=>{
+const m=$('rhMode').value;let body;
+if(m==='paste_jd'){if(!$('rhJdTitle').value.trim())return alert('Title is required.');if(!$('rhJdText').value.trim())return alert('Paste the job description text first.');body={import_mode:'paste_jd',title:$('rhJdTitle').value.trim(),client_name:$('rhJdClient').value.trim()||null,text:$('rhJdText').value}}
+else if(m==='url'){if(!$('rhUrlTitle').value.trim()||!$('rhUrlValue').value.trim())return alert('Title and URL are required.');body={import_mode:'url',title:$('rhUrlTitle').value.trim(),url:$('rhUrlValue').value.trim(),description:$('rhUrlDescription').value||null}}
+else if(m==='csv_json'){let rows;try{rows=JSON.parse($('rhCsvJson').value)}catch(e){return alert('That is not valid JSON.')}body={import_mode:'csv_json',rows}}
+else{if(!$('rhTitle').value.trim())return alert('Title is required.');body={import_mode:'manual',title:$('rhTitle').value.trim(),client_name:$('rhClient').value.trim()||null,description:$('rhDescription').value||null,budget_rate:$('rhBudget').value||null,required_skills:$('rhSkills').value||null,deadline:$('rhDeadline').value||null,contract_type:$('rhContractType').value||null,location_timezone:$('rhLocation').value||null,urgency:$('rhUrgency').value||null}}
+try{await api('/api/rh/opportunities',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});['rhTitle','rhClient','rhDescription','rhBudget','rhSkills','rhDeadline','rhContractType','rhLocation','rhUrgency','rhJdTitle','rhJdClient','rhJdText','rhUrlTitle','rhUrlValue','rhUrlDescription','rhCsvJson'].forEach(id=>{if($(id))$(id).value=''});await loadRhOpportunities()}catch(e){alert(e.message)}
+};
+async function loadRhToday(){const d=await api('/api/rh/dashboard');$('rhPipelineValue').textContent='$'+d.pipeline_value;$('rhWonRevenue').textContent='$'+d.won_revenue;$('rhNextActions').innerHTML=d.next_actions.length?d.next_actions.map(a=>`<div class="item"><h3>${esc(a.title||'')}</h3><div class="meta"><span>${esc(a.type)}</span></div><div>${esc(a.why||'')}</div></div>`).join(''):'<div class="empty">Nothing urgent right now.</div>'}
+async function loadRhOpportunities(){const stage=$('rhStageFilter').value;const d=await api('/api/rh/opportunities'+(stage?`?stage=${encodeURIComponent(stage)}`:''));renderRhOpportunities(d.items||[])}
+function rhCard(o){return `<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div><div class="actions"><button class="secondary rhOpen" data-id="${esc(o.id)}">Open</button></div></div>`}
+function renderRhOpportunities(items){$('rhOpportunityList').innerHTML=items.length?items.map(o=>rhOpenId===o.id?rhDetailCard(o):rhCard(o)).join(''):'<div class="empty">No opportunities yet.</div>';wireRhList()}
+function wireRhList(){
+document.querySelectorAll('.rhOpen').forEach(b=>b.onclick=async()=>{rhOpenId=b.dataset.id;await loadRhOpportunities()});
+document.querySelectorAll('.rhClose').forEach(b=>b.onclick=async()=>{rhOpenId=null;await loadRhOpportunities()});
+document.querySelectorAll('.rhQualify').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/qualify`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadRhOpportunities()}catch(e){alert(e.message)}});
+document.querySelectorAll('.rhStageBtn').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/stage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to_stage:b.dataset.stage})});await loadRhOpportunities()}catch(e){alert(e.message)}});
+document.querySelectorAll('.rhWon').forEach(b=>b.onclick=async()=>{const price=prompt('Final price (optional):');try{await api(`/api/rh/opportunities/${b.dataset.id}/won`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({final_price:price?Number(price):null})});await loadRhOpportunities()}catch(e){alert(e.message)}});
+document.querySelectorAll('.rhLost').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason (optional):')||null;try{await api(`/api/rh/opportunities/${b.dataset.id}/lost`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason})});await loadRhOpportunities()}catch(e){alert(e.message)}});
+document.querySelectorAll('.rhProposal').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/proposals`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:b.dataset.kind})});await loadRhOpportunities()}catch(e){alert(e.message)}});
+document.querySelectorAll('.rhFollowup').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/followups`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:b.dataset.kind})});await loadRhOpportunities()}catch(e){alert(e.message)}});
+document.querySelectorAll('.rhFollowupSent').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/followups/${b.dataset.id}/sent`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadRhOpportunities()}catch(e){alert(e.message)}});
+document.querySelectorAll('.rhActiveJob').forEach(b=>b.onclick=async()=>{try{await api(`/api/rh/opportunities/${b.dataset.id}/active-job`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});alert('Active Job created. Trigger the Falguna handoff from Active Jobs when ready.')}catch(e){alert(e.message)}});
+}
+function rhDetailCard(o){
+const q=o.qualification;
+return `<div class="item">
+<h3>${esc(o.title)}</h3>
+<div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div>
+${o.description?`<div>${esc(o.description)}</div>`:''}
+<div class="contrib"><b>Qualification:</b> ${q?`fit ${q.fit_score}/100, budget ${esc(q.budget_quality)}, <b>${esc(q.recommendation)}</b>, price ${esc(q.suggested_price)}, timeline ${esc(q.suggested_timeline)}${q.risk_flags?`, risks: ${esc(q.risk_flags)}`:''}`:'not qualified yet'}</div>
+<div class="actions">
+${!q?`<button class="rhQualify" data-id="${esc(o.id)}">Qualify</button>`:''}
+${RH_STAGES.map(s=>`<button class="secondary rhStageBtn" data-id="${esc(o.id)}" data-stage="${s}">${s}</button>`).join('')}
+${o.stage!=='Won'&&o.stage!=='Lost'?`<button class="rhWon" data-id="${esc(o.id)}">Won</button><button class="danger rhLost" data-id="${esc(o.id)}">Lost</button>`:''}
+${o.stage==='Won'?`<button class="secondary rhActiveJob" data-id="${esc(o.id)}">Create Active Job</button>`:''}
+<button class="secondary rhClose" data-id="${esc(o.id)}">Close</button>
+</div>
+<div class="contrib"><b>Proposals</b></div>
+<div class="actions">${PROPOSAL_KINDS.map(k=>`<button class="secondary rhProposal" data-id="${esc(o.id)}" data-kind="${k}">Draft ${k}</button>`).join('')}</div>
+${(o.proposals||[]).map(p=>`<div class="contrib"><b>${esc(p.kind)} (${esc(p.status)}):</b><br>${esc(p.content)}</div>`).join('')}
+<div class="contrib"><b>Follow-ups</b></div>
+<div class="actions">${FOLLOWUP_KINDS.map(k=>`<button class="secondary rhFollowup" data-id="${esc(o.id)}" data-kind="${k}">Draft ${k.replace('_followup','')}</button>`).join('')}</div>
+${(o.followups||[]).map(f=>`<div class="contrib"><b>${esc(f.kind)} (${esc(f.status)}):</b> ${esc(f.draft_content)} ${f.status==='DRAFT'?`<button class="secondary rhFollowupSent" data-id="${esc(f.id)}">Mark sent</button>`:''}</div>`).join('')}
+<div class="contrib"><b>Stage history</b></div>
+${(o.stage_history||[]).map(h=>`<div class="contrib">${esc(h.from_stage||'-')} &rarr; <b>${esc(h.to_stage)}</b> by ${esc(h.actor)}${h.note?': '+esc(h.note):''}</div>`).join('')}
+</div>`;
+}
+async function loadRhPipeline(){const d=await api('/api/rh/opportunities');const items=d.items||[];const byStage={};RH_STAGES.forEach(s=>byStage[s]=[]);items.forEach(o=>{(byStage[o.stage]||(byStage[o.stage]=[])).push(o)});
+$('rhPipelineBoard').innerHTML=RH_STAGES.map(s=>`<div class="section"><h2>${s} (${(byStage[s]||[]).length})</h2><div class="list">${(byStage[s]||[]).length?(byStage[s]||[]).map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta">${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div></div>`).join(''):'<div class="empty">Empty</div>'}</div></div>`).join('')}
+async function loadRhClients(){const d=await api('/api/rh/opportunities');const items=d.items||[];const byClient={};items.forEach(o=>{const key=o.client_name||'(no client name)';(byClient[key]=byClient[key]||[]).push(o)});
+const rows=Object.entries(byClient);
+$('rhClientsList').innerHTML=rows.length?rows.map(([client,opps])=>{const won=opps.filter(o=>o.stage==='Won');const revenue=won.reduce((sum,o)=>sum+(o.final_price||0),0);return `<div class="item"><h3>${esc(client)}</h3><div class="meta"><span>${opps.length} opportunit${opps.length===1?'y':'ies'}</span><span>${won.length} won</span><span>$${revenue} revenue</span></div></div>`}).join(''):'<div class="empty">No clients yet.</div>'}
+async function loadRhActiveJobs(){const d=await api('/api/rh/active-jobs');renderRhActiveJobs(d.items||[])}
+function renderRhActiveJobs(items){$('rhActiveJobsList').innerHTML=items.length?items.map(j=>`<div class="item"><h3>Active Job ${esc(j.id)}</h3><div class="meta"><span>${esc(j.handoff_status)}</span>${j.mission_id?`<span>mission ${esc(j.mission_id)}</span>`:''}</div>${j.handoff_status!=='HANDED_OFF'?`<div class="form"><input class="rhRepoInput" data-id="${esc(j.id)}" placeholder="Local git repository path for the target job"><div class="actions"><button class="secondary rhHandoff" data-id="${esc(j.id)}">Trigger Falguna handoff</button></div></div>`:''}</div>`).join(''):'<div class="empty">No Active Jobs yet -- create one from a Won opportunity.</div>';
+document.querySelectorAll('.rhHandoff').forEach(b=>b.onclick=async()=>{const repo=document.querySelector(`.rhRepoInput[data-id="${b.dataset.id}"]`).value.trim();if(!repo)return alert('Enter the target repository path first.');try{await api(`/api/rh/active-jobs/${b.dataset.id}/handoff`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repository:repo})});await loadRhActiveJobs()}catch(e){alert(e.message)}})}
+async function loadRhRevenue(){const a=await api('/api/rh/analytics');$('rhAnalytics').innerHTML=`<div class="item"><div class="meta">
+<span>Added: ${a.opportunities_added}</span><span>Qualified: ${a.qualified}</span><span>Proposals: ${a.proposals_created}</span><span>Sent: ${a.proposals_sent}</span>
+<span>Replies: ${a.replies}</span><span>Meetings: ${a.meetings}</span><span>Wins: ${a.wins}</span><span>Losses: ${a.losses}</span>
+<span>Conversion: ${Math.round(a.conversion_rate*100)}%</span><span>Pipeline value: $${a.pipeline_value}</span><span>Won revenue: $${a.won_revenue}</span>
+</div></div>`+Object.entries(a.source_performance||{}).map(([src,s])=>`<div class="item"><h3>${esc(src)}</h3><div class="meta"><span>added ${s.added}</span><span>won ${s.won}</span><span>lost ${s.lost}</span></div></div>`).join('')}
+
 loadAll().catch(e=>{$('boardroomList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`});
 </script></body></html>'''

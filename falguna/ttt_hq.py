@@ -28,6 +28,10 @@ BACKLOG_STATUSES = ["Future", "Planned", "Active", "Done", "Deferred"]
 NEEDS_ARYAN_KINDS = {
     "strategic_approval", "proposal_approval", "pricing_decision", "scope_expansion",
     "risky_action", "final_delivery_approval", "client_response_decision",
+    # Added for Revenue Hunter (PASS 2): outreach and negotiation-response
+    # approvals are business decisions like the others above, surfaced
+    # through this same queue rather than a parallel approval system.
+    "outreach_approval", "negotiation_response_approval",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 
@@ -315,7 +319,7 @@ def hq_overview() -> Dict[str, Any]:
         "company": "Twenty Two Technologies Pvt. Ltd.",
         "products": [
             {"name": "Falguna", "role": "Engineering intelligence/work execution (isolated worktrees, verification, review, supervisor/recovery)"},
-            {"name": "Revenue Hunter", "role": "Client acquisition -- separate app for now; see falguna/handoff.py for the future integration boundary"},
+            {"name": "Revenue Hunter", "role": "Client acquisition -- built into TTT HQ, separate from Falguna Engineering; see falguna/handoff.py for the Won -> Active Job integration boundary"},
         ],
         "hierarchy": "Aryan -> Twenty Two Technologies Pvt. Ltd. -> Falguna + other TTT products",
         "note": "TTT HQ owns company decisions, revenue ops, ventures, Boardroom, and owner approvals. Falguna powers the underlying work.",

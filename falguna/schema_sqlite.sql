@@ -48,3 +48,17 @@ CREATE INDEX IF NOT EXISTS idx_boardroom_decision_topic ON boardroom_decisions(t
 CREATE INDEX IF NOT EXISTS idx_backlog_status ON backlog_items(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_backlog_history_item ON backlog_history(item_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_needs_aryan_status ON needs_aryan_items(status, created_at);
+
+-- Revenue Hunter: client acquisition, served by TTT HQ (not Falguna Engineering)
+CREATE TABLE IF NOT EXISTS rh_opportunities (id TEXT PRIMARY KEY, source TEXT NOT NULL, source_url TEXT, client_name TEXT, title TEXT NOT NULL, description TEXT, budget_rate TEXT, required_skills TEXT, deadline TEXT, contract_type TEXT, location_timezone TEXT, urgency TEXT, stage TEXT NOT NULL, final_price REAL, lost_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_stage_history (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), from_stage TEXT, to_stage TEXT NOT NULL, actor TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_qualifications (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), fit_score INTEGER NOT NULL, budget_quality TEXT NOT NULL, effort_vs_return TEXT NOT NULL, portfolio_match TEXT, portfolio_match_reason TEXT, recurring_potential TEXT NOT NULL, urgency TEXT NOT NULL, risk_flags TEXT, recommendation TEXT NOT NULL, suggested_price TEXT, suggested_timeline TEXT, suggested_portfolio_proof TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_proposals (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), kind TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL, approved_by TEXT, approved_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_followups (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), kind TEXT NOT NULL, draft_content TEXT NOT NULL, status TEXT NOT NULL, due_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_active_jobs (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), job_payload_json TEXT NOT NULL, handoff_status TEXT NOT NULL, mission_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_rh_opportunities_stage ON rh_opportunities(stage, updated_at);
+CREATE INDEX IF NOT EXISTS idx_rh_stage_history_opportunity ON rh_stage_history(opportunity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_qualifications_opportunity ON rh_qualifications(opportunity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_proposals_opportunity ON rh_proposals(opportunity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_followups_status ON rh_followups(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_active_jobs_opportunity ON rh_active_jobs(opportunity_id, created_at);
