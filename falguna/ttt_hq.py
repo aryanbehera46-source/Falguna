@@ -32,6 +32,11 @@ NEEDS_ARYAN_KINDS = {
     # approvals are business decisions like the others above, surfaced
     # through this same queue rather than a parallel approval system.
     "outreach_approval", "negotiation_response_approval",
+    # Added for the Digital Workforce + Media/Growth Engine v1: a computer/
+    # browser action a worker could not safely complete alone, a real
+    # external publish/send, and an unexpected cost -- surfaced through the
+    # same queue, not a parallel approval system.
+    "workforce_action_approval", "publish_approval", "cost_approval",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 # A run in one of these statuses cannot become actionable again through
@@ -342,3 +347,64 @@ def hq_overview() -> Dict[str, Any]:
         "hierarchy": "Aryan -> Twenty Two Technologies Pvt. Ltd. -> Falguna + other TTT products",
         "note": "TTT HQ owns company decisions, revenue ops, ventures, Boardroom, and owner approvals. Falguna powers the underlying work.",
     }
+
+
+def workforce_media_today_signals(store: StateStore, content_due_within_days: int = 3) -> Dict[str, Any]:
+    """Digital Workforce + Media/Growth signals for the Today/CEO view
+    (Section 20): blocked workforce tasks, media items needing approval,
+    content due soon, publishing failures, strong growth signals. Purely
+    additive read-only queries merged into the existing dashboard response
+    at the route level -- this never touches `DashboardService.today()`'s
+    own, already-tested Revenue Hunter logic.
+    """
+    from datetime import datetime, timezone
+
+    blocked_tasks = store.list("wf_tasks", "status=?", ("BLOCKED",)) + store.list("wf_tasks", "status=?", ("NEEDS_ARYAN",))
+
+    media_pending_approval = [
+        item for item in store.list("needs_aryan_items", "status=?", ("PENDING",))
+        if item["kind"] in {"publish_approval", "cost_approval", "workforce_action_approval"}
+    ]
+
+    now = datetime.now(timezone.utc)
+    content_due_soon = []
+    for item in store.list("media_content_items"):
+        if item["content_state"] in ("LEARN", "CANCELLED") or not item.get("planned_publish_date"):
+            continue
+        try:
+            due = datetime.fromisoformat(item["planned_publish_date"])
+        except (TypeError, ValueError):
+            continue
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        if 0 <= (due - now).days <= content_due_within_days:
+            content_due_soon.append(item)
+
+    publishing_failures = store.list("media_publications", "status=?", ("FAILED",))
+
+    # A strong growth signal is a real (non-simulated), already-computed
+    # "repeat" recommendation -- recorded as evidence on the ANALYTICS ->
+    # LEARN transition by GrowthRecommendationAgent, never recomputed here.
+    strong_growth_signals = []
+    for event in store.list("media_content_events", "to_state=?", ("LEARN",)):
+        if not event.get("evidence_json"):
+            continue
+        try:
+            evidence = _json_loads(event["evidence_json"])
+        except ValueError:
+            continue
+        if evidence.get("decision") == "repeat":
+            strong_growth_signals.append({"content_id": event["content_id"], "reasoning": evidence.get("reasoning")})
+
+    return {
+        "workforce_blocked_tasks": blocked_tasks,
+        "media_pending_approval": media_pending_approval,
+        "content_due_soon": content_due_soon,
+        "publishing_failures": publishing_failures,
+        "strong_growth_signals": strong_growth_signals,
+    }
+
+
+def _json_loads(text: str) -> Dict[str, Any]:
+    import json
+    return json.loads(text)

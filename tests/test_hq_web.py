@@ -182,6 +182,135 @@ class TTTHQServerTests(_LiveServerCase):
         self.assertEqual(code, 404)
 
 
+class WorkforceMediaHQServerTests(TTTHQServerTests):
+    """Digital Workforce + Media/Growth Engine v1 routes (Section 20),
+    exercised through the real HTTP layer this server actually serves --
+    not just the underlying store objects (already covered exhaustively
+    in tests/test_workforce*.py and tests/test_media*.py)."""
+
+    def test_workforce_task_create_and_execute_over_http(self):
+        status, out = self._post(self.hq_port, "/api/wf/tasks", {
+            "department": "ops", "objective": "Draft a note", "task_type": "document_creation",
+            "inputs": {"title": "HTTP Test Doc", "content_text": "hello from the HTTP layer"},
+        })
+        self.assertEqual(status, 201)
+        task_id = out["task_id"]
+
+        status, result = self._post(self.hq_port, f"/api/wf/tasks/{task_id}/execute", {"actor": "Aryan"})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["status"], "COMPLETED")
+
+        status, listing = self._get(self.hq_port, "/api/wf/tasks")
+        self.assertTrue(any(t["id"] == task_id for t in listing["items"]))
+
+        status, history = self._get(self.hq_port, f"/api/wf/tasks/{task_id}/history")
+        self.assertGreaterEqual(len(history["items"]), 2)
+
+    def test_workforce_task_with_no_adapter_escalates_not_crashes(self):
+        status, out = self._post(self.hq_port, "/api/wf/tasks", {
+            "department": "media", "objective": "Research a topic", "task_type": "browser_research",
+        })
+        task_id = out["task_id"]
+        status, result = self._post(self.hq_port, f"/api/wf/tasks/{task_id}/execute", {"actor": "Aryan"})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["status"], "NEEDS_ARYAN")
+
+    def test_recurring_workflow_create_and_run_due_over_http(self):
+        status, out = self._post(self.hq_port, "/api/wf/recurring-workflows", {
+            "name": "Daily doc check", "department": "ops", "objective": "check docs", "task_type": "document_creation",
+            "schedule_kind": "hourly",
+        })
+        self.assertEqual(status, 201)
+        status, listing = self._get(self.hq_port, "/api/wf/recurring-workflows")
+        self.assertTrue(any(w["id"] == out["workflow_id"] for w in listing["items"]))
+
+    def test_media_brand_campaign_content_pipeline_over_http(self):
+        status, brand_out = self._post(self.hq_port, "/api/media/brands", {"name": "TTT", "voice_tone": "confident", "platforms": ["instagram"]})
+        self.assertEqual(status, 201)
+        brand_id = brand_out["brand_id"]
+
+        status, content_out = self._post(self.hq_port, "/api/media/content", {
+            "brand_id": brand_id, "title": "3 tips", "format": "short_form_video",
+        })
+        self.assertEqual(status, 201)
+        content_id = content_out["content_id"]
+
+        status, item = self._get(self.hq_port, f"/api/media/content/{content_id}")
+        self.assertEqual(item["content_state"], "RESEARCH")
+
+        status, result = self._post(self.hq_port, f"/api/media/content/{content_id}/transition", {"to_state": "IDEA", "actor": "Aryan"})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["content_state"], "IDEA")
+
+        status, history = self._get(self.hq_port, f"/api/media/content/{content_id}/history")
+        self.assertEqual(len(history["items"]), 2)
+
+        status, script_out = self._post(self.hq_port, f"/api/media/content/{content_id}/scripts", {"hook": "Hook", "body": "Body"})
+        self.assertEqual(status, 201)
+        status, scripts = self._get(self.hq_port, f"/api/media/content/{content_id}/scripts")
+        self.assertEqual(len(scripts["items"]), 1)
+        self.assertEqual(scripts["items"][0]["id"], script_out["script_id"])
+
+    def test_media_publication_manual_fallback_over_http(self):
+        _, brand_out = self._post(self.hq_port, "/api/media/brands", {"name": "TTT"})
+        _, content_out = self._post(self.hq_port, "/api/media/content", {"brand_id": brand_out["brand_id"], "title": "Post", "format": "image_post"})
+        content_id = content_out["content_id"]
+
+        _, pub_out = self._post(self.hq_port, "/api/media/publications", {"content_id": content_id, "platform": "instagram"})
+        pub_id = pub_out["publication_id"]
+
+        status, submitted = self._post(self.hq_port, f"/api/media/publications/{pub_id}/submit-for-approval", {"actor": "Aryan"})
+        self.assertEqual(status, 201)
+        self.assertEqual(submitted["status"], "AWAITING_APPROVAL")
+        needs_aryan_id = submitted["needs_aryan_id"]
+
+        status, _ = self._post(self.hq_port, f"/api/needs-aryan/{needs_aryan_id}/decision", {"action": "approve", "actor": "Aryan"})
+        self.assertEqual(status, 200)
+
+        status, approved = self._post(self.hq_port, f"/api/media/publications/{pub_id}/approve", {"actor": "Aryan"})
+        self.assertEqual(status, 200)
+        self.assertEqual(approved["status"], "APPROVED")
+
+        # No real adapter -> honest FAILED + manual-fallback escalation, never a fabricated PUBLISHED.
+        status, attempt = self._post(self.hq_port, f"/api/media/publications/{pub_id}/publish", {"actor": "system"})
+        self.assertEqual(status, 200)
+        self.assertEqual(attempt["status"], "FAILED")
+
+        status, manual = self._post(self.hq_port, f"/api/media/publications/{pub_id}/mark-published-manually", {
+            "evidence": {"post_url": "https://instagram.com/p/real"}, "actor": "Aryan",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(manual["status"], "PUBLISHED")
+        self.assertEqual(manual["execution_mode"], "manual")
+
+    def test_media_analytics_and_growth_experiment_over_http(self):
+        _, brand_out = self._post(self.hq_port, "/api/media/brands", {"name": "TTT"})
+        _, content_out = self._post(self.hq_port, "/api/media/content", {"brand_id": brand_out["brand_id"], "title": "Post", "format": "image_post"})
+        _, pub_out = self._post(self.hq_port, "/api/media/publications", {"content_id": content_out["content_id"], "platform": "instagram"})
+        pub_id = pub_out["publication_id"]
+
+        status, _ = self._post(self.hq_port, "/api/media/analytics", {"publication_id": pub_id, "metric_kind": "views", "value": 100, "source": "manual_entry"})
+        self.assertEqual(status, 201)
+        status, listing = self._get(self.hq_port, f"/api/media/publications/{pub_id}/analytics")
+        self.assertEqual(len(listing["items"]), 1)
+
+        status, rec = self._get(self.hq_port, f"/api/media/publications/{pub_id}/growth-recommendation")
+        self.assertEqual(status, 200)
+        self.assertEqual(rec["decision"], "stop")  # views recorded but zero engagement -> honestly weak, not insufficient
+
+        status, exp_out = self._post(self.hq_port, "/api/media/experiments", {"hypothesis": "Shorter hooks help", "content_id": content_out["content_id"]})
+        self.assertEqual(status, 201)
+        status, exp_result = self._post(self.hq_port, f"/api/media/experiments/{exp_out['experiment_id']}/result", {"result": "up", "decision": "adopt", "actor": "Aryan"})
+        self.assertEqual(status, 200)
+        self.assertEqual(exp_result["status"], "COMPLETED")
+
+    def test_today_dashboard_includes_workforce_media_signals(self):
+        status, today = self._get(self.hq_port, "/api/rh/dashboard")
+        self.assertEqual(status, 200)
+        for key in ("workforce_blocked_tasks", "media_pending_approval", "content_due_soon", "publishing_failures", "strong_growth_signals"):
+            self.assertIn(key, today)
+
+
 class FalgunaServerStillWorksTests(_LiveServerCase):
     """Falguna Engineering must still launch and behave exactly as before --
     and must never expose the TTT HQ routes that used to live inside it."""

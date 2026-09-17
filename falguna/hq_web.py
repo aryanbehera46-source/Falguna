@@ -32,19 +32,31 @@ HTML, and vice versa.
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .account_management import AccountManagementError, AccountManagerService
+from .analytics_growth import AnalyticsError, AnalyticsStore, GrowthAgent, GrowthExperimentStore
 from .application_executor import ApplicationExecutor, ApplicationExecutorError
 from .billing import BillingError, BillingStore, CompletionError, CompletionService, RetentionError, RetentionStore
 from .conversations import ConversationError, ConversationStore
+from .documents import DocumentError, DocumentStore
+from .email_admin import EmailError, EmailStore
 from .lifecycle import LifecycleError, LifecycleOrchestrator
+from .media import BrandStore, CampaignStore, ContentStore, MediaError, ScriptStore
+from .media_agents import (
+    AnalyticsIngestionAgent, ContentStrategistAgent, CreativeDirectorAgent, GrowthRecommendationAgent,
+    PublishingAgent, ScriptWriterAgent, ThumbnailAgent, VideoEditAgent, VisualAssetAgent, VoiceAgent,
+)
+from .media_providers import MediaAssetStore, MediaProviderError
 from .onboarding import DeliveryBriefService, OnboardingError, OnboardingStore
 from .opportunity_agent import (
     AcquisitionProfileStore, DiscoveryEngine, DiscoveryRunStore, build_qualification_engine,
     get_research_for_opportunity, requalify_all,
 )
 from .outbound import OutboundLeadError, OutboundLeadStore, OutreachError, OutreachService
+from .publishing import ManualPublishingChannel, PublicationStore, PublishingError
+from .recurring_workflows import RecurringWorkflowError, RecurringWorkflowStore
 from .revenue_hunter import (
     ActiveJobError, ActiveJobStore, AnalyticsService, DashboardService, FollowupError,
     FollowupStore, OpportunityError, OpportunityStore, ProposalError, ProposalStore,
@@ -53,9 +65,48 @@ from .revenue_hunter import (
 from .runtime import open_control_plane
 from .sales_manager import SalesManagerService
 from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
-from .ttt_hq import BacklogStore, BoardroomStore, NeedsAryanQueue, hq_overview
+from .ttt_hq import BacklogStore, BoardroomStore, NeedsAryanQueue, hq_overview, workforce_media_today_signals
+from .video_pipeline import VideoPipeline
+from .workforce import WorkforceError, WorkforceOrchestrator, WorkforceTaskStore
+from .workforce_workers import (
+    BrowserWorker, ContentWorker, DataWorker, DocumentWorker, EmailAdminWorker, ResearchWorker,
+    SpreadsheetWorker,
+)
 
 PRODUCT_NAME = "Twenty Two Technologies HQ"
+
+
+def _build_workforce_orchestrator(app_root, store, audit, needs_aryan) -> WorkforceOrchestrator:
+    """Wires one WorkforceOrchestrator with every registered worker --
+    Digital Workforce (Pass A/B) and every Media agent (Pass C/D) -- all
+    sharing the same task model, per Section 10's "do not make separate
+    incompatible execution frameworks." Every honest default applies here
+    exactly as it does in isolation: no browser/publish adapter, no
+    research provider, so those task types BLOCK and escalate rather than
+    fabricate a result -- this route wires nothing that pretends otherwise.
+    """
+    media_output_root = Path(app_root) / ".falguna" / "media_output"
+    documents = DocumentStore(store, audit)
+    emails = EmailStore(store, audit, needs_aryan=needs_aryan)
+    content = ContentStore(store, audit)
+    scripts = ScriptStore(store, audit)
+    assets = MediaAssetStore(store, audit, output_root=media_output_root / "assets")
+    pipeline = VideoPipeline(media_output_root / "video")
+    publications = PublicationStore(store, audit, needs_aryan=needs_aryan)
+    analytics = AnalyticsStore(store, audit)
+    growth = GrowthAgent(analytics)
+
+    orch = WorkforceOrchestrator(store, audit, needs_aryan=needs_aryan)
+    for worker in [
+        BrowserWorker(), ResearchWorker(), DataWorker(), DocumentWorker(documents), SpreadsheetWorker(documents),
+        EmailAdminWorker(emails), ContentWorker(documents),
+        ContentStrategistAgent(content), ScriptWriterAgent(content, scripts), CreativeDirectorAgent(content, scripts),
+        VisualAssetAgent(content, assets), VoiceAgent(content, assets), VideoEditAgent(content, assets, pipeline),
+        ThumbnailAgent(content, assets), PublishingAgent(content, publications),
+        AnalyticsIngestionAgent(content, publications, analytics), GrowthRecommendationAgent(content, publications, growth),
+    ]:
+        orch.register_worker(worker)
+    return orch
 
 
 class TTTHQHandler(BaseHTTPRequestHandler):
@@ -163,7 +214,9 @@ class TTTHQHandler(BaseHTTPRequestHandler):
             if path == "/api/rh/dashboard":
                 pending = NeedsAryanQueue(store, control.audit, control).list_pending()
                 discovery_runs = DiscoveryRunStore(store).list(limit=5)
-                return self._json(DashboardService(store).today(pending, discovery_runs))
+                today = DashboardService(store).today(pending, discovery_runs)
+                today.update(workforce_media_today_signals(store))
+                return self._json(today)
             if path == "/api/rh/analytics":
                 return self._json(AnalyticsService(store).summary())
             if path == "/api/rh/acquisition-profile":
@@ -192,6 +245,87 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 client_id = path.rsplit("/", 1)[-1]
                 client = ClientStore(store, control.audit).get(client_id)
                 return self._json(client or {"error": "client not found"}, HTTPStatus.OK if client else HTTPStatus.NOT_FOUND)
+
+            # -- Digital Workforce (Section 20) --
+            if path == "/api/wf/tasks":
+                query = parse_qs(urlparse(self.path).query)
+                department = (query.get("department") or [None])[0]
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": WorkforceTaskStore(store, control.audit).list(department, status)})
+            if path.startswith("/api/wf/tasks/") and path.endswith("/history"):
+                task_id = path.split("/")[4]
+                return self._json({"items": WorkforceTaskStore(store, control.audit).history(task_id)})
+            if path.startswith("/api/wf/tasks/"):
+                task_id = path.rsplit("/", 1)[-1]
+                task = WorkforceTaskStore(store, control.audit).get(task_id)
+                return self._json(task or {"error": "task not found"}, HTTPStatus.OK if task else HTTPStatus.NOT_FOUND)
+            if path == "/api/wf/recurring-workflows":
+                return self._json({"items": RecurringWorkflowStore(store, control.audit).list()})
+            if path.startswith("/api/wf/recurring-workflows/"):
+                workflow_id = path.rsplit("/", 1)[-1]
+                workflow = RecurringWorkflowStore(store, control.audit).get(workflow_id)
+                return self._json(workflow or {"error": "workflow not found"}, HTTPStatus.OK if workflow else HTTPStatus.NOT_FOUND)
+            if path == "/api/wf/documents":
+                query = parse_qs(urlparse(self.path).query)
+                department = (query.get("department") or [None])[0]
+                doc_type = (query.get("doc_type") or [None])[0]
+                return self._json({"items": DocumentStore(store, control.audit).list(department, doc_type)})
+            if path.startswith("/api/wf/documents/"):
+                doc_id = path.rsplit("/", 1)[-1]
+                doc = DocumentStore(store, control.audit).get(doc_id)
+                return self._json(doc or {"error": "document not found"}, HTTPStatus.OK if doc else HTTPStatus.NOT_FOUND)
+            if path == "/api/wf/emails":
+                query = parse_qs(urlparse(self.path).query)
+                department = (query.get("department") or [None])[0]
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": EmailStore(store, control.audit).list(department, status)})
+
+            # -- Media/Growth Engine (Section 20) --
+            if path == "/api/media/brands":
+                return self._json({"items": BrandStore(store, control.audit).list()})
+            if path.startswith("/api/media/brands/"):
+                brand_id = path.rsplit("/", 1)[-1]
+                brand = BrandStore(store, control.audit).get(brand_id)
+                return self._json(brand or {"error": "brand not found"}, HTTPStatus.OK if brand else HTTPStatus.NOT_FOUND)
+            if path == "/api/media/campaigns":
+                query = parse_qs(urlparse(self.path).query)
+                brand_id = (query.get("brand_id") or [None])[0]
+                return self._json({"items": CampaignStore(store, control.audit).list(brand_id)})
+            if path == "/api/media/content":
+                query = parse_qs(urlparse(self.path).query)
+                brand_id = (query.get("brand_id") or [None])[0]
+                campaign_id = (query.get("campaign_id") or [None])[0]
+                content_state = (query.get("content_state") or [None])[0]
+                return self._json({"items": ContentStore(store, control.audit).list(brand_id, campaign_id, content_state)})
+            if path.startswith("/api/media/content/") and path.endswith("/history"):
+                content_id = path.split("/")[4]
+                return self._json({"items": ContentStore(store, control.audit).history(content_id)})
+            if path.startswith("/api/media/content/") and path.endswith("/scripts"):
+                content_id = path.split("/")[4]
+                return self._json({"items": ScriptStore(store, control.audit).list_versions(content_id)})
+            if path.startswith("/api/media/content/") and path.endswith("/assets"):
+                content_id = path.split("/")[4]
+                return self._json({"items": MediaAssetStore(store, control.audit).list(content_id)})
+            if path.startswith("/api/media/content/"):
+                content_id = path.rsplit("/", 1)[-1]
+                content_item = ContentStore(store, control.audit).get(content_id)
+                return self._json(content_item or {"error": "content item not found"}, HTTPStatus.OK if content_item else HTTPStatus.NOT_FOUND)
+            if path == "/api/media/publications":
+                query = parse_qs(urlparse(self.path).query)
+                content_id = (query.get("content_id") or [None])[0]
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": PublicationStore(store, control.audit).list(content_id, status)})
+            if path.startswith("/api/media/publications/") and path.endswith("/analytics"):
+                publication_id = path.split("/")[4]
+                return self._json({"items": AnalyticsStore(store, control.audit).list(publication_id)})
+            if path.startswith("/api/media/publications/") and path.endswith("/growth-recommendation"):
+                publication_id = path.split("/")[4]
+                return self._json(GrowthAgent(AnalyticsStore(store, control.audit)).recommend(publication_id))
+            if path == "/api/media/experiments":
+                query = parse_qs(urlparse(self.path).query)
+                content_id = (query.get("content_id") or [None])[0]
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": GrowthExperimentStore(store, control.audit).list(content_id, status)})
         finally:
             store.close()
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -552,6 +686,125 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     )
                     return self._json(result, HTTPStatus.CREATED)
 
+                # -- Digital Workforce (Section 20) --
+                needs_aryan_q = NeedsAryanQueue(store, control.audit, control)
+                if path == "/api/wf/tasks":
+                    task_id = WorkforceTaskStore(store, control.audit).create(
+                        body.get("department", ""), body.get("objective", ""), body.get("task_type", ""),
+                        actor=body.get("actor", "Aryan"), source=body.get("source"), priority=body.get("priority"),
+                        inputs=body.get("inputs"),
+                    )
+                    return self._json({"task_id": task_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/wf/tasks/") and path.endswith("/execute"):
+                    task_id = path.split("/")[4]
+                    orch = _build_workforce_orchestrator(self.app_root, store, control.audit, needs_aryan_q)
+                    result = orch.execute(task_id, actor=body.get("actor", "system"))
+                    return self._json(result)
+                if path == "/api/wf/recurring-workflows":
+                    workflow_id = RecurringWorkflowStore(store, control.audit).create(
+                        body.get("name", ""), body.get("department", ""), body.get("objective", ""), body.get("task_type", ""),
+                        body.get("schedule_kind", ""), schedule_config=body.get("schedule_config"),
+                        task_template=body.get("task_template"), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"workflow_id": workflow_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/wf/recurring-workflows/") and path.endswith("/pause"):
+                    workflow_id = path.split("/")[4]
+                    return self._json(RecurringWorkflowStore(store, control.audit).pause(workflow_id, body.get("actor", "Aryan")))
+                if path.startswith("/api/wf/recurring-workflows/") and path.endswith("/resume"):
+                    workflow_id = path.split("/")[4]
+                    return self._json(RecurringWorkflowStore(store, control.audit).resume(workflow_id, body.get("actor", "Aryan")))
+                if path == "/api/wf/recurring-workflows/run-due":
+                    task_ids = RecurringWorkflowStore(store, control.audit).run_due(actor=body.get("actor", "system"))
+                    return self._json({"task_ids": task_ids}, HTTPStatus.CREATED)
+
+                # -- Media/Growth Engine (Section 20) --
+                if path == "/api/media/brands":
+                    brand_id = BrandStore(store, control.audit).create(
+                        body.get("name", ""), voice_tone=body.get("voice_tone"), audience=body.get("audience"),
+                        platforms=body.get("platforms"), content_pillars=body.get("content_pillars"),
+                        visual_guidelines=body.get("visual_guidelines"), publishing_rules=body.get("publishing_rules"),
+                        approval_policy=body.get("approval_policy"), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"brand_id": brand_id}, HTTPStatus.CREATED)
+                if path == "/api/media/campaigns":
+                    campaign_id = CampaignStore(store, control.audit).create(
+                        body.get("brand_id", ""), body.get("name", ""), objective=body.get("objective"),
+                        start_date=body.get("start_date"), end_date=body.get("end_date"), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"campaign_id": campaign_id}, HTTPStatus.CREATED)
+                if path == "/api/media/content":
+                    content_id = ContentStore(store, control.audit).create(
+                        body.get("brand_id", ""), body.get("title", ""), body.get("format", ""),
+                        objective=body.get("objective"), campaign_id=body.get("campaign_id"), platform=body.get("platform"),
+                        target_audience=body.get("target_audience"), cta=body.get("cta"),
+                        planned_publish_date=body.get("planned_publish_date"), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"content_id": content_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/media/content/") and path.endswith("/transition"):
+                    content_id = path.split("/")[4]
+                    result = ContentStore(store, control.audit).transition(
+                        content_id, body.get("to_state", ""), body.get("actor", "Aryan"),
+                        reason=body.get("reason"), evidence=body.get("evidence"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/media/content/") and path.endswith("/scripts"):
+                    content_id = path.split("/")[4]
+                    script_id = ScriptStore(store, control.audit).create_version(
+                        content_id, hook=body.get("hook"), body=body.get("body"), scenes=body.get("scenes"),
+                        voiceover=body.get("voiceover"), visual_cues=body.get("visual_cues"), cta=body.get("cta"),
+                        caption=body.get("caption"), title_options=body.get("title_options"), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"script_id": script_id}, HTTPStatus.CREATED)
+                if path == "/api/media/publications":
+                    pub_id = PublicationStore(store, control.audit, needs_aryan=needs_aryan_q).create(
+                        body.get("content_id", ""), body.get("platform", ""), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"publication_id": pub_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/media/publications/") and path.endswith("/submit-for-approval"):
+                    pub_id = path.split("/")[4]
+                    publications = PublicationStore(store, control.audit, needs_aryan=needs_aryan_q)
+                    publications.mark_ready(pub_id, body.get("actor", "Aryan"))
+                    return self._json(publications.submit_for_approval(pub_id, body.get("actor", "Aryan")), HTTPStatus.CREATED)
+                if path.startswith("/api/media/publications/") and path.endswith("/approve"):
+                    pub_id = path.split("/")[4]
+                    return self._json(PublicationStore(store, control.audit, needs_aryan=needs_aryan_q).approve(pub_id, body.get("actor", "Aryan")))
+                if path.startswith("/api/media/publications/") and path.endswith("/publish"):
+                    # Always the honest, manual-by-default channel over HTTP --
+                    # a simulated "publish" is QA-only and never exposed here.
+                    pub_id = path.split("/")[4]
+                    publications = PublicationStore(store, control.audit, needs_aryan=needs_aryan_q)
+                    pub = publications.get(pub_id)
+                    if not pub:
+                        return self._json({"error": "publication not found"}, HTTPStatus.NOT_FOUND)
+                    content_row = ContentStore(store, control.audit).get(pub["content_id"])
+                    result = publications.publish(pub_id, content_row, ManualPublishingChannel(), actor=body.get("actor", "system"))
+                    return self._json(result)
+                if path.startswith("/api/media/publications/") and path.endswith("/mark-published-manually"):
+                    pub_id = path.split("/")[4]
+                    result = PublicationStore(store, control.audit, needs_aryan=needs_aryan_q).mark_published_manually(
+                        pub_id, body.get("evidence") or {}, body.get("actor", "Aryan"),
+                    )
+                    return self._json(result)
+                if path == "/api/media/analytics":
+                    metric_id = AnalyticsStore(store, control.audit).record(
+                        body.get("publication_id", ""), body.get("metric_kind", ""), body.get("value"),
+                        body.get("source", ""), captured_at=body.get("captured_at"), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"metric_id": metric_id}, HTTPStatus.CREATED)
+                if path == "/api/media/experiments":
+                    experiment_id = GrowthExperimentStore(store, control.audit).create(
+                        body.get("hypothesis", ""), content_id=body.get("content_id"),
+                        variable_tested=body.get("variable_tested"), expected_signal=body.get("expected_signal"),
+                        actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"experiment_id": experiment_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/media/experiments/") and path.endswith("/result"):
+                    experiment_id = path.split("/")[4]
+                    result = GrowthExperimentStore(store, control.audit).record_result(
+                        experiment_id, body.get("result", ""), body.get("decision", ""), body.get("actor", "Aryan"),
+                    )
+                    return self._json(result)
+
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             finally:
                 store.close()
@@ -616,6 +869,14 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <button class="navitem" data-view="rhActiveJobs">Active Jobs / Delivery</button>
 <button class="navitem" data-view="rhRevenue">Revenue</button>
 <button class="navitem" data-view="rhSettings">Acquisition Settings</button>
+<div class="navsec">Digital Workforce</div>
+<button class="navitem" data-view="wfTasks">Workforce Tasks</button>
+<button class="navitem" data-view="wfWorkflows">Recurring Workflows</button>
+<div class="navsec">Media / Growth</div>
+<button class="navitem" data-view="mediaBrands">Brands</button>
+<button class="navitem" data-view="mediaContent">Content Calendar</button>
+<button class="navitem" data-view="mediaPublications">Publishing</button>
+<button class="navitem" data-view="mediaExperiments">Growth Experiments</button>
 <div class="navsec">Coming soon</div>
 <button class="navitem disabled" disabled>Ventures / Company Ops</button>
 <div class="boundary">TTT HQ decides · Falguna executes<br>Local-only, no automatic merge or deploy</div>
@@ -669,6 +930,15 @@ HQ_INDEX_HTML = r'''<!doctype html>
 </div>
 <div class="section"><h2>Last discovery run</h2><div class="list" id="rhLastRun"></div></div>
 <div class="section"><h2>Next actions</h2><div class="list" id="rhNextActions"></div></div>
+<div class="row">
+<div class="section" style="flex:1"><h2>Blocked workforce tasks</h2><div class="list" id="todayWfBlocked"></div></div>
+<div class="section" style="flex:1"><h2>Media needing approval</h2><div class="list" id="todayMediaApproval"></div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2>Content due soon</h2><div class="list" id="todayContentDue"></div></div>
+<div class="section" style="flex:1"><h2>Publishing failures</h2><div class="list" id="todayPublishFailures"></div></div>
+</div>
+<div class="section"><h2>Strong growth signals</h2><div class="list" id="todayGrowthSignals"></div></div>
 </div>
 <div class="view" id="view-rhSalesManager">
 <h1>Sales Manager</h1>
@@ -802,6 +1072,36 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="actions"><button id="rhRequalifyAll" type="button">Requalify all</button></div>
 <div class="list" id="rhRequalifyResult"></div>
 </div>
+<div class="view" id="view-wfTasks">
+<h1>Workforce Tasks</h1>
+<div class="pageintro">The Digital Workforce's durable task queue -- research, browser/API/computer work, documents, spreadsheets, email prep, content ops, and every Media agent step. Created by recurring workflows or by other TTT/Falguna processes; a BLOCKED or NEEDS_ARYAN task means a real capability gap or a real decision, surfaced generically in Needs Aryan.</div>
+<div class="list" id="wfTasksList"></div>
+</div>
+<div class="view" id="view-wfWorkflows">
+<h1>Recurring Workflows</h1>
+<div class="pageintro">Lightweight schedule definitions -- not an OS-level daemon. Each one creates a real Workforce Task when it's due; nothing here executes a task by itself.</div>
+<div class="list" id="wfWorkflowsList"></div>
+</div>
+<div class="view" id="view-mediaBrands">
+<h1>Brands</h1>
+<div class="pageintro">Persistent voice/tone, audience, platforms, content pillars, visual guidelines, and approval policy -- one definition per brand, read by every piece of content and every Media agent.</div>
+<div class="list" id="mediaBrandsList"></div>
+</div>
+<div class="view" id="view-mediaContent">
+<h1>Content Calendar</h1>
+<div class="pageintro">Every content item's real pipeline state: Research -> Idea -> Content Plan -> Script -> Visual Plan -> Asset Creation -> Voice -> Video/Edit -> Captions -> Thumbnail -> Approval -> Publish -> Analytics -> Learn.</div>
+<div class="list" id="mediaContentList"></div>
+</div>
+<div class="view" id="view-mediaPublications">
+<h1>Publishing</h1>
+<div class="pageintro">DRAFT -> READY -> AWAITING_APPROVAL -> APPROVED -> PUBLISHING -> PUBLISHED/FAILED. No real platform adapter exists yet in v1 -- a real publish always needs owner approval (Needs Aryan) and, today, a manual publish + real evidence outside this system; PUBLISHED here is never claimed without that real evidence.</div>
+<div class="list" id="mediaPublicationsList"></div>
+</div>
+<div class="view" id="view-mediaExperiments">
+<h1>Growth Experiments</h1>
+<div class="pageintro">Hypothesis / variable tested / expected signal / result / decision -- a plain record, not an attribution model.</div>
+<div class="list" id="mediaExperimentsList"></div>
+</div>
 </div>
 </main>
 </div>
@@ -810,7 +1110,7 @@ const $=id=>document.getElementById(id);
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings};
+const rhLoaders={rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
 async function loadBoardroom(){const d=await api('/api/boardroom');renderBoardroom(d.topics||[])}
@@ -899,7 +1199,12 @@ try{await api('/api/rh/opportunities',{method:'POST',headers:{'Content-Type':'ap
 };
 async function loadRhToday(){const d=await api('/api/rh/dashboard');$('rhPipelineValue').textContent='$'+d.pipeline_value;$('rhWonRevenue').textContent='$'+d.won_revenue;$('rhFoundToday').textContent=d.opportunities_discovered_today||0;$('rhAgingCount').textContent=(d.aging_opportunities||[]).length;
 const lr=d.last_discovery_run;$('rhLastRun').innerHTML=lr?`<div class="item"><div class="meta"><span>${esc(lr.started_at||'')}</span><span>found ${lr.opportunities_found}</span><span>new ${lr.opportunities_new}</span><span>duplicates ${lr.opportunities_duplicate}</span><span>filtered ${lr.opportunities_filtered||0}</span><span>invalid ${lr.opportunities_invalid||0}</span></div>${(lr.providers||[]).map(p=>`<div class="contrib"><b>${esc(p.provider)}:</b> ${p.available===false?'unavailable -- '+esc(p.error||''):(p.error?'error -- '+esc(p.error):`found ${p.found}, new ${p.new}, duplicates ${p.duplicates}, filtered ${p.filtered||0}, invalid ${p.invalid||0}`)}</div>`).join('')}</div>`:'<div class="empty">No discovery run yet -- try "Find Opportunities Now" on Opportunities.</div>';
-$('rhNextActions').innerHTML=d.next_actions.length?d.next_actions.map(a=>`<div class="item"><h3>${esc(a.title||'')}</h3><div class="meta"><span>${esc(a.type)}</span></div><div>${esc(a.why||'')}</div></div>`).join(''):'<div class="empty">Nothing urgent right now.</div>'}
+$('rhNextActions').innerHTML=d.next_actions.length?d.next_actions.map(a=>`<div class="item"><h3>${esc(a.title||'')}</h3><div class="meta"><span>${esc(a.type)}</span></div><div>${esc(a.why||'')}</div></div>`).join(''):'<div class="empty">Nothing urgent right now.</div>'
+$('todayWfBlocked').innerHTML=(d.workforce_blocked_tasks||[]).length?d.workforce_blocked_tasks.map(t=>`<div class="item"><h3>${esc(t.objective)}</h3><div class="meta"><span>${esc(t.status)}</span><span>${esc(t.task_type)}</span><span>${esc(t.department)}</span></div></div>`).join(''):'<div class="empty">No blocked workforce tasks.</div>'
+$('todayMediaApproval').innerHTML=(d.media_pending_approval||[]).length?d.media_pending_approval.map(i=>`<div class="item"><h3>${esc(i.title)}</h3><div class="meta"><span>${esc(i.kind)}</span></div></div>`).join(''):'<div class="empty">Nothing pending.</div>'
+$('todayContentDue').innerHTML=(d.content_due_soon||[]).length?d.content_due_soon.map(c=>`<div class="item"><h3>${esc(c.title)}</h3><div class="meta"><span>${esc(c.content_state)}</span><span>due ${esc(c.planned_publish_date)}</span></div></div>`).join(''):'<div class="empty">Nothing due soon.</div>'
+$('todayPublishFailures').innerHTML=(d.publishing_failures||[]).length?d.publishing_failures.map(p=>`<div class="item"><h3>${esc(p.platform)}</h3><div class="meta"><span>${esc(p.status)}</span></div></div>`).join(''):'<div class="empty">No publishing failures.</div>'
+$('todayGrowthSignals').innerHTML=(d.strong_growth_signals||[]).length?d.strong_growth_signals.map(s=>`<div class="item"><div class="meta"><span>content ${esc(s.content_id)}</span></div><div>${esc(s.reasoning||'')}</div></div>`).join(''):'<div class="empty">No strong growth signals yet.</div>'}
 function rhAge(o){const t=Date.parse(o.created_at);if(isNaN(t))return null;return Math.max(0,Math.floor((Date.now()-t)/86400000))}
 function rhPopulateSourceFilter(items){const cur=$('rhSourceFilter').value;const sources=[...new Set(items.map(o=>o.source).filter(Boolean))].sort();const opts='<option value="">All sources</option>'+sources.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if($('rhSourceFilter').innerHTML!==opts)$('rhSourceFilter').innerHTML=opts;$('rhSourceFilter').value=sources.includes(cur)?cur:''}
 function rhNextAction(o){const q=o.qualification;if(!q)return'Qualify';if(o.stage==='Won'||o.stage==='Lost')return'-- done --';if(q.recommendation==='IGNORE')return'Review or leave ignored';if(q.recommendation==='PURSUE'&&(o.stage==='New'||o.stage==='Qualified'||o.stage==='Proposal Ready'))return'Review draft proposal, approve & send';if(q.recommendation==='MAYBE')return'Decide: pursue or ignore';if(o.stage==='Applied/Sent')return'Await reply / send follow-up';if(o.stage==='Replied')return'Schedule meeting';if(o.stage==='Meeting'||o.stage==='Negotiating')return'Move to Won or Lost';return'-'}
@@ -1097,6 +1402,15 @@ $('obCompany').value='';$('obWebsite').value='';$('obContact').value='';$('obLik
 await loadRhOutboundLeads();
 }catch(e){alert(e.message)}
 };
+
+// ---------- Digital Workforce ----------
+async function loadWfTasks(){const d=await api('/api/wf/tasks');$('wfTasksList').innerHTML=(d.items||[]).length?d.items.map(t=>`<div class="item"><h3>${esc(t.objective)}</h3><div class="meta"><span>${esc(t.status)}</span><span>${esc(t.task_type)}</span><span>${esc(t.department)}</span>${t.assigned_worker?`<span>${esc(t.assigned_worker)}</span>`:''}${t.retries?`<span>${t.retries} retr${t.retries===1?'y':'ies'}</span>`:''}</div></div>`).join(''):'<div class="empty">No workforce tasks yet.</div>'}
+async function loadWfWorkflows(){const d=await api('/api/wf/recurring-workflows');$('wfWorkflowsList').innerHTML=(d.items||[]).length?d.items.map(w=>`<div class="item"><h3>${esc(w.name)}</h3><div class="meta"><span>${esc(w.status)}</span><span>${esc(w.schedule_kind)}</span><span>${esc(w.department)}</span>${w.next_due_at?`<span>next due ${esc(w.next_due_at)}</span>`:''}</div></div>`).join(''):'<div class="empty">No recurring workflows yet.</div>'}
+// ---------- Media / Growth ----------
+async function loadMediaBrands(){const d=await api('/api/media/brands');$('mediaBrandsList').innerHTML=(d.items||[]).length?d.items.map(b=>`<div class="item"><h3>${esc(b.name)}</h3><div class="meta">${b.voice_tone?`<span>${esc(b.voice_tone)}</span>`:''}${b.audience?`<span>${esc(b.audience)}</span>`:''}</div></div>`).join(''):'<div class="empty">No brands yet.</div>'}
+async function loadMediaContent(){const d=await api('/api/media/content');$('mediaContentList').innerHTML=(d.items||[]).length?d.items.map(c=>`<div class="item"><h3>${esc(c.title)}</h3><div class="meta"><span>${esc(c.content_state)}</span><span>${esc(c.format)}</span>${c.platform?`<span>${esc(c.platform)}</span>`:''}${c.planned_publish_date?`<span>due ${esc(c.planned_publish_date)}</span>`:''}</div></div>`).join(''):'<div class="empty">No content items yet.</div>'}
+async function loadMediaPublications(){const d=await api('/api/media/publications');$('mediaPublicationsList').innerHTML=(d.items||[]).length?d.items.map(p=>`<div class="item"><h3>${esc(p.platform)}</h3><div class="meta"><span>${esc(p.status)}</span>${p.execution_mode?`<span>${esc(p.execution_mode)}</span>`:''}${p.published_at?`<span>published ${esc(p.published_at)}</span>`:''}</div></div>`).join(''):'<div class="empty">No publications yet.</div>'}
+async function loadMediaExperiments(){const d=await api('/api/media/experiments');$('mediaExperimentsList').innerHTML=(d.items||[]).length?d.items.map(x=>`<div class="item"><h3>${esc(x.hypothesis)}</h3><div class="meta"><span>${esc(x.status)}</span>${x.variable_tested?`<span>${esc(x.variable_tested)}</span>`:''}</div>${x.decision?`<div class="contrib"><b>Decision:</b> ${esc(x.decision)}</div>`:''}</div>`).join(''):'<div class="empty">No growth experiments yet.</div>'}
 
 loadAll().catch(e=>{$('boardroomList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`});
 </script></body></html>'''
