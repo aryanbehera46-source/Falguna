@@ -34,12 +34,25 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .account_management import AccountManagementError, AccountManagerService
+from .application_executor import ApplicationExecutor, ApplicationExecutorError
+from .billing import BillingError, BillingStore, CompletionError, CompletionService, RetentionError, RetentionStore
+from .conversations import ConversationError, ConversationStore
+from .lifecycle import LifecycleError, LifecycleOrchestrator
+from .onboarding import DeliveryBriefService, OnboardingError, OnboardingStore
+from .opportunity_agent import (
+    AcquisitionProfileStore, DiscoveryEngine, DiscoveryRunStore, build_qualification_engine,
+    get_research_for_opportunity, requalify_all,
+)
+from .outbound import OutboundLeadError, OutboundLeadStore, OutreachError, OutreachService
 from .revenue_hunter import (
     ActiveJobError, ActiveJobStore, AnalyticsService, DashboardService, FollowupError,
     FollowupStore, OpportunityError, OpportunityStore, ProposalError, ProposalStore,
     QualificationStore, apply_decision_side_effect, extract_fields_from_text, extract_from_csv_rows,
 )
 from .runtime import open_control_plane
+from .sales_manager import SalesManagerService
+from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
 from .ttt_hq import BacklogStore, BoardroomStore, NeedsAryanQueue, hq_overview
 
 PRODUCT_NAME = "Twenty Two Technologies HQ"
@@ -78,18 +91,107 @@ class TTTHQHandler(BaseHTTPRequestHandler):
             if path == "/api/rh/opportunities":
                 query = parse_qs(urlparse(self.path).query)
                 stage = (query.get("stage") or [None])[0]
-                return self._json({"items": OpportunityStore(store, control.audit).list(stage)})
+                items = OpportunityStore(store, control.audit).list(stage)
+                recommendation = (query.get("recommendation") or [None])[0]
+                if recommendation:
+                    items = [o for o in items if (o.get("qualification") or {}).get("recommendation") == recommendation]
+                source = (query.get("source") or [None])[0]
+                if source:
+                    items = [o for o in items if o.get("source") == source]
+                return self._json({"items": items})
+            if path.startswith("/api/rh/opportunities/") and path.endswith("/lifecycle"):
+                # Checked ahead of the bare opportunity-fetch route below (same
+                # ordering trick that route's own suffix checks already use),
+                # since that route's naive rsplit would otherwise treat
+                # "lifecycle" itself as the opportunity id.
+                opportunity_id = path.split("/")[4]
+                if not store.get("rh_opportunities", opportunity_id):
+                    return self._json({"error": "opportunity not found"}, HTTPStatus.NOT_FOUND)
+                orchestrator = LifecycleOrchestrator(store, control.audit)
+                return self._json({
+                    "opportunity_id": opportunity_id, "current_state": orchestrator.current_state(opportunity_id),
+                    "history": orchestrator.history(opportunity_id),
+                })
+            if path.startswith("/api/rh/opportunities/") and path.endswith("/conversations"):
+                opportunity_id = path.split("/")[4]
+                return self._json({"items": ConversationStore(store, control.audit).list_for_opportunity(opportunity_id)})
+            if path.startswith("/api/rh/opportunities/") and path.endswith("/negotiations"):
+                opportunity_id = path.split("/")[4]
+                return self._json({"items": NegotiationGuardrails(store, control.audit).history(opportunity_id)})
+            if path.startswith("/api/rh/opportunities/") and path.endswith("/onboarding"):
+                opportunity_id = path.split("/")[4]
+                return self._json({"items": OnboardingStore(store, control.audit).list_for_opportunity(opportunity_id)})
+            if path.startswith("/api/rh/opportunities/") and path.endswith("/delivery-brief"):
+                opportunity_id = path.split("/")[4]
+                return self._json(DeliveryBriefService(store, control.audit).build(opportunity_id))
+            if path.startswith("/api/rh/opportunities/") and path.endswith("/completion"):
+                opportunity_id = path.split("/")[4]
+                record = CompletionService(store, control.audit).get_for_opportunity(opportunity_id)
+                return self._json(record or {"error": "no completion record yet"}, HTTPStatus.OK if record else HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/rh/opportunities/") and path.endswith("/scope-signals"):
+                opportunity_id = path.split("/")[4]
+                return self._json({"items": AccountManagerService(store, control.audit).scope_signals(opportunity_id)})
             if path.startswith("/api/rh/opportunities/"):
                 opportunity_id = path.rsplit("/", 1)[-1]
                 opportunity = OpportunityStore(store, control.audit).get(opportunity_id)
+                if opportunity:
+                    opportunity["research"] = get_research_for_opportunity(store, opportunity_id)
                 return self._json(opportunity or {"error": "opportunity not found"}, HTTPStatus.OK if opportunity else HTTPStatus.NOT_FOUND)
             if path == "/api/rh/active-jobs":
                 return self._json({"items": ActiveJobStore(store, control.audit).list()})
+            if path.startswith("/api/rh/active-jobs/") and path.endswith("/account-status"):
+                active_job_id = path.split("/")[4]
+                return self._json(AccountManagerService(store, control.audit).status_for_active_job(active_job_id))
+            if path.startswith("/api/rh/active-jobs/") and path.endswith("/client-update-draft"):
+                active_job_id = path.split("/")[4]
+                return self._json({"draft": AccountManagerService(store, control.audit).client_update_draft(active_job_id)})
+            if path == "/api/rh/portfolio-overview":
+                return self._json({"items": AccountManagerService(store, control.audit).portfolio_overview()})
+            if path == "/api/rh/sales-manager/overview":
+                return self._json(SalesManagerService(store, control.audit, control).overview())
+            if path == "/api/rh/outbound-leads":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": OutboundLeadStore(store, control.audit).list(status)})
+            if path.startswith("/api/rh/outbound-leads/") and path.endswith("/outreach"):
+                lead_id = path.split("/")[4]
+                return self._json({"items": OutreachService(store, control.audit).list_for_lead(lead_id)})
+            if path.startswith("/api/rh/outbound-leads/"):
+                lead_id = path.rsplit("/", 1)[-1]
+                lead = OutboundLeadStore(store, control.audit).get(lead_id)
+                return self._json(lead or {"error": "lead not found"}, HTTPStatus.OK if lead else HTTPStatus.NOT_FOUND)
             if path == "/api/rh/dashboard":
                 pending = NeedsAryanQueue(store, control.audit, control).list_pending()
-                return self._json(DashboardService(store).today(pending))
+                discovery_runs = DiscoveryRunStore(store).list(limit=5)
+                return self._json(DashboardService(store).today(pending, discovery_runs))
             if path == "/api/rh/analytics":
                 return self._json(AnalyticsService(store).summary())
+            if path == "/api/rh/acquisition-profile":
+                return self._json(AcquisitionProfileStore(store).get())
+            if path == "/api/rh/discovery-runs":
+                return self._json({"items": DiscoveryRunStore(store).list(limit=20)})
+            if path.startswith("/api/rh/discovery-runs/"):
+                run_id = path.rsplit("/", 1)[-1]
+                run = DiscoveryRunStore(store).get(run_id)
+                return self._json(run or {"error": "discovery run not found"}, HTTPStatus.OK if run else HTTPStatus.NOT_FOUND)
+            if path == "/api/rh/sales-policy":
+                return self._json(SalesPolicyStore(store).get())
+            if path == "/api/rh/clients":
+                return self._json({"items": ClientStore(store, control.audit).list()})
+            if path == "/api/rh/invoices":
+                return self._json({"items": BillingStore(store, control.audit).list()})
+            if path.startswith("/api/rh/clients/") and path.endswith("/invoices"):
+                client_id = path.split("/")[4]
+                return self._json({"items": BillingStore(store, control.audit).list_for_client(client_id)})
+            if path.startswith("/api/rh/clients/") and path.endswith("/retention"):
+                client_id = path.split("/")[4]
+                return self._json({"items": RetentionStore(store, control.audit).list_for_client(client_id)})
+            if path == "/api/rh/retention/due":
+                return self._json({"items": RetentionStore(store, control.audit).list_due()})
+            if path.startswith("/api/rh/clients/"):
+                client_id = path.rsplit("/", 1)[-1]
+                client = ClientStore(store, control.audit).get(client_id)
+                return self._json(client or {"error": "client not found"}, HTTPStatus.OK if client else HTTPStatus.NOT_FOUND)
         finally:
             store.close()
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -100,6 +202,7 @@ class TTTHQHandler(BaseHTTPRequestHandler):
             body = self._body()
             control, store = open_control_plane(self.app_root)
             try:
+                orchestrator = LifecycleOrchestrator(store, control.audit)
                 if path == "/api/boardroom":
                     boardroom = BoardroomStore(store, control.audit)
                     topic_id = boardroom.create_topic(
@@ -144,11 +247,17 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     before = store.get("needs_aryan_items", item_id)  # captured pre-decision for the side-effect hook below
                     result = queue.decide(item_id, body.get("action", ""), body.get("actor", "Aryan"), note=body.get("note"))
                     if before is not None and result.get("action"):
-                        apply_decision_side_effect(store, control.audit, dict(before), result["action"], body.get("actor", "Aryan"))
+                        apply_decision_side_effect(store, control.audit, dict(before), result["action"], body.get("actor", "Aryan"), orchestrator=orchestrator)
+                        if before.get("ref_type") == "rh_closing_package" and result["action"] == "APPROVED":
+                            # Commercial safety default: an unconfigured Sales
+                            # Policy prepared this as a package instead of
+                            # closing immediately -- approval is the one
+                            # moment the real close actually executes.
+                            ClosingService(store, control.audit, orchestrator=orchestrator, needs_aryan=queue).finalize_pending_closing(item_id, body.get("actor", "Aryan"))
                     return self._json(result)
 
                 if path == "/api/rh/opportunities":
-                    opportunities = OpportunityStore(store, control.audit)
+                    opportunities = OpportunityStore(store, control.audit, orchestrator=orchestrator)
                     import_mode = body.get("import_mode", "manual")
                     if import_mode == "paste_jd":
                         fields = extract_fields_from_text(body.get("text", ""))
@@ -173,7 +282,13 @@ class TTTHQHandler(BaseHTTPRequestHandler):
 
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/qualify"):
                     opportunity_id = path.split("/")[4]
-                    result = QualificationStore(store, control.audit).qualify(opportunity_id, actor=body.get("actor", "Aryan"))
+                    profile = AcquisitionProfileStore(store).get()
+                    result = QualificationStore(store, control.audit, build_qualification_engine(profile), orchestrator=orchestrator).qualify(opportunity_id, actor=body.get("actor", "Aryan"))
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path == "/api/rh/requalify":
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    result = requalify_all(store, control.audit, needs_aryan, actor=body.get("actor", "Aryan"), orchestrator=orchestrator)
                     return self._json(result, HTTPStatus.CREATED)
 
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/stage"):
@@ -184,7 +299,7 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/proposals"):
                     opportunity_id = path.split("/")[4]
                     needs_aryan = NeedsAryanQueue(store, control.audit, control)
-                    result = ProposalStore(store, control.audit, needs_aryan).generate(opportunity_id, body.get("kind", ""), actor=body.get("actor", "Aryan"))
+                    result = ProposalStore(store, control.audit, needs_aryan, orchestrator=orchestrator).generate(opportunity_id, body.get("kind", ""), actor=body.get("actor", "Aryan"))
                     return self._json(result, HTTPStatus.CREATED)
 
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/followups"):
@@ -199,12 +314,16 @@ class TTTHQHandler(BaseHTTPRequestHandler):
 
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/won"):
                     opportunity_id = path.split("/")[4]
-                    opportunity = OpportunityStore(store, control.audit).mark_won(opportunity_id, body.get("actor", "Aryan"), final_price=body.get("final_price"))
+                    actor = body.get("actor", "Aryan")
+                    opportunity = OpportunityStore(store, control.audit).mark_won(opportunity_id, actor, final_price=body.get("final_price"))
+                    orchestrator.try_transition(opportunity_id, "WON", actor, reason="marked Won directly", sync_stage=False)
                     return self._json(opportunity)
 
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/lost"):
                     opportunity_id = path.split("/")[4]
-                    opportunity = OpportunityStore(store, control.audit).mark_lost(opportunity_id, body.get("actor", "Aryan"), reason=body.get("reason"))
+                    actor = body.get("actor", "Aryan")
+                    opportunity = OpportunityStore(store, control.audit).mark_lost(opportunity_id, actor, reason=body.get("reason"))
+                    orchestrator.try_transition(opportunity_id, "LOST", actor, reason=body.get("reason") or "marked Lost directly", sync_stage=False)
                     return self._json(opportunity)
 
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/active-job"):
@@ -221,8 +340,212 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     opportunity = OpportunityStore(store, control.audit).update(opportunity_id, actor, **body)
                     return self._json(opportunity)
 
+                if path == "/api/rh/discover":
+                    # AUTO-FIND -> AUTO-ANALYZE -> AUTO-DRAFT, in one owner-triggered
+                    # call. Never sends, applies, or emails anything -- see
+                    # opportunity_agent.DiscoveryEngine's own docstring.
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    engine = DiscoveryEngine(store, control.audit, needs_aryan, orchestrator=orchestrator)
+                    result = engine.run_now(
+                        actor=body.get("actor", "Aryan"),
+                        limit_per_source=int(body.get("limit_per_source", 25)),
+                        research=bool(body.get("research", True)),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path == "/api/rh/acquisition-profile":
+                    profile = AcquisitionProfileStore(store).save(body)
+                    return self._json(profile)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/lifecycle/transition"):
+                    opportunity_id = path.split("/")[4]
+                    # Explicit route -> raises on an illegal transition
+                    # (LifecycleError), unlike the best-effort hooks wired
+                    # into qualify()/generate()/etc: a caller hitting this
+                    # route directly needs to know whether it actually
+                    # landed, per lifecycle.py's own try_transition docstring.
+                    event = orchestrator.transition(
+                        opportunity_id, body.get("to_state", ""), body.get("actor", "Aryan"),
+                        reason=body.get("reason"), evidence=body.get("evidence"), next_action=body.get("next_action"),
+                        approval_required=bool(body.get("approval_required", False)), approval_status=body.get("approval_status"),
+                        money_impact=body.get("money_impact"),
+                    )
+                    return self._json(event, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/apply"):
+                    opportunity_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    executor = ApplicationExecutor(store, control.audit, needs_aryan=needs_aryan, orchestrator=orchestrator)
+                    result = executor.apply(
+                        opportunity_id, body.get("proposal_id", ""), actor=body.get("actor", "Aryan"),
+                        channel=body.get("channel", "manual_review"), allow_simulated=bool(body.get("allow_simulated", False)),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path == "/api/rh/sales-policy":
+                    policy = SalesPolicyStore(store).save(body)
+                    return self._json(policy)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/negotiation/evaluate"):
+                    opportunity_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    terms = {k: body.get(k) for k in (
+                        "price", "currency", "discount_pct", "upfront_payment_pct",
+                        "payment_terms", "free_revisions", "timeline_days",
+                    ) if k in body}
+                    result = NegotiationGuardrails(store, control.audit, needs_aryan=needs_aryan).evaluate(
+                        opportunity_id, body.get("actor", "Aryan"), **terms,
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/close"):
+                    opportunity_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    result = ClosingService(store, control.audit, orchestrator=orchestrator, needs_aryan=needs_aryan).close(
+                        opportunity_id, body.get("actor", "Aryan"), client_name=body.get("client_name", ""),
+                        final_scope=body.get("final_scope"), final_price=body.get("final_price"), currency=body.get("currency"),
+                        payment_terms=body.get("payment_terms"), milestones=body.get("milestones"), deadline=body.get("deadline"),
+                        deliverables=body.get("deliverables"), acceptance_criteria=body.get("acceptance_criteria"),
+                        communication_channel=body.get("communication_channel"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/conversations"):
+                    opportunity_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    conversations = ConversationStore(store, control.audit, orchestrator=orchestrator, needs_aryan=needs_aryan)
+                    result = conversations.record_inbound(
+                        opportunity_id, body.get("channel", ""), body.get("body", ""), actor=body.get("actor", "system"),
+                        sender=body.get("sender"), external_thread_id=body.get("external_thread_id"), evidence=body.get("evidence"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/conversations/") and path.endswith("/draft-reply"):
+                    message_id = path.split("/")[4]
+                    result = ConversationStore(store, control.audit, orchestrator=orchestrator).draft_reply(message_id, actor=body.get("actor", "system"))
+                    return self._json(result or {"drafted": False}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/conversations/") and path.endswith("/sent"):
+                    message_id = path.split("/")[4]
+                    result = ConversationStore(store, control.audit, orchestrator=orchestrator).mark_sent(message_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/onboarding/init"):
+                    opportunity_id = path.split("/")[4]
+                    items = OnboardingStore(store, control.audit).init_checklist(opportunity_id, actor=body.get("actor", "Aryan"))
+                    return self._json({"items": items}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/onboarding"):
+                    opportunity_id = path.split("/")[4]
+                    result = OnboardingStore(store, control.audit).set_item(
+                        opportunity_id, body.get("item_type", ""), body.get("status", ""),
+                        actor=body.get("actor", "Aryan"), value_text=body.get("value_text"), notes=body.get("notes"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/completion"):
+                    opportunity_id = path.split("/")[4]
+                    record_id = CompletionService(store, control.audit).record_completion(
+                        opportunity_id, body.get("actor", "Aryan"), body.get("evidence"),
+                        active_job_id=body.get("active_job_id"), checklist=body.get("checklist"),
+                    )
+                    return self._json({"record_id": record_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/clients/") and path.endswith("/invoices"):
+                    client_id = path.split("/")[4]
+                    invoice_id = BillingStore(store, control.audit).create_invoice(
+                        client_id, body.get("actor", "Aryan"), body.get("amount"), currency=body.get("currency", "USD"),
+                        opportunity_id=body.get("opportunity_id"), active_job_id=body.get("active_job_id"),
+                        milestone=body.get("milestone"), due_date=body.get("due_date"),
+                    )
+                    return self._json({"invoice_id": invoice_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/invoices/") and path.endswith("/ready"):
+                    invoice_id = path.split("/")[4]
+                    result = BillingStore(store, control.audit).mark_ready(invoice_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+
+                if path.startswith("/api/rh/invoices/") and path.endswith("/sent"):
+                    invoice_id = path.split("/")[4]
+                    result = BillingStore(store, control.audit).mark_sent(invoice_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+
+                if path.startswith("/api/rh/invoices/") and path.endswith("/payment"):
+                    invoice_id = path.split("/")[4]
+                    result = BillingStore(store, control.audit).record_payment(
+                        invoice_id, body.get("amount"), body.get("actor", "Aryan"), body.get("evidence"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/invoices/") and path.endswith("/overdue-check"):
+                    invoice_id = path.split("/")[4]
+                    result = BillingStore(store, control.audit).check_overdue(invoice_id)
+                    return self._json(result)
+
+                if path.startswith("/api/rh/invoices/") and path.endswith("/cancel"):
+                    invoice_id = path.split("/")[4]
+                    result = BillingStore(store, control.audit).cancel(invoice_id, body.get("actor", "Aryan"), reason=body.get("reason"))
+                    return self._json(result)
+
+                if path.startswith("/api/rh/clients/") and path.endswith("/retention"):
+                    client_id = path.split("/")[4]
+                    item_id = RetentionStore(store, control.audit).create_item(
+                        client_id, body.get("kind", ""), body.get("actor", "Aryan"),
+                        opportunity_id=body.get("opportunity_id"), notes=body.get("notes"), follow_up_date=body.get("follow_up_date"),
+                    )
+                    return self._json({"item_id": item_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/retention/") and len(path.split("/")) == 5:
+                    item_id = path.split("/")[4]
+                    result = RetentionStore(store, control.audit).update_item(
+                        item_id, body.get("actor", "Aryan"), status=body.get("status"),
+                        notes=body.get("notes"), follow_up_date=body.get("follow_up_date"),
+                    )
+                    return self._json(result)
+
+                if path == "/api/rh/outbound-leads":
+                    lead_id = OutboundLeadStore(store, control.audit).create_lead(
+                        body.get("company_name", ""), body.get("actor", "Aryan"), website=body.get("website"),
+                        contact_name=body.get("contact_name"), contact_channel=body.get("contact_channel"),
+                        likely_need=body.get("likely_need"), proposed_offer=body.get("proposed_offer"),
+                        confidence=body.get("confidence"), relevance_notes=body.get("relevance_notes"), source=body.get("source"),
+                    )
+                    return self._json({"lead_id": lead_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/outbound-leads/") and path.endswith("/status"):
+                    lead_id = path.split("/")[4]
+                    result = OutboundLeadStore(store, control.audit).update_status(lead_id, body.get("status", ""), body.get("actor", "Aryan"))
+                    return self._json(result)
+
+                if path.startswith("/api/rh/outbound-leads/") and path.endswith("/outreach"):
+                    lead_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    result = OutreachService(store, control.audit, needs_aryan=needs_aryan).draft_message(
+                        lead_id, body.get("channel", ""), body.get("message", ""), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/outreach/") and path.endswith("/sent"):
+                    draft_id = path.split("/")[4]
+                    result = OutreachService(store, control.audit).mark_sent(draft_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+
+                if path.startswith("/api/rh/active-jobs/") and path.endswith("/enrich"):
+                    active_job_id = path.split("/")[4]
+                    result = DeliveryBriefService(store, control.audit).enrich_active_job_payload(active_job_id, actor=body.get("actor", "system"))
+                    return self._json(result, HTTPStatus.CREATED)
+
                 if path.startswith("/api/rh/active-jobs/") and path.endswith("/handoff"):
                     active_job_id = path.split("/")[4]
+                    # Best-effort: automatically fold in whatever onboarding
+                    # context exists so far before the real handoff, exactly
+                    # like every other observability hook in this codebase --
+                    # onboarding data being incomplete or absent must never
+                    # block a real, owner-triggered handoff.
+                    try:
+                        DeliveryBriefService(store, control.audit).enrich_active_job_payload(active_job_id, actor=body.get("actor", "Aryan"))
+                    except OnboardingError:
+                        pass
                     result = ActiveJobStore(store, control.audit).trigger_handoff(
                         active_job_id, body.get("repository", ""), control,
                         actor=body.get("actor", "Aryan"), policy_overrides=body.get("policy_overrides"),
@@ -275,7 +598,7 @@ def serve_hq(root, host: str = "127.0.0.1", port: int = 8766, falguna_url: str =
 HQ_INDEX_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Twenty Two Technologies</title><style>
-:root{color-scheme:dark;--bg:#0b0908;--side:#100c0a;--panel:#181310;--soft:#201a16;--line:#332a23;--text:#f7f3ef;--muted:#a89c8f;--accent:#e2a15c;--warn:#ffc66d;--bad:#ff8c96}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}.app{height:100dvh;display:grid;grid-template-columns:250px minmax(0,1fr);overflow:hidden}aside{background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;overflow:hidden}.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 20px;font-weight:750;font-size:16px}.mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#221202;font-weight:900}.navsec{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:16px 8px 6px}.navitem{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text);padding:8px 8px;border-radius:8px;cursor:pointer;font-size:13px}.navitem:hover,.navitem.active{background:var(--soft)}.navitem.disabled{color:#5b5148;cursor:default}.navitem.disabled:hover{background:transparent}.boundary{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px 2px;border-top:1px solid var(--line)}main{min-width:0;overflow-y:auto;padding:28px max(24px,calc((100vw - 250px - 860px)/2))}.col{max-width:860px;margin:0 auto;display:grid;gap:20px}h1{font-size:22px;margin:0 0 2px}.pageintro{color:var(--muted);font-size:13px;margin-bottom:6px}.view{display:none}.view.active{display:block}.section{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:18px;margin-bottom:18px}.section h2{margin:0 0 4px;font-size:17px}.sub{color:var(--muted);font-size:12px;margin-bottom:14px}.list{display:grid;gap:10px}.item{border:1px solid var(--line);background:var(--soft);border-radius:11px;padding:13px}.item h3{margin:0 0 4px;font-size:14px}.meta{color:var(--muted);font-size:11px;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}.meta span{border:1px solid var(--line);border-radius:999px;padding:2px 8px}.empty{color:var(--muted);font-size:12px;padding:6px 0}.form{display:grid;gap:8px;margin-top:12px;border-top:1px solid var(--line);padding-top:12px}.form input,.form select,.form textarea{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}.form textarea{min-height:50px;resize:vertical}.row{display:flex;gap:8px}.row>*{flex:1}.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.actions button{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;cursor:pointer;background:var(--accent);color:#221202}.actions button.secondary{background:#2c241d;color:var(--text)}.actions button.danger{background:#542c34;color:#ffe0e4}.contrib{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin-top:6px;font-size:12px}.contrib b{color:var(--accent)}.badge-actionable{color:var(--accent)}.badge-inspect{color:var(--warn)}
+:root{color-scheme:dark;--bg:#0b0908;--side:#100c0a;--panel:#181310;--soft:#201a16;--line:#332a23;--text:#f7f3ef;--muted:#a89c8f;--accent:#e2a15c;--warn:#ffc66d;--bad:#ff8c96}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}.app{height:100dvh;display:grid;grid-template-columns:250px minmax(0,1fr);overflow:hidden}aside{background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;overflow:hidden}.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 20px;font-weight:750;font-size:16px}.mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#221202;font-weight:900}.navsec{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:16px 8px 6px}.navitem{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text);padding:8px 8px;border-radius:8px;cursor:pointer;font-size:13px}.navitem:hover,.navitem.active{background:var(--soft)}.navitem.disabled{color:#5b5148;cursor:default}.navitem.disabled:hover{background:transparent}.boundary{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px 2px;border-top:1px solid var(--line)}main{min-width:0;overflow-y:auto;padding:28px max(24px,calc((100vw - 250px - 860px)/2))}.col{max-width:860px;margin:0 auto;display:grid;gap:20px}h1{font-size:22px;margin:0 0 2px}.pageintro{color:var(--muted);font-size:13px;margin-bottom:6px}.view{display:none}.view.active{display:block}.section{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:18px;margin-bottom:18px}.section h2{margin:0 0 4px;font-size:17px}.sub{color:var(--muted);font-size:12px;margin-bottom:14px}.list{display:grid;gap:10px}.item{border:1px solid var(--line);background:var(--soft);border-radius:11px;padding:13px}.item h3{margin:0 0 4px;font-size:14px}.meta{color:var(--muted);font-size:11px;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}.meta span{border:1px solid var(--line);border-radius:999px;padding:2px 8px}.empty{color:var(--muted);font-size:12px;padding:6px 0}.form{display:grid;gap:8px;margin-top:12px;border-top:1px solid var(--line);padding-top:12px}.form input,.form select,.form textarea{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}.form textarea{min-height:50px;resize:vertical}.row{display:flex;gap:8px}.row>*{flex:1}.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.actions button{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;cursor:pointer;background:var(--accent);color:#221202}.actions button.secondary{background:#2c241d;color:var(--text)}.actions button.danger{background:#542c34;color:#ffe0e4}.contrib{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin-top:6px;font-size:12px}.contrib b{color:var(--accent)}.badge-actionable{color:var(--accent)}.badge-inspect{color:var(--warn)}.badge{color:var(--warn);font-weight:700;border-color:var(--warn)!important}
 @media(max-width:820px){.app{grid-template-columns:1fr;height:auto;min-height:100dvh}aside{flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}aside .brand{width:100%;padding:2px 4px 10px}aside .navsec,aside .boundary{display:none}aside .navitem{padding:6px 10px;font-size:12px}main{padding:20px 16px}.row{flex-direction:column}}
 </style></head><body><div class="app"><aside>
 <div class="brand"><span class="mark">TT</span>Twenty Two Technologies</div>
@@ -285,11 +608,14 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <button class="navitem" data-view="needsAryan">Needs Aryan</button>
 <div class="navsec">Revenue Hunter</div>
 <button class="navitem" data-view="rhToday">Today</button>
+<button class="navitem" data-view="rhSalesManager">Sales Manager</button>
 <button class="navitem" data-view="rhOpportunities">Opportunities</button>
+<button class="navitem" data-view="rhOutboundLeads">Outbound Leads</button>
 <button class="navitem" data-view="rhPipeline">Sales Pipeline</button>
 <button class="navitem" data-view="rhClients">Clients</button>
-<button class="navitem" data-view="rhActiveJobs">Active Jobs</button>
+<button class="navitem" data-view="rhActiveJobs">Active Jobs / Delivery</button>
 <button class="navitem" data-view="rhRevenue">Revenue</button>
+<button class="navitem" data-view="rhSettings">Acquisition Settings</button>
 <div class="navsec">Coming soon</div>
 <button class="navitem disabled" disabled>Ventures / Company Ops</button>
 <div class="boundary">TTT HQ decides · Falguna executes<br>Local-only, no automatic merge or deploy</div>
@@ -337,11 +663,53 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="section" style="flex:1"><h2 id="rhPipelineValue">$0</h2><div class="sub">Pipeline value</div></div>
 <div class="section" style="flex:1"><h2 id="rhWonRevenue">$0</h2><div class="sub">Won revenue</div></div>
 </div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="rhFoundToday">0</h2><div class="sub">Opportunities found today</div></div>
+<div class="section" style="flex:1"><h2 id="rhAgingCount">0</h2><div class="sub">Aging opportunities (14+ days, still active)</div></div>
+</div>
+<div class="section"><h2>Last discovery run</h2><div class="list" id="rhLastRun"></div></div>
 <div class="section"><h2>Next actions</h2><div class="list" id="rhNextActions"></div></div>
+</div>
+<div class="view" id="view-rhSalesManager">
+<h1>Sales Manager</h1>
+<div class="pageintro">The full lifecycle in one place -- what needs attention, who replied, what can close soon, who's onboarding, what's blocked, what's overdue, and who to upsell. Read-only: every item links back to where you actually act on it.</div>
+<div class="section"><h2>Needs attention now</h2><div class="list" id="smAttention"></div></div>
+<div class="section"><h2>Best leads</h2><div class="sub">Priority is a plain High/Medium/Low label from real qualification + age -- never a manufactured probability.</div><div class="list" id="smBestLeads"></div></div>
+<div class="row">
+<div class="section" style="flex:1"><h2>Who replied</h2><div class="list" id="smWhoReplied"></div></div>
+<div class="section" style="flex:1"><h2>Negotiations needing action</h2><div class="list" id="smNegotiations"></div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2>Can close soon</h2><div class="list" id="smCloseSoon"></div></div>
+<div class="section" style="flex:1"><h2>Onboarding clients</h2><div class="list" id="smOnboarding"></div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2>Blocked deliveries</h2><div class="list" id="smBlockedDeliveries"></div></div>
+<div class="section" style="flex:1"><h2>Overdue invoices</h2><div class="list" id="smOverdueInvoices"></div></div>
+</div>
+<div class="section"><h2>Upsell-ready clients</h2><div class="list" id="smUpsell"></div></div>
 </div>
 <div class="view" id="view-rhOpportunities">
 <h1>Opportunities</h1>
-<div class="pageintro">Add an opportunity from a pasted job description, a URL, a manual form, or CSV/JSON import. Nothing here is ever sent automatically.</div>
+<div class="pageintro">Auto-discovered from configured sources, or add one yourself. Nothing here is ever sent automatically -- discovery only finds, qualifies, and drafts; you approve.</div>
+<div class="section">
+<div class="actions"><button id="rhDiscoverNow" type="button">Find Opportunities Now</button></div>
+<div class="list" id="rhDiscoverStatus"></div>
+</div>
+<div class="row" style="margin:6px 0;flex-wrap:wrap">
+<button class="secondary rhQuickFilter" data-filter="all">All</button>
+<button class="secondary rhQuickFilter" data-filter="new">New discoveries</button>
+<button class="secondary rhQuickFilter" data-filter="pursue">Pursue</button>
+<button class="secondary rhQuickFilter" data-filter="maybe">Maybe</button>
+<button class="secondary rhQuickFilter" data-filter="ignored">Ignored</button>
+<button class="secondary rhQuickFilter" data-filter="reviewed">Already reviewed</button>
+</div>
+<div class="row" style="margin:6px 0;flex-wrap:wrap">
+<select id="rhStageFilter"><option value="">All stages</option></select>
+<select id="rhSourceFilter"><option value="">All sources</option></select>
+<input id="rhMinScore" type="number" min="0" max="100" placeholder="Min score">
+<input id="rhMaxAgeDays" type="number" min="0" placeholder="Max age (days)">
+</div>
 <div class="form">
 <select id="rhMode"><option value="manual">Manual form</option><option value="paste_jd">Paste job description</option><option value="url">Paste URL</option><option value="csv_json">CSV/JSON import</option></select>
 <div id="rhModeManual">
@@ -367,10 +735,25 @@ HQ_INDEX_HTML = r'''<!doctype html>
 </div>
 <div class="actions"><button id="rhCreate" type="button">Add opportunity</button></div>
 </div>
-<div class="row" style="margin:6px 0">
-<select id="rhStageFilter"><option value="">All stages</option></select>
-</div>
 <div class="list" id="rhOpportunityList"></div>
+</div>
+<div class="view" id="view-rhOutboundLeads">
+<h1>Outbound Leads</h1>
+<div class="pageintro">One researched prospect at a time -- no bulk lists, no scraping. Outreach is always drafted only: nothing here ever sends a message. A draft needs your approval in Needs Aryan before you send it yourself and mark it sent.</div>
+<div class="form">
+<input id="obCompany" placeholder="Company name">
+<input id="obWebsite" placeholder="Website (optional)">
+<input id="obContact" placeholder="Contact name / channel (optional)">
+<textarea id="obLikelyNeed" placeholder="Likely need"></textarea>
+<textarea id="obOffer" placeholder="Proposed offer"></textarea>
+<div class="row">
+<select id="obConfidence"><option value="">Confidence (optional)</option><option>Low</option><option>Medium</option><option>High</option></select>
+<input id="obSource" placeholder="Source (how you found them)">
+</div>
+<textarea id="obNotes" placeholder="Relevance notes -- why this is a real, explainable lead"></textarea>
+<div class="actions"><button id="obCreate" type="button">Add lead</button></div>
+</div>
+<div class="list" id="rhOutboundLeadsList"></div>
 </div>
 <div class="view" id="view-rhPipeline">
 <h1>Sales Pipeline</h1>
@@ -392,6 +775,33 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="pageintro">Lean analytics on the acquisition funnel.</div>
 <div class="list" id="rhAnalytics"></div>
 </div>
+<div class="view" id="view-rhSettings">
+<h1>Acquisition Settings</h1>
+<div class="pageintro">What Opportunity Agent looks for and where. Changes take effect on the next discovery run -- persisted, not hard-coded.</div>
+<div class="form">
+<textarea id="rhSetServices" placeholder="Services we sell (one per line)"></textarea>
+<textarea id="rhSetSkills" placeholder="Skills (comma-separated)"></textarea>
+<div class="row"><input id="rhSetMinBudget" type="number" placeholder="Minimum budget (USD, optional)"><input id="rhSetMaxAge" type="number" placeholder="Maximum listing age (days)"></div>
+<div class="row">
+<select id="rhSetRemote"><option value="remote_ok">Remote OK (default)</option><option value="remote_only">Remote only</option><option value="any">Any</option></select>
+<input id="rhSetCountries" placeholder="Target countries (comma-separated, blank = no restriction)">
+</div>
+<input id="rhSetKeywords" placeholder="Keywords to require (comma-separated, blank = no restriction)">
+<input id="rhSetExcluded" placeholder="Excluded keywords (comma-separated)">
+<div class="sub">Relevance gate (service-relevance hardening)</div>
+<textarea id="rhSetPositiveSignals" placeholder="Positive service signals -- phrases that indicate genuine deliverable dev/AI work (one per line)"></textarea>
+<textarea id="rhSetExclusionSignals" placeholder="Exclusion role signals -- phrases for roles TTT does not deliver, e.g. writer, recruiter, sales rep (one per line)"></textarea>
+<div class="sub">Sources</div>
+<div class="list" id="rhSetSources"></div>
+<div class="actions"><button id="rhSetSave" type="button">Save acquisition profile</button></div>
+</div>
+</div>
+<div class="section">
+<h2>Re-qualify existing opportunities</h2>
+<div class="pageintro">Re-runs qualification for every non-terminal opportunity using the current acquisition profile and scoring logic -- e.g. after a relevance hardening pass. Never deletes history; a PURSUE downgrade supersedes its draft proposal and rejects any pending Needs Aryan item for it, an upgrade drafts a proposal exactly as a fresh discovery would.</div>
+<div class="actions"><button id="rhRequalifyAll" type="button">Requalify all</button></div>
+<div class="list" id="rhRequalifyResult"></div>
+</div>
 </div>
 </main>
 </div>
@@ -400,7 +810,7 @@ const $=id=>document.getElementById(id);
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={rhToday:loadRhToday,rhOpportunities:loadRhOpportunities,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue};
+const rhLoaders={rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
 async function loadBoardroom(){const d=await api('/api/boardroom');renderBoardroom(d.topics||[])}
@@ -457,9 +867,28 @@ const PROPOSAL_KINDS=["short","detailed","upwork","email_pitch","follow_up"];
 const FOLLOWUP_KINDS=["proposal_followup","response_followup","negotiation_followup","payment_followup","repeat_business_followup"];
 let rhOpenId=null;
 let rhEditId=null;
+let rhQuickFilterVal='all';
+const RH_REVIEWED_STAGES=new Set(['Applied/Sent','Replied','Meeting','Negotiating','Won','Lost']);
 if($('rhStageFilter').children.length<2)RH_STAGES.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;$('rhStageFilter').appendChild(o)});
 $('rhMode').onchange=()=>{const m=$('rhMode').value;$('rhModeManual').style.display=m==='manual'?'':'none';$('rhModePasteJd').style.display=m==='paste_jd'?'':'none';$('rhModeUrl').style.display=m==='url'?'':'none';$('rhModeCsv').style.display=m==='csv_json'?'':'none'};
 $('rhStageFilter').onchange=()=>loadRhOpportunities();
+$('rhSourceFilter').onchange=()=>loadRhOpportunities();
+$('rhMinScore').oninput=()=>loadRhOpportunities();
+$('rhMaxAgeDays').oninput=()=>loadRhOpportunities();
+document.querySelectorAll('.rhQuickFilter').forEach(b=>b.onclick=()=>{rhQuickFilterVal=b.dataset.filter;document.querySelectorAll('.rhQuickFilter').forEach(x=>x.classList.remove('active'));b.classList.add('active');loadRhOpportunities()});
+$('rhDiscoverNow').onclick=async()=>{
+$('rhDiscoverNow').disabled=true;
+$('rhDiscoverStatus').innerHTML='<div class="empty">Running discovery -- Remotive and WeWorkRemotely only; unavailable sources are reported, never faked...</div>';
+try{
+const r=await api('/api/rh/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+$('rhDiscoverStatus').innerHTML=`<div class="item"><div class="meta"><span>found ${r.opportunities_found}</span><span>new ${r.opportunities_new}</span><span>duplicates ${r.opportunities_duplicate}</span><span>filtered ${r.opportunities_filtered||0}</span><span>invalid ${r.opportunities_invalid||0}</span></div>${(r.providers||[]).map(p=>`<div class="contrib"><b>${esc(p.provider)}:</b> ${p.available===false?'unavailable -- '+esc(p.error||''):(p.error?'error -- '+esc(p.error):`found ${p.found}, new ${p.new}, duplicates ${p.duplicates}, filtered ${p.filtered||0}, invalid ${p.invalid||0}`)}</div>`).join('')}</div>`;
+await loadRhOpportunities();
+}catch(e){
+$('rhDiscoverStatus').innerHTML=`<div class="empty">Discovery failed: ${esc(e.message)}</div>`;
+}finally{
+$('rhDiscoverNow').disabled=false;
+}
+};
 $('rhCreate').onclick=async()=>{
 const m=$('rhMode').value;let body;
 if(m==='paste_jd'){if(!$('rhJdTitle').value.trim())return alert('Title is required.');if(!$('rhJdText').value.trim())return alert('Paste the job description text first.');body={import_mode:'paste_jd',title:$('rhJdTitle').value.trim(),client_name:$('rhJdClient').value.trim()||null,text:$('rhJdText').value}}
@@ -468,9 +897,37 @@ else if(m==='csv_json'){let rows;try{rows=JSON.parse($('rhCsvJson').value)}catch
 else{if(!$('rhTitle').value.trim())return alert('Title is required.');body={import_mode:'manual',title:$('rhTitle').value.trim(),client_name:$('rhClient').value.trim()||null,description:$('rhDescription').value||null,budget_rate:$('rhBudget').value||null,required_skills:$('rhSkills').value||null,deadline:$('rhDeadline').value||null,contract_type:$('rhContractType').value||null,location_timezone:$('rhLocation').value||null,urgency:$('rhUrgency').value||null}}
 try{await api('/api/rh/opportunities',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});['rhTitle','rhClient','rhDescription','rhBudget','rhSkills','rhDeadline','rhContractType','rhLocation','rhUrgency','rhJdTitle','rhJdClient','rhJdText','rhUrlTitle','rhUrlValue','rhUrlDescription','rhCsvJson'].forEach(id=>{if($(id))$(id).value=''});await loadRhOpportunities()}catch(e){alert(e.message)}
 };
-async function loadRhToday(){const d=await api('/api/rh/dashboard');$('rhPipelineValue').textContent='$'+d.pipeline_value;$('rhWonRevenue').textContent='$'+d.won_revenue;$('rhNextActions').innerHTML=d.next_actions.length?d.next_actions.map(a=>`<div class="item"><h3>${esc(a.title||'')}</h3><div class="meta"><span>${esc(a.type)}</span></div><div>${esc(a.why||'')}</div></div>`).join(''):'<div class="empty">Nothing urgent right now.</div>'}
-async function loadRhOpportunities(){const stage=$('rhStageFilter').value;const d=await api('/api/rh/opportunities'+(stage?`?stage=${encodeURIComponent(stage)}`:''));renderRhOpportunities(d.items||[])}
-function rhCard(o){return `<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div><div class="actions"><button class="secondary rhOpen" data-id="${esc(o.id)}">Open</button></div></div>`}
+async function loadRhToday(){const d=await api('/api/rh/dashboard');$('rhPipelineValue').textContent='$'+d.pipeline_value;$('rhWonRevenue').textContent='$'+d.won_revenue;$('rhFoundToday').textContent=d.opportunities_discovered_today||0;$('rhAgingCount').textContent=(d.aging_opportunities||[]).length;
+const lr=d.last_discovery_run;$('rhLastRun').innerHTML=lr?`<div class="item"><div class="meta"><span>${esc(lr.started_at||'')}</span><span>found ${lr.opportunities_found}</span><span>new ${lr.opportunities_new}</span><span>duplicates ${lr.opportunities_duplicate}</span><span>filtered ${lr.opportunities_filtered||0}</span><span>invalid ${lr.opportunities_invalid||0}</span></div>${(lr.providers||[]).map(p=>`<div class="contrib"><b>${esc(p.provider)}:</b> ${p.available===false?'unavailable -- '+esc(p.error||''):(p.error?'error -- '+esc(p.error):`found ${p.found}, new ${p.new}, duplicates ${p.duplicates}, filtered ${p.filtered||0}, invalid ${p.invalid||0}`)}</div>`).join('')}</div>`:'<div class="empty">No discovery run yet -- try "Find Opportunities Now" on Opportunities.</div>';
+$('rhNextActions').innerHTML=d.next_actions.length?d.next_actions.map(a=>`<div class="item"><h3>${esc(a.title||'')}</h3><div class="meta"><span>${esc(a.type)}</span></div><div>${esc(a.why||'')}</div></div>`).join(''):'<div class="empty">Nothing urgent right now.</div>'}
+function rhAge(o){const t=Date.parse(o.created_at);if(isNaN(t))return null;return Math.max(0,Math.floor((Date.now()-t)/86400000))}
+function rhPopulateSourceFilter(items){const cur=$('rhSourceFilter').value;const sources=[...new Set(items.map(o=>o.source).filter(Boolean))].sort();const opts='<option value="">All sources</option>'+sources.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if($('rhSourceFilter').innerHTML!==opts)$('rhSourceFilter').innerHTML=opts;$('rhSourceFilter').value=sources.includes(cur)?cur:''}
+function rhNextAction(o){const q=o.qualification;if(!q)return'Qualify';if(o.stage==='Won'||o.stage==='Lost')return'-- done --';if(q.recommendation==='IGNORE')return'Review or leave ignored';if(q.recommendation==='PURSUE'&&(o.stage==='New'||o.stage==='Qualified'||o.stage==='Proposal Ready'))return'Review draft proposal, approve & send';if(q.recommendation==='MAYBE')return'Decide: pursue or ignore';if(o.stage==='Applied/Sent')return'Await reply / send follow-up';if(o.stage==='Replied')return'Schedule meeting';if(o.stage==='Meeting'||o.stage==='Negotiating')return'Move to Won or Lost';return'-'}
+async function loadRhOpportunities(){
+const d=await api('/api/rh/opportunities');
+const items=d.items||[];
+rhPopulateSourceFilter(items);
+const stage=$('rhStageFilter').value;
+const source=$('rhSourceFilter').value;
+const minScore=$('rhMinScore').value?Number($('rhMinScore').value):null;
+const maxAgeDays=$('rhMaxAgeDays').value?Number($('rhMaxAgeDays').value):null;
+const filtered=items.filter(o=>{
+const q=o.qualification;
+if(stage&&o.stage!==stage)return false;
+if(source&&o.source!==source)return false;
+if(minScore!=null&&(!q||q.fit_score<minScore))return false;
+const age=rhAge(o);
+if(maxAgeDays!=null&&(age==null||age>maxAgeDays))return false;
+if(rhQuickFilterVal==='new'&&o.stage!=='New')return false;
+if(rhQuickFilterVal==='pursue'&&(!q||q.recommendation!=='PURSUE'))return false;
+if(rhQuickFilterVal==='maybe'&&(!q||q.recommendation!=='MAYBE'))return false;
+if(rhQuickFilterVal==='ignored'&&(!q||q.recommendation!=='IGNORE'))return false;
+if(rhQuickFilterVal==='reviewed'&&!RH_REVIEWED_STAGES.has(o.stage))return false;
+return true;
+});
+renderRhOpportunities(filtered);
+}
+function rhCard(o){const q=o.qualification;const age=rhAge(o);return `<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span>${o.source?`<span>src: ${esc(o.source)}</span>`:''}${age!=null?`<span>${age}d old</span>`:''}${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${q?`<span>score ${q.fit_score}</span><span><b>${esc(q.recommendation)}</b></span>${q.recommendation_detail==='PURSUE_WITH_BUDGET_UNKNOWN'?'<span class="badge">Budget unknown</span>':''}${q.suggested_price?`<span>sugg. ${esc(q.suggested_price)}</span>`:''}${q.portfolio_match?`<span>match: ${esc(q.portfolio_match)}</span>`:''}`:'<span>not qualified</span>'}</div><div class="contrib"><b>Next:</b> ${esc(rhNextAction(o))}</div><div class="actions"><button class="secondary rhOpen" data-id="${esc(o.id)}">Open</button></div></div>`}
 function renderRhOpportunities(items){$('rhOpportunityList').innerHTML=items.length?items.map(o=>rhOpenId===o.id?rhDetailCard(o):rhCard(o)).join(''):'<div class="empty">No opportunities yet.</div>';wireRhList()}
 function wireRhList(){
 document.querySelectorAll('.rhOpen').forEach(b=>b.onclick=async()=>{rhOpenId=b.dataset.id;rhEditId=null;await loadRhOpportunities()});
@@ -489,9 +946,11 @@ document.querySelectorAll('.rhActiveJob').forEach(b=>b.onclick=async()=>{try{awa
 }
 function rhDetailCard(o){
 const q=o.qualification;
+const age=rhAge(o);
 return `<div class="item">
 <h3>${esc(o.title)}</h3>
-<div class="meta"><span>${esc(o.stage)}</span>${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div>
+<div class="meta"><span>${esc(o.stage)}</span>${o.source?`<span>source: ${esc(o.source)}</span>`:''}${age!=null?`<span>${age}d old</span>`:''}${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div>
+${o.source_url?`<div class="contrib"><b>Source link:</b> <a href="${esc(o.source_url)}" target="_blank" rel="noopener">${esc(o.source_url)}</a></div>`:''}
 ${o.description&&rhEditId!==o.id?`<div>${esc(o.description)}</div>`:''}
 ${rhEditId===o.id?`<div class="form">
 <div class="row"><input id="rhEditTitle_${esc(o.id)}" placeholder="Title" value="${esc(o.title||'')}"><input id="rhEditClient_${esc(o.id)}" placeholder="Client name" value="${esc(o.client_name||'')}"></div>
@@ -501,7 +960,14 @@ ${rhEditId===o.id?`<div class="form">
 <div class="row"><input id="rhEditLocation_${esc(o.id)}" placeholder="Location/timezone" value="${esc(o.location_timezone||'')}"><input id="rhEditUrgency_${esc(o.id)}" placeholder="Urgency" value="${esc(o.urgency||'')}"></div>
 <div class="actions"><button class="rhEditSave" data-id="${esc(o.id)}">Save changes</button><button class="secondary rhEditCancel" data-id="${esc(o.id)}">Cancel</button></div>
 </div>`:''}
-<div class="contrib"><b>Qualification:</b> ${q?`fit ${q.fit_score}/100, budget ${esc(q.budget_quality)}, <b>${esc(q.recommendation)}</b>, price ${esc(q.suggested_price)}, timeline ${esc(q.suggested_timeline)}${q.risk_flags?`, risks: ${esc(q.risk_flags)}`:''}`:'not qualified yet'}</div>
+<div class="contrib"><b>Qualification:</b> ${q?`fit ${q.fit_score}/100, budget ${esc(q.budget_quality)}, <b>${esc(q.recommendation)}</b>${q.recommendation_detail==='PURSUE_WITH_BUDGET_UNKNOWN'?' <span class="badge">Budget unknown</span>':''}, price ${esc(q.suggested_price)}, timeline ${esc(q.suggested_timeline)}${q.risk_flags?`, risks: ${esc(q.risk_flags)}`:''}`:'not qualified yet'}</div>
+${q?`<div class="contrib"><b>Relevance gate:</b> ${q.relevance_passed?'passed':'<b>failed -- forced IGNORE regardless of score</b>'}${q.relevance_exclusion_signals?`, exclusion signals: ${esc(q.relevance_exclusion_signals)}`:''}${q.relevance_positive_signals?`, positive signals: ${esc(q.relevance_positive_signals)}`:''}</div>`:''}
+${q?`<div class="contrib"><b>Budget source:</b> ${esc(q.budget_source||(q.budget_amount!=null?'client-stated':'unknown (TTT estimate only)'))}</div>`:''}
+${q&&q.strongest_technical_match?`<div class="contrib"><b>Strongest technical match:</b> ${esc(q.strongest_technical_match)}</div>`:''}
+${q&&q.biggest_risk?`<div class="contrib"><b>Biggest risk:</b> ${esc(q.biggest_risk)}</div>`:''}
+${q&&q.estimated_project_value?`<div class="contrib"><b>Estimated project value:</b> ${esc(q.estimated_project_value)}</div>`:''}
+${q&&q.capability_gaps?`<div class="contrib"><b>Capability gaps:</b> ${esc(q.capability_gaps)}</div>`:''}
+${q&&q.why?`<div class="contrib"><b>Why:</b> ${esc(q.why)}</div>`:''}
 <div class="actions">
 <button class="secondary rhEditToggle" data-id="${esc(o.id)}">${rhEditId===o.id?'Hide edit':'Edit'}</button>
 ${!q?`<button class="rhQualify" data-id="${esc(o.id)}">Qualify</button>`:''}
@@ -518,6 +984,7 @@ ${(o.proposals||[]).map(p=>`<div class="contrib"><b>${esc(p.kind)} (${esc(p.stat
 ${(o.followups||[]).map(f=>`<div class="contrib"><b>${esc(f.kind)} (${esc(f.status)}):</b> ${esc(f.draft_content)} ${f.status==='DRAFT'?`<button class="secondary rhFollowupSent" data-id="${esc(f.id)}">Mark sent</button>`:''}</div>`).join('')}
 <div class="contrib"><b>Stage history</b></div>
 ${(o.stage_history||[]).map(h=>`<div class="contrib">${esc(h.from_stage||'-')} &rarr; <b>${esc(h.to_stage)}</b> by ${esc(h.actor)}${h.note?': '+esc(h.note):''}</div>`).join('')}
+${(o.research||[]).length?`<div class="contrib"><b>Research (client/company context -- untrusted input, cited)</b></div>`+(o.research||[]).map(r=>`<div class="contrib">${esc(r.answer||'')}${(r.sources||[]).length?'<br><i>Sources: '+(r.sources||[]).map(s=>`<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||s.domain||s.url)}</a>`).join(', ')+'</i>':''}</div>`).join(''):''}
 </div>`;
 }
 async function loadRhPipeline(){const d=await api('/api/rh/opportunities');const items=d.items||[];const byStage={};RH_STAGES.forEach(s=>byStage[s]=[]);items.forEach(o=>{(byStage[o.stage]||(byStage[o.stage]=[])).push(o)});
@@ -533,6 +1000,103 @@ async function loadRhRevenue(){const a=await api('/api/rh/analytics');$('rhAnaly
 <span>Replies: ${a.replies}</span><span>Meetings: ${a.meetings}</span><span>Wins: ${a.wins}</span><span>Losses: ${a.losses}</span>
 <span>Conversion: ${Math.round(a.conversion_rate*100)}%</span><span>Pipeline value: $${a.pipeline_value}</span><span>Won revenue: $${a.won_revenue}</span>
 </div></div>`+Object.entries(a.source_performance||{}).map(([src,s])=>`<div class="item"><h3>${esc(src)}</h3><div class="meta"><span>added ${s.added}</span><span>won ${s.won}</span><span>lost ${s.lost}</span></div></div>`).join('')}
+async function loadRhSettings(){
+const p=await api('/api/rh/acquisition-profile');
+$('rhSetServices').value=(p.services||[]).join('\n');
+$('rhSetSkills').value=(p.skills||[]).join(', ');
+$('rhSetMinBudget').value=p.min_budget_usd!=null?p.min_budget_usd:'';
+$('rhSetMaxAge').value=p.max_age_days!=null?p.max_age_days:'';
+$('rhSetRemote').value=p.remote_preference||'remote_ok';
+$('rhSetCountries').value=(p.target_countries||[]).join(', ');
+$('rhSetKeywords').value=(p.keywords||[]).join(', ');
+$('rhSetExcluded').value=(p.excluded_keywords||[]).join(', ');
+$('rhSetPositiveSignals').value=(p.positive_service_signals||[]).join('\n');
+$('rhSetExclusionSignals').value=(p.exclusion_role_signals||[]).join('\n');
+const sourceSettings=p.source_settings||{};
+$('rhSetSources').innerHTML=Object.keys(sourceSettings).length?Object.entries(sourceSettings).map(([name,cfg])=>`<label style="display:flex;gap:8px;align-items:center;padding:4px 0"><input type="checkbox" class="rhSetSourceToggle" data-source="${esc(name)}" ${cfg&&cfg.enabled?'checked':''}> ${esc(name)}</label>`).join(''):'<div class="empty">No sources configured.</div>';
+}
+$('rhSetSave').onclick=async()=>{
+const services=$('rhSetServices').value.split('\n').map(s=>s.trim()).filter(Boolean);
+const skills=$('rhSetSkills').value.split(',').map(s=>s.trim()).filter(Boolean);
+const targetCountries=$('rhSetCountries').value.split(',').map(s=>s.trim()).filter(Boolean);
+const keywords=$('rhSetKeywords').value.split(',').map(s=>s.trim()).filter(Boolean);
+const excludedKeywords=$('rhSetExcluded').value.split(',').map(s=>s.trim()).filter(Boolean);
+const positiveServiceSignals=$('rhSetPositiveSignals').value.split('\n').map(s=>s.trim()).filter(Boolean);
+const exclusionRoleSignals=$('rhSetExclusionSignals').value.split('\n').map(s=>s.trim()).filter(Boolean);
+const sourceSettings={};
+document.querySelectorAll('.rhSetSourceToggle').forEach(cb=>{sourceSettings[cb.dataset.source]={enabled:cb.checked}});
+const body={
+services, skills,
+min_budget_usd:$('rhSetMinBudget').value?Number($('rhSetMinBudget').value):null,
+max_age_days:$('rhSetMaxAge').value?Number($('rhSetMaxAge').value):null,
+remote_preference:$('rhSetRemote').value,
+target_countries:targetCountries,
+keywords, excluded_keywords:excludedKeywords,
+positive_service_signals:positiveServiceSignals,
+exclusion_role_signals:exclusionRoleSignals,
+source_settings:sourceSettings,
+};
+try{
+await api('/api/rh/acquisition-profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+alert('Acquisition profile saved.');
+await loadRhSettings();
+}catch(e){alert(e.message)}
+};
+$('rhRequalifyAll').onclick=async()=>{
+$('rhRequalifyAll').disabled=true;
+$('rhRequalifyResult').innerHTML='<div class="empty">Requalifying every non-terminal opportunity against the current profile...</div>';
+try{
+const r=await api('/api/rh/requalify',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+const d=r.distribution||{};
+$('rhRequalifyResult').innerHTML=`<div class="item"><div class="meta"><span>requalified ${r.requalified}</span><span>PURSUE ${d.PURSUE||0}</span><span>MAYBE ${d.MAYBE||0}</span><span>IGNORE ${d.IGNORE||0}</span></div>
+<div class="contrib"><b>Downgraded from PURSUE:</b> ${(r.downgraded_from_pursue||[]).length}</div>
+<div class="contrib"><b>Upgraded to PURSUE:</b> ${(r.upgraded_to_pursue||[]).length}</div>
+<div class="contrib"><b>Superseded proposals:</b> ${(r.superseded_proposal_ids||[]).length}</div>
+<div class="contrib"><b>Rejected stale Needs Aryan items:</b> ${(r.rejected_needs_aryan_ids||[]).length}</div>
+</div>`;
+await loadRhOpportunities();
+}catch(e){
+$('rhRequalifyResult').innerHTML=`<div class="empty">Requalification failed: ${esc(e.message)}</div>`;
+}finally{
+$('rhRequalifyAll').disabled=false;
+}
+};
+
+function smItem(title,metaParts){return `<div class="item"><h3>${esc(title)}</h3><div class="meta">${(metaParts||[]).filter(Boolean).map(m=>`<span>${esc(m)}</span>`).join('')}</div></div>`}
+async function loadRhSalesManager(){
+const o=await api('/api/rh/sales-manager/overview');
+const att=o.attention||{};
+$('smAttention').innerHTML=`<div class="item"><div class="meta"><span>${(att.needs_aryan_pending||[]).length} pending decisions</span><span>${(att.blocked_deliveries||[]).length} blocked deliveries</span><span>${(att.overdue_invoices||[]).length} overdue invoices</span></div></div>`;
+$('smBestLeads').innerHTML=(o.best_leads||[]).length?o.best_leads.map(l=>smItem(l.title,[l.priority+' priority',l.recommendation,l.suggested_price,l.stage])).join(''):'<div class="empty">No active leads yet.</div>';
+$('smWhoReplied').innerHTML=(o.who_replied||[]).length?o.who_replied.map(m=>smItem(m.body?m.body.slice(0,80):'(message)',[m.intent,m.channel])).join(''):'<div class="empty">No open replies.</div>';
+$('smNegotiations').innerHTML=(o.negotiations_needing_action||[]).length?o.negotiations_needing_action.map(i=>smItem(i.title,[i.kind])).join(''):'<div class="empty">None right now.</div>';
+$('smCloseSoon').innerHTML=(o.can_close_soon||[]).length?o.can_close_soon.map(c=>smItem(c.title,['within policy'])).join(''):'<div class="empty">Nothing flagged yet.</div>';
+$('smOnboarding').innerHTML=(o.onboarding_clients||[]).length?o.onboarding_clients.map(c=>smItem(c.title,[`${(c.onboarding_completeness||{}).received||0}/${(c.onboarding_completeness||{}).total||0} received`])).join(''):'<div class="empty">No one onboarding right now.</div>';
+$('smBlockedDeliveries').innerHTML=(o.blocked_deliveries||[]).length?o.blocked_deliveries.map(d=>smItem(d.title||d.active_job_id,[d.blocker_reason])).join(''):'<div class="empty">Nothing blocked.</div>';
+$('smOverdueInvoices').innerHTML=(o.overdue_invoices||[]).length?o.overdue_invoices.map(i=>smItem('Invoice '+i.id,['$'+i.amount+' '+(i.currency||''),'due '+(i.due_date||'')])).join(''):'<div class="empty">Nothing overdue.</div>';
+$('smUpsell').innerHTML=(o.upsell_ready_clients||[]).length?o.upsell_ready_clients.map(c=>smItem(c.client_name,[`${(c.due_items||[]).length} due follow-up(s)`])).join(''):'<div class="empty">No upsell follow-ups due.</div>';
+}
+async function loadRhOutboundLeads(){const d=await api('/api/rh/outbound-leads');renderRhOutboundLeads(d.items||[])}
+function renderRhOutboundLeads(items){
+$('rhOutboundLeadsList').innerHTML=items.length?items.map(l=>`<div class="item"><h3>${esc(l.company_name)}</h3><div class="meta"><span>${esc(l.status)}</span>${l.confidence?`<span>${esc(l.confidence)} confidence</span>`:''}${l.website?`<span>${esc(l.website)}</span>`:''}</div>${l.likely_need?`<div class="contrib"><b>Likely need:</b> ${esc(l.likely_need)}</div>`:''}${l.relevance_notes?`<div class="contrib"><b>Why:</b> ${esc(l.relevance_notes)}</div>`:''}<div class="form"><textarea class="obDraftMsg" data-id="${esc(l.id)}" placeholder="Draft outreach message (nothing is ever sent automatically)"></textarea><input class="obDraftChannel" data-id="${esc(l.id)}" placeholder="Channel (e.g. business email)"><div class="actions"><button class="secondary obDraft" data-id="${esc(l.id)}">Prepare outreach draft</button></div></div></div>`).join(''):'<div class="empty">No outbound leads yet -- add one researched prospect at a time.</div>';
+document.querySelectorAll('.obDraft').forEach(b=>b.onclick=async()=>{
+const msg=document.querySelector(`.obDraftMsg[data-id="${b.dataset.id}"]`).value.trim();
+const channel=document.querySelector(`.obDraftChannel[data-id="${b.dataset.id}"]`).value.trim()||'email';
+if(!msg)return alert('Write the draft message first.');
+try{await api(`/api/rh/outbound-leads/${b.dataset.id}/outreach`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel,message:msg})});alert('Draft prepared -- review it in Needs Aryan before sending it yourself.');await loadRhOutboundLeads()}catch(e){alert(e.message)}
+});
+}
+$('obCreate').onclick=async()=>{
+try{
+await api('/api/rh/outbound-leads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+company_name:$('obCompany').value.trim(),website:$('obWebsite').value.trim()||null,contact_name:$('obContact').value.trim()||null,
+likely_need:$('obLikelyNeed').value.trim()||null,proposed_offer:$('obOffer').value.trim()||null,
+confidence:$('obConfidence').value||null,source:$('obSource').value.trim()||null,relevance_notes:$('obNotes').value.trim()||null,
+})});
+$('obCompany').value='';$('obWebsite').value='';$('obContact').value='';$('obLikelyNeed').value='';$('obOffer').value='';$('obConfidence').value='';$('obSource').value='';$('obNotes').value='';
+await loadRhOutboundLeads();
+}catch(e){alert(e.message)}
+};
 
 loadAll().catch(e=>{$('boardroomList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`});
 </script></body></html>'''

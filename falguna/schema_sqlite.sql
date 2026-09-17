@@ -62,3 +62,91 @@ CREATE INDEX IF NOT EXISTS idx_rh_qualifications_opportunity ON rh_qualification
 CREATE INDEX IF NOT EXISTS idx_rh_proposals_opportunity ON rh_proposals(opportunity_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_rh_followups_status ON rh_followups(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_rh_active_jobs_opportunity ON rh_active_jobs(opportunity_id, created_at);
+
+-- Opportunity Agent v1: automatic discovery, dedup, config, research linkage
+CREATE TABLE IF NOT EXISTS rh_discovery_runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT, actor TEXT NOT NULL, profile_snapshot_json TEXT NOT NULL, providers_json TEXT NOT NULL, opportunities_found INTEGER NOT NULL, opportunities_new INTEGER NOT NULL, opportunities_duplicate INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_discovered_sources (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), source TEXT NOT NULL, external_id TEXT, url_canonical TEXT, content_fingerprint TEXT NOT NULL, discovery_run_id TEXT, raw_metadata_json TEXT, discovered_at TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_opportunity_research (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), research_id TEXT NOT NULL REFERENCES research_queries(id), created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rh_settings (id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, value_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_rh_discovery_runs_created ON rh_discovery_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_discovered_sources_opportunity ON rh_discovered_sources(opportunity_id);
+CREATE INDEX IF NOT EXISTS idx_rh_discovered_sources_source_extid ON rh_discovered_sources(source, external_id);
+CREATE INDEX IF NOT EXISTS idx_rh_discovered_sources_url ON rh_discovered_sources(url_canonical);
+CREATE INDEX IF NOT EXISTS idx_rh_discovered_sources_fingerprint ON rh_discovered_sources(content_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_rh_opportunity_research_opportunity ON rh_opportunity_research(opportunity_id);
+
+-- TTT Autonomous Revenue-to-Delivery Loop v1 (Pass A: orchestrator + sales
+-- execution). All new tables, so CREATE TABLE IF NOT EXISTS is safe against
+-- an already-migrated production database with none of these yet -- the
+-- one existing table that gains a field (rh_opportunities.lifecycle_state)
+-- goes through the additive-column mechanism in store.py instead, since
+-- this file is a no-op against a table that already exists.
+--
+-- rh_lifecycle_events: the single shared business lifecycle's append-only
+-- audit trail (Company Workflow Orchestrator, falguna/lifecycle.py). Never
+-- updated or deleted -- every transition, valid or refused, is a new row,
+-- so "why did this opportunity reach WON" is always answerable from history
+-- alone, independent of and complementary to rh_stage_history (which keeps
+-- tracking the older, coarser pipeline `stage` field unchanged).
+CREATE TABLE IF NOT EXISTS rh_lifecycle_events (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), from_state TEXT, to_state TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, evidence_json TEXT, next_action TEXT, approval_required INTEGER NOT NULL DEFAULT 0, approval_status TEXT, money_impact_json TEXT, created_at TEXT NOT NULL);
+-- rh_application_attempts: Application Executor evidence log (falguna/
+-- application_executor.py). One row per real attempt -- a channel that
+-- merely prepares a manual-review package still gets a row, so "did we
+-- actually try, and what happened" never depends on memory or the UI.
+CREATE TABLE IF NOT EXISTS rh_application_attempts (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), channel TEXT NOT NULL, status TEXT NOT NULL, blocked_reason TEXT, evidence_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+-- clients: first-class client record (Closing Agent, falguna/sales_ops.py).
+-- Previously "clients" was only a derived grouping of rh_opportunities by
+-- client_name in the UI (loadRhClients in hq_web.py) -- this is additive,
+-- that grouping keeps working unchanged; a real row here is what Onboarding/
+-- Delivery/Billing/Retention (later passes) attach to.
+CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, primary_contact TEXT, contact_channel TEXT, status TEXT NOT NULL, total_won_value REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- rh_closing_records: the structured terms captured when a deal is closed
+-- (Closing Agent, Section 8) -- final scope/price/currency/payment terms/
+-- milestones/deadline/deliverables/acceptance criteria/communication
+-- channel, exactly as agreed, never re-derived or guessed later.
+CREATE TABLE IF NOT EXISTS rh_closing_records (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), client_id TEXT NOT NULL REFERENCES clients(id), final_scope TEXT, final_price REAL, currency TEXT, payment_terms TEXT, milestones_json TEXT, deadline TEXT, deliverables TEXT, acceptance_criteria TEXT, communication_channel TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_rh_lifecycle_events_opportunity ON rh_lifecycle_events(opportunity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_application_attempts_opportunity ON rh_application_attempts(opportunity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_clients_name ON clients(name);
+CREATE INDEX IF NOT EXISTS idx_rh_closing_records_opportunity ON rh_closing_records(opportunity_id);
+
+-- TTT Autonomous Revenue-to-Delivery Loop v1, Passes B-E. All new tables
+-- (existing ones get additive columns via store.py instead), so
+-- CREATE TABLE IF NOT EXISTS is safe against the live production database.
+--
+-- rh_negotiation_terms: Negotiation Agent history/evidence (Section 7,
+-- falguna/sales_ops.py). Every evaluate() call is a permanent row, not just
+-- an audit-log line -- so "what has been proposed on this deal, and was it
+-- ever out of policy" is a real, queryable history, not something you have
+-- to reconstruct from the audit trail.
+CREATE TABLE IF NOT EXISTS rh_negotiation_terms (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), actor TEXT NOT NULL, price REAL, currency TEXT, discount_pct REAL, upfront_payment_pct REAL, payment_terms TEXT, free_revisions INTEGER, timeline_days INTEGER, within_policy INTEGER NOT NULL, violations_json TEXT, needs_aryan_id TEXT, created_at TEXT NOT NULL);
+-- rh_conversation_messages: Conversation Inbox (Section 6, falguna/
+-- conversations.py). One row per real inbound or drafted-outbound message,
+-- classified and evidenced -- never fabricated, never silently sent.
+CREATE TABLE IF NOT EXISTS rh_conversation_messages (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), client_id TEXT, channel TEXT NOT NULL, external_thread_id TEXT, sender TEXT, direction TEXT NOT NULL, body TEXT NOT NULL, intent TEXT, status TEXT NOT NULL, evidence_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- rh_onboarding_items: Client Onboarding checklist (Section 9, falguna/
+-- onboarding.py). `sensitive` items never carry the real secret in
+-- `value_text` -- see OnboardingStore's own docstring.
+CREATE TABLE IF NOT EXISTS rh_onboarding_items (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), item_type TEXT NOT NULL, status TEXT NOT NULL, sensitive INTEGER NOT NULL DEFAULT 0, value_text TEXT, notes TEXT, actor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- rh_invoices: Billing/Receivables (Section 12, falguna/billing.py). Never
+-- moved to PAID without `evidence_json` -- see BillingStore.record_payment.
+CREATE TABLE IF NOT EXISTS rh_invoices (id TEXT PRIMARY KEY, client_id TEXT NOT NULL REFERENCES clients(id), opportunity_id TEXT, active_job_id TEXT, amount REAL NOT NULL, currency TEXT NOT NULL, milestone TEXT, due_date TEXT, amount_received REAL NOT NULL DEFAULT 0, status TEXT NOT NULL, evidence_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- rh_completion_records: Completion/handover evidence (Section 13).
+CREATE TABLE IF NOT EXISTS rh_completion_records (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES rh_opportunities(id), active_job_id TEXT, evidence_json TEXT NOT NULL, checklist_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+-- rh_retention_items: Retention/Upsell follow-ups (Section 13).
+CREATE TABLE IF NOT EXISTS rh_retention_items (id TEXT PRIMARY KEY, client_id TEXT NOT NULL REFERENCES clients(id), opportunity_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL, follow_up_date TEXT, notes TEXT, actor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- rh_outbound_leads: Outbound Lead Agent (Section 4, falguna/outbound.py).
+-- Quality-over-volume by construction -- every lead is a single researched
+-- record with a stated reason, never a bulk-scraped list.
+CREATE TABLE IF NOT EXISTS rh_outbound_leads (id TEXT PRIMARY KEY, company_name TEXT NOT NULL, website TEXT, contact_name TEXT, contact_channel TEXT, likely_need TEXT, proposed_offer TEXT, confidence TEXT, relevance_notes TEXT, source TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- rh_outreach_drafts: Outreach Agent (Section 5). Always PREPARED, never
+-- SENT by this codebase itself -- see OutreachService's own docstring.
+CREATE TABLE IF NOT EXISTS rh_outreach_drafts (id TEXT PRIMARY KEY, lead_id TEXT NOT NULL REFERENCES rh_outbound_leads(id), channel TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, needs_aryan_id TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_rh_negotiation_terms_opportunity ON rh_negotiation_terms(opportunity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_conversation_messages_opportunity ON rh_conversation_messages(opportunity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_onboarding_items_opportunity ON rh_onboarding_items(opportunity_id);
+CREATE INDEX IF NOT EXISTS idx_rh_invoices_client ON rh_invoices(client_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_completion_records_opportunity ON rh_completion_records(opportunity_id);
+CREATE INDEX IF NOT EXISTS idx_rh_retention_items_client ON rh_retention_items(client_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_outbound_leads_status ON rh_outbound_leads(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_rh_outreach_drafts_lead ON rh_outreach_drafts(lead_id);

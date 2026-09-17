@@ -171,9 +171,15 @@ class OpportunityError(ValueError):
 
 
 class OpportunityStore:
-    def __init__(self, store: StateStore, audit: AuditLog):
+    def __init__(self, store: StateStore, audit: AuditLog, orchestrator=None):
         self.store = store
         self.audit = audit
+        # LifecycleOrchestrator, injected (like ProposalStore's needs_aryan)
+        # to avoid a circular import -- lifecycle.py itself imports
+        # OpportunityStore from this module. Optional and best-effort: this
+        # observability layer must never change or break this class's own,
+        # already-tested behavior when the caller doesn't wire it in.
+        self.orchestrator = orchestrator
 
     def create(self, fields: Dict[str, Any], actor: str = "Aryan", source: str = "manual") -> str:
         title = (fields.get("title") or "").strip()
@@ -200,6 +206,8 @@ class OpportunityStore:
         opportunity_id = self.store.create("rh_opportunities", row)
         self._record_stage(opportunity_id, None, "New", actor, "created")
         self.audit.append("RH_OPPORTUNITY_CREATED", {"opportunity_id": opportunity_id, "title": title, "source": source})
+        if self.orchestrator is not None:
+            self.orchestrator.try_initialize(opportunity_id, actor, reason="opportunity discovered")
         return opportunity_id
 
     def update(self, opportunity_id: str, actor: str, **fields: Any) -> Dict[str, Any]:
@@ -273,7 +281,18 @@ class OpportunityStore:
             rows = self.store.list("rh_opportunities", "stage=?", (stage,))
         else:
             rows = self.store.list("rh_opportunities")
-        return list(reversed(rows))
+        rows = list(reversed(rows))
+        # Attach each opportunity's latest qualification -- lightweight
+        # (unlike get(), this never pulls proposals/followups/stage_history)
+        # but the acquisition inbox (score, recommendation, suggested
+        # price, portfolio match columns) needs this on every row, not
+        # just when a single opportunity is opened.
+        out = []
+        for row in rows:
+            row = dict(row)
+            row["qualification"] = self.latest_qualification(row["id"])
+            out.append(row)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +303,142 @@ DEFAULT_CAPABILITY_SKILLS = [
     "javascript", "typescript", "react", "node.js", "node", "express", "python",
     "sqlite", "postgresql", "rest api", "stripe", "payments", "e-commerce",
     "ecommerce", "booking system", "crm", "automation", "ai", "saas", "html", "css",
+]
+
+# A handful of capability names above are also ordinary English words, not
+# just technology names -- "react" (verb: "companies can react faster"),
+# "node" (noun: "a node in the network"), "express" (verb/adjective:
+# "express your interest", "express delivery"). Found live, during real-
+# data requalification (qualification-calibration pass): a genuine Senior
+# Product Manager listing (Confluent, "Cluster Linking") kept registering a
+# false "react" skill match purely because its description used the verb
+# "react" in an ordinary sentence, which then both inflated fit_score and
+# overrode the new PM-role exclusion gate. _skill_tokens' free-text
+# ("implied") skill scan below deliberately skips these three -- an
+# opportunity that actually wants React/Node/Express work overwhelmingly
+# either lists it as an explicit skill tag (still fully detected, since
+# `listed` skills are never filtered) or names the concrete framework
+# phrase ("react developer", "node.js", "express.js") rather than the bare
+# ambiguous word alone.
+_AMBIGUOUS_ENGLISH_WORD_CAPABILITIES = {"react", "node", "express"}
+
+# Some capability keywords name a *topic* or *domain* ("ai", "saas", "crm",
+# "automation", "e-commerce", "ecommerce", "payments", "booking system")
+# rather than a concrete technology -- they show up in job postings that
+# have nothing to do with software delivery just as often as in real dev
+# work (a company can be "an AI company" and still be hiring a copywriter,
+# a recruiter, or a salesperson). A *single* match against one of these
+# alone must never be trusted as strong signal -- see _fit_score's comment
+# for the exact bug this caused (Freelance Writer scoring 100/PURSUE off
+# one incidental "AI" mention). Concrete stack names below are excluded
+# from this set deliberately: nobody lists "react" or "postgresql" as a
+# requirement unless the work is actually software development.
+_GENERIC_TOPIC_CAPABILITY_TOKENS = {
+    "ai", "saas", "crm", "automation", "e-commerce", "ecommerce", "payments", "booking system",
+}
+
+# Skill tokens strong enough, on their own, to override an exclusion-role
+# match in _service_relevance (e.g. "technical writer" who also lists
+# "html, css" is NOT overridden by that alone -- markup/styling skills are
+# common in non-dev content/design work too and are weak evidence of an
+# actual software-delivery ask). A real backend/frontend programming
+# language or framework is a much stronger signal that the underlying
+# request is to build something, not describe or format something.
+_STRONG_DEV_OVERRIDE_TOKENS = {
+    "javascript", "typescript", "react", "node.js", "node", "express", "python", "sqlite", "postgresql", "rest api",
+}
+
+# Phrases that establish "this is a request to build/deliver software",
+# independent of the opportunity's declared skill list -- title/description
+# language, not tags. Used only to *override* an exclusion-role match (see
+# _service_relevance): an opportunity that mentions a role we don't do
+# (e.g. "writer") is still relevant if the actual ask is clearly building a
+# tool/platform/app rather than performing that role personally.
+DEFAULT_POSITIVE_SERVICE_SIGNALS = [
+    "full-stack", "full stack", "frontend developer", "front-end developer", "backend developer",
+    "back-end developer", "software developer", "software engineer", "web developer", "app developer",
+    "mobile developer", "build a", "build an", "build our", "develop a", "develop an", "developing a",
+    "programming", "web application", "web app", "mvp development", "api development", "api integration",
+    "database design", "dashboard", "admin panel", "booking system", "reservation system",
+    "e-commerce platform", "ecommerce platform", "automation script", "integrate ai", "ai integration",
+    "machine learning integration", "react developer", "node.js developer", "python developer",
+    "coding", "codebase", "tech stack", "write code", "write software", "build software",
+    "develop software", "developing software", "engineer a solution",
+    # Deliberately excludes bare "html"/"css" -- markup/styling alone is weak
+    # evidence of a real software-delivery ask (a technical writer producing
+    # an HTML style guide is not a dev job); see _STRONG_DEV_OVERRIDE_TOKENS.
+    #
+    # Also deliberately excludes bare "react" and "express" here (unlike
+    # "javascript", "typescript", "node.js", "postgresql", "rest api",
+    # which are safe as free-text prose matches): both are ordinary English
+    # words ("...so companies can react faster...", "express your
+    # interest...") as well as framework names, so matching them as plain
+    # substrings against a title/description sentence is unreliable. Found
+    # live, during real-data requalification (qualification-calibration
+    # pass): a genuine Product Manager listing (Confluent, "Senior Product
+    # Manager, Cluster Linking") kept overriding the new PM exclusion gate
+    # solely because its description said "...so companies can react
+    # faster, build smarter..." -- an ordinary verb, not a framework
+    # mention. "react developer" (above) and skill-token matches against
+    # _STRONG_DEV_OVERRIDE_TOKENS (where "react" as a literal listed skill
+    # tag is unambiguous) remain the ways a real React ask is detected.
+    "javascript", "typescript", "node.js", "postgresql", "rest api",
+]
+
+# Phrases that indicate the opportunity itself IS a role outside TTT's
+# acquisition profile -- content/people/finance/legal/medical work, not
+# software engineering. Deliberately phrase-level (not single generic
+# words) to avoid brittle false positives; combined with the positive
+# signals above via _service_relevance so context still overrides a bare
+# mention (e.g. "build a tool for content writers" is not excluded).
+#
+# Qualification-calibration pass: added the management/leadership role
+# family (Product/Project/Engineering/Program Manager, Head of
+# Engineering) -- these are hiring-for-a-person roles, not a hands-on
+# software deliverable TTT can sell, and were previously passing the gate
+# too easily just because their listings mention plenty of dev-adjacent
+# language. Phrased as the occupation ("product manager") rather than the
+# business domain ("product management") deliberately: "Senior Product
+# Manager for SaaS company" should match and gate to IGNORE, but "Build a
+# SaaS product-management dashboard" (a real deliverable, in the domain of
+# product management) never contains the phrase "product manager" at all,
+# so it's unaffected without needing any special-case. Also added
+# customer-success/account-management, rounding out the sales/CS family.
+#
+# Work-Type Relevance Gate pass: added the admin/operational-support role
+# family (virtual/office/administrative/executive assistant, bookkeeping,
+# data entry, office administration, operations assistant, payroll/
+# accounting support) -- found live, during real-data requalification,
+# via a real "Remote Office Assistant" listing (Coalition Technologies)
+# that reached PURSUE on a client-stated budget purely because its tag
+# list happened to include several web/CMS-adjacent words (css, html,
+# php, wordpress, shopify) despite the actual job -- answering phones,
+# reconciling invoices, data entry, calendar management -- being pure
+# administrative/bookkeeping work with zero coding ask anywhere in the
+# description. Same occupation-vs-domain phrasing choice as the PM family
+# above: "bookkeeping" / "data entry" / "office administration" gate a
+# role whose JOB is to personally perform that operational work, but
+# never match a real software deliverable ABOUT that domain ("build a
+# bookkeeping automation tool", "develop payroll SaaS", "build an admin
+# dashboard" -- none of these phrases contain any of the exclusion
+# phrases below at all, so they are gated in the first place only when a
+# listing genuinely also names the assistant/admin role, and even then
+# still pass via the same positive-service-signal override used
+# throughout this gate).
+DEFAULT_EXCLUSION_ROLE_SIGNALS = [
+    "copywriter", "copywriting", "content writer", "freelance writer", "blog writer",
+    "technical writer", "ghostwriter", "proofreader", "content editor",
+    "recruiter", "recruiting", "talent acquisition", "hr generalist", "human resources",
+    "sales representative", "sales development representative", "business development representative",
+    "account executive", "account manager", "customer support", "customer service representative",
+    "support agent", "customer success", "customer success manager",
+    "accountant", "bookkeeper", "tax preparer", "attorney", "lawyer", "legal counsel", "paralegal",
+    "nurse", "physician", "doctor", "dentist", "therapist", "social media manager",
+    "content marketing specialist", "influencer",
+    "product manager", "project manager", "engineering manager", "program manager", "head of engineering",
+    "virtual assistant", "office assistant", "administrative assistant", "executive assistant",
+    "bookkeeping", "data entry", "office administration", "operations assistant",
+    "payroll support", "payroll processing", "accounting support",
 ]
 
 # Real, self-built portfolio work (see ~/Freelancing) used as the default
@@ -302,9 +457,18 @@ class QualificationEngine:
     """Deterministic, documented scoring rules -- see class docstring on each
     method for exactly how a number is produced. No network, no model call."""
 
-    def __init__(self, capability_skills: Optional[List[str]] = None, portfolio: Optional[List[Dict[str, Any]]] = None):
+    def __init__(self, capability_skills: Optional[List[str]] = None, portfolio: Optional[List[Dict[str, Any]]] = None,
+                 positive_service_signals: Optional[List[str]] = None, exclusion_role_signals: Optional[List[str]] = None):
         self.capability_skills = [s.lower() for s in (capability_skills or DEFAULT_CAPABILITY_SKILLS)]
         self.portfolio = portfolio or DEFAULT_PORTFOLIO_PROJECTS
+        # None-check (not a truthy-check like capability_skills/portfolio
+        # above): an explicitly configured empty list is a valid, meaningful
+        # acquisition-profile choice ("no exclusions configured"), not the
+        # same as "nothing was passed, use the default" -- a truthy-check
+        # would silently discard that choice and fall back to the default
+        # list instead.
+        self.positive_service_signals = [s.lower() for s in (positive_service_signals if positive_service_signals is not None else DEFAULT_POSITIVE_SERVICE_SIGNALS)]
+        self.exclusion_role_signals = [s.lower() for s in (exclusion_role_signals if exclusion_role_signals is not None else DEFAULT_EXCLUSION_ROLE_SIGNALS)]
 
     def score(self, opportunity: Dict[str, Any]) -> Dict[str, Any]:
         text = " ".join(filter(None, [
@@ -320,13 +484,26 @@ class QualificationEngine:
         urgency = self._urgency(text, opportunity.get("urgency"))
         effort_vs_return = self._effort_vs_return(budget_quality, skill_tokens, opportunity.get("description"))
         portfolio_name, portfolio_reason = self._portfolio_match(skill_tokens)
-        recommendation = self._recommendation(fit_score, budget_quality, risk_flags)
-        suggested_price = self._suggested_price(budget_quality, budget_amount, fit_score)
+        relevance = self._service_relevance(opportunity.get("title", ""), opportunity.get("description", ""), skill_tokens)
+        recommendation, recommendation_detail = self._recommendation(fit_score, budget_quality, risk_flags, relevance)
+        suggested_price = self._suggested_price(budget_quality, budget_amount, fit_score, skill_tokens)
         suggested_timeline = self._suggested_timeline(skill_tokens, effort_vs_return)
+        capability_gaps = self._capability_gaps(skill_tokens)
+        estimated_project_value = self._estimated_project_value(opportunity.get("budget_rate"), budget_amount, skill_tokens)
+        concrete_matches, _ = self._concrete_matches(skill_tokens)
+        # "Strongest" = most specific/longest matched phrase (e.g. prefer
+        # "rest api" or "postgresql" over a shorter, less distinctive match)
+        # -- simple and auditable rather than a second weighting scheme.
+        strongest_technical_match = max(concrete_matches, key=len) if concrete_matches else None
+        biggest_risk = self._biggest_risk(risk_flags)
+        budget_source = "client-stated" if budget_amount is not None else "unknown (TTT estimate only)"
+        why = self._why(recommendation, recommendation_detail, fit_score, budget_quality, risk_flags,
+                          portfolio_name, capability_gaps, relevance, strongest_technical_match, biggest_risk)
 
         return {
             "fit_score": fit_score,
             "budget_quality": budget_quality,
+            "budget_source": budget_source,
             "effort_vs_return": effort_vs_return,
             "portfolio_match": portfolio_name,
             "portfolio_match_reason": portfolio_reason,
@@ -334,9 +511,18 @@ class QualificationEngine:
             "urgency": urgency,
             "risk_flags": risk_flags,
             "recommendation": recommendation,
+            "recommendation_detail": recommendation_detail,
             "suggested_price": suggested_price,
             "suggested_timeline": suggested_timeline,
             "suggested_portfolio_proof": self._proof_for(portfolio_name),
+            "capability_gaps": capability_gaps,
+            "estimated_project_value": estimated_project_value,
+            "strongest_technical_match": strongest_technical_match,
+            "biggest_risk": biggest_risk,
+            "why": why,
+            "relevance_passed": relevance["passes_gate"],
+            "relevance_exclusion_signals": relevance["exclusion_matches"],
+            "relevance_positive_signals": relevance["positive_matches"],
         }
 
     def _skill_tokens(self, opportunity: Dict[str, Any]) -> List[str]:
@@ -348,20 +534,76 @@ class QualificationEngine:
         # "available", inflating the fit score on unrelated text.
         implied = [
             s for s in self.capability_skills
-            if s not in listed and re.search(r"(?<![a-z0-9])" + re.escape(s) + r"(?![a-z0-9])", text)
+            if s not in listed and s not in _AMBIGUOUS_ENGLISH_WORD_CAPABILITIES
+            and re.search(r"(?<![a-z0-9])" + re.escape(s) + r"(?![a-z0-9])", text)
         ]
         return listed + implied
 
+    def _concrete_matches(self, skill_tokens: List[str]) -> (set, bool):
+        """Shared by _fit_score and score()'s "strongest technical match"
+        explainability field: which of this opportunity's skill tokens are
+        real, concrete technology matches against our capability list (as
+        opposed to a generic/topic word -- see _GENERIC_TOPIC_CAPABILITY_TOKENS),
+        and whether any generic/topic word matched at all.
+
+        Match direction matters (see _service_relevance's concrete_skill_positive
+        comment for the identical class of bug this guards against): a skill
+        token must EQUAL a capability phrase, or CONTAIN it (a longer
+        descriptive skill string like "react developer" that embeds the
+        exact capability name) -- never merely be a substring INSIDE a
+        longer capability phrase. That reverse direction is what let the
+        real scraped required_skills value "REST" (a lone, ambiguous
+        fragment) match capability phrase "rest api" via "rest" in "rest
+        api", wrongly registering as a match at all."""
+        concrete: set = set()
+        generic_hit = False
+        for s in skill_tokens:
+            matched_cap = next((cap for cap in self.capability_skills if s == cap or cap in s), None)
+            if matched_cap is None:
+                continue
+            if matched_cap in _GENERIC_TOPIC_CAPABILITY_TOKENS:
+                generic_hit = True
+            else:
+                concrete.add(matched_cap)
+        return concrete, generic_hit
+
     def _fit_score(self, skill_tokens: List[str]) -> int:
-        """0-100: overlap between the opportunity's skills and our capability
-        list, scaled by how many of the opportunity's own listed skills we
-        actually cover (so a 1-skill exact match scores as well as a
-        10-skill exact match, but partial coverage is penalized)."""
+        """0-100: weighted count of DISTINCT, concrete technology matches
+        against our capability list -- not a coverage percentage.
+
+        Root-cause fix #1 (relevance hardening pass): the original formula
+        was matches / total tokens, so a listing with only one detected
+        skill token that happened to match a single generic/topic
+        capability word (see _GENERIC_TOPIC_CAPABILITY_TOKENS) scored a
+        perfect 100% -- identical treatment to ten exact, concrete
+        tech-stack matches. That's exactly how a "Freelance Writer" post
+        mentioning "AI" once (skill_tokens == ["ai"]) reached fit_score=100.
+
+        Root-cause fix #2 (qualification-calibration pass): the ratio
+        formula has an OPPOSITE failure mode once fix #1 closed the first
+        one -- a real WeWorkRemotely/Lemon.io-style listing tagged with
+        40-50 generic recruiting keywords (blockchain, Unity, WordPress,
+        Symfony, ...) alongside 3-5 genuinely matching core skills
+        (React, Node.js, Python) scored only ~20/100 under the ratio
+        (3 matches / 45 tags), landing in IGNORE despite being a
+        legitimately strong lead -- the opposite mistake of over-scoring,
+        but just as wrong. Counting DISTINCT concrete matches directly,
+        uncapped by how much irrelevant noise surrounds them, fixes both
+        directions at once: a thin, entirely-generic or entirely-empty
+        match set still can't reach a confident score, but a real listing's
+        score no longer depends on how many unrelated tags a scraper or
+        aggregator happened to also attach."""
         if not skill_tokens:
             return 40  # no signal either way -- neutral-low, never a confident PURSUE
-        matches = sum(1 for s in skill_tokens if any(cap in s or s in cap for cap in self.capability_skills))
-        coverage = matches / len(skill_tokens)
-        return round(min(100, coverage * 100))
+        concrete, generic_hit = self._concrete_matches(skill_tokens)
+        if not concrete:
+            return 45 if generic_hit else 0
+        # Each additional distinct concrete tech match adds confidence, but
+        # with diminishing need for more than a handful -- 3+ solid matches
+        # (e.g. React, Node.js, PostgreSQL) is already as strong a signal as
+        # 10 would be, so this saturates at 100 rather than requiring the
+        # opportunity's ENTIRE tag list to be relevant.
+        return min(100, 55 + 15 * len(concrete))
 
     def _budget_quality(self, budget_rate: Optional[str]) -> (str, Optional[float]):
         if not budget_rate:
@@ -436,32 +678,223 @@ class QualificationEngine:
                 return project["proof"]
         return None
 
-    def _recommendation(self, fit_score: int, budget_quality: str, risk_flags: List[str]) -> str:
+    def _service_relevance(self, title: Optional[str], description: Optional[str], skill_tokens: List[str]) -> Dict[str, Any]:
+        """Hard relevance gate, independent of the numeric fit score: does
+        this opportunity's actual *category of work* belong to TTT's
+        acquisition profile at all? This is what a pure skill-token overlap
+        score can never answer -- "mentions AI" and "is a software
+        engineering deliverable" are unrelated facts, and the fit score
+        alone conflated them (see _fit_score's docstring for how).
+
+        Deliberately phrase-level and two-sided, not a single-word
+        blacklist: an exclusion-role phrase (e.g. "copywriter") only fails
+        the gate when there is *no* positive service signal anywhere in
+        the title/description to override it. "Build an AI writing SaaS
+        for copywriters" matches "copywriters" (exclusion) but also "build
+        a[n]" and "saas" (positive) -- the actual ask is building software,
+        so it passes. "Copywriter for AI company" matches "copywriter"
+        with nothing but the bare topic word "ai" alongside it -- "ai" is
+        deliberately not a positive signal on its own (see
+        DEFAULT_POSITIVE_SERVICE_SIGNALS' comment) because it is exactly as
+        overloaded as a topic word as it is as a skill token -- so the gate
+        correctly fails it."""
+        text = f"{title or ''} {description or ''}".lower()
+        exclusion_matches = [phrase for phrase in self.exclusion_role_signals if phrase in text]
+        positive_matches = [phrase for phrase in self.positive_service_signals if phrase in text]
+        # A strong dev/tech skill token is itself a positive signal too, even
+        # if its exact phrase isn't in positive_service_signals (e.g.
+        # "postgresql" as a listed skill rather than in the prose). Only
+        # _STRONG_DEV_OVERRIDE_TOKENS count here -- see its comment for why
+        # markup/styling alone (html, css) or generic topic words (ai, saas,
+        # ...) are deliberately excluded from being able to override an
+        # exclusion-role match by themselves.
+        #
+        # Match direction matters: a skill token must EQUAL an override
+        # token, or CONTAIN it as a substring (a longer descriptive skill
+        # phrase like "react developer" or "rest api integration" that
+        # embeds the exact tech name/phrase) -- never the reverse. Checking
+        # whether the token is merely contained INSIDE a longer override
+        # phrase (e.g. "s in d") is exactly the coverage-percentage class of
+        # bug this hardening pass exists to close: real scraped listing data
+        # showed a "Freelance Writer" job with required_skills literally set
+        # to the single junk word "REST" (an unrelated scraper artifact),
+        # which satisfied "rest" in "rest api" and wrongly overrode the
+        # exclusion gate. "rest" and "api" are common/ambiguous fragments of
+        # the two-word override phrase "rest api" and must never count on
+        # their own.
+        concrete_skill_positive = [
+            s for s in skill_tokens
+            if any(s == d or d in s for d in _STRONG_DEV_OVERRIDE_TOKENS)
+        ]
+        positive_matches = list(dict.fromkeys(positive_matches + concrete_skill_positive))
+        passes_gate = (not exclusion_matches) or bool(positive_matches)
+        return {"passes_gate": passes_gate, "exclusion_matches": exclusion_matches, "positive_matches": positive_matches}
+
+    def _recommendation(self, fit_score: int, budget_quality: str, risk_flags: List[str],
+                          relevance: Dict[str, Any]) -> (str, str):
+        """Returns (recommendation, recommendation_detail).
+
+        `recommendation` is the coarse PURSUE/MAYBE/IGNORE value everything
+        downstream already branches on (proposal auto-drafting, requalify_all's
+        upgrade/downgrade detection, the UI's quick filters) -- its shape is
+        unchanged so nothing else needs to learn a new value.
+        `recommendation_detail` additionally distinguishes
+        PURSUE_WITH_BUDGET_UNKNOWN (qualification-calibration pass, item 1):
+        a listing can become PURSUE on service-relevance + technical fit +
+        a clean gate alone -- a missing client-stated budget is an
+        uncertainty factor to surface (see score()'s budget_source field and
+        _suggested_price's TTT-estimate labeling), never by itself a reason
+        to bury an otherwise excellent, clearly-relevant lead in MAYBE
+        forever just because a job board didn't publish a rate."""
         hard_red_flags = [f for f in risk_flags if f in _RED_FLAG_PHRASES]
         if hard_red_flags:
-            return "IGNORE"
+            return "IGNORE", "IGNORE"
+        if not relevance["passes_gate"]:
+            # Clearly outside TTT's service scope (an excluded role, with no
+            # software-delivery signal to override it) -- never PURSUE,
+            # regardless of how high the numeric fit score computed, per the
+            # relevance hardening pass. This is a hard gate, not a score
+            # penalty, so a future scoring tweak can't accidentally let one
+            # back through.
+            return "IGNORE", "IGNORE"
         if fit_score < 25:
-            return "IGNORE"
-        if fit_score >= 60 and budget_quality in {"MEDIUM", "HIGH"} and len(risk_flags) == 0:
-            return "PURSUE"
-        return "MAYBE"
+            return "IGNORE", "IGNORE"
+        if "description too vague to scope confidently" in risk_flags:
+            # Scope clarity is a separate axis from budget: an opportunity
+            # that's genuinely relevant but too thinly described to size up
+            # confidently stays MAYBE regardless of budget -- this is NOT
+            # what the missing-budget policy below is for.
+            return "MAYBE", "MAYBE"
+        budget_known_good = budget_quality in {"MEDIUM", "HIGH"}
+        if fit_score >= 60 and budget_known_good:
+            return "PURSUE", "PURSUE"
+        # Missing-budget PURSUE requires a materially higher bar than the
+        # budget-known path: strong technical fit (>=75, not just >=60) AND
+        # a gate pass with NO excluded-role phrase present at all (not
+        # merely one that got overridden by dev language) -- a borderline
+        # "excluded role, but overridden" case still needs a real stated
+        # budget before PURSUE, since that override is already doing one
+        # job of judgment call; stacking a second one (assumed budget) on
+        # top of it would be too permissive.
+        strong_relevance = not relevance["exclusion_matches"]
+        if fit_score >= 75 and budget_quality == "UNKNOWN" and strong_relevance:
+            return "PURSUE", "PURSUE_WITH_BUDGET_UNKNOWN"
+        return "MAYBE", "MAYBE"
 
-    def _suggested_price(self, budget_quality: str, budget_amount: Optional[float], fit_score: int) -> str:
-        if budget_amount is None:
-            return "Ask for budget range before quoting"
-        multiplier = 1.0 if fit_score >= 60 else 0.9
-        return f"${round(budget_amount * multiplier)}"
+    def _suggested_price(self, budget_quality: str, budget_amount: Optional[float], fit_score: int,
+                           skill_tokens: List[str]) -> str:
+        if budget_amount is not None:
+            multiplier = 1.0 if fit_score >= 60 else 0.9
+            return f"${round(budget_amount * multiplier)}"
+        # No client-stated budget -- per the qualification-calibration
+        # pass, give a workable number rather than stalling on "ask for a
+        # budget range" forever, but label it unmistakably as TTT's own
+        # estimate, never a client-stated figure (never invent what the
+        # client would actually pay). A rough scope-based weekly-rate band,
+        # kept deliberately simple to stay auditable.
+        weeks = self._timeline_weeks(skill_tokens)
+        low, high = weeks * 700, weeks * 1400
+        return f"${low}-${high} (TTT estimate -- client budget not stated)"
+
+    def _biggest_risk(self, risk_flags: List[str]) -> Optional[str]:
+        """Single most important risk to surface, in priority order -- for
+        explainability (qualification-calibration pass, item 4), not a new
+        decision input."""
+        hard = [f for f in risk_flags if f in _RED_FLAG_PHRASES]
+        if hard:
+            return hard[0]
+        if "description too vague to scope confidently" in risk_flags:
+            return "description too vague to scope confidently"
+        if "no budget stated" in risk_flags:
+            return "no budget stated -- pricing is a TTT estimate"
+        return risk_flags[0] if risk_flags else None
+
+    def _timeline_weeks(self, skill_tokens: List[str]) -> int:
+        return max(1, min(8, 1 + len(skill_tokens) // 2))
 
     def _suggested_timeline(self, skill_tokens: List[str], effort_vs_return: str) -> str:
-        weeks = max(1, min(8, 1 + len(skill_tokens) // 2))
-        return f"{weeks} week(s)"
+        return f"{self._timeline_weeks(skill_tokens)} week(s)"
+
+    def _capability_gaps(self, skill_tokens: List[str]) -> List[str]:
+        """Skills this opportunity asks for that our own capability list does
+        not cover -- surfaced honestly rather than silently ignored, so a
+        gap is visible before proposing anything."""
+        return [s for s in skill_tokens if not any(cap in s or s in cap for cap in self.capability_skills)]
+
+    def _estimated_project_value(self, budget_rate: Optional[str], budget_amount: Optional[float], skill_tokens: List[str]) -> Optional[str]:
+        """Distinct from suggested_price (what we'd quote): this is a rough
+        estimate of the total deal size implied by the stated rate and the
+        estimated timeline -- e.g. an hourly rate is projected across the
+        estimated weeks of work, while a fixed/project rate is taken as-is.
+        Returns None (never a fabricated number) when there is no budget to
+        work from at all."""
+        if budget_amount is None:
+            return None
+        is_hourly = bool(budget_rate) and ("/hr" in budget_rate.replace(" ", "").lower() or "hour" in budget_rate.lower())
+        if is_hourly:
+            weeks = self._timeline_weeks(skill_tokens)
+            return f"${round(budget_amount * 40 * weeks)}"
+        return f"${round(budget_amount)}"
+
+    def _why(self, recommendation: str, recommendation_detail: str, fit_score: int, budget_quality: str,
+              risk_flags: List[str], portfolio_name: Optional[str], capability_gaps: List[str],
+              relevance: Optional[Dict[str, Any]] = None, strongest_technical_match: Optional[str] = None,
+              biggest_risk: Optional[str] = None) -> str:
+        """One deterministic explanation built from the same signals score()
+        already computed -- never a separate, possibly inconsistent
+        judgment call. Qualification-calibration pass, item 4: every
+        qualification must explain why it's relevant, why it landed on
+        PURSUE/MAYBE/IGNORE, whether budget is client-stated or a TTT
+        estimate, the strongest technical match, and the biggest risk --
+        so the trailing sentence below is appended for every recommendation,
+        not just PURSUE."""
+        relevance = relevance or {"passes_gate": True, "exclusion_matches": [], "positive_matches": []}
+        if recommendation == "PURSUE":
+            if recommendation_detail == "PURSUE_WITH_BUDGET_UNKNOWN":
+                sentence = (
+                    f"Strong fit ({fit_score}/100) and clearly relevant, deliverable software/AI work -- "
+                    "pursuing on service-relevance and technical fit alone since the client hasn't stated a budget."
+                )
+            else:
+                sentence = f"Strong fit ({fit_score}/100) with {budget_quality.lower()} budget quality and no blocking risk flags."
+            if portfolio_name:
+                sentence += f" Matches our {portfolio_name} portfolio work."
+        elif recommendation == "IGNORE":
+            hard_flags = [f for f in risk_flags if f in _RED_FLAG_PHRASES]
+            if hard_flags:
+                sentence = f"Ignored due to red flags: {', '.join(hard_flags)}."
+            elif not relevance["passes_gate"]:
+                sentence = (
+                    f"Ignored: this looks like {', '.join(relevance['exclusion_matches'])} work, not a software/AI "
+                    "development opportunity in TTT's acquisition profile -- fit score is not evaluated for out-of-scope work."
+                )
+            else:
+                sentence = f"Ignored: fit score too low ({fit_score}/100) to justify pursuing."
+        else:
+            sentence = f"Marked MAYBE: fit {fit_score}/100 with {budget_quality.lower()} budget quality -- worth a second look but not a confident pursue."
+            if capability_gaps:
+                sentence += f" Capability gap(s): {', '.join(capability_gaps)}."
+
+        if relevance["passes_gate"] and relevance.get("positive_matches"):
+            sentence += f" Relevant because: {', '.join(relevance['positive_matches'][:3])}."
+        sentence += (
+            " Budget: client-stated." if budget_quality != "UNKNOWN"
+            else " Budget: unknown -- any price shown is a TTT estimate, not a client-stated figure."
+        )
+        if strongest_technical_match:
+            sentence += f" Strongest technical match: {strongest_technical_match}."
+        if biggest_risk:
+            sentence += f" Biggest risk: {biggest_risk}."
+        return sentence
 
 
 class QualificationStore:
-    def __init__(self, store: StateStore, audit: AuditLog, engine: Optional[QualificationEngine] = None):
+    def __init__(self, store: StateStore, audit: AuditLog, engine: Optional[QualificationEngine] = None, orchestrator=None):
         self.store = store
         self.audit = audit
         self.engine = engine or QualificationEngine()
+        # LifecycleOrchestrator, injected -- see OpportunityStore's own note.
+        self.orchestrator = orchestrator
 
     def qualify(self, opportunity_id: str, actor: str = "Aryan") -> Dict[str, Any]:
         opportunity = self.store.get("rh_opportunities", opportunity_id)
@@ -477,12 +910,31 @@ class QualificationStore:
             "urgency": result["urgency"], "risk_flags": ", ".join(result["risk_flags"]) if result["risk_flags"] else None,
             "recommendation": result["recommendation"], "suggested_price": result["suggested_price"],
             "suggested_timeline": result["suggested_timeline"], "suggested_portfolio_proof": result["suggested_portfolio_proof"],
+            "capability_gaps": ", ".join(result["capability_gaps"]) if result["capability_gaps"] else None,
+            "estimated_project_value": result["estimated_project_value"], "why": result["why"],
+            "relevance_passed": 1 if result["relevance_passed"] else 0,
+            "relevance_exclusion_signals": ", ".join(result["relevance_exclusion_signals"]) if result["relevance_exclusion_signals"] else None,
+            "relevance_positive_signals": ", ".join(result["relevance_positive_signals"]) if result["relevance_positive_signals"] else None,
+            "recommendation_detail": result["recommendation_detail"],
+            "budget_source": result["budget_source"],
+            "strongest_technical_match": result["strongest_technical_match"],
+            "biggest_risk": result["biggest_risk"],
             "created_at": now,
         }
         self.store.create("rh_qualifications", row)
         if opportunity["stage"] == "New":
             OpportunityStore(self.store, self.audit).move_stage(opportunity_id, "Qualified", actor, "auto-qualified")
         self.audit.append("RH_OPPORTUNITY_QUALIFIED", {"opportunity_id": opportunity_id, "recommendation": result["recommendation"], "fit_score": result["fit_score"]})
+        if self.orchestrator is not None:
+            # Always recorded regardless of PURSUE/MAYBE/IGNORE -- mirrors
+            # the existing stage-move behavior above, which likewise never
+            # branches on the recommendation. Deciding to drop an IGNORE
+            # opportunity to LOST is a business call for a later pass, not
+            # something this qualification hook should do silently.
+            self.orchestrator.try_transition(
+                opportunity_id, "QUALIFIED", actor, reason=f"qualified: {result['recommendation']}",
+                evidence={"fit_score": result["fit_score"], "recommendation": result["recommendation"]},
+            )
         return row
 
 
@@ -552,10 +1004,11 @@ def generate_proposal_text(opportunity: Dict[str, Any], qualification: Optional[
 
 
 class ProposalStore:
-    def __init__(self, store: StateStore, audit: AuditLog, needs_aryan=None):
+    def __init__(self, store: StateStore, audit: AuditLog, needs_aryan=None, orchestrator=None):
         self.store = store
         self.audit = audit
         self.needs_aryan = needs_aryan  # NeedsAryanQueue, injected to avoid a circular import at module load
+        self.orchestrator = orchestrator  # LifecycleOrchestrator, injected for the same reason
 
     def generate(self, opportunity_id: str, kind: str, actor: str = "Aryan") -> Dict[str, Any]:
         opportunity = self.store.get("rh_opportunities", opportunity_id)
@@ -579,6 +1032,13 @@ class ProposalStore:
                 actor=actor, recommendation=(qualification or {}).get("recommendation"),
                 ref_type="rh_proposal", ref_id=proposal_id,
             )
+        if self.orchestrator is not None:
+            self.orchestrator.try_transition(opportunity_id, "PITCH_READY", actor, reason=f"{kind} proposal drafted")
+            if needs_aryan_id is not None:
+                self.orchestrator.try_transition(
+                    opportunity_id, "AWAITING_APPROVAL", actor, reason="proposal awaiting Aryan's approval",
+                    approval_required=True, approval_status="PENDING",
+                )
         return {"proposal_id": proposal_id, "content": content, "needs_aryan_id": needs_aryan_id}
 
     def mark_approved(self, proposal_id: str, actor: str) -> None:
@@ -587,6 +1047,21 @@ class ProposalStore:
             raise ProposalError("proposal not found")
         self.store.update("rh_proposals", proposal_id, status="APPROVED", approved_by=actor, approved_at=utcnow())
         self.audit.append("RH_PROPOSAL_APPROVED", {"proposal_id": proposal_id, "actor": actor})
+
+    def mark_superseded(self, proposal_id: str, actor: str, reason: str) -> None:
+        """Used only by the requalification pass: a proposal drafted while an
+        opportunity was (incorrectly) qualified PURSUE, whose opportunity has
+        since been requalified to MAYBE/IGNORE. Never deletes the proposal --
+        its content and history stay intact for audit -- it just moves the
+        status off DRAFT/APPROVED so it can never be mistaken for one still
+        awaiting a real decision. A SUPERSEDED proposal was never sent."""
+        proposal = self.store.get("rh_proposals", proposal_id)
+        if not proposal:
+            raise ProposalError("proposal not found")
+        if proposal["status"] == "APPROVED":
+            raise ProposalError("an already-approved proposal cannot be superseded automatically -- decide it manually")
+        self.store.update("rh_proposals", proposal_id, status="SUPERSEDED", approved_by=None, approved_at=None)
+        self.audit.append("RH_PROPOSAL_SUPERSEDED", {"proposal_id": proposal_id, "actor": actor, "reason": reason})
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +1236,8 @@ class DashboardService:
     def __init__(self, store: StateStore):
         self.store = store
 
-    def today(self, needs_aryan_pending: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def today(self, needs_aryan_pending: Optional[List[Dict[str, Any]]] = None,
+              discovery_runs: Optional[List[Dict[str, Any]]] = None, aging_days: int = 14) -> Dict[str, Any]:
         opportunities = self.store.list("rh_opportunities")
         by_id = {o["id"]: o for o in opportunities}
         active = [o for o in opportunities if o["stage"] not in TERMINAL_STAGES]
@@ -790,6 +1266,27 @@ class DashboardService:
             opp = by_id.get(fu["opportunity_id"])
             next_actions.append({"type": "follow_up", "opportunity_id": fu["opportunity_id"], "title": (opp or {}).get("title", fu["opportunity_id"]), "why": f"{fu['kind']} draft ready to send"})
 
+        now = datetime.now(timezone.utc)
+        aging = []
+        for opp in active:
+            try:
+                created = datetime.fromisoformat(opp["created_at"])
+            except (TypeError, ValueError):
+                continue
+            if (now - created).days >= aging_days:
+                aging.append(opp)
+
+        discovery_runs = discovery_runs or []
+        last_run = discovery_runs[0] if discovery_runs else None
+        found_today = 0
+        if last_run and last_run.get("started_at"):
+            try:
+                started = datetime.fromisoformat(last_run["started_at"])
+                if started.date() == now.date():
+                    found_today = last_run.get("opportunities_new", 0)
+            except (TypeError, ValueError):
+                pass
+
         return {
             "opportunities_needing_qualification": needing_qualification,
             "proposals_needing_approval": rh_pending,
@@ -797,6 +1294,9 @@ class DashboardService:
             "pipeline_value": round(pipeline_value, 2),
             "won_revenue": round(won_revenue, 2),
             "next_actions": next_actions[:10],
+            "aging_opportunities": aging,
+            "last_discovery_run": last_run,
+            "opportunities_discovered_today": found_today,
         }
 
     def _latest_qualification(self, opportunity_id: str) -> Optional[Dict[str, Any]]:
@@ -871,7 +1371,24 @@ class AnalyticsService:
 # NeedsAryanQueue.decide() -- keeps NeedsAryanQueue itself fully generic)
 # ---------------------------------------------------------------------------
 
-def apply_decision_side_effect(store: StateStore, audit: AuditLog, item: Dict[str, Any], action: str, actor: str) -> None:
-    if item.get("ref_type") != "rh_proposal" or action != "APPROVED":
+def apply_decision_side_effect(store: StateStore, audit: AuditLog, item: Dict[str, Any], action: str, actor: str, orchestrator=None) -> None:
+    if item.get("ref_type") != "rh_proposal":
         return
-    ProposalStore(store, audit).mark_approved(item["ref_id"], actor)
+    proposal = store.get("rh_proposals", item["ref_id"])
+    if action == "APPROVED":
+        ProposalStore(store, audit).mark_approved(item["ref_id"], actor)
+        if orchestrator is not None and proposal:
+            orchestrator.try_transition(
+                proposal["opportunity_id"], "APPROVED", actor, reason="proposal approved",
+                approval_required=True, approval_status="APPROVED",
+            )
+        return
+    if action in {"REJECTED", "CHANGES_REQUESTED"} and orchestrator is not None and proposal:
+        # Bounced back to PITCH_READY (a real, allowed edge from
+        # AWAITING_APPROVAL) rather than left stuck -- a rejected/
+        # changes-requested proposal means a new one needs drafting, not
+        # that the opportunity is dead.
+        orchestrator.try_transition(
+            proposal["opportunity_id"], "PITCH_READY", actor, reason=f"proposal {action.lower()}",
+            approval_required=True, approval_status=action,
+        )

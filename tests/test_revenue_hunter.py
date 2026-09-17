@@ -137,6 +137,448 @@ class QualificationEngineTests(unittest.TestCase):
         self.assertEqual(result["recurring_potential"], "HIGH")
 
 
+# ---------- Relevance hardening pass (adversarial qualification) ----------
+# Reproduces and locks in the fix for the live-QA finding: "Freelance
+# Writer" (a Remotive listing whose only detected "skill" was the
+# incidental word "AI" in its description) scored fit_score=100 and
+# PURSUE. Root cause: _fit_score is a *coverage* percentage (matches over
+# total tokens) with no floor on how little real signal justified a high
+# score -- 1 match out of 1 possible token was scored identically to 10/10
+# concrete tech matches. Fixed two ways, both covered below: (1) a matched
+# token that is only a generic/topic word (ai, saas, crm, ...) can no
+# longer alone produce a high fit_score, and (2) a hard relevance gate,
+# independent of the numeric score, that a clearly-excluded role (writer,
+# recruiter, HR, sales, support, accountant, ...) can never pass into
+# PURSUE regardless of what the score computes -- unless the actual
+# requested work is evidently software delivery (context override).
+
+class RelevanceHardeningTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = QualificationEngine()
+
+    def _score(self, title, description, skills=None, budget=None):
+        return self.engine.score({"title": title, "description": description, "required_skills": skills, "budget_rate": budget})
+
+    def test_freelance_writer_no_longer_scores_100_or_pursue(self):
+        # The exact live-QA finding, reproduced: a Remotive-style writer
+        # listing whose description happens to mention "AI" once, with no
+        # real required_skills field at all.
+        result = self._score(
+            "Freelance Writer",
+            "We need a freelance writer to create blog content about AI tools and trends for our marketing site. "
+            "Must have strong writing skills and SEO knowledge.",
+            skills=None, budget="$25/hr",
+        )
+        self.assertLess(result["fit_score"], 60)
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+        self.assertIn("freelance writer", result["relevance_exclusion_signals"])
+
+    def test_a_single_generic_topic_token_match_is_capped_well_below_pursue(self):
+        # Root-cause regression, isolated from the relevance gate entirely:
+        # one incidental match against a generic/topic capability word (not
+        # a concrete technology) must never alone justify a high score, even
+        # for an opportunity with no exclusion-role phrase at all.
+        result = self._score("Generic AI Consulting Gig", "Some kind of AI-adjacent work, details TBD.", skills=None, budget=None)
+        self.assertLessEqual(result["fit_score"], 45)
+
+    def test_should_ignore_hr_recruiter(self):
+        result = self._score("HR Recruiter", "Looking for an experienced recruiter to source and screen candidates for our growing team.")
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_should_ignore_customer_support(self):
+        result = self._score("Remote Customer Support Representative", "Provide friendly customer support via chat and email for our SaaS product users.", budget="$18/hr")
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_should_ignore_sales_development_representative(self):
+        result = self._score("Sales Development Representative", "Generate leads and book demos for our AI-powered sales platform.", budget="$20/hr")
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_should_ignore_accountant(self):
+        result = self._score("Accountant", "Manage bookkeeping and financial statements for a small business.")
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_relevance_gate_blocks_pursue_even_with_a_genuinely_high_fit_score(self):
+        # Proves the gate does independent work beyond the fit_score fix:
+        # this listing legitimately scores high (html/css/git are real,
+        # concrete overlapping tokens, not generic topic words) but the
+        # role itself is "technical writer", with no dev-action language
+        # anywhere -- markup/styling skills alone must not be strong enough
+        # to override that.
+        result = self._score(
+            "Technical Writer for Developer Docs",
+            "We need a technical writer to create clear documentation for our HTML and CSS style guide, "
+            "working closely with the engineering team on git-based docs.",
+            skills="html, css, git", budget="$3000",
+        )
+        self.assertGreaterEqual(result["fit_score"], 60)  # the raw score really is high
+        self.assertEqual(result["recommendation"], "IGNORE")  # the gate still blocks it
+        self.assertFalse(result["relevance_passed"])
+
+    def test_should_pursue_or_maybe_full_stack_saas_mvp(self):
+        result = self._score(
+            "Full Stack Developer for SaaS MVP", "Build a full-stack SaaS MVP using React, Node.js and PostgreSQL from scratch.",
+            skills="react, node.js, postgresql", budget="$3000",
+        )
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+        self.assertTrue(result["relevance_passed"])
+
+    def test_should_pursue_or_maybe_node_react_booking_platform(self):
+        result = self._score(
+            "Node/React booking platform", "Develop a booking platform with Node.js backend and React frontend, Stripe payments integration.",
+            skills="node.js, react, stripe", budget="$2500",
+        )
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+        self.assertTrue(result["relevance_passed"])
+
+    def test_should_pursue_or_maybe_restaurant_reservation_dashboard(self):
+        result = self._score(
+            "Build restaurant reservation dashboard",
+            "We need a reservation and table management dashboard for our restaurant chain, built with a modern web stack.",
+            skills="react, node.js, postgresql", budget="$2800",
+        )
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+        self.assertTrue(result["relevance_passed"])
+
+    def test_should_pursue_or_maybe_ai_integration_into_web_app(self):
+        result = self._score(
+            "AI integration into existing web app", "Integrate an AI/LLM feature into our existing Node.js and React web application.",
+            skills="react, node.js, rest api", budget="$3500",
+        )
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+        self.assertTrue(result["relevance_passed"])
+
+    def test_should_pursue_or_maybe_ecommerce_backend_api(self):
+        result = self._score(
+            "E-commerce backend/API development", "Build backend and API for an e-commerce platform, Stripe payments, PostgreSQL database.",
+            skills="node.js, postgresql, stripe, rest api", budget="$3200",
+        )
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+        self.assertTrue(result["relevance_passed"])
+
+    def test_context_sensitive_ai_writing_saas_for_copywriters_is_relevant(self):
+        # Exclusion phrase "copywriters" is present, but the actual ask is
+        # building a SaaS product (a real full-stack dev request) -- context
+        # overrides the exclusion match.
+        result = self._score(
+            "Build an AI writing SaaS for copywriters",
+            "We are building a SaaS platform (an AI writing tool) for copywriters. Need a full-stack developer "
+            "with React and Node.js to build the MVP.",
+            skills="react, node.js", budget="$3000",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertIn("copywriter", result["relevance_exclusion_signals"])
+        self.assertNotEqual(result["recommendation"], "IGNORE")
+
+    def test_context_sensitive_copywriter_for_ai_company_is_irrelevant(self):
+        # Exclusion phrase "copywriter" is present, and the only
+        # counter-signal is the bare topic word "AI" describing the
+        # company, not the requested work -- must stay excluded.
+        result = self._score(
+            "Copywriter for AI company", "We are an AI company looking for a talented copywriter to write blog posts and marketing copy.",
+            budget="$30/hr",
+        )
+        self.assertFalse(result["relevance_passed"])
+        self.assertEqual(result["recommendation"], "IGNORE")
+
+    def test_recommendation_and_why_stay_consistent_for_a_gated_ignore(self):
+        result = self._score("Freelance Writer", "Write blog posts about our AI product for our marketing team.", budget="$2000")
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertIn("freelance writer", result["why"])
+        self.assertIn("not a software/AI development opportunity", result["why"])
+
+    def test_a_bogus_rest_skill_tag_does_not_override_a_content_writer_listing(self):
+        # Real live-QA finding on the Mac: a genuine WeWorkRemotely/Remotive
+        # "Freelance Writer" listing had required_skills scraped down to the
+        # single junk word "REST" (an unrelated artifact of the source
+        # listing, not an actual skill claim). The bare word "REST" is a
+        # substring of the two-word override phrase "rest api", so a naive
+        # bidirectional substring check ("rest" in "rest api") wrongly
+        # treated it as concrete evidence of REST API development and
+        # overrode the exclusion gate, letting this back-end scored PURSUE.
+        # "REST" alone (not "REST API") must never count as strong-dev
+        # evidence.
+        result = self._score(
+            "Freelance Writer",
+            "Our organization is seeking content writers to create articles and blog posts on a variety of "
+            "topics such as health, fitness, home decor, and restaurants. Work well as a team member with the "
+            "rest of our content management and editorial staff.",
+            skills="REST", budget="$20/article",
+        )
+        self.assertFalse(result["relevance_passed"])
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertNotEqual(result["fit_score"], 100)
+
+    def test_a_genuine_rest_api_skill_tag_still_overrides_correctly(self):
+        # The fix must not overcorrect: a listing that actually lists the
+        # full "REST API" skill phrase (or a descriptive skill string that
+        # contains it) still counts as strong-dev evidence.
+        result = self._score(
+            "Backend Developer", "Build and maintain backend services for our platform.",
+            skills="REST API, PostgreSQL", budget="$4000",
+        )
+        self.assertTrue(result["relevance_passed"])
+
+
+class QualificationCalibrationTests(unittest.TestCase):
+    """Final Opportunity Agent Qualification Calibration Pass: PURSUE no
+    longer requires a client-stated budget when relevance and technical fit
+    are both excellent (item 1); a listing tagged with dozens of generic/
+    unrelated skill keywords is no longer under-scored just because only a
+    few of them are relevant (item 2); management/leadership roles are
+    gated the same way other non-delivery roles already were (item 3)."""
+
+    def setUp(self):
+        self.engine = QualificationEngine()
+
+    def _score(self, title, description, skills=None, budget=None):
+        return self.engine.score({"title": title, "description": description, "required_skills": skills, "budget_rate": budget})
+
+    def test_strong_dev_role_budget_unknown_still_reaches_pursue(self):
+        result = self._score(
+            "Senior Full Stack Developer",
+            "Build and maintain a full-stack web application using React, Node.js, and PostgreSQL for our growing platform.",
+            skills="react, node.js, postgresql",
+        )
+        self.assertEqual(result["recommendation"], "PURSUE")
+        self.assertEqual(result["recommendation_detail"], "PURSUE_WITH_BUDGET_UNKNOWN")
+        self.assertEqual(result["budget_source"], "unknown (TTT estimate only)")
+        self.assertIn("TTT estimate", result["suggested_price"])
+
+    def test_strong_dev_role_with_numeric_budget_is_a_plain_pursue(self):
+        result = self._score(
+            "Senior Full Stack Developer",
+            "Build and maintain a full-stack web application using React, Node.js, and PostgreSQL for our growing platform.",
+            skills="react, node.js, postgresql", budget="$4000",
+        )
+        self.assertEqual(result["recommendation"], "PURSUE")
+        self.assertEqual(result["recommendation_detail"], "PURSUE")
+        self.assertEqual(result["budget_source"], "client-stated")
+
+    def test_generic_40_tag_listing_is_not_under_scored(self):
+        skills = (
+            ".Net, android, AWS, backend, C, C#, C++, data science, fullstack, golang, ios, java, "
+            "javascript, node.js, php, python, react, react js, ruby/rails, scala, shopify, swift, "
+            "UI/UX, wordpress, blockchain, AI/ML, automation, project management, react native, rust, "
+            "unity, electron, spring, laravel, Ethereum, graphic design, Typescript, angular, firebase, "
+            "data engineering, Site Reliability, Symfony, startup, marketplace, next.js, flutter"
+        )
+        result = self._score(
+            "Senior React Full-stack Developer",
+            "Are you a talented Senior Developer looking for a remote job with hand-picked startups?",
+            skills=skills,
+        )
+        self.assertGreaterEqual(result["fit_score"], 70)
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+        self.assertNotEqual(result["recommendation"], "IGNORE")
+
+    def test_product_manager_mentioning_react_as_a_verb_is_still_ignored(self):
+        # Found live, during real-data requalification against the real Mac
+        # database: a genuine Senior Product Manager listing (Confluent,
+        # "Senior Product Manager, Cluster Linking") kept overriding the PM
+        # exclusion gate solely because its description used "react" as an
+        # ordinary English verb ("...so companies can react faster, build
+        # smarter...") -- identical in spelling to the React.js framework
+        # name. Neither _skill_tokens' free-text "implied" skill scan nor
+        # _service_relevance's positive-signal scan may treat that bare verb
+        # as evidence of a React development ask; a role with zero real
+        # hands-on delivery language must still gate to IGNORE.
+        result = self._score(
+            "Senior Product Manager, Cluster Linking",
+            "Our platform puts information in motion, streaming in near real-time so companies "
+            "can react faster, build smarter, and deliver experiences as dynamic as the world "
+            "around them. About the Role: 5+ years of product management experience, ideally in "
+            "infrastructure or cloud products. Partner closely with your engineering manager "
+            "counterpart as a strategic partner.",
+        )
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+        self.assertNotIn("react", result["relevance_positive_signals"] or [])
+
+    def test_a_real_react_developer_listing_is_unaffected_by_the_verb_fix(self):
+        # The fix above must not overcorrect: a listing that actually lists
+        # "react" as a skill tag, or names the framework in prose alongside
+        # real dev language, still passes and scores well.
+        result = self._score(
+            "React Frontend Engineer",
+            "Build a responsive frontend using React and TypeScript for our SaaS product.",
+            skills="react, typescript", budget="$3000",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertEqual(result["recommendation"], "PURSUE")
+
+    def test_should_ignore_product_manager(self):
+        result = self._score(
+            "Senior Product Manager for SaaS company",
+            "We're looking for an experienced Product Manager to own our SaaS roadmap, work with stakeholders, and drive strategy.",
+            budget="$5000",
+        )
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_should_ignore_engineering_manager(self):
+        result = self._score(
+            "Engineering Manager",
+            "Lead a team of 8 engineers, run sprint planning, and manage performance reviews for our engineering org.",
+            budget="$6000",
+        )
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_build_software_for_product_managers_is_relevant(self):
+        result = self._score(
+            "Build a SaaS dashboard for product managers",
+            "We want to build software for product managers -- a SaaS dashboard with React and Node.js to track roadmaps and OKRs.",
+            skills="react, node.js", budget="$4000",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertNotEqual(result["recommendation"], "IGNORE")
+
+    def test_ai_developer_is_relevant(self):
+        result = self._score(
+            "AI Developer", "Build and integrate AI/LLM features into our Python and React based product.",
+            skills="python, react, rest api", budget="$3500",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+
+    def test_ai_copywriter_is_irrelevant(self):
+        result = self._score(
+            "AI Copywriter", "We need an AI-savvy copywriter to write marketing copy and blog posts using AI tools.",
+            budget="$25/hr",
+        )
+        self.assertFalse(result["relevance_passed"])
+        self.assertEqual(result["recommendation"], "IGNORE")
+
+    def test_frontend_react_project_is_relevant(self):
+        result = self._score(
+            "Frontend React project", "Build a responsive frontend for our web application using React and TypeScript.",
+            skills="react, typescript", budget="$2500",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+
+    def test_node_api_backend_work_is_relevant(self):
+        result = self._score(
+            "Node/API backend work", "Develop and maintain backend REST APIs using Node.js and PostgreSQL.",
+            skills="node.js, postgresql, rest api", budget="$3000",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertIn(result["recommendation"], {"PURSUE", "MAYBE"})
+
+    def test_every_qualification_explains_budget_source_and_strongest_match(self):
+        result = self._score(
+            "Full Stack Developer for SaaS MVP", "Build a full-stack SaaS MVP using React, Node.js and PostgreSQL from scratch.",
+            skills="react, node.js, postgresql", budget="$3000",
+        )
+        self.assertIn("Budget: client-stated", result["why"])
+        self.assertIsNotNone(result["strongest_technical_match"])
+        self.assertIn(result["strongest_technical_match"], result["why"])
+
+    def test_budget_unknown_why_explains_ttt_estimate(self):
+        result = self._score(
+            "Senior Full Stack Developer",
+            "Build and maintain a full-stack web application using React, Node.js, and PostgreSQL for our growing platform.",
+            skills="react, node.js, postgresql",
+        )
+        self.assertIn("TTT estimate", result["why"])
+
+
+class WorkTypeRelevanceGateTests(unittest.TestCase):
+    """Work-Type Relevance Gate pass: a role whose actual job is to
+    personally perform operational/administrative/bookkeeping work must
+    never reach PURSUE just because its metadata/tags happen to contain
+    technical-looking words -- found live via a real "Remote Office
+    Assistant" listing (Coalition Technologies) that reached PURSUE on a
+    client-stated budget purely from web/CMS-adjacent tag noise (css,
+    html, php, wordpress, shopify) despite the description being 100%
+    admin/bookkeeping/data-entry work. A software project ABOUT one of
+    these domains (a bookkeeping automation tool, an admin dashboard, a
+    payroll SaaS) must remain fully relevant -- the gate evaluates the
+    requested deliverable, not a title-only blacklist."""
+
+    def setUp(self):
+        self.engine = QualificationEngine()
+
+    def _score(self, title, description, skills=None, budget=None):
+        return self.engine.score({"title": title, "description": description, "required_skills": skills, "budget_rate": budget})
+
+    def test_remote_office_assistant_is_ignored_despite_web_adjacent_tags(self):
+        # The real listing text (abridged) that exposed this bug.
+        description = (
+            "Coalition Technologies is seeking a reliable, detail-oriented, and highly organized "
+            "Remote Office Assistant to support administrative, bookkeeping, billing, reporting, "
+            "data entry, and internal operations tasks. As an Office Assistant, you will help "
+            "support daily administrative operations, assist with entry-level bookkeeping, organize "
+            "client documents, support internal reporting, and help maintain accurate company "
+            "records. Answering phones and emails. Completing entry-level bookkeeping tasks. "
+            "Organizing new client contracts, creating invoices, and processing client payments. "
+            "Contributing to internal database maintenance, upkeep, and data entry."
+        )
+        result = self._score(
+            "Remote Office Assistant", description,
+            skills="CSS, excel, frontend, git, html, illustrator, magento, photoshop, php, shopify, "
+                   "wordpress, MySQL, startup, responsive, themes, bootstrap, insurance, jQuery, Ajax",
+            budget="$31,2k- $52k",
+        )
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_virtual_assistant_is_ignored(self):
+        result = self._score(
+            "Virtual Assistant",
+            "We are hiring a Virtual Assistant to manage email, schedule meetings, and handle "
+            "general admin tasks for our busy executive team.",
+            budget="$15/hr",
+        )
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_bookkeeper_is_ignored(self):
+        result = self._score(
+            "Bookkeeper",
+            "Seeking an experienced Bookkeeper to manage accounts payable/receivable, reconcile "
+            "bank statements, and maintain the general ledger using QuickBooks.",
+            budget="$20/hr",
+        )
+        self.assertEqual(result["recommendation"], "IGNORE")
+        self.assertFalse(result["relevance_passed"])
+
+    def test_build_bookkeeping_automation_tool_is_relevant(self):
+        result = self._score(
+            "Build bookkeeping automation tool",
+            "Build an automation tool to handle our bookkeeping workflows, including invoicing "
+            "and ledger syncing, using Python and PostgreSQL.",
+            skills="python, postgresql", budget="$4000",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertNotEqual(result["recommendation"], "IGNORE")
+
+    def test_build_admin_dashboard_is_relevant(self):
+        result = self._score(
+            "Build admin dashboard",
+            "Build an admin dashboard for our operations team, with role-based access, reporting, "
+            "and analytics, using React and Node.js.",
+            skills="react, node.js", budget="$3500",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertNotEqual(result["recommendation"], "IGNORE")
+
+    def test_build_payroll_saas_is_relevant(self):
+        result = self._score(
+            "Build payroll SaaS",
+            "Develop a payroll and accounting SaaS platform for small businesses, including "
+            "automated tax calculations and direct deposit, using Python and PostgreSQL.",
+            skills="python, postgresql", budget="$5000",
+        )
+        self.assertTrue(result["relevance_passed"])
+        self.assertNotEqual(result["recommendation"], "IGNORE")
+
+
 # ---------- Proposal generation ----------
 
 class ProposalGenerationTests(unittest.TestCase):

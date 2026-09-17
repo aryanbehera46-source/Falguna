@@ -223,6 +223,7 @@ class NeedsAryanQueue:
         recommendation: Optional[str] = None, rationale: Optional[str] = None,
         risk: Optional[str] = None, expected_value: Optional[str] = None,
         ref_type: Optional[str] = None, ref_id: Optional[str] = None,
+        payload_json: Optional[str] = None,
     ) -> str:
         if kind not in NEEDS_ARYAN_KINDS:
             raise ValueError(f"kind must be one of {sorted(NEEDS_ARYAN_KINDS)}")
@@ -234,7 +235,7 @@ class NeedsAryanQueue:
         item_id = self.store.create("needs_aryan_items", {
             "kind": kind, "ref_type": ref_type, "ref_id": ref_id, "title": title.strip(),
             "what_is_needed": what_is_needed.strip(), "recommendation": recommendation, "rationale": rationale,
-            "risk": risk, "expected_value": expected_value, "status": "PENDING",
+            "risk": risk, "expected_value": expected_value, "status": "PENDING", "payload_json": payload_json,
             "decision_note": None, "decided_by": None, "created_at": now, "updated_at": now, "decided_at": None,
         })
         self.audit.append("NEEDS_ARYAN_ITEM_CREATED", {"item_id": item_id, "kind": kind, "title": title})
