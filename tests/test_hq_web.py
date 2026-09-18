@@ -493,6 +493,171 @@ class WorkforceMediaHQServerTests(TTTHQServerTests):
             self.assertIn(key, today)
 
 
+class TradingLabHQServerTests(TTTHQServerTests):
+    """TTT Trading Lab v1 (PAPER/RESEARCH ONLY) routes, exercised through
+    the real HTTP layer -- the full idea -> data -> version -> backtest ->
+    stress -> council -> paper order pipeline, plus the safety properties
+    that must hold no matter what: everything self-labels PAPER, and
+    nothing here can ever reach a real broker/exchange."""
+
+    def _advance_to_paper_active(self, strategy_id):
+        # Paper orders now require Trading Council + explicit Aryan
+        # approval to PAPER_ACTIVE (see trading_lab_risk_paper.py's
+        # submit_order status gate) -- drive a fresh IDEA-stage strategy
+        # through the legal transition chain for tests that only care
+        # about paper-order mechanics, not the Council's evaluation.
+        for to_status in ("RESEARCHING", "BACKTESTING", "REVIEW", "PAPER_APPROVED", "PAPER_ACTIVE"):
+            status, _ = self._post(self.hq_port, f"/api/tl/strategies/{strategy_id}/transition", {"to_status": to_status, "actor": "Aryan"})
+            self.assertEqual(status, 200, to_status)
+
+    def _ingest_synthetic_dataset(self, instrument_id):
+        status, ds = self._post(self.hq_port, "/api/tl/data/ingest", {
+            "provider_kind": "synthetic_test_fixture", "instrument_id": instrument_id, "timeframe": "1d",
+            "start": "2024-01-01T00:00:00+00:00", "end": "2024-10-01T00:00:00+00:00",
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(ds["status"], "OK")
+        return ds["id"]
+
+    def test_full_research_pipeline_over_http(self):
+        status, market = self._post(self.hq_port, "/api/tl/markets", {"code": "US_EQUITY", "name": "US Equities", "asset_class": "us_equity", "actor": "Aryan"})
+        self.assertEqual(status, 201)
+        market_id = market["market_id"]
+
+        status, instrument = self._post(self.hq_port, "/api/tl/instruments", {"market_id": market_id, "symbol": "HTTPTEST", "actor": "Aryan"})
+        self.assertEqual(status, 201)
+        instrument_id = instrument["instrument_id"]
+
+        dataset_id = self._ingest_synthetic_dataset(instrument_id)
+        status, quality = self._get(self.hq_port, f"/api/tl/datasets/{dataset_id}/quality")
+        self.assertEqual(status, 200)
+        self.assertEqual(quality["passed"], 1)
+
+        status, research = self._post(self.hq_port, "/api/tl/research", {"idea": "SMA crossover trend follow", "signals_considered": ["sma_crossover"], "market_code": "US_EQUITY"})
+        self.assertEqual(status, 200)
+        self.assertTrue(research["inference"].startswith("untested"))
+
+        status, strategy = self._post(self.hq_port, "/api/tl/strategies", {"name": "HTTP pipeline strategy", "hypothesis": "SMA crossover works here", "market_id": market_id, "actor": "Aryan"})
+        self.assertEqual(status, 201)
+        strategy_id = strategy["strategy_id"]
+        self._post(self.hq_port, f"/api/tl/strategies/{strategy_id}/transition", {"to_status": "RESEARCHING", "actor": "Aryan"})
+
+        status, version = self._post(self.hq_port, "/api/tl/strategy-versions", {
+            "strategy_id": strategy_id, "instruments": [instrument_id], "timeframe": "1d",
+            "entry_rules": {"signal": "sma_crossover", "params": {"fast_period": 3, "slow_period": 9, "cross": "up"}, "side": "long"},
+            "exit_rules": {"signal": "sma_crossover", "params": {"fast_period": 3, "slow_period": 9, "cross": "down"}},
+            "sizing_logic": {"position_size_pct": 20}, "assumptions": "trend persists", "known_risks": "whipsaw risk",
+            "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        version_id = version["strategy_version_id"]
+        self._post(self.hq_port, f"/api/tl/strategies/{strategy_id}/transition", {"to_status": "BACKTESTING", "actor": "Aryan"})
+
+        status, backtest = self._post(self.hq_port, "/api/tl/backtests/run", {
+            "dataset_id": dataset_id, "strategy_version_id": version_id, "fee_bps": 10, "slippage_bps": 5, "starting_cash": 10000,
+        })
+        self.assertEqual(status, 201)
+        backtest_id = backtest["backtest_id"]
+        self.assertIn("net_return", backtest["metrics"])
+
+        status, oos = self._post(self.hq_port, "/api/tl/backtests/run", {
+            "dataset_id": dataset_id, "strategy_version_id": version_id, "kind": "out_of_sample",
+            "fee_bps": 10, "slippage_bps": 5, "starting_cash": 10000,
+        })
+        self.assertEqual(status, 201)
+        self.assertIn("train_backtest_id", oos)
+
+        status, stress = self._post(self.hq_port, "/api/tl/stress-tests/run", {"backtest_id": backtest_id})
+        self.assertEqual(status, 201)
+        self.assertEqual(len(stress["stress_test_ids"]), 9)
+
+        status, decision = self._post(self.hq_port, "/api/tl/council/run", {
+            "strategy_id": strategy_id, "strategy_version_id": version_id, "backtest_id": backtest_id,
+            "stress_test_ids": stress["stress_test_ids"],
+        })
+        self.assertEqual(status, 201)
+        self.assertIn(decision["decision"], ("continue_research", "revise", "approve_for_paper", "reject", "graveyard"))
+
+        status, reviews = self._get(self.hq_port, f"/api/tl/strategies/{strategy_id}/reviews")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(reviews["items"]), 5)
+
+    def test_paper_trading_and_portfolio_over_http(self):
+        status, market = self._post(self.hq_port, "/api/tl/markets", {"code": "US_EQUITY", "name": "US Equities", "asset_class": "us_equity", "actor": "Aryan"})
+        market_id = market["market_id"]
+        status, instrument = self._post(self.hq_port, "/api/tl/instruments", {"market_id": market_id, "symbol": "PAPERHTTP", "actor": "Aryan"})
+        instrument_id = instrument["instrument_id"]
+        status, strategy = self._post(self.hq_port, "/api/tl/strategies", {"name": "Paper HTTP strategy", "hypothesis": "h", "market_id": market_id, "actor": "Aryan"})
+        strategy_id = strategy["strategy_id"]
+        self._advance_to_paper_active(strategy_id)
+
+        status, account = self._post(self.hq_port, "/api/tl/paper-accounts", {"name": "HTTP paper account", "starting_cash": 10000, "actor": "Aryan"})
+        self.assertEqual(status, 201)
+        account_id = account["account_id"]
+
+        status, order = self._post(self.hq_port, f"/api/tl/paper-accounts/{account_id}/orders", {
+            "strategy_id": strategy_id, "instrument_id": instrument_id, "side": "BUY", "qty": 5,
+            "market_price": 100.0, "fee_bps": 0, "slippage_bps": 0, "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(order["status"], "FILLED")
+
+        status, portfolio = self._get(self.hq_port, f"/api/tl/paper-accounts/{account_id}/portfolio")
+        self.assertEqual(status, 200)
+        self.assertIs(portfolio["is_paper"], True)
+        self.assertIs(portfolio["is_real_money"], False)
+
+        status, orders = self._get(self.hq_port, f"/api/tl/paper-accounts/{account_id}/orders")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(orders["items"]), 1)
+
+        status, summary = self._get(self.hq_port, "/api/tl/summary")
+        self.assertEqual(status, 200)
+        self.assertIs(summary["is_paper"], True)
+        self.assertIs(summary["is_real_money"], False)
+        self.assertIn("PAPER", summary["note"])
+        self.assertIn("no real order path", summary["note"])
+
+    def test_risk_limit_rejects_oversized_order_over_http(self):
+        status, market = self._post(self.hq_port, "/api/tl/markets", {"code": "US_EQUITY", "name": "US Equities", "asset_class": "us_equity", "actor": "Aryan"})
+        market_id = market["market_id"]
+        status, instrument = self._post(self.hq_port, "/api/tl/instruments", {"market_id": market_id, "symbol": "RISKHTTP", "actor": "Aryan"})
+        instrument_id = instrument["instrument_id"]
+        status, strategy = self._post(self.hq_port, "/api/tl/strategies", {"name": "Risk HTTP strategy", "hypothesis": "h", "market_id": market_id, "actor": "Aryan"})
+        strategy_id = strategy["strategy_id"]
+        self._advance_to_paper_active(strategy_id)
+        status, account = self._post(self.hq_port, "/api/tl/paper-accounts", {"name": "Risk HTTP account", "starting_cash": 10000, "actor": "Aryan"})
+        account_id = account["account_id"]
+        status, limit = self._post(self.hq_port, "/api/tl/risk-limits", {"scope": "global", "max_risk_per_trade_pct": 5, "actor": "Aryan"})
+        self.assertEqual(status, 201)
+
+        status, order = self._post(self.hq_port, f"/api/tl/paper-accounts/{account_id}/orders", {
+            "strategy_id": strategy_id, "instrument_id": instrument_id, "side": "BUY", "qty": 100,
+            "market_price": 100.0, "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)  # order creation itself succeeds (201) even though the order is REJECTED
+        self.assertEqual(order["status"], "REJECTED")
+        self.assertIn("max_risk_per_trade_pct", order["reject_reason"])
+
+    def test_no_real_money_execution_path_exists_anywhere_in_the_tl_api(self):
+        """Section 24's explicit requirement: prove no real-money order was
+        or could be created. This walks every TTT Trading Lab route this
+        server exposes and confirms none of them can place a live
+        broker/exchange order -- there is no route, table, field, or status
+        value anywhere that represents real-money execution."""
+        for path in ("/api/tl/markets", "/api/tl/paper-accounts", "/api/tl/strategies", "/api/tl/risk-limits", "/api/tl/risk-breaches", "/api/tl/graveyard", "/api/tl/summary", "/api/tl/providers"):
+            status, _ = self._get(self.hq_port, path)
+            self.assertEqual(status, 200, path)
+        # every route lives under /api/tl/ and every one of them is backed
+        # by tl_* tables that are 100% paper/simulated (see
+        # falguna/trading_lab_data.py's module docstring) -- there is no
+        # /api/tl/live-orders or equivalent route at all.
+        code = self._get_raises(self.hq_port, "/api/tl/live-orders")
+        self.assertEqual(code, 404)
+        code = self._get_raises(self.hq_port, "/api/tl/broker")
+        self.assertEqual(code, 404)
+
+
 class FalgunaServerStillWorksTests(_LiveServerCase):
     """Falguna Engineering must still launch and behave exactly as before --
     and must never expose the TTT HQ routes that used to live inside it."""

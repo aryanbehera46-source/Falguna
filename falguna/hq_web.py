@@ -74,6 +74,17 @@ from .runtime import open_control_plane
 from .sales_manager import SalesManagerService
 from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
 from .ttt_hq import BacklogStore, BoardroomStore, NeedsAryanQueue, hq_overview, workforce_media_today_signals
+from .trading_lab_data import (
+    DataSourceStore, DatasetStore, InstrumentStore, MarketStore, PROVIDER_REGISTRY,
+)
+from .trading_lab_strategy import StrategyStore, StrategyVersionStore, research_strategy_idea
+from .trading_lab_backtest import BacktestStore, run_backtest, run_out_of_sample_validation, run_stress_review
+from .trading_lab_risk_paper import (
+    PaperAccountStore, PaperTradingEngine, RiskEngine, RiskLimitStore,
+    portfolio_summary, record_performance_snapshot, strategy_performance,
+)
+from .trading_lab_council import ReviewStore, bury_strategy, check_graveyard_for_similar, run_trading_council
+
 from .video_pipeline import VideoPipeline
 from .workforce import WorkforceError, WorkforceOrchestrator, WorkforceTaskStore
 from .workforce_workers import (
@@ -391,6 +402,110 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 content_id = (query.get("content_id") or [None])[0]
                 status = (query.get("status") or [None])[0]
                 return self._json({"items": GrowthExperimentStore(store, control.audit).list(content_id, status)})
+
+            # -- TTT Trading Lab v1 (PAPER/RESEARCH ONLY -- see falguna/
+            # trading_lab_data.py's module docstring; no route in this
+            # section can ever move real money or place a real order) --
+            if path == "/api/tl/markets":
+                return self._json({"items": MarketStore(store, control.audit).list_all()})
+            if path == "/api/tl/instruments":
+                query = parse_qs(urlparse(self.path).query)
+                market_id = (query.get("market_id") or [None])[0]
+                if not market_id:
+                    return self._json({"error": "market_id is required"}, HTTPStatus.BAD_REQUEST)
+                return self._json({"items": InstrumentStore(store, control.audit).list_for_market(market_id)})
+            if path == "/api/tl/strategies":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": StrategyStore(store, control.audit).list_all(status)})
+            if path.startswith("/api/tl/strategies/") and path.endswith("/versions"):
+                strategy_id = path.split("/")[4]
+                return self._json({"items": StrategyVersionStore(store, control.audit).list_for_strategy(strategy_id)})
+            if path.startswith("/api/tl/strategies/") and path.endswith("/reviews"):
+                strategy_id = path.split("/")[4]
+                versions = StrategyVersionStore(store, control.audit).list_for_strategy(strategy_id)
+                items = []
+                for v in versions:
+                    items.extend(ReviewStore(store, control.audit).list_for_version(v["id"]))
+                return self._json({"items": items})
+            if path.startswith("/api/tl/strategies/") and path.endswith("/council-decisions"):
+                strategy_id = path.split("/")[4]
+                return self._json({"items": store.list("tl_council_decisions", "strategy_id=?", (strategy_id,))})
+            if path.startswith("/api/tl/strategies/") and path.endswith("/performance"):
+                strategy_id = path.split("/")[4]
+                return self._json(strategy_performance(store, strategy_id))
+            if path.startswith("/api/tl/strategies/"):
+                strategy_id = path.rsplit("/", 1)[-1]
+                strategy = StrategyStore(store, control.audit).get(strategy_id)
+                return self._json(strategy or {"error": "strategy not found"}, HTTPStatus.OK if strategy else HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/tl/strategy-versions/") and path.endswith("/backtests"):
+                version_id = path.split("/")[4]
+                return self._json({"items": BacktestStore(store, control.audit).list_for_strategy_version(version_id)})
+            if path.startswith("/api/tl/backtests/") and path.endswith("/stress-tests"):
+                backtest_id = path.split("/")[4]
+                return self._json({"items": store.list("tl_stress_tests", "backtest_id=?", (backtest_id,))})
+            if path.startswith("/api/tl/backtests/"):
+                backtest_id = path.rsplit("/", 1)[-1]
+                backtest = BacktestStore(store, control.audit).get(backtest_id)
+                return self._json(backtest or {"error": "backtest not found"}, HTTPStatus.OK if backtest else HTTPStatus.NOT_FOUND)
+            if path == "/api/tl/datasets":
+                query = parse_qs(urlparse(self.path).query)
+                instrument_id = (query.get("instrument_id") or [None])[0]
+                where = "instrument_id=?" if instrument_id else "1=1"
+                params = (instrument_id,) if instrument_id else ()
+                return self._json({"items": store.list("tl_datasets", where, params)})
+            if path.startswith("/api/tl/datasets/") and path.endswith("/quality"):
+                dataset_id = path.split("/")[4]
+                return self._json(DatasetStore(store, control.audit).latest_quality_report(dataset_id) or {"error": "no quality report yet"})
+            if path == "/api/tl/paper-accounts":
+                return self._json({"items": PaperAccountStore(store, control.audit).list_all()})
+            if path.startswith("/api/tl/paper-accounts/") and path.endswith("/portfolio"):
+                account_id = path.split("/")[4]
+                account = PaperAccountStore(store, control.audit).get(account_id)
+                if not account:
+                    return self._json({"error": "paper account not found"}, HTTPStatus.NOT_FOUND)
+                return self._json(portfolio_summary(store, account_id))
+            if path.startswith("/api/tl/paper-accounts/") and path.endswith("/orders"):
+                account_id = path.split("/")[4]
+                return self._json({"items": store.list("tl_paper_orders", "paper_account_id=?", (account_id,))})
+            if path.startswith("/api/tl/paper-accounts/") and path.endswith("/trades"):
+                account_id = path.split("/")[4]
+                return self._json({"items": store.list("tl_trades", "paper_account_id=?", (account_id,))})
+            if path.startswith("/api/tl/paper-accounts/"):
+                account_id = path.rsplit("/", 1)[-1]
+                account = PaperAccountStore(store, control.audit).get(account_id)
+                return self._json(account or {"error": "paper account not found"}, HTTPStatus.OK if account else HTTPStatus.NOT_FOUND)
+            if path == "/api/tl/risk-limits":
+                return self._json({"items": RiskLimitStore(store, control.audit).active_limits()})
+            if path == "/api/tl/risk-breaches":
+                return self._json({"items": store.list("tl_risk_breach_events", "1=1", ())})
+            if path == "/api/tl/graveyard":
+                return self._json({"items": store.list("tl_graveyard", "1=1", ())})
+            if path == "/api/tl/providers":
+                return self._json({"items": [{"name": p.name, "is_synthetic": p.is_synthetic} for p in PROVIDER_REGISTRY.values()]})
+            if path == "/api/tl/summary":
+                # Command Center surfacing (Section 19): paper P&L, active
+                # paper strategies, drawdown, breached limits, Needs Aryan --
+                # every figure below is PAPER/SIMULATED, never real money.
+                accounts = PaperAccountStore(store, control.audit).list_all()
+                active_strategies = StrategyStore(store, control.audit).list_all("PAPER_ACTIVE")
+                open_breaches = store.list("tl_risk_breach_events", "1=1", ())
+                summaries = [portfolio_summary(store, a["id"]) for a in accounts]
+                total_equity = sum(s["equity"] for s in summaries)
+                total_realized_pnl = sum(s["realized_pnl_total"] for s in summaries)
+                worst_drawdown = max([s["drawdown_pct"] for s in summaries], default=0.0)
+                pending_tl_needs_aryan = [
+                    i for i in store.list("needs_aryan_items", "status=?", ("PENDING",))
+                    if i["kind"].startswith("trading_")
+                ]
+                return self._json({
+                    "is_paper": True, "is_real_money": False,
+                    "paper_account_count": len(accounts), "active_paper_strategy_count": len(active_strategies),
+                    "total_paper_equity": round(total_equity, 4), "total_paper_realized_pnl": round(total_realized_pnl, 4),
+                    "worst_drawdown_pct": round(worst_drawdown, 4), "open_risk_breach_count": len(open_breaches),
+                    "pending_needs_aryan_count": len(pending_tl_needs_aryan),
+                    "note": "TTT Trading Lab v1 -- 100% PAPER/SIMULATED. No real money, no live broker connection, no real order path exists in this phase.",
+                })
         finally:
             store.close()
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -926,6 +1041,145 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     )
                     return self._json(result)
 
+                # -- TTT Trading Lab v1 (PAPER/RESEARCH ONLY) --
+                if path == "/api/tl/markets":
+                    market_id = MarketStore(store, control.audit).create(
+                        body.get("code", ""), body.get("name", ""), body.get("asset_class", ""),
+                        description=body.get("description", ""), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"market_id": market_id}, HTTPStatus.CREATED)
+                if path == "/api/tl/instruments":
+                    instrument_id = InstrumentStore(store, control.audit).create(
+                        body.get("market_id", ""), body.get("symbol", ""), name=body.get("name", ""),
+                        currency=body.get("currency", "USD"), metadata=body.get("metadata"), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"instrument_id": instrument_id}, HTTPStatus.CREATED)
+                if path == "/api/tl/data/ingest":
+                    provider = PROVIDER_REGISTRY.get(body.get("provider_kind", ""))
+                    if provider is None:
+                        return self._json({"error": f"unknown provider_kind, must be one of {list(PROVIDER_REGISTRY)}"}, HTTPStatus.BAD_REQUEST)
+                    source_id = DataSourceStore(store, control.audit).register(
+                        body.get("data_source_name", provider.name), provider.name, is_synthetic=provider.is_synthetic,
+                    )
+                    dataset_id = DatasetStore(store, control.audit).ingest(
+                        source_id, body.get("instrument_id", ""), body.get("timeframe", "1d"), provider,
+                        body.get("start", ""), body.get("end", ""),
+                    )
+                    return self._json(store.get("tl_datasets", dataset_id), HTTPStatus.CREATED)
+                if path == "/api/tl/research":
+                    result = research_strategy_idea(body.get("idea", ""), body.get("signals_considered", []), body.get("market_code", ""))
+                    return self._json(result)
+                if path == "/api/tl/strategies":
+                    strategy_id = StrategyStore(store, control.audit).create(
+                        body.get("name", ""), body.get("hypothesis", ""), market_id=body.get("market_id"),
+                        actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"strategy_id": strategy_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/tl/strategies/") and path.endswith("/transition"):
+                    strategy_id = path.split("/")[4]
+                    StrategyStore(store, control.audit).transition(strategy_id, body.get("to_status", ""), body.get("actor", "Aryan"), reason=body.get("reason", ""))
+                    return self._json(StrategyStore(store, control.audit).get(strategy_id))
+                if path == "/api/tl/strategy-versions":
+                    version_id = StrategyVersionStore(store, control.audit).create(
+                        body.get("strategy_id", ""), body.get("instruments", []), body.get("timeframe", "1d"),
+                        body.get("entry_rules", {}), body.get("exit_rules", {}), body.get("sizing_logic", {}),
+                        stop_logic=body.get("stop_logic"), allowed_hours=body.get("allowed_hours", ""),
+                        max_exposure_pct=body.get("max_exposure_pct", 100.0), assumptions=body.get("assumptions", ""),
+                        known_risks=body.get("known_risks", ""), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"strategy_version_id": version_id}, HTTPStatus.CREATED)
+                if path == "/api/tl/backtests/run":
+                    dataset_id = body.get("dataset_id", "")
+                    dataset_store = DatasetStore(store, control.audit)
+                    eligibility = dataset_store.is_backtest_eligible(dataset_id)
+                    if not eligibility["eligible"]:
+                        return self._json({"error": f"dataset not eligible for backtest: {eligibility['reason']}"}, HTTPStatus.BAD_REQUEST)
+                    version = StrategyVersionStore(store, control.audit).get(body.get("strategy_version_id", ""))
+                    if not version:
+                        return self._json({"error": "unknown strategy_version_id"}, HTTPStatus.BAD_REQUEST)
+                    bars = dataset_store.get_bars(dataset_id)
+                    entry_rules = json.loads(version["entry_rules_json"])
+                    exit_rules = json.loads(version["exit_rules_json"])
+                    sizing_logic = json.loads(version["sizing_logic_json"])
+                    stop_logic = json.loads(version["stop_logic_json"]) if version["stop_logic_json"] else None
+                    fee_bps = body.get("fee_bps", 10.0)
+                    slippage_bps = body.get("slippage_bps", 5.0)
+                    starting_cash = body.get("starting_cash", 10000.0)
+                    kind = body.get("kind", "full")
+                    if kind == "out_of_sample":
+                        oos = run_out_of_sample_validation(bars, entry_rules, exit_rules, sizing_logic, stop_logic,
+                                                             fee_bps=fee_bps, slippage_bps=slippage_bps, starting_cash=starting_cash)
+                        train_id = BacktestStore(store, control.audit).record(version["id"], dataset_id, "train", fee_bps, slippage_bps, starting_cash, oos["train"], actor=body.get("actor", "Aryan"))
+                        test_id = None
+                        if oos["test"] is not None:
+                            test_id = BacktestStore(store, control.audit).record(version["id"], dataset_id, "test", fee_bps, slippage_bps, starting_cash, oos["test"], actor=body.get("actor", "Aryan"))
+                        return self._json({"train_backtest_id": train_id, "test_backtest_id": test_id, "warnings": oos["warnings"]}, HTTPStatus.CREATED)
+                    result = run_backtest(bars, entry_rules, exit_rules, sizing_logic, stop_logic,
+                                           fee_bps=fee_bps, slippage_bps=slippage_bps, starting_cash=starting_cash)
+                    backtest_id = BacktestStore(store, control.audit).record(version["id"], dataset_id, kind, fee_bps, slippage_bps, starting_cash, result, actor=body.get("actor", "Aryan"))
+                    return self._json({"backtest_id": backtest_id, "metrics": result["metrics"], "warnings": result["warnings"]}, HTTPStatus.CREATED)
+                if path == "/api/tl/stress-tests/run":
+                    backtest = BacktestStore(store, control.audit).get(body.get("backtest_id", ""))
+                    if not backtest:
+                        return self._json({"error": "unknown backtest_id"}, HTTPStatus.BAD_REQUEST)
+                    version = StrategyVersionStore(store, control.audit).get(backtest["strategy_version_id"])
+                    bars = DatasetStore(store, control.audit).get_bars(backtest["dataset_id"])
+                    entry_rules = json.loads(version["entry_rules_json"])
+                    exit_rules = json.loads(version["exit_rules_json"])
+                    sizing_logic = json.loads(version["sizing_logic_json"])
+                    stop_logic = json.loads(version["stop_logic_json"]) if version["stop_logic_json"] else None
+                    stress_ids = run_stress_review(store, control.audit, backtest["id"], bars, entry_rules, exit_rules,
+                                                    sizing_logic, stop_logic, backtest["fee_bps"], backtest["slippage_bps"],
+                                                    backtest["starting_cash"], actor=body.get("actor", "Aryan"))
+                    return self._json({"stress_test_ids": stress_ids}, HTTPStatus.CREATED)
+                if path == "/api/tl/council/run":
+                    needs_aryan_tl = NeedsAryanQueue(store, control.audit, control)
+                    decision_id = run_trading_council(
+                        store, control.audit, needs_aryan_tl, body.get("strategy_id", ""), body.get("strategy_version_id", ""),
+                        backtest_id=body.get("backtest_id"), oos_warnings=body.get("oos_warnings", []),
+                        stress_test_ids=body.get("stress_test_ids", []), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json(store.get("tl_council_decisions", decision_id), HTTPStatus.CREATED)
+                if path == "/api/tl/graveyard":
+                    grave_id = bury_strategy(
+                        store, control.audit, body.get("strategy_id", ""), body.get("strategy_version_id", ""),
+                        body.get("reason_rejected", ""), failed_metrics=body.get("failed_metrics"),
+                        failure_conditions=body.get("failure_conditions", ""), reviewer_notes=body.get("reviewer_notes", ""),
+                        actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"grave_id": grave_id}, HTTPStatus.CREATED)
+                if path == "/api/tl/graveyard/check-similar":
+                    hits = check_graveyard_for_similar(store, body.get("market_id"), body.get("signal_names", []))
+                    return self._json({"items": hits})
+                if path == "/api/tl/paper-accounts":
+                    account_id = PaperAccountStore(store, control.audit).create(
+                        body.get("name", ""), body.get("starting_cash", 0.0), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"account_id": account_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/tl/paper-accounts/") and path.endswith("/orders"):
+                    account_id = path.split("/")[4]
+                    needs_aryan_tl = NeedsAryanQueue(store, control.audit, control)
+                    risk_engine = RiskEngine(store, control.audit, needs_aryan_tl)
+                    engine = PaperTradingEngine(store, control.audit, risk_engine)
+                    order_id = engine.submit_order(
+                        account_id, body.get("strategy_id", ""), body.get("instrument_id", ""), body.get("side", ""),
+                        body.get("qty"), body.get("market_price"), fee_bps=body.get("fee_bps", 10.0),
+                        slippage_bps=body.get("slippage_bps", 5.0), actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json(store.get("tl_paper_orders", order_id), HTTPStatus.CREATED)
+                if path == "/api/tl/risk-limits":
+                    limit_id = RiskLimitStore(store, control.audit).create(
+                        body.get("scope", "global"), strategy_id=body.get("strategy_id"),
+                        max_risk_per_trade_pct=body.get("max_risk_per_trade_pct"), max_daily_loss=body.get("max_daily_loss"),
+                        max_strategy_drawdown_pct=body.get("max_strategy_drawdown_pct"),
+                        max_portfolio_drawdown_pct=body.get("max_portfolio_drawdown_pct"),
+                        max_concurrent_positions=body.get("max_concurrent_positions"),
+                        max_instrument_exposure_pct=body.get("max_instrument_exposure_pct"),
+                        max_strategy_allocation_pct=body.get("max_strategy_allocation_pct"),
+                        actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json({"limit_id": limit_id}, HTTPStatus.CREATED)
+
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             finally:
                 store.close()
@@ -978,6 +1232,11 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="brand"><span class="mark">TT</span>Twenty Two Technologies</div>
 <div class="navsec">Command Center</div>
 <button class="navitem active" data-view="commandCenter">Command Center</button>
+<div class="navsec">Trading Lab (PAPER)</div>
+<button class="navitem" data-view="tlOverview">Trading Lab Overview</button>
+<button class="navitem" data-view="tlStrategies">Strategies</button>
+<button class="navitem" data-view="tlPaperPortfolio">Paper Portfolio</button>
+<button class="navitem" data-view="tlRiskGraveyard">Risk &amp; Graveyard</button>
 <div class="navsec">CEO Intelligence / Finance</div>
 <button class="navitem" data-view="ccGoals">Goals</button>
 <button class="navitem" data-view="ccKpis">KPIs</button>
@@ -1146,6 +1405,67 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <textarea id="rkEvidence" placeholder="Evidence (optional)"></textarea>
 <div class="actions"><button id="rkCreate" type="button">Log risk</button></div>
 </div>
+</div>
+<div class="view" id="view-tlOverview">
+<h1>Trading Lab -- PAPER / SIMULATED ONLY</h1>
+<div class="pageintro" style="font-weight:600;color:#b45309">Every figure on this page and everywhere else in the Trading Lab is paper/simulated. No real money, no live broker connection, and no real order path exists anywhere in this build. Historical or simulated performance never guarantees future results.</div>
+<div class="list" id="tlOverviewList"></div>
+</div>
+<div class="view" id="view-tlStrategies">
+<h1>Strategies</h1>
+<div class="pageintro">Lifecycle: IDEA -&gt; RESEARCHING -&gt; BACKTESTING -&gt; REVIEW -&gt; PAPER_APPROVED -&gt; PAPER_ACTIVE -&gt; PAUSED -&gt; REJECTED -&gt; GRAVEYARD. There is no LIVE status. "Quick research run" ingests a synthetic test dataset (clearly not real market data) and runs a full backtest + stress review + Trading Council pass with default SMA-crossover parameters, so a new idea can be evidence-tested in one click; author more specific rules via the API for real research.</div>
+<div class="list" id="tlStrategiesList"></div>
+<div class="form">
+<input id="tlStratName" placeholder="Strategy name">
+<textarea id="tlStratHypothesis" placeholder="Hypothesis (required -- Section 7: no strategy may exist only as vague prose)"></textarea>
+<select id="tlStratMarket"><option value="">(no market yet -- will use/create US_EQUITY)</option></select>
+<div class="actions"><button id="tlStratCreate" type="button">Create strategy idea</button></div>
+</div>
+</div>
+<div class="view" id="view-tlPaperPortfolio">
+<h1>Paper Portfolio</h1>
+<div class="pageintro">Paper cash only. Orders are rejected (not silently adjusted) when they breach a risk limit or exceed available paper cash -- see the reject_reason on any REJECTED order below.</div>
+<div class="list" id="tlPaperAccountsList"></div>
+<div class="form">
+<input id="tlPaAccName" placeholder="Paper account name">
+<input id="tlPaAccCash" type="number" placeholder="Starting paper cash" value="10000">
+<div class="actions"><button id="tlPaAccCreate" type="button">Create paper account</button></div>
+</div>
+<h1 style="margin-top:24px">Submit a paper order</h1>
+<div class="pageintro">strategy_id and instrument_id are the ids shown on the Strategies page and above.</div>
+<div class="form">
+<input id="tlOrdAccount" placeholder="Paper account id">
+<input id="tlOrdStrategy" placeholder="Strategy id">
+<input id="tlOrdInstrument" placeholder="Instrument id">
+<div class="row">
+<select id="tlOrdSide"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
+<input id="tlOrdQty" type="number" placeholder="Qty">
+<input id="tlOrdPrice" type="number" placeholder="Reference market price">
+</div>
+<div class="actions"><button id="tlOrdSubmit" type="button">Submit paper order</button></div>
+</div>
+</div>
+<div class="view" id="view-tlRiskGraveyard">
+<h1>Risk Limits</h1>
+<div class="pageintro">A breach stops new paper entries platform-wide for the affected scope and creates a Needs Aryan item -- see the Needs Aryan queue. Exits are never blocked by a breach or by a risk limit.</div>
+<div class="list" id="tlRiskLimitsList"></div>
+<div class="form">
+<div class="row">
+<select id="tlRiskScope"><option value="global">global</option><option value="strategy">strategy</option></select>
+<input id="tlRiskStrategyId" placeholder="Strategy id (only if scope=strategy)">
+</div>
+<div class="row">
+<input id="tlRiskMaxPerTrade" type="number" placeholder="max_risk_per_trade_pct">
+<input id="tlRiskMaxDrawdown" type="number" placeholder="max_portfolio_drawdown_pct">
+<input id="tlRiskMaxDailyLoss" type="number" placeholder="max_daily_loss">
+</div>
+<div class="actions"><button id="tlRiskCreate" type="button">Create risk limit</button></div>
+</div>
+<h1 style="margin-top:24px">Risk Breach Events</h1>
+<div class="list" id="tlRiskBreachesList"></div>
+<h1 style="margin-top:24px">Strategy Graveyard</h1>
+<div class="pageintro">Buried strategies persist here permanently, with the metrics and conditions that killed them, so the same bad idea is never quietly re-approved.</div>
+<div class="list" id="tlGraveyardList"></div>
 </div>
 <div class="view" id="view-boardroom">
 <h1>Boardroom</h1>
@@ -1374,7 +1694,7 @@ const $=id=>document.getElementById(id);
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadCommandCenter(),loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
 async function loadCommandCenter(){
@@ -1472,6 +1792,111 @@ ${r.mitigation?`<div>${esc(r.mitigation)}</div>`:''}
 ['mitigating','monitoring','closed'].forEach(cls=>{document.querySelectorAll('#ccRiskRegisterList .'+cls).forEach(b=>b.onclick=async()=>{await api(`/api/cc/risks/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:cls.toUpperCase(),actor:'Aryan'})});await loadCcRiskRegister()})});
 }
 $('rkCreate').onclick=async()=>{const title=$('rkTitle').value.trim();if(!title)return alert('Title is required.');await api('/api/cc/risks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,category:$('rkCategory').value,severity:$('rkSeverity').value,likelihood_band:$('rkLikelihood').value,owner:$('rkOwner').value||null,mitigation:$('rkMitigation').value||null,evidence:$('rkEvidence').value||null,actor:'Aryan'})});$('rkTitle').value='';$('rkOwner').value='';$('rkMitigation').value='';$('rkEvidence').value='';await loadCcRiskRegister()};
+function tlFmt(n){return (n===null||n===undefined)?'--':(typeof n==='number'?n.toLocaleString(undefined,{maximumFractionDigits:4}):n)}
+
+async function loadTlOverview(){
+  const s=await api('/api/tl/summary');
+  $('tlOverviewList').innerHTML=`<div class="item"><b>PAPER equity across all accounts:</b> ${tlFmt(s.total_paper_equity)}<br>
+<b>PAPER realized P&amp;L:</b> ${tlFmt(s.total_paper_realized_pnl)}<br>
+<b>Active PAPER_ACTIVE strategies:</b> ${s.active_paper_strategy_count}<br>
+<b>Worst current drawdown:</b> ${tlFmt(s.worst_drawdown_pct)}%<br>
+<b>Open risk breaches:</b> ${s.open_risk_breach_count}<br>
+<b>Pending Trading Lab Needs Aryan items:</b> ${s.pending_needs_aryan_count} (see the Needs Aryan queue)<br>
+<i>${s.note}</i></div>`;
+}
+
+async function loadTlStrategies(){
+  const markets=(await api('/api/tl/markets')).items||[];
+  const sel=$('tlStratMarket');
+  sel.innerHTML='<option value="">(no market yet -- will use/create US_EQUITY)</option>'+markets.map(m=>`<option value="${m.id}">${m.code} -- ${m.name}</option>`).join('');
+  const items=(await api('/api/tl/strategies')).items||[];
+  $('tlStrategiesList').innerHTML=items.length?items.map(st=>`<div class="item">
+<b>${st.name}</b> -- <span style="font-family:monospace">${st.status}</span><br>
+${st.hypothesis}<br>
+<span style="font-family:monospace;font-size:12px;color:#666">id: ${st.id}</span>
+<div class="actions">
+<button type="button" class="tlQuickRun" data-id="${st.id}" data-market="${st.market_id||''}">Quick research run (synthetic data)</button>
+</div>
+</div>`).join(''):'<div class="item">No strategies yet.</div>';
+  document.querySelectorAll('.tlQuickRun').forEach(b=>b.onclick=async()=>{
+    b.disabled=true; b.textContent='Running...';
+    try{
+      const strategyId=b.dataset.id;
+      let marketId=b.dataset.market;
+      if(!marketId){const m=await api('/api/tl/markets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:'US_EQUITY',name:'US Equities',asset_class:'us_equity',actor:'Aryan'})});marketId=m.market_id;}
+      const inst=await api('/api/tl/instruments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market_id:marketId,symbol:'QR'+strategyId.slice(0,6).toUpperCase(),actor:'Aryan'})});
+      const now=new Date();const start=new Date(now.getTime()-600*86400000).toISOString();const end=now.toISOString();
+      const ds=await api('/api/tl/data/ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider_kind:'synthetic_test_fixture',instrument_id:inst.instrument_id,timeframe:'1d',start,end})});
+      await api(`/api/tl/strategies/${strategyId}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to_status:'RESEARCHING',actor:'Aryan'})}).catch(()=>{});
+      const ver=await api('/api/tl/strategy-versions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy_id:strategyId,instruments:[inst.instrument_id],timeframe:'1d',entry_rules:{signal:'sma_crossover',params:{fast_period:3,slow_period:9,cross:'up'},side:'long'},exit_rules:{signal:'sma_crossover',params:{fast_period:3,slow_period:9,cross:'down'}},sizing_logic:{position_size_pct:20},assumptions:'quick research run default SMA crossover',known_risks:'default parameters, not tuned; synthetic test data only',actor:'Aryan'})});
+      await api(`/api/tl/strategies/${strategyId}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to_status:'BACKTESTING',actor:'Aryan'})}).catch(()=>{});
+      const bt=await api('/api/tl/backtests/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset_id:ds.id,strategy_version_id:ver.strategy_version_id,fee_bps:10,slippage_bps:5,starting_cash:10000})});
+      const stress=await api('/api/tl/stress-tests/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({backtest_id:bt.backtest_id})});
+      const decision=await api('/api/tl/council/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy_id:strategyId,strategy_version_id:ver.strategy_version_id,backtest_id:bt.backtest_id,stress_test_ids:stress.stress_test_ids})});
+      alert(`Quick research run complete.\nBacktest net_return: ${bt.metrics.net_return}\nTrade count: ${bt.metrics.trade_count}\nTrading Council decision: ${decision.decision}\n(This used SYNTHETIC test data, not real market data -- see the dataset's data source.)`);
+    }catch(e){alert('Quick research run failed: '+(e.data&&e.data.error||e.message));}
+    finally{b.disabled=false;b.textContent='Quick research run (synthetic data)';await loadTlStrategies();}
+  });
+}
+
+async function loadTlPaperPortfolio(){
+  const accounts=(await api('/api/tl/paper-accounts')).items||[];
+  const rows=await Promise.all(accounts.map(async a=>{
+    const summary=await api(`/api/tl/paper-accounts/${a.id}/portfolio`);
+    return `<div class="item"><b>${a.name}</b> <span style="font-family:monospace;font-size:12px;color:#666">id: ${a.id}</span><br>
+PAPER equity: ${tlFmt(summary.equity)} | cash: ${tlFmt(summary.cash)} | realized P&amp;L: ${tlFmt(summary.realized_pnl_total)} | open positions: ${summary.open_position_count} | drawdown: ${tlFmt(summary.drawdown_pct)}%<br>
+<i>${summary.note}</i></div>`;
+  }));
+  $('tlPaperAccountsList').innerHTML=rows.length?rows.join(''):'<div class="item">No paper accounts yet.</div>';
+}
+
+async function loadTlRiskGraveyard(){
+  const limits=(await api('/api/tl/risk-limits')).items||[];
+  $('tlRiskLimitsList').innerHTML=limits.length?limits.map(l=>`<div class="item">scope: ${l.scope}${l.strategy_id?(' ('+l.strategy_id+')'):''} -- max_risk_per_trade_pct=${tlFmt(l.max_risk_per_trade_pct)} max_portfolio_drawdown_pct=${tlFmt(l.max_portfolio_drawdown_pct)} max_daily_loss=${tlFmt(l.max_daily_loss)} max_concurrent_positions=${tlFmt(l.max_concurrent_positions)}</div>`).join(''):'<div class="item">No risk limits configured yet -- every order will be accepted or rejected purely on cash/position-flip checks.</div>';
+  const breaches=(await api('/api/tl/risk-breaches')).items||[];
+  $('tlRiskBreachesList').innerHTML=breaches.length?breaches.map(b=>`<div class="item">${b.breach_type} -- ${b.detail}<br><span style="font-family:monospace;font-size:12px;color:#666">${b.created_at}</span></div>`).join(''):'<div class="item">No risk breaches recorded.</div>';
+  const grave=(await api('/api/tl/graveyard')).items||[];
+  $('tlGraveyardList').innerHTML=grave.length?grave.map(g=>`<div class="item">strategy: ${g.strategy_id}<br>reason: ${g.reason_rejected}<br><span style="font-family:monospace;font-size:12px;color:#666">killed_at: ${g.killed_at}</span></div>`).join(''):'<div class="item">Graveyard is empty.</div>';
+}
+
+$('tlStratCreate').onclick=async()=>{
+  const name=$('tlStratName').value.trim();const hypothesis=$('tlStratHypothesis').value.trim();
+  if(!name||!hypothesis)return alert('Name and hypothesis are both required.');
+  let marketId=$('tlStratMarket').value;
+  if(!marketId){const m=await api('/api/tl/markets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:'US_EQUITY',name:'US Equities',asset_class:'us_equity',actor:'Aryan'})});marketId=m.market_id;}
+  await api('/api/tl/strategies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,hypothesis,market_id:marketId,actor:'Aryan'})});
+  $('tlStratName').value='';$('tlStratHypothesis').value='';
+  await loadTlStrategies();
+};
+
+$('tlPaAccCreate').onclick=async()=>{
+  const name=$('tlPaAccName').value.trim();const cash=parseFloat($('tlPaAccCash').value);
+  if(!name||!cash)return alert('Name and a positive starting cash are required.');
+  await api('/api/tl/paper-accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,starting_cash:cash,actor:'Aryan'})});
+  $('tlPaAccName').value='';
+  await loadTlPaperPortfolio();
+};
+
+$('tlOrdSubmit').onclick=async()=>{
+  const accountId=$('tlOrdAccount').value.trim();const strategyId=$('tlOrdStrategy').value.trim();const instrumentId=$('tlOrdInstrument').value.trim();
+  const side=$('tlOrdSide').value;const qty=parseFloat($('tlOrdQty').value);const price=parseFloat($('tlOrdPrice').value);
+  if(!accountId||!strategyId||!instrumentId||!qty||!price)return alert('All fields are required.');
+  try{
+    const order=await api(`/api/tl/paper-accounts/${accountId}/orders`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy_id:strategyId,instrument_id:instrumentId,side,qty,market_price:price,actor:'Aryan'})});
+    alert(`Order ${order.status}${order.reject_reason?(': '+order.reject_reason):''}`);
+  }catch(e){alert('Order failed: '+(e.data&&e.data.error||e.message));}
+  await loadTlPaperPortfolio();
+};
+
+$('tlRiskCreate').onclick=async()=>{
+  const scope=$('tlRiskScope').value;const strategyId=$('tlRiskStrategyId').value.trim()||null;
+  const maxPerTrade=$('tlRiskMaxPerTrade').value?parseFloat($('tlRiskMaxPerTrade').value):null;
+  const maxDrawdown=$('tlRiskMaxDrawdown').value?parseFloat($('tlRiskMaxDrawdown').value):null;
+  const maxDailyLoss=$('tlRiskMaxDailyLoss').value?parseFloat($('tlRiskMaxDailyLoss').value):null;
+  await api('/api/tl/risk-limits',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scope,strategy_id:strategyId,max_risk_per_trade_pct:maxPerTrade,max_portfolio_drawdown_pct:maxDrawdown,max_daily_loss:maxDailyLoss,actor:'Aryan'})});
+  await loadTlRiskGraveyard();
+};
+
 async function loadBoardroom(){const d=await api('/api/boardroom');renderBoardroom(d.topics||[])}
 function renderBoardroom(topics){$('boardroomList').innerHTML=topics.length?topics.map(t=>`<div class="item" data-topic="${esc(t.id)}">
 <h3>${esc(t.title)}</h3>

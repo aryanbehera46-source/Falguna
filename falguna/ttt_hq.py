@@ -42,6 +42,15 @@ NEEDS_ARYAN_KINDS = {
     # never an automatic action -- see Section 18 of that phase's spec.
     "budget_override", "capital_allocation_execution", "reserve_policy_change",
     "financial_writeoff", "financial_refund", "large_financial_commitment", "risk_escalation",
+    # Added for TTT Trading Lab v1 (Section 18): paper-lab decisions that
+    # must be an owner call. Nothing here approves real-money execution --
+    # there is no LIVE state or broker order path in this phase at all
+    # (see falguna/trading_lab_data.py's module docstring); these kinds
+    # only gate paper-trading activation, risk-policy overrides, breach
+    # review, data-quality uncertainty, and any future request to move
+    # toward live trading (which this phase does not implement).
+    "trading_paper_activation_request", "trading_risk_policy_override", "trading_risk_breach",
+    "trading_data_quality_uncertainty", "trading_live_mode_transition_request",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 # A run in one of these statuses cannot become actionable again through

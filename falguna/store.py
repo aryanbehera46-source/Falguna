@@ -112,7 +112,11 @@ class StateStore:
             "wf_tasks", "wf_task_events", "wf_recurring_workflows", "wf_recurring_runs", "wf_documents", "wf_email_messages",
             "media_brands", "media_campaigns", "media_content_items", "media_content_events", "media_scripts",
             "media_assets", "media_publications", "media_analytics", "media_experiments",
-            "cc_ceo_briefs", "cc_goals", "cc_goal_progress_events", "cc_ledger_entries", "cc_budgets", "cc_risks"}
+            "cc_ceo_briefs", "cc_goals", "cc_goal_progress_events", "cc_ledger_entries", "cc_budgets", "cc_risks",
+            "tl_markets", "tl_instruments", "tl_data_sources", "tl_datasets", "tl_ohlcv_bars", "tl_data_quality_reports",
+            "tl_strategies", "tl_strategy_versions", "tl_strategy_status_events", "tl_backtests", "tl_stress_tests",
+            "tl_risk_limits", "tl_risk_breach_events", "tl_paper_accounts", "tl_paper_orders", "tl_paper_positions",
+            "tl_trades", "tl_performance_snapshots", "tl_reviews", "tl_council_decisions", "tl_graveyard"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())
