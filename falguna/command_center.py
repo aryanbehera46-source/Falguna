@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 from .audit import AuditLog
 from .revenue_hunter import DashboardService, TERMINAL_STAGES, _STAGE_INDEX
 from .store import StateStore, utcnow
+from .ventures import command_center_venture_rollup
 
 CEO_BRIEF_DEFAULT_LOOKBACK_HOURS = 24
 
@@ -209,6 +210,11 @@ def command_center_snapshot(store: StateStore, upcoming_within_days: int = 14) -
         },
         "upcoming_obligations": upcoming_obligations,
         "risk_signals": risk_signals,
+        # Venture Studio v1 (Section 20): venture rollup merged in as an
+        # additive key -- computed by falguna/ventures.py from vs_ventures
+        # + venture-scoped ledger/goal/needs-aryan rows, never duplicating
+        # this function's own Revenue Hunter/billing/workforce/media logic.
+        "ventures": command_center_venture_rollup(store),
     }
 
 

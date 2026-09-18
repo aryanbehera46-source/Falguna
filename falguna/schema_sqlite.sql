@@ -222,3 +222,34 @@ CREATE INDEX IF NOT EXISTS idx_tl_performance_snapshots_account ON tl_performanc
 CREATE INDEX IF NOT EXISTS idx_tl_reviews_strategy_version ON tl_reviews(strategy_version_id);
 CREATE INDEX IF NOT EXISTS idx_tl_council_decisions_strategy ON tl_council_decisions(strategy_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tl_graveyard_strategy ON tl_graveyard(strategy_id);
+
+-- TTT Venture Studio / Multi-Venture Operating System v1. `vs_` prefix,
+-- additive-only CREATE TABLE IF NOT EXISTS, same convention as every prior
+-- pass. See falguna/ventures.py for the stores. Venture-scoping columns on
+-- pre-existing tables (cc_ledger_entries.venture_id, cc_goals.venture_id,
+-- cc_risks.venture_id, wf_tasks.venture_id, missions.venture_id,
+-- media_brands.venture_id, rh_opportunities.venture_id) are added via
+-- StateStore._ADDITIVE_COLUMNS in store.py, never here.
+CREATE TABLE IF NOT EXISTS vs_ventures (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL, venture_type TEXT NOT NULL, description TEXT, thesis TEXT, owner TEXT, status TEXT NOT NULL, launch_date TEXT, parent_company TEXT NOT NULL, linked_product TEXT, linked_brand_id TEXT, linked_departments_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_venture_status_events (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), from_status TEXT, to_status TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, evidence_json TEXT, financial_impact TEXT, next_action TEXT, needs_aryan_id TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_experiments (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), hypothesis TEXT NOT NULL, metric TEXT NOT NULL, target TEXT, owner TEXT, budget REAL, start_date TEXT, end_date TEXT, evidence_json TEXT, result TEXT, decision TEXT, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_validation_signals (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), signal_type TEXT NOT NULL, description TEXT NOT NULL, evidence TEXT, strength TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_capital_allocations (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), direction TEXT NOT NULL, amount REAL NOT NULL, source_note TEXT NOT NULL, related_venture_id TEXT, needs_aryan_id TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_resource_requests (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), department TEXT NOT NULL, resource_type TEXT NOT NULL, amount_or_qty REAL NOT NULL, status TEXT NOT NULL, conflict_with_json TEXT, actor TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_recommendations (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), recommendation TEXT NOT NULL, rationale_json TEXT NOT NULL, inputs_snapshot_json TEXT, needs_aryan_id TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_graveyard (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), original_thesis TEXT, total_invested REAL, experiments_summary_json TEXT, evidence_summary_json TEXT, reason_killed TEXT NOT NULL, lessons TEXT, assets_produced_json TEXT, actor TEXT NOT NULL, killed_at TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_assets (id TEXT PRIMARY KEY, venture_id TEXT NOT NULL REFERENCES vs_ventures(id), asset_type TEXT NOT NULL, name TEXT NOT NULL, description TEXT, location_or_ref TEXT, metadata_json TEXT, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vs_relationships (id TEXT PRIMARY KEY, venture_a_id TEXT NOT NULL REFERENCES vs_ventures(id), venture_b_id TEXT NOT NULL REFERENCES vs_ventures(id), relationship_type TEXT NOT NULL, description TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_vs_ventures_slug ON vs_ventures(slug);
+CREATE INDEX IF NOT EXISTS idx_vs_ventures_status ON vs_ventures(status);
+CREATE INDEX IF NOT EXISTS idx_vs_venture_status_events_venture ON vs_venture_status_events(venture_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_vs_experiments_venture ON vs_experiments(venture_id, status);
+CREATE INDEX IF NOT EXISTS idx_vs_validation_signals_venture ON vs_validation_signals(venture_id);
+CREATE INDEX IF NOT EXISTS idx_vs_capital_allocations_venture ON vs_capital_allocations(venture_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_vs_resource_requests_venture ON vs_resource_requests(venture_id, status);
+CREATE INDEX IF NOT EXISTS idx_vs_resource_requests_dept ON vs_resource_requests(department, resource_type, status);
+CREATE INDEX IF NOT EXISTS idx_vs_recommendations_venture ON vs_recommendations(venture_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_vs_graveyard_venture ON vs_graveyard(venture_id);
+CREATE INDEX IF NOT EXISTS idx_vs_assets_venture ON vs_assets(venture_id, asset_type);
+CREATE INDEX IF NOT EXISTS idx_vs_relationships_a ON vs_relationships(venture_a_id);
+CREATE INDEX IF NOT EXISTS idx_vs_relationships_b ON vs_relationships(venture_b_id);

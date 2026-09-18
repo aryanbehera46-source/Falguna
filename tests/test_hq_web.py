@@ -26,7 +26,8 @@ class HTMLSeparationTests(unittest.TestCase):
         for label in (
             "Twenty Two Technologies", "Boardroom", "Master Vision Backlog", "Needs Aryan",
             "Opportunities", "Sales Pipeline", "Clients", "Active Jobs", "Revenue",
-            "Ventures / Company Ops", "TTT HQ decides · Falguna executes",
+            "Venture Studio", "Venture Pipeline", "Venture Risks", "Venture Graveyard",
+            "TTT HQ decides · Falguna executes",
             "Open in Falguna Engineering",
         ):
             self.assertIn(label, HQ_INDEX_HTML)

@@ -117,7 +117,7 @@ class WorkforceTaskStore:
     def create(
         self, department: str, objective: str, task_type: str, actor: str = "Aryan",
         source: Optional[str] = None, priority: Optional[str] = None,
-        inputs: Optional[Dict[str, Any]] = None,
+        inputs: Optional[Dict[str, Any]] = None, venture_id: Optional[str] = None,
     ) -> str:
         if not department or not department.strip():
             raise WorkforceError("department is required")
@@ -133,6 +133,11 @@ class WorkforceTaskStore:
             "outputs_json": None, "evidence_json": None, "blockers_json": None,
             "approval_required": 0, "needs_aryan_id": None, "execution_method": None,
             "cost": None, "retries": 0, "error": None, "actor": actor,
+            # Venture Studio v1 (Section 23): every venture-created task is
+            # explicitly tagged with its parent venture -- NULL for
+            # company-wide (non-venture) tasks, exactly as before this
+            # column existed.
+            "venture_id": venture_id,
             "created_at": now, "started_at": None, "completed_at": None, "updated_at": now,
         })
         self._record_event(task_id, None, "CREATED", actor, "task created")
@@ -142,15 +147,16 @@ class WorkforceTaskStore:
     def get(self, task_id: str) -> Optional[Dict[str, Any]]:
         return self.store.get("wf_tasks", task_id)
 
-    def list(self, department: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        if department and status:
-            rows = self.store.list("wf_tasks", "department=? AND status=?", (department, status))
-        elif department:
-            rows = self.store.list("wf_tasks", "department=?", (department,))
-        elif status:
-            rows = self.store.list("wf_tasks", "status=?", (status,))
-        else:
-            rows = self.store.list("wf_tasks")
+    def list(self, department: Optional[str] = None, status: Optional[str] = None, venture_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        clauses, params = [], []
+        if department:
+            clauses.append("department=?"); params.append(department)
+        if status:
+            clauses.append("status=?"); params.append(status)
+        if venture_id:
+            clauses.append("venture_id=?"); params.append(venture_id)
+        where = " AND ".join(clauses) if clauses else "1=1"
+        rows = self.store.list("wf_tasks", where, tuple(params))
         return list(reversed(rows))
 
     def _record_event(self, task_id: str, from_status: Optional[str], to_status: str, actor: str, reason: Optional[str], evidence: Optional[Dict[str, Any]] = None) -> None:

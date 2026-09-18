@@ -301,6 +301,7 @@ class RiskRegisterStore:
         self, title: str, category: str, severity: str, actor: str = "Aryan",
         likelihood_band: str = "unknown", owner: Optional[str] = None,
         mitigation: Optional[str] = None, evidence: Optional[str] = None,
+        venture_id: Optional[str] = None,
     ) -> str:
         if not title or not title.strip():
             raise CapitalRiskError("title is required")
@@ -314,15 +315,23 @@ class RiskRegisterStore:
         risk_id = self.store.create("cc_risks", {
             "title": title.strip(), "category": category, "severity": severity, "likelihood_band": likelihood_band,
             "owner": owner, "mitigation": mitigation, "evidence": evidence, "status": "OPEN",
+            # Venture Studio v1 (Section 27): a risk optionally belongs to
+            # one venture -- NULL means company-wide, exactly as before.
+            "venture_id": venture_id,
             "needs_aryan_id": None, "actor": actor, "created_at": now, "updated_at": now,
         })
         needs_aryan_id = None
         if severity in _ESCALATING_SEVERITIES and self.needs_aryan is not None:
+            # A high/critical risk on a venture escalates through the
+            # venture-specific kind (Section 22: "high-risk venture issue")
+            # rather than the generic company-wide risk_escalation kind, so
+            # Needs Aryan can distinguish the two at a glance.
+            kind = "venture_risk_escalation" if venture_id else "risk_escalation"
             needs_aryan_id = self.needs_aryan.create_item(
-                "risk_escalation", f"High-severity risk logged: {title.strip()}",
+                kind, f"High-severity risk logged: {title.strip()}",
                 "Review this risk and decide on mitigation, acceptance, or further investigation.",
                 actor=actor, rationale=mitigation, risk=f"{severity} severity, {likelihood_band} likelihood",
-                ref_type="cc_risk", ref_id=risk_id,
+                ref_type="vs_venture" if venture_id else "cc_risk", ref_id=venture_id or risk_id,
             )
             self.store.update("cc_risks", risk_id, needs_aryan_id=needs_aryan_id)
         self.audit.append("CC_RISK_CREATED", {"risk_id": risk_id, "category": category, "severity": severity, "actor": actor, "needs_aryan_id": needs_aryan_id})
@@ -351,13 +360,14 @@ class RiskRegisterStore:
     def get(self, risk_id: str) -> Optional[Dict[str, Any]]:
         return self.store.get("cc_risks", risk_id)
 
-    def list(self, status: Optional[str] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
-        if status and category:
-            rows = self.store.list("cc_risks", "status=? AND category=?", (status, category))
-        elif status:
-            rows = self.store.list("cc_risks", "status=?", (status,))
-        elif category:
-            rows = self.store.list("cc_risks", "category=?", (category,))
-        else:
-            rows = self.store.list("cc_risks")
+    def list(self, status: Optional[str] = None, category: Optional[str] = None, venture_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        clauses, params = [], []
+        if status:
+            clauses.append("status=?"); params.append(status)
+        if category:
+            clauses.append("category=?"); params.append(category)
+        if venture_id:
+            clauses.append("venture_id=?"); params.append(venture_id)
+        where = " AND ".join(clauses) if clauses else "1=1"
+        rows = self.store.list("cc_risks", where, tuple(params))
         return list(reversed(rows))

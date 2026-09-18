@@ -85,6 +85,12 @@ from .trading_lab_risk_paper import (
 )
 from .trading_lab_council import ReviewStore, bury_strategy, check_graveyard_for_similar, run_trading_council
 
+from .ventures import (
+    AssetRegisterStore, CapitalAllocationStore, ExperimentStore, GraveyardStore,
+    RelationshipStore, ResourceAllocationStore, VentureError, VentureStore, ValidationStore,
+    command_center_venture_rollup, recommend_venture_action, venture_capital_account,
+    venture_recommendation_history, venture_scorecard,
+)
 from .video_pipeline import VideoPipeline
 from .workforce import WorkforceError, WorkforceOrchestrator, WorkforceTaskStore
 from .workforce_workers import (
@@ -210,7 +216,8 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 query = parse_qs(urlparse(self.path).query)
                 status_filter = (query.get("status") or [None])[0]
                 category_filter = (query.get("category") or [None])[0]
-                return self._json({"items": RiskRegisterStore(store, control.audit).list(status_filter, category_filter)})
+                venture_filter = (query.get("venture_id") or [None])[0]
+                return self._json({"items": RiskRegisterStore(store, control.audit).list(status_filter, category_filter, venture_id=venture_filter)})
             if path == "/api/cc/department-performance":
                 return self._json(department_performance(store))
             if path == "/api/cc/ai-workforce-performance":
@@ -506,6 +513,78 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     "pending_needs_aryan_count": len(pending_tl_needs_aryan),
                     "note": "TTT Trading Lab v1 -- 100% PAPER/SIMULATED. No real money, no live broker connection, no real order path exists in this phase.",
                 })
+            # ---------- Venture Studio / Multi-Venture OS v1 ----------
+            if path == "/api/vs/ventures":
+                query = parse_qs(urlparse(self.path).query)
+                status_filter = (query.get("status") or [None])[0]
+                type_filter = (query.get("venture_type") or [None])[0]
+                return self._json({"items": VentureStore(store, control.audit, NeedsAryanQueue(store, control.audit, control)).list(status_filter, type_filter)})
+            if path == "/api/vs/pipeline":
+                return self._json(VentureStore(store, control.audit).pipeline())
+            if path == "/api/vs/graveyard":
+                return self._json({"items": GraveyardStore(store, control.audit, VentureStore(store, control.audit)).list()})
+            if path == "/api/vs/rollup":
+                return self._json(command_center_venture_rollup(store))
+            if path.startswith("/api/vs/ventures/") and path.endswith("/status-events"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": VentureStore(store, control.audit).status_events(venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/goals"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": GoalStore(store, control.audit).list(venture_id=venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/experiments"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": ExperimentStore(store, control.audit).list(venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/validation"):
+                venture_id = path.split("/")[4]
+                validation = ValidationStore(store, control.audit)
+                return self._json({"signals": validation.list(venture_id), "summary": validation.summary(venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/capital-account"):
+                venture_id = path.split("/")[4]
+                venture = VentureStore(store, control.audit).get(venture_id)
+                if not venture:
+                    return self._json({"error": "venture not found"}, HTTPStatus.NOT_FOUND)
+                return self._json(venture_capital_account(store, venture))
+            if path.startswith("/api/vs/ventures/") and path.endswith("/capital-allocations"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": CapitalAllocationStore(store, control.audit).list(venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/ledger"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": LedgerStore(store, control.audit).list(venture_id=venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/scorecard"):
+                venture_id = path.split("/")[4]
+                venture = VentureStore(store, control.audit).get(venture_id)
+                if not venture:
+                    return self._json({"error": "venture not found"}, HTTPStatus.NOT_FOUND)
+                return self._json(venture_scorecard(store, venture))
+            if path.startswith("/api/vs/ventures/") and path.endswith("/recommendations"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": venture_recommendation_history(store, venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/resources"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": ResourceAllocationStore(store, control.audit).list(venture_id=venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/assets"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": AssetRegisterStore(store, control.audit).list(venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/relationships"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": RelationshipStore(store, control.audit).list_for_venture(venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/risks"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": RiskRegisterStore(store, control.audit).list(venture_id=venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/workforce-tasks"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": WorkforceTaskStore(store, control.audit).list(venture_id=venture_id)})
+            if path.startswith("/api/vs/ventures/") and path.endswith("/opportunities"):
+                venture_id = path.split("/")[4]
+                return self._json({"items": store.list("rh_opportunities", "venture_id=?", (venture_id,))})
+            if path == "/api/vs/resource-requests":
+                query = parse_qs(urlparse(self.path).query)
+                department = (query.get("department") or [None])[0]
+                return self._json({"items": ResourceAllocationStore(store, control.audit).list(department=department)})
+            if path.startswith("/api/vs/ventures/"):
+                venture_id = path.rsplit("/", 1)[-1]
+                venture = VentureStore(store, control.audit).get(venture_id)
+                return self._json(venture or {"error": "venture not found"}, HTTPStatus.OK if venture else HTTPStatus.NOT_FOUND)
         finally:
             store.close()
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -597,6 +676,7 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         body.get("title", ""), body.get("category", ""), body.get("severity", ""),
                         actor=body.get("actor", "Aryan"), likelihood_band=body.get("likelihood_band", "unknown"),
                         owner=body.get("owner"), mitigation=body.get("mitigation"), evidence=body.get("evidence"),
+                        venture_id=body.get("venture_id"),
                     )
                     return self._json({"risk_id": risk_id}, HTTPStatus.CREATED)
                 if path.startswith("/api/cc/risks/") and path.endswith("/status"):
@@ -1180,6 +1260,177 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     )
                     return self._json({"limit_id": limit_id}, HTTPStatus.CREATED)
 
+                # ---------- Venture Studio / Multi-Venture OS v1 ----------
+                if path == "/api/vs/ventures":
+                    needs_aryan_vs = NeedsAryanQueue(store, control.audit, control)
+                    result = VentureStore(store, control.audit, needs_aryan_vs).create(
+                        body.get("name", ""), body.get("venture_type", ""), actor=body.get("actor", "Aryan"),
+                        description=body.get("description"), thesis=body.get("thesis"), owner=body.get("owner"),
+                        slug=body.get("slug"), linked_product=body.get("linked_product"),
+                        linked_brand_id=body.get("linked_brand_id"), linked_departments=body.get("linked_departments"),
+                        initial_capital_commitment=body.get("initial_capital_commitment"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/update"):
+                    venture_id = path.split("/")[4]
+                    fields = {k: v for k, v in body.items() if k not in {"actor"}}
+                    venture = VentureStore(store, control.audit).update_details(venture_id, body.get("actor", "Aryan"), **fields)
+                    return self._json(venture)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/transition"):
+                    venture_id = path.split("/")[4]
+                    needs_aryan_vs = NeedsAryanQueue(store, control.audit, control)
+                    venture = VentureStore(store, control.audit, needs_aryan_vs).transition(
+                        venture_id, body.get("to_status", ""), body.get("actor", "Aryan"),
+                        reason=body.get("reason"), evidence=body.get("evidence"),
+                        financial_impact=body.get("financial_impact"), next_action=body.get("next_action"),
+                    )
+                    return self._json(venture)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/goals"):
+                    venture_id = path.split("/")[4]
+                    goal_id = GoalStore(store, control.audit).create(
+                        body.get("title", ""), body.get("target"), body.get("unit", ""), actor=body.get("actor", "Aryan"),
+                        start_date=body.get("start_date"), deadline=body.get("deadline"), owner=body.get("owner"),
+                        department=body.get("department"), venture_id=venture_id,
+                    )
+                    return self._json({"goal_id": goal_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/experiments"):
+                    venture_id = path.split("/")[4]
+                    experiment_id = ExperimentStore(store, control.audit).create(
+                        venture_id, body.get("hypothesis", ""), body.get("metric", ""), body.get("target"),
+                        actor=body.get("actor", "Aryan"), owner=body.get("owner"), budget=body.get("budget"),
+                        start_date=body.get("start_date"), end_date=body.get("end_date"),
+                    )
+                    return self._json({"experiment_id": experiment_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/experiments/") and path.endswith("/start"):
+                    experiment_id = path.split("/")[4]
+                    return self._json(ExperimentStore(store, control.audit).start(experiment_id, body.get("actor", "Aryan")))
+                if path.startswith("/api/vs/experiments/") and path.endswith("/result"):
+                    experiment_id = path.split("/")[4]
+                    experiment = ExperimentStore(store, control.audit).record_result(
+                        experiment_id, body.get("actor", "Aryan"), body.get("evidence"),
+                        body.get("result", ""), body.get("decision", ""),
+                    )
+                    return self._json(experiment)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/risks"):
+                    venture_id = path.split("/")[4]
+                    needs_aryan_vs = NeedsAryanQueue(store, control.audit, control)
+                    risk_id = RiskRegisterStore(store, control.audit, needs_aryan=needs_aryan_vs).create(
+                        body.get("title", ""), body.get("category", ""), body.get("severity", ""),
+                        actor=body.get("actor", "Aryan"), likelihood_band=body.get("likelihood_band", "unknown"),
+                        owner=body.get("owner"), mitigation=body.get("mitigation"), evidence=body.get("evidence"),
+                        venture_id=venture_id,
+                    )
+                    return self._json({"risk_id": risk_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/validation-signals"):
+                    venture_id = path.split("/")[4]
+                    signal_id = ValidationStore(store, control.audit).add_signal(
+                        venture_id, body.get("signal_type", ""), body.get("description", ""),
+                        actor=body.get("actor", "Aryan"), evidence=body.get("evidence"), strength=body.get("strength", "moderate"),
+                    )
+                    return self._json({"signal_id": signal_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/capital-allocations"):
+                    venture_id = path.split("/")[4]
+                    needs_aryan_vs = NeedsAryanQueue(store, control.audit, control)
+                    result = CapitalAllocationStore(store, control.audit, needs_aryan_vs).allocate(
+                        venture_id, body.get("amount"), actor=body.get("actor", "Aryan"),
+                        source_note=body.get("source_note"), direction=body.get("direction", "IN"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/ledger"):
+                    venture_id = path.split("/")[4]
+                    entry_id = LedgerStore(store, control.audit).record(
+                        body.get("entry_type", ""), body.get("category", ""), body.get("amount"), body.get("evidence"),
+                        actor=body.get("actor", "Aryan"), currency=body.get("currency", "INR"),
+                        business_unit=body.get("business_unit"), client_id=body.get("client_id"),
+                        occurred_on=body.get("occurred_on"), note=body.get("note"), venture_id=venture_id,
+                    )
+                    return self._json({"entry_id": entry_id}, HTTPStatus.CREATED)
+                if path == "/api/vs/capital-reallocations":
+                    needs_aryan_vs = NeedsAryanQueue(store, control.audit, control)
+                    result = CapitalAllocationStore(store, control.audit, needs_aryan_vs).reallocate(
+                        body.get("from_venture_id", ""), body.get("to_venture_id", ""), body.get("amount"),
+                        body.get("actor", "Aryan"), body.get("reason", ""),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/resource-requests"):
+                    venture_id = path.split("/")[4]
+                    request_id = ResourceAllocationStore(store, control.audit).request(
+                        venture_id, body.get("department", ""), body.get("resource_type", ""), body.get("amount_or_qty"),
+                        actor=body.get("actor", "Aryan"), note=body.get("note"),
+                    )
+                    return self._json({"request_id": request_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/resource-requests/") and path.endswith("/allocate"):
+                    request_id = path.split("/")[4]
+                    return self._json(ResourceAllocationStore(store, control.audit).allocate(request_id, body.get("actor", "Aryan")))
+                if path.startswith("/api/vs/resource-requests/") and path.endswith("/deny"):
+                    request_id = path.split("/")[4]
+                    return self._json(ResourceAllocationStore(store, control.audit).deny(request_id, body.get("actor", "Aryan"), body.get("reason")))
+                if path.startswith("/api/vs/ventures/") and path.endswith("/recommendation/run"):
+                    venture_id = path.split("/")[4]
+                    venture = VentureStore(store, control.audit).get(venture_id)
+                    if not venture:
+                        return self._json({"error": "venture not found"}, HTTPStatus.NOT_FOUND)
+                    needs_aryan_vs = NeedsAryanQueue(store, control.audit, control)
+                    return self._json(recommend_venture_action(store, venture, actor=body.get("actor", "system"), needs_aryan=needs_aryan_vs), HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/assets"):
+                    venture_id = path.split("/")[4]
+                    asset_id = AssetRegisterStore(store, control.audit).register(
+                        venture_id, body.get("asset_type", ""), body.get("name", ""), actor=body.get("actor", "Aryan"),
+                        description=body.get("description"), location_or_ref=body.get("location_or_ref"),
+                        metadata=body.get("metadata"),
+                    )
+                    return self._json({"asset_id": asset_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/assets/") and path.endswith("/retire"):
+                    asset_id = path.split("/")[4]
+                    return self._json(AssetRegisterStore(store, control.audit).retire(asset_id, body.get("actor", "Aryan")))
+                if path == "/api/vs/relationships":
+                    relationship_id = RelationshipStore(store, control.audit).link(
+                        body.get("venture_a_id", ""), body.get("venture_b_id", ""), body.get("relationship_type", ""),
+                        actor=body.get("actor", "Aryan"), description=body.get("description"),
+                    )
+                    return self._json({"relationship_id": relationship_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/vs/ventures/") and path.endswith("/close"):
+                    venture_id = path.split("/")[4]
+                    needs_aryan_vs = NeedsAryanQueue(store, control.audit, control)
+                    venture_store_vs = VentureStore(store, control.audit, needs_aryan_vs)
+                    grave = GraveyardStore(store, control.audit, venture_store_vs).close_venture(
+                        venture_id, body.get("reason_killed", ""), body.get("actor", "Aryan"), lessons=body.get("lessons"),
+                    )
+                    return self._json(grave, HTTPStatus.CREATED)
+                if path == "/api/vs/graveyard/check-similar":
+                    hits = GraveyardStore(store, control.audit, VentureStore(store, control.audit)).check_similar_thesis(body.get("thesis", ""))
+                    return self._json({"items": hits})
+                if path.startswith("/api/vs/ventures/") and path.endswith("/link-mission"):
+                    venture_id = path.split("/")[4]
+                    mission_id = body.get("mission_id", "")
+                    if not store.get("missions", mission_id):
+                        return self._json({"error": "mission not found"}, HTTPStatus.NOT_FOUND)
+                    if not store.get("vs_ventures", venture_id):
+                        return self._json({"error": "venture not found"}, HTTPStatus.NOT_FOUND)
+                    store.update("missions", mission_id, venture_id=venture_id)
+                    control.audit.append("VS_MISSION_LINKED", {"venture_id": venture_id, "mission_id": mission_id, "actor": body.get("actor", "Aryan")})
+                    return self._json({"mission_id": mission_id, "venture_id": venture_id})
+                if path.startswith("/api/vs/ventures/") and path.endswith("/link-opportunity"):
+                    venture_id = path.split("/")[4]
+                    opportunity_id = body.get("opportunity_id", "")
+                    if not store.get("rh_opportunities", opportunity_id):
+                        return self._json({"error": "opportunity not found"}, HTTPStatus.NOT_FOUND)
+                    if not store.get("vs_ventures", venture_id):
+                        return self._json({"error": "venture not found"}, HTTPStatus.NOT_FOUND)
+                    store.update("rh_opportunities", opportunity_id, venture_id=venture_id)
+                    control.audit.append("VS_OPPORTUNITY_LINKED", {"venture_id": venture_id, "opportunity_id": opportunity_id, "actor": body.get("actor", "Aryan")})
+                    return self._json({"opportunity_id": opportunity_id, "venture_id": venture_id})
+                if path.startswith("/api/vs/ventures/") and path.endswith("/workforce-tasks"):
+                    venture_id = path.split("/")[4]
+                    if not store.get("vs_ventures", venture_id):
+                        return self._json({"error": "venture not found"}, HTTPStatus.NOT_FOUND)
+                    task_id = WorkforceTaskStore(store, control.audit).create(
+                        body.get("department", ""), body.get("objective", ""), body.get("task_type", ""),
+                        actor=body.get("actor", "Aryan"), source=body.get("source"), priority=body.get("priority"),
+                        inputs=body.get("inputs"), venture_id=venture_id,
+                    )
+                    return self._json({"task_id": task_id}, HTTPStatus.CREATED)
+
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             finally:
                 store.close()
@@ -1268,8 +1519,12 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <button class="navitem" data-view="mediaContent">Content Calendar</button>
 <button class="navitem" data-view="mediaPublications">Publishing</button>
 <button class="navitem" data-view="mediaExperiments">Growth Experiments</button>
-<div class="navsec">Coming soon</div>
-<button class="navitem disabled" disabled>Ventures / Company Ops</button>
+<div class="navsec">Venture Studio</div>
+<button class="navitem" data-view="vsStudio">Venture Studio</button>
+<button class="navitem" data-view="vsPipeline">Venture Pipeline</button>
+<button class="navitem" data-view="vsVentures">Ventures</button>
+<button class="navitem" data-view="vsRisks">Venture Risks</button>
+<button class="navitem" data-view="vsGraveyard">Venture Graveyard</button>
 <div class="boundary">TTT HQ decides · Falguna executes<br>Local-only, no automatic merge or deploy</div>
 </aside>
 <main>
@@ -1686,6 +1941,70 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="pageintro">Hypothesis / variable tested / expected signal / result / decision -- a plain record, not an attribution model.</div>
 <div class="list" id="mediaExperimentsList"></div>
 </div>
+<div class="view" id="view-vsStudio">
+<h1>Venture Studio</h1>
+<div class="pageintro">Every venture TTT is running, validating, or considering -- one company-wide rollup. Aryan has final authority on creation, closure, capital, and policy; nothing here moves money automatically.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="vsRollupCount">0</h2><div class="sub">Total ventures</div></div>
+<div class="section" style="flex:1"><h2 id="vsRollupActive">0</h2><div class="sub">Active</div></div>
+<div class="section" style="flex:1"><h2 id="vsRollupValidating">0</h2><div class="sub">Validating</div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="vsRollupRevenue">$0</h2><div class="sub">Venture revenue (ledger + linked invoices)</div></div>
+<div class="section" style="flex:1"><h2 id="vsRollupSpend">$0</h2><div class="sub">Venture spend</div></div>
+<div class="section" style="flex:1"><h2 id="vsRollupProfit">$0</h2><div class="sub">Estimated profitability</div></div>
+</div>
+<div class="section"><h2>Ventures requiring a decision</h2><div class="list" id="vsRollupDecisions"></div></div>
+<div class="section"><h2>Upcoming milestones</h2><div class="list" id="vsRollupMilestones"></div></div>
+<div class="section"><h2>New venture</h2>
+<div class="pageintro">A non-trivial initial capital commitment (&gt;= the large-allocation threshold) escalates to Needs Aryan automatically -- creation itself never moves money.</div>
+<div class="form">
+<input id="vnName" placeholder="Venture name">
+<div class="row">
+<select id="vnType"><option value="software_services">software_services</option><option value="saas">saas</option><option value="ai_product">ai_product</option><option value="media_content">media_content</option><option value="internal_platform">internal_platform</option><option value="experimental">experimental</option><option value="investment_research">investment_research</option></select>
+<input id="vnOwner" placeholder="Owner (optional)">
+</div>
+<textarea id="vnDescription" placeholder="Description (optional)"></textarea>
+<textarea id="vnThesis" placeholder="Thesis -- why this venture, in one or two sentences (optional)"></textarea>
+<input id="vnCapital" type="number" step="any" placeholder="Initial capital commitment (optional)">
+<div class="actions"><button id="vnCreate" type="button">Create venture</button></div>
+</div>
+</div>
+</div>
+<div class="view" id="view-vsPipeline">
+<h1>Venture Pipeline</h1>
+<div class="pageintro">Incoming ideas -&gt; research -&gt; building -&gt; active -&gt; paused -&gt; rejected -&gt; closed. A read-only grouping over each venture's real lifecycle status -- rejected ideas are preserved, never deleted.</div>
+<div class="section"><h2>Incoming ideas</h2><div class="list" id="vsPipeIncoming"></div></div>
+<div class="section"><h2>Under research (validating)</h2><div class="list" id="vsPipeResearch"></div></div>
+<div class="section"><h2>Building</h2><div class="list" id="vsPipeBuilding"></div></div>
+<div class="section"><h2>Active</h2><div class="list" id="vsPipeActive"></div></div>
+<div class="section"><h2>Paused</h2><div class="list" id="vsPipePaused"></div></div>
+<div class="section"><h2>Rejected</h2><div class="list" id="vsPipeRejected"></div></div>
+<div class="section"><h2>Closed</h2><div class="list" id="vsPipeClosed"></div></div>
+</div>
+<div class="view" id="view-vsVentures">
+<h1>Ventures</h1>
+<div class="pageintro">Click a venture to open its detail: financials, goals, experiments, validation, resources, assets, relationships, and the recommendation engine. Nothing here ever mixes with Trading Lab capital.</div>
+<div class="list" id="vsVenturesList"></div>
+<div id="vsDetail"></div>
+</div>
+<div class="view" id="view-vsRisks">
+<h1>Venture Risks</h1>
+<div class="pageintro">Every risk on this page is scoped to exactly one venture -- a company-wide (non-venture) risk still lives on the CEO Intelligence Risk Register. A critical/high severity risk here escalates under the venture_risk_escalation kind, never the generic company-wide kind, so Needs Aryan always shows which venture it's about.</div>
+<div class="list" id="vsRisksList"></div>
+</div>
+<div class="view" id="view-vsGraveyard">
+<h1>Venture Graveyard</h1>
+<div class="pageintro">Closed ventures, preserved permanently -- original thesis, total invested, experiments run, evidence gathered, reason killed, lessons, and any assets produced. Nothing here is ever deleted, so the same failed thesis is never silently retried.</div>
+<div class="section"><h2>Check a thesis against past failures</h2>
+<div class="form">
+<textarea id="vgThesisCheck" placeholder="Paste a thesis to check for keyword overlap with past graveyard entries (advisory only)"></textarea>
+<div class="actions"><button id="vgCheckSimilar" type="button">Check for similar past ventures</button></div>
+</div>
+<div class="list" id="vgSimilarResults"></div>
+</div>
+<div class="list" id="vsGraveyardList"></div>
+</div>
 </div>
 </main>
 </div>
@@ -1694,7 +2013,7 @@ const $=id=>document.getElementById(id);
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadCommandCenter(),loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
 async function loadCommandCenter(){
@@ -2196,6 +2515,172 @@ async function loadMediaBrands(){const d=await api('/api/media/brands');$('media
 async function loadMediaContent(){const d=await api('/api/media/content');$('mediaContentList').innerHTML=(d.items||[]).length?d.items.map(c=>`<div class="item"><h3>${esc(c.title)}</h3><div class="meta"><span>${esc(c.content_state)}</span><span>${esc(c.format)}</span>${c.platform?`<span>${esc(c.platform)}</span>`:''}${c.planned_publish_date?`<span>due ${esc(c.planned_publish_date)}</span>`:''}</div></div>`).join(''):'<div class="empty">No content items yet.</div>'}
 async function loadMediaPublications(){const d=await api('/api/media/publications');$('mediaPublicationsList').innerHTML=(d.items||[]).length?d.items.map(p=>`<div class="item"><h3>${esc(p.platform)}</h3><div class="meta"><span>${esc(p.status)}</span>${p.execution_mode?`<span>${esc(p.execution_mode)}</span>`:''}${p.published_at?`<span>published ${esc(p.published_at)}</span>`:''}</div></div>`).join(''):'<div class="empty">No publications yet.</div>'}
 async function loadMediaExperiments(){const d=await api('/api/media/experiments');$('mediaExperimentsList').innerHTML=(d.items||[]).length?d.items.map(x=>`<div class="item"><h3>${esc(x.hypothesis)}</h3><div class="meta"><span>${esc(x.status)}</span>${x.variable_tested?`<span>${esc(x.variable_tested)}</span>`:''}</div>${x.decision?`<div class="contrib"><b>Decision:</b> ${esc(x.decision)}</div>`:''}</div>`).join(''):'<div class="empty">No growth experiments yet.</div>'}
+
+// ---------- Venture Studio ----------
+const VS_TRANSITIONS={IDEA:['VALIDATING','REJECTED'],VALIDATING:['BUILDING','IDEA','REJECTED'],BUILDING:['PRELAUNCH','PAUSED','CLOSED'],PRELAUNCH:['ACTIVE','PAUSED','CLOSED'],ACTIVE:['PAUSED','SCALING','SUNSETTING','CLOSED'],PAUSED:['ACTIVE','BUILDING','SUNSETTING','CLOSED'],SCALING:['ACTIVE','PAUSED','SUNSETTING','CLOSED'],SUNSETTING:['CLOSED','ACTIVE'],CLOSED:[],REJECTED:[]};
+async function loadVsStudio(){
+const d=await api('/api/vs/rollup');
+$('vsRollupCount').textContent=d.venture_count;
+$('vsRollupActive').textContent=d.active_venture_count;
+$('vsRollupValidating').textContent=d.validating_venture_count;
+$('vsRollupRevenue').textContent='$'+d.venture_revenue_total;
+$('vsRollupSpend').textContent='$'+d.venture_spend_total;
+$('vsRollupProfit').textContent='$'+d.venture_profitability_estimate;
+$('vsRollupDecisions').innerHTML=(d.ventures_requiring_decision||[]).length?d.ventures_requiring_decision.map(v=>`<div class="item"><h3>${esc(v.name)}</h3><div class="meta"><span>${esc(v.status)}</span><span>${esc(v.reason)}</span></div></div>`).join(''):'<div class="empty">No ventures currently need a decision.</div>';
+$('vsRollupMilestones').innerHTML=(d.upcoming_milestones||[]).length?d.upcoming_milestones.map(m=>`<div class="item"><h3>${esc(m.title||'')}</h3><div class="meta"><span>${esc(m.venture_name||'')}</span>${m.deadline?`<span>due ${esc(m.deadline)}</span>`:''}</div></div>`).join(''):'<div class="empty">No upcoming milestones.</div>';
+}
+$('vnCreate').onclick=async()=>{
+const name=$('vnName').value.trim();if(!name)return alert('Venture name is required.');
+const body={name,venture_type:$('vnType').value,owner:$('vnOwner').value.trim()||null,description:$('vnDescription').value.trim()||null,thesis:$('vnThesis').value.trim()||null,actor:'Aryan'};
+const cap=$('vnCapital').value;if(cap)body.initial_capital_commitment=parseFloat(cap);
+try{await api('/api/vs/ventures',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});['vnName','vnOwner','vnDescription','vnThesis','vnCapital'].forEach(id=>$(id).value='');await loadVsStudio();alert('Venture created. Open it from the Ventures view.')}catch(e){alert(e.message)}
+};
+async function loadVsPipeline(){
+const d=await api('/api/vs/pipeline');
+const render=items=>(items||[]).length?items.map(v=>`<div class="item"><h3>${esc(v.name)}</h3><div class="meta"><span>${esc(v.venture_type)}</span><span>${esc(v.status)}</span><span>${esc(v.slug)}</span></div></div>`).join(''):'<div class="empty">None.</div>';
+$('vsPipeIncoming').innerHTML=render(d.incoming_ideas);
+$('vsPipeResearch').innerHTML=render(d.under_research);
+$('vsPipeBuilding').innerHTML=render(d.building);
+$('vsPipeActive').innerHTML=render(d.active);
+$('vsPipePaused').innerHTML=render(d.paused);
+$('vsPipeRejected').innerHTML=render(d.rejected);
+$('vsPipeClosed').innerHTML=render(d.closed);
+}
+let vsSelectedVentureId=null;
+async function loadVsVentures(){
+const d=await api('/api/vs/ventures');const items=d.items||[];
+$('vsVenturesList').innerHTML=items.length?items.map(v=>`<div class="item">
+<h3>${esc(v.name)} <span style="color:var(--muted);font-weight:400">(${esc(v.status)})</span></h3>
+<div class="meta"><span>${esc(v.venture_type)}</span><span>${esc(v.slug)}</span>${v.owner?`<span>owner ${esc(v.owner)}</span>`:''}</div>
+${v.thesis?`<div>${esc(v.thesis)}</div>`:''}
+<div class="actions"><button class="secondary viewVenture" data-id="${esc(v.id)}">View detail</button></div>
+</div>`).join(''):'<div class="empty">No ventures yet -- create one from Venture Studio.</div>';
+document.querySelectorAll('#vsVenturesList .viewVenture').forEach(b=>b.onclick=()=>selectVenture(b.dataset.id));
+if(vsSelectedVentureId&&items.some(v=>v.id===vsSelectedVentureId))await selectVenture(vsSelectedVentureId);
+}
+async function selectVenture(id){
+vsSelectedVentureId=id;
+const [venture,account,scorecard,validation,experiments,goals,tasks,resources,assets,relationships,recommendations,allocations,ledger,risks,allVentures]=await Promise.all([
+api(`/api/vs/ventures/${id}`),api(`/api/vs/ventures/${id}/capital-account`),api(`/api/vs/ventures/${id}/scorecard`),
+api(`/api/vs/ventures/${id}/validation`),api(`/api/vs/ventures/${id}/experiments`),api(`/api/vs/ventures/${id}/goals`),
+api(`/api/vs/ventures/${id}/workforce-tasks`),api(`/api/vs/ventures/${id}/resources`),api(`/api/vs/ventures/${id}/assets`),
+api(`/api/vs/ventures/${id}/relationships`),api(`/api/vs/ventures/${id}/recommendations`),api(`/api/vs/ventures/${id}/capital-allocations`),
+api(`/api/vs/ventures/${id}/ledger`),api(`/api/vs/ventures/${id}/risks`),api('/api/vs/ventures'),
+]);
+renderVsDetail(venture,account,scorecard,validation,experiments,goals,tasks,resources,assets,relationships,recommendations,allocations,ledger,risks,allVentures);
+}
+function renderVsDetail(v,account,scorecard,validation,experiments,goals,tasks,resources,assets,relationships,recommendations,allocations,ledger,risks,allVentures){
+const id=v.id;
+const next=VS_TRANSITIONS[v.status]||[];
+const isTerminal=next.length===0;
+const otherVentures=(allVentures.items||[]).filter(x=>x.id!==id);
+$('vsDetail').innerHTML=`
+<div class="section"><h2>${esc(v.name)}</h2>
+<div class="meta"><span>${esc(v.status)}</span><span>${esc(v.venture_type)}</span><span>${esc(v.slug)}</span>${v.owner?`<span>owner ${esc(v.owner)}</span>`:''}${v.launch_date?`<span>launched ${esc(v.launch_date)}</span>`:''}</div>
+${v.thesis?`<div><b>Thesis:</b> ${esc(v.thesis)}</div>`:''}
+${v.description?`<div>${esc(v.description)}</div>`:''}
+${!isTerminal?`<div class="form">
+<div class="row"><select id="vdToStatus">${next.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('')}</select><input id="vdReason" placeholder="Reason (required)"></div>
+<div class="actions"><button id="vdTransition" type="button">Transition</button><button id="vdRunRec" type="button" class="secondary">Run recommendation</button></div>
+</div>`:`<div class="empty">Terminal status -- no further transitions.</div>`}
+${!isTerminal?`<div class="form"><textarea id="vdCloseReason" placeholder="Reason killed (required to close/graveyard)"></textarea><textarea id="vdCloseLessons" placeholder="Lessons learned (optional)"></textarea><div class="actions"><button class="danger" id="vdClose" type="button">Close &amp; graveyard</button></div></div>`:''}
+</div>
+<div class="section"><h2>Scorecard</h2><div class="meta">${['execution','financials','traction','risks','milestones'].map(k=>`<span>${k}: ${esc(scorecard[k].band)}</span>`).join('')}</div>
+<div class="list">${['execution','financials','traction','risks','milestones'].map(k=>`<div class="item"><h3>${k} -- ${esc(scorecard[k].band)}</h3><div>${esc(scorecard[k].reason)}</div></div>`).join('')}</div>
+</div>
+<div class="section"><h2>Recommendation history</h2><div class="list">${(recommendations.items||[]).length?recommendations.items.map(r=>`<div class="item"><h3>${esc(r.recommendation)}</h3><div class="meta"><span>${esc(r.created_at)}</span>${r.needs_aryan_id?'<span class="badge">escalated</span>':''}</div><div>${(r.rationale||[]).map(esc).join(' · ')}</div></div>`).join(''):'<div class="empty">No recommendations run yet.</div>'}</div>
+</div>
+<div class="section"><h2>Capital account</h2>
+<div class="meta"><span>allocated $${esc(account.actual.assigned_budget_net_allocated)}</span><span>spend $${esc(account.actual.spend_to_date)}</span><span>revenue $${esc(account.actual.revenue_total)}</span><span>est. gross profit $${esc(account.estimated.estimated_gross_profit)}</span></div>
+<div class="sub">${esc(account.note)}</div>
+<h2 style="margin-top:14px;font-size:14px">Capital allocations</h2>
+<div class="list">${(allocations.items||[]).length?allocations.items.map(a=>`<div class="item"><h3>${esc(a.direction)} $${esc(a.amount)}</h3><div class="meta"><span>${esc(a.created_at)}</span>${a.needs_aryan_id?'<span class="badge">escalated</span>':''}</div><div>${esc(a.source_note||'')}</div></div>`).join(''):'<div class="empty">No allocations yet.</div>'}</div>
+<div class="form"><div class="row"><select id="vdAllocDirection"><option value="IN">IN</option><option value="OUT">OUT</option></select><input id="vdAllocAmount" type="number" step="any" placeholder="Amount"></div><input id="vdAllocNote" placeholder="Source note"><div class="actions"><button id="vdAllocCreate" type="button">Allocate</button></div></div>
+<h2 style="margin-top:14px;font-size:14px">Ledger entries</h2>
+<div class="list">${(ledger.items||[]).length?ledger.items.map(e=>`<div class="item"><h3>${esc(e.entry_type)} ${esc(e.currency)} ${esc(e.amount)} -- ${esc(e.category)}</h3><div class="meta"><span>${esc(e.occurred_on)}</span><span>${esc(e.status)}</span></div><div>${esc(e.evidence)}</div></div>`).join(''):'<div class="empty">No ledger entries yet.</div>'}</div>
+<div class="form"><div class="row"><select id="vdLeType"><option value="OUTFLOW">OUTFLOW</option><option value="INFLOW">INFLOW</option></select><select id="vdLeCategory"><option value="client_revenue">client_revenue</option><option value="subscription_api_cost">subscription_api_cost</option><option value="software_tooling">software_tooling</option><option value="hosting">hosting</option><option value="contractor">contractor</option><option value="marketing">marketing</option><option value="hardware">hardware</option><option value="tax_reserve">tax_reserve</option><option value="owner_contribution">owner_contribution</option><option value="other">other</option></select></div><input id="vdLeAmount" type="number" step="any" placeholder="Amount"><input id="vdLeEvidence" placeholder="Evidence (required)"><div class="actions"><button id="vdLeCreate" type="button">Record entry</button></div></div>
+</div>
+<div class="section"><h2>Validation</h2><div class="sub">${esc(validation.summary.note)}</div>
+<div class="list">${(validation.signals||[]).length?validation.signals.map(s=>`<div class="item"><h3>${esc(s.signal_type)} (${esc(s.strength)})</h3><div>${esc(s.description)}</div><div class="meta"><span>${esc(s.evidence||'')}</span></div></div>`).join(''):'<div class="empty">No validation signals yet.</div>'}</div>
+<div class="form"><div class="row"><select id="vdSigType"><option value="interview">interview</option><option value="demand_signal">demand_signal</option><option value="lead">lead</option><option value="preorder">preorder</option><option value="waitlist">waitlist</option><option value="paid_pilot">paid_pilot</option><option value="manual_service_proof">manual_service_proof</option><option value="traffic_conversion">traffic_conversion</option><option value="competitor_research">competitor_research</option></select><select id="vdSigStrength"><option value="weak">weak</option><option value="moderate">moderate</option><option value="strong">strong</option></select></div><textarea id="vdSigDescription" placeholder="Description"></textarea><input id="vdSigEvidence" placeholder="Evidence (optional)"><div class="actions"><button id="vdSigCreate" type="button">Add signal</button></div></div>
+</div>
+<div class="section"><h2>Experiments</h2>
+<div class="list">${(experiments.items||[]).length?experiments.items.map(e=>`<div class="item"><h3>${esc(e.hypothesis)} <span style="color:var(--muted);font-weight:400">(${esc(e.status)})</span></h3><div class="meta"><span>${esc(e.metric)}</span><span>target ${esc(e.target)}</span>${e.budget?`<span>budget $${esc(e.budget)}</span>`:''}</div>${e.decision?`<div class="contrib"><b>Decision:</b> ${esc(e.decision)} -- ${esc(e.result||'')}</div>`:e.status==='RUNNING'?`<div class="actions"><button class="secondary vdExpResult" data-id="${esc(e.id)}">Record result</button></div>`:e.status==='PLANNED'?`<div class="actions"><button class="secondary vdExpStart" data-id="${esc(e.id)}">Start</button></div>`:''}</div>`).join(''):'<div class="empty">No experiments yet.</div>'}</div>
+<div class="form"><input id="vdExpHypothesis" placeholder="Hypothesis"><div class="row"><input id="vdExpMetric" placeholder="Metric"><input id="vdExpTarget" placeholder="Target"></div><input id="vdExpBudget" type="number" step="any" placeholder="Budget (optional)"><div class="actions"><button id="vdExpCreate" type="button">Add experiment</button></div></div>
+</div>
+<div class="section"><h2>Goals</h2><div class="list">${(goals.items||[]).length?goals.items.map(g=>`<div class="item"><h3>${esc(g.title)}</h3><div class="meta"><span>${esc(g.current_value)} / ${esc(g.target)} ${esc(g.unit)}</span><span>${esc(g.status)}</span></div></div>`).join(''):'<div class="empty">No goals yet.</div>'}</div>
+<div class="form"><input id="vdGoalTitle" placeholder="Goal title"><div class="row"><input id="vdGoalTarget" type="number" step="any" placeholder="Target"><input id="vdGoalUnit" placeholder="Unit"></div><div class="actions"><button id="vdGoalCreate" type="button">Add goal</button></div></div>
+</div>
+<div class="section"><h2>Workforce tasks</h2><div class="list">${(tasks.items||[]).length?tasks.items.map(t=>`<div class="item"><h3>${esc(t.objective)}</h3><div class="meta"><span>${esc(t.status)}</span><span>${esc(t.task_type)}</span><span>${esc(t.department)}</span></div></div>`).join(''):'<div class="empty">No workforce tasks yet.</div>'}</div>
+<div class="form"><div class="row"><select id="vdTaskDept">${SHARED_DEPARTMENTS_JS.map(d=>`<option value="${esc(d)}">${esc(d)}</option>`).join('')}</select><input id="vdTaskType" placeholder="Task type"></div><input id="vdTaskObjective" placeholder="Objective"><div class="actions"><button id="vdTaskCreate" type="button">Add task</button></div></div>
+</div>
+<div class="section"><h2>Shared-capability resource requests</h2><div class="list">${(resources.items||[]).length?resources.items.map(r=>`<div class="item"><h3>${esc(r.department)} -- ${esc(r.resource_type)}</h3><div class="meta"><span>${esc(r.amount_or_qty)}</span><span>${esc(r.status)}</span></div>${r.status==='REQUESTED'?`<div class="actions"><button class="secondary vdResAllocate" data-id="${esc(r.id)}">Allocate</button><button class="danger vdResDeny" data-id="${esc(r.id)}">Deny</button></div>`:''}${r.status==='CONFLICT'?'<div class="empty">Conflicts with another venture request -- see audit log.</div>':''}</div>`).join(''):'<div class="empty">No resource requests yet.</div>'}</div>
+<div class="form"><div class="row"><select id="vdResDept">${SHARED_DEPARTMENTS_JS.map(d=>`<option value="${esc(d)}">${esc(d)}</option>`).join('')}</select><select id="vdResType"><option value="workforce_task_capacity">workforce_task_capacity</option><option value="engineering_capacity">engineering_capacity</option><option value="media_slot">media_slot</option><option value="sales_attention">sales_attention</option><option value="budget">budget</option></select></div><input id="vdResAmount" type="number" step="any" placeholder="Amount / qty"><div class="actions"><button id="vdResCreate" type="button">Request resource</button></div></div>
+</div>
+<div class="section"><h2>Assets</h2><div class="list">${(assets.items||[]).length?assets.items.map(a=>`<div class="item"><h3>${esc(a.name)} <span style="color:var(--muted);font-weight:400">(${esc(a.status)})</span></h3><div class="meta"><span>${esc(a.asset_type)}</span></div>${a.status==='ACTIVE'?`<div class="actions"><button class="danger vdAssetRetire" data-id="${esc(a.id)}">Retire</button></div>`:''}</div>`).join(''):'<div class="empty">No assets registered yet.</div>'}</div>
+<div class="form"><div class="row"><select id="vdAssetType"><option value="code">code</option><option value="domain">domain</option><option value="brand">brand</option><option value="logo">logo</option><option value="dataset">dataset</option><option value="research">research</option><option value="contract">contract</option><option value="content">content</option><option value="product_ip">product_ip</option></select><input id="vdAssetName" placeholder="Name"></div><div class="actions"><button id="vdAssetCreate" type="button">Register asset</button></div></div>
+</div>
+<div class="section"><h2>Risks (venture-scoped)</h2><div class="list">${(risks.items||[]).length?risks.items.map(r=>`<div class="item"><h3>${esc(r.title)} <span style="color:var(--muted);font-weight:400">(${esc(r.status)})</span></h3><div class="meta"><span>${esc(r.category)}</span><span>severity ${esc(r.severity)}</span></div></div>`).join(''):'<div class="empty">No risks logged for this venture.</div>'}</div>
+<div class="form"><input id="vdRiskTitle" placeholder="Risk title"><div class="row"><select id="vdRiskCategory"><option value="revenue_risk">revenue_risk</option><option value="client_risk">client_risk</option><option value="delivery_risk">delivery_risk</option><option value="finance_risk">finance_risk</option><option value="security_risk">security_risk</option><option value="infrastructure_risk">infrastructure_risk</option><option value="legal_compliance_risk">legal_compliance_risk</option><option value="concentration_risk">concentration_risk</option></select><select id="vdRiskSeverity"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="critical">critical</option></select></div><div class="actions"><button id="vdRiskCreate" type="button">Log risk</button></div></div>
+</div>
+<div class="section"><h2>Relationships</h2><div class="list">${(relationships.items||[]).length?relationships.items.map(r=>`<div class="item"><h3>${esc(r.relationship_type)}</h3><div class="meta"><span>${r.venture_a_id===id?esc(r.venture_b_id):esc(r.venture_a_id)}</span></div></div>`).join(''):'<div class="empty">No inter-venture relationships yet.</div>'}</div>
+${otherVentures.length?`<div class="form"><div class="row"><select id="vdRelTarget">${otherVentures.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}</select><select id="vdRelType"><option value="shared_technology">shared_technology</option><option value="shared_customers">shared_customers</option><option value="shared_distribution">shared_distribution</option><option value="shared_brand_assets">shared_brand_assets</option><option value="internal_service">internal_service</option></select></div><div class="actions"><button id="vdRelCreate" type="button">Link relationship</button></div></div>`:'<div class="empty">No other ventures to link to yet.</div>'}
+</div>
+`;
+if(!isTerminal){
+$('vdTransition').onclick=async()=>{const reason=$('vdReason').value.trim();if(!reason)return alert('A reason is required.');try{await api(`/api/vs/ventures/${id}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to_status:$('vdToStatus').value,reason,actor:'Aryan'})});await loadVsVentures();await loadVsStudio()}catch(e){alert(e.message)}};
+$('vdClose').onclick=async()=>{const reason_killed=$('vdCloseReason').value.trim();if(!reason_killed)return alert('A reason is required to close a venture.');if(!confirm('Close and graveyard this venture? This transitions it to CLOSED.'))return;try{await api(`/api/vs/ventures/${id}/close`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason_killed,lessons:$('vdCloseLessons').value.trim()||null,actor:'Aryan'})});vsSelectedVentureId=null;$('vsDetail').innerHTML='';await loadVsVentures();await loadVsStudio()}catch(e){alert(e.message)}};
+}
+$('vdRunRec').onclick=async()=>{try{await api(`/api/vs/ventures/${id}/recommendation/run`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+$('vdAllocCreate').onclick=async()=>{const amount=parseFloat($('vdAllocAmount').value);if(isNaN(amount))return alert('Amount is required.');try{await api(`/api/vs/ventures/${id}/capital-allocations`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount,direction:$('vdAllocDirection').value,source_note:$('vdAllocNote').value.trim()||null,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+$('vdLeCreate').onclick=async()=>{const amount=parseFloat($('vdLeAmount').value);const evidence=$('vdLeEvidence').value.trim();if(isNaN(amount)||!evidence)return alert('Amount and evidence are required.');try{await api(`/api/vs/ventures/${id}/ledger`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry_type:$('vdLeType').value,category:$('vdLeCategory').value,amount,evidence,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+$('vdSigCreate').onclick=async()=>{const description=$('vdSigDescription').value.trim();if(!description)return alert('Description is required.');try{await api(`/api/vs/ventures/${id}/validation-signals`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({signal_type:$('vdSigType').value,strength:$('vdSigStrength').value,description,evidence:$('vdSigEvidence').value.trim()||null,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+$('vdExpCreate').onclick=async()=>{const hypothesis=$('vdExpHypothesis').value.trim();const metric=$('vdExpMetric').value.trim();if(!hypothesis||!metric)return alert('Hypothesis and metric are required.');const budget=$('vdExpBudget').value;try{await api(`/api/vs/ventures/${id}/experiments`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hypothesis,metric,target:$('vdExpTarget').value||null,budget:budget?parseFloat(budget):null,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+document.querySelectorAll('.vdExpStart').forEach(b=>b.onclick=async()=>{try{await api(`/api/vs/experiments/${b.dataset.id}/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}});
+document.querySelectorAll('.vdExpResult').forEach(b=>b.onclick=async()=>{const result=prompt('What happened (result summary)?');if(!result)return;const decision=prompt('Decision -- CONTINUE, ITERATE, SCALE, PAUSE, or KILL:');if(!decision)return;try{await api(`/api/vs/experiments/${b.dataset.id}/result`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({result,decision:decision.toUpperCase(),actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}});
+$('vdGoalCreate').onclick=async()=>{const title=$('vdGoalTitle').value.trim();const target=parseFloat($('vdGoalTarget').value);const unit=$('vdGoalUnit').value.trim();if(!title||isNaN(target)||!unit)return alert('Title, target, and unit are required.');try{await api(`/api/vs/ventures/${id}/goals`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,target,unit,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+$('vdTaskCreate').onclick=async()=>{const objective=$('vdTaskObjective').value.trim();const task_type=$('vdTaskType').value.trim();if(!objective||!task_type)return alert('Objective and task type are required.');try{await api(`/api/vs/ventures/${id}/workforce-tasks`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:$('vdTaskDept').value,objective,task_type,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+$('vdResCreate').onclick=async()=>{const amount_or_qty=parseFloat($('vdResAmount').value);if(isNaN(amount_or_qty))return alert('Amount / qty is required.');try{await api(`/api/vs/ventures/${id}/resource-requests`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:$('vdResDept').value,resource_type:$('vdResType').value,amount_or_qty,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+document.querySelectorAll('.vdResAllocate').forEach(b=>b.onclick=async()=>{try{await api(`/api/vs/resource-requests/${b.dataset.id}/allocate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}});
+document.querySelectorAll('.vdResDeny').forEach(b=>b.onclick=async()=>{try{await api(`/api/vs/resource-requests/${b.dataset.id}/deny`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}});
+$('vdAssetCreate').onclick=async()=>{const name=$('vdAssetName').value.trim();if(!name)return alert('Name is required.');try{await api(`/api/vs/ventures/${id}/assets`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset_type:$('vdAssetType').value,name,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+document.querySelectorAll('.vdAssetRetire').forEach(b=>b.onclick=async()=>{try{await api(`/api/vs/assets/${b.dataset.id}/retire`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}});
+$('vdRiskCreate').onclick=async()=>{const title=$('vdRiskTitle').value.trim();if(!title)return alert('Title is required.');try{await api(`/api/vs/ventures/${id}/risks`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,category:$('vdRiskCategory').value,severity:$('vdRiskSeverity').value,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+if($('vdRelCreate'))$('vdRelCreate').onclick=async()=>{try{await api('/api/vs/relationships',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({venture_a_id:id,venture_b_id:$('vdRelTarget').value,relationship_type:$('vdRelType').value,actor:'Aryan'})});await selectVenture(id)}catch(e){alert(e.message)}};
+}
+const SHARED_DEPARTMENTS_JS=['Revenue/Sales','Digital Workforce','Media/Growth','Falguna Engineering','Finance','Research'];
+async function loadVsRisks(){
+const [risksResp,venturesResp]=await Promise.all([api('/api/cc/risks'),api('/api/vs/ventures')]);
+const nameById={};(venturesResp.items||[]).forEach(v=>nameById[v.id]=v.name);
+const items=(risksResp.items||[]).filter(r=>r.venture_id);
+$('vsRisksList').innerHTML=items.length?items.map(r=>`<div class="item">
+<h3>${esc(r.title)} <span style="color:var(--muted);font-weight:400">(${esc(r.status)})</span></h3>
+<div class="meta"><span>${esc(nameById[r.venture_id]||r.venture_id)}</span><span>${esc(r.category)}</span><span>severity ${esc(r.severity)}</span><span>likelihood ${esc(r.likelihood_band)}</span></div>
+${r.mitigation?`<div>${esc(r.mitigation)}</div>`:''}
+<div class="actions">
+<button class="secondary mitigating" data-id="${esc(r.id)}">Mitigating</button>
+<button class="secondary monitoring" data-id="${esc(r.id)}">Monitoring</button>
+<button class="danger closed" data-id="${esc(r.id)}">Closed</button>
+</div>
+</div>`).join(''):'<div class="empty">No venture-scoped risks logged yet.</div>';
+['mitigating','monitoring','closed'].forEach(cls=>{document.querySelectorAll('#vsRisksList .'+cls).forEach(b=>b.onclick=async()=>{await api(`/api/cc/risks/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:cls.toUpperCase(),actor:'Aryan'})});await loadVsRisks()})});
+}
+async function loadVsGraveyard(){
+const d=await api('/api/vs/graveyard');const items=d.items||[];
+$('vsGraveyardList').innerHTML=items.length?items.map(g=>{
+const experiments=JSON.parse(g.experiments_summary_json||'[]');const evidence=JSON.parse(g.evidence_summary_json||'[]');const assetsProduced=JSON.parse(g.assets_produced_json||'[]');
+return `<div class="item">
+<h3>${esc(g.original_thesis||'(no thesis recorded)')}</h3>
+<div class="meta"><span>total invested $${esc(g.total_invested)}</span><span>killed ${esc(g.killed_at)}</span></div>
+<div><b>Reason killed:</b> ${esc(g.reason_killed)}</div>
+${g.lessons?`<div><b>Lessons:</b> ${esc(g.lessons)}</div>`:''}
+${experiments.length?`<div class="meta">${experiments.map(e=>`<span>${esc(e.hypothesis)}: ${esc(e.decision||'no decision')}</span>`).join('')}</div>`:''}
+${evidence.length?`<div class="meta">${evidence.map(s=>`<span>${esc(s.signal_type)} (${esc(s.strength)})</span>`).join('')}</div>`:''}
+${assetsProduced.length?`<div class="meta">${assetsProduced.map(a=>`<span>${esc(a.asset_type)}: ${esc(a.name)}</span>`).join('')}</div>`:''}
+</div>`;
+}).join(''):'<div class="empty">No ventures have been closed yet.</div>';
+}
+$('vgCheckSimilar').onclick=async()=>{const thesis=$('vgThesisCheck').value.trim();if(!thesis)return alert('Paste a thesis to check.');const r=await api('/api/vs/graveyard/check-similar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({thesis})});$('vgSimilarResults').innerHTML=(r.items||[]).length?r.items.map(h=>`<div class="item"><h3>Similar to a past venture</h3><div class="meta"><span>${esc(h.reason_killed)}</span></div><div>overlap: ${h.overlap_words.map(esc).join(', ')}</div></div>`).join(''):'<div class="empty">No overlapping past theses found (advisory only, not a block).</div>'};
 
 loadAll().catch(e=>{$('boardroomList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`});
 </script></body></html>'''

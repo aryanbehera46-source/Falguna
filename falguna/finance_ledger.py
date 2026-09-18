@@ -49,6 +49,7 @@ class LedgerStore:
         self, entry_type: str, category: str, amount: float, evidence: Any, actor: str = "Aryan",
         currency: str = "INR", business_unit: Optional[str] = None, client_id: Optional[str] = None,
         project_ref: Optional[str] = None, occurred_on: Optional[str] = None, note: Optional[str] = None,
+        venture_id: Optional[str] = None,
     ) -> str:
         if entry_type not in LEDGER_ENTRY_TYPES:
             raise LedgerError(f"entry_type must be one of {sorted(LEDGER_ENTRY_TYPES)}")
@@ -63,7 +64,15 @@ class LedgerStore:
             "entry_type": entry_type, "category": category, "amount": amount, "currency": currency,
             "business_unit": business_unit, "client_id": client_id, "project_ref": project_ref,
             "occurred_on": occurred_on or now[:10], "evidence": json.dumps(evidence) if not isinstance(evidence, str) else evidence,
-            "note": note, "status": "RECORDED", "actor": actor, "created_at": now, "updated_at": now,
+            "note": note, "status": "RECORDED",
+            # Venture Studio v1 (Sections 4/26/27): a ledger entry
+            # optionally belongs to one venture -- NULL means company-wide,
+            # exactly as before this column existed. A venture's capital
+            # account (falguna/ventures.py) reads this column directly, so
+            # this is the single source of truth for venture-scoped spend
+            # and revenue; nothing duplicates it into a separate balance.
+            "venture_id": venture_id,
+            "actor": actor, "created_at": now, "updated_at": now,
         })
         self.audit.append("CC_LEDGER_ENTRY_RECORDED", {"entry_id": entry_id, "entry_type": entry_type, "category": category, "amount": amount, "actor": actor})
         return entry_id
@@ -90,7 +99,7 @@ class LedgerStore:
     def list(
         self, entry_type: Optional[str] = None, category: Optional[str] = None,
         business_unit: Optional[str] = None, client_id: Optional[str] = None,
-        status: str = "RECORDED",
+        status: str = "RECORDED", venture_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         clauses, params = [], []
         if status:
@@ -103,6 +112,8 @@ class LedgerStore:
             clauses.append("business_unit=?"); params.append(business_unit)
         if client_id:
             clauses.append("client_id=?"); params.append(client_id)
+        if venture_id:
+            clauses.append("venture_id=?"); params.append(venture_id)
         where = " AND ".join(clauses) if clauses else "1=1"
         return list(reversed(self.store.list("cc_ledger_entries", where, tuple(params))))
 

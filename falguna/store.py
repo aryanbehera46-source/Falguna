@@ -72,6 +72,10 @@ class StateStore:
             # post-Won states (ONBOARDING, DELIVERY, CLIENT_REVIEW, ...) on
             # top, which `stage` has no equivalent for at all today.
             ("lifecycle_state", "TEXT"),
+            # Venture Studio v1 (Section 25): an opportunity optionally
+            # belongs to one venture -- NULL means company-wide, exactly as
+            # before this column existed.
+            ("venture_id", "TEXT"),
         ],
         "needs_aryan_items": [
             # A generic structured-payload slot (Passes B-E): a "closing
@@ -83,6 +87,18 @@ class StateStore:
             # than requiring the caller to remember or re-supply it.
             ("payload_json", "TEXT"),
         ],
+        # TTT Venture Studio / Multi-Venture OS v1 (Section 27: data
+        # isolation) -- every table below gets one explicit, nullable
+        # venture_id column so a venture-scoped row is always structurally
+        # linked to its venture, never inferred by name matching. NULL
+        # means "not venture-scoped" (company-wide), exactly as it did
+        # before this column existed -- fully backward compatible.
+        "cc_ledger_entries": [("venture_id", "TEXT")],
+        "cc_goals": [("venture_id", "TEXT")],
+        "cc_risks": [("venture_id", "TEXT")],
+        "wf_tasks": [("venture_id", "TEXT")],
+        "missions": [("venture_id", "TEXT")],
+        "media_brands": [("venture_id", "TEXT")],
     }
 
     def migrate(self) -> None:
@@ -116,7 +132,10 @@ class StateStore:
             "tl_markets", "tl_instruments", "tl_data_sources", "tl_datasets", "tl_ohlcv_bars", "tl_data_quality_reports",
             "tl_strategies", "tl_strategy_versions", "tl_strategy_status_events", "tl_backtests", "tl_stress_tests",
             "tl_risk_limits", "tl_risk_breach_events", "tl_paper_accounts", "tl_paper_orders", "tl_paper_positions",
-            "tl_trades", "tl_performance_snapshots", "tl_reviews", "tl_council_decisions", "tl_graveyard"}
+            "tl_trades", "tl_performance_snapshots", "tl_reviews", "tl_council_decisions", "tl_graveyard",
+            "vs_ventures", "vs_venture_status_events", "vs_experiments", "vs_validation_signals",
+            "vs_capital_allocations", "vs_resource_requests", "vs_recommendations", "vs_graveyard",
+            "vs_assets", "vs_relationships"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

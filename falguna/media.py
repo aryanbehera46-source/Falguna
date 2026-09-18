@@ -80,7 +80,7 @@ class BrandStore:
         self, name: str, voice_tone: Optional[str] = None, audience: Optional[str] = None,
         platforms: Optional[List[str]] = None, content_pillars: Optional[List[str]] = None,
         visual_guidelines: Optional[str] = None, publishing_rules: Optional[str] = None,
-        approval_policy: Optional[str] = None, actor: str = "Aryan",
+        approval_policy: Optional[str] = None, actor: str = "Aryan", venture_id: Optional[str] = None,
     ) -> str:
         if not name or not name.strip():
             raise MediaError("name is required")
@@ -90,7 +90,12 @@ class BrandStore:
             "platforms_json": json.dumps(platforms) if platforms is not None else None,
             "content_pillars_json": json.dumps(content_pillars) if content_pillars is not None else None,
             "visual_guidelines": visual_guidelines, "publishing_rules": publishing_rules,
-            "approval_policy": approval_policy, "actor": actor, "created_at": now, "updated_at": now,
+            "approval_policy": approval_policy,
+            # Venture Studio v1 (Section 14): a brand optionally belongs to
+            # one venture, keeping TTT's and Falguna's own brand identities
+            # (venture_id=NULL) separate from a venture-owned brand.
+            "venture_id": venture_id,
+            "actor": actor, "created_at": now, "updated_at": now,
         })
         self.audit.append("MEDIA_BRAND_CREATED", {"brand_id": brand_id, "name": name, "actor": actor})
         return brand_id

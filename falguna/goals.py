@@ -35,6 +35,7 @@ class GoalStore:
         start_date: Optional[str] = None, deadline: Optional[str] = None,
         owner: Optional[str] = None, department: Optional[str] = None,
         linked_kpis: Optional[List[str]] = None, linked_actions: Optional[List[str]] = None,
+        venture_id: Optional[str] = None,
     ) -> str:
         if not title or not title.strip():
             raise GoalError("title is required")
@@ -49,6 +50,11 @@ class GoalStore:
             "owner": owner, "department": department, "status": "ACTIVE",
             "linked_kpis_json": json.dumps(linked_kpis or []),
             "linked_actions_json": json.dumps(linked_actions or []),
+            # Venture Studio v1 (Section 6): a goal optionally belongs to one
+            # venture, so it rolls up into both that venture's scorecard and
+            # the company-wide goal list untouched -- this reuses the
+            # existing goal engine rather than building a parallel one.
+            "venture_id": venture_id,
             "actor": actor, "created_at": now, "updated_at": now,
         })
         self.audit.append("CC_GOAL_CREATED", {"goal_id": goal_id, "title": title, "target": target, "unit": unit, "actor": actor})
@@ -96,15 +102,16 @@ class GoalStore:
             return None
         return self._with_computed_fields(goal)
 
-    def list(self, status: Optional[str] = None, department: Optional[str] = None) -> List[Dict[str, Any]]:
-        if status and department:
-            rows = self.store.list("cc_goals", "status=? AND department=?", (status, department))
-        elif status:
-            rows = self.store.list("cc_goals", "status=?", (status,))
-        elif department:
-            rows = self.store.list("cc_goals", "department=?", (department,))
-        else:
-            rows = self.store.list("cc_goals")
+    def list(self, status: Optional[str] = None, department: Optional[str] = None, venture_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        clauses, params = [], []
+        if status:
+            clauses.append("status=?"); params.append(status)
+        if department:
+            clauses.append("department=?"); params.append(department)
+        if venture_id:
+            clauses.append("venture_id=?"); params.append(venture_id)
+        where = " AND ".join(clauses) if clauses else "1=1"
+        rows = self.store.list("cc_goals", where, tuple(params))
         return [self._with_computed_fields(g) for g in reversed(rows)]
 
     def _with_computed_fields(self, goal: Dict[str, Any]) -> Dict[str, Any]:

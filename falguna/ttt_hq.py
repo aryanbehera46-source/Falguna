@@ -51,6 +51,18 @@ NEEDS_ARYAN_KINDS = {
     # toward live trading (which this phase does not implement).
     "trading_paper_activation_request", "trading_risk_policy_override", "trading_risk_breach",
     "trading_data_quality_uncertainty", "trading_live_mode_transition_request",
+    # Added for TTT Venture Studio / Multi-Venture OS v1 (Section 22): the
+    # eight high-impact venture decisions that must always be an owner
+    # call, never an automatic action -- non-trivial capital commitment on
+    # creation, a major budget allocation (incl. cross-venture
+    # reallocation), a launch approval, a material resource shift, a
+    # pause/kill recommendation from the recommendation engine or an
+    # explicit pause/close transition, a high-risk venture issue, and a
+    # large spend override. Routine CONTINUE/ITERATE reporting from the
+    # recommendation engine never creates one of these.
+    "venture_creation_approval", "venture_budget_allocation", "venture_launch_approval",
+    "venture_resource_shift_approval", "venture_pause_recommendation", "venture_kill_recommendation",
+    "venture_risk_escalation", "venture_large_spend_override",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 # A run in one of these statuses cannot become actionable again through
