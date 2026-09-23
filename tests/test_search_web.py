@@ -388,17 +388,22 @@ class SearchHttpLayerTests(_LiveFalgunaServerCase):
         self.assertEqual(out["sources"], [])
 
     def test_research_with_sources_but_no_authenticated_codex_degrades_to_failed_not_a_crash(self):
-        # This environment has no authenticated `codex` executable, exactly
-        # like Chat's equivalent test. A provider that finds sources but a
-        # synthesis model that is unavailable must still return 201 with a
-        # FAILED record and a clear MODEL_UNAVAILABLE error -- never a 500,
-        # never a fabricated answer.
+        # This environment has no authenticated `codex` executable and no
+        # local Ollama runtime, exactly like Chat's equivalent test. A
+        # provider that finds sources but every configured model provider
+        # is unavailable must still return 201 with a FAILED record and a
+        # clear, sanitized error -- never a 500, never a fabricated answer.
+        # Falguna V2.1: the message comes from falguna.model_router's honest
+        # NO_COMPATIBLE_MODEL reporting rather than a raw "MODEL_UNAVAILABLE:
+        # <exception>" string that could embed raw Codex CLI stdout/stderr.
         fake_provider = CallableSearchProvider(lambda q, n: [{"url": "https://real.example.com/page", "title": "A real page"}], name="fake")
         with unittest.mock.patch.object(web, "SEARCH_PROVIDER", fake_provider):
             status, out = self._post("/api/research", {"query": "a query with one real source"})
         self.assertEqual(status, 201)
         self.assertEqual(out["research"]["status"], "FAILED")
-        self.assertIn("MODEL_UNAVAILABLE", out["research"]["error"])
+        self.assertIn("provider", out["research"]["error"].lower())
+        self.assertNotIn("Traceback", out["research"]["error"])
+        self.assertNotIn("stdout=", out["research"]["error"])
         # save_failure never calls save_result, so no source rows are ever
         # written on a synthesis failure -- a failed research record cites
         # nothing, rather than half-persisting sources for an answer that

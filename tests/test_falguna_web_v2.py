@@ -27,9 +27,11 @@ from pathlib import Path
 
 from falguna.attachments import AttachmentError, AttachmentStore
 from falguna.chat import ChatError, ConversationStore
+from falguna.models import RunPolicy, WorkerResult
 from falguna.notifications import NotificationStore
 from falguna.runtime import open_control_plane
 from falguna.web import FalgunaHandler, WORK_MODE_SETTINGS
+from falguna.workers import ScriptedWorker
 
 
 class ChatMessageStateTests(unittest.TestCase):
@@ -470,7 +472,10 @@ class AggregateEndpointsHttpTests(_LiveFalgunaServerCase):
     def test_missions_board_buckets_are_present_and_empty_on_a_fresh_repo(self):
         status, board = self._get("/api/missions/board")
         self.assertEqual(status, 200)
-        self.assertEqual(set(board.keys()), {"running", "needs_you", "completed", "failed", "cancelled"})
+        # Falguna V2.1: "archived" is a real bucket too now (Mission Control
+        # count cleanup) -- a run explicitly dismissed from the active board,
+        # never deleted. See _archive_run_from_board in web.py.
+        self.assertEqual(set(board.keys()), {"running", "needs_you", "completed", "failed", "cancelled", "archived"})
         self.assertEqual(sum(len(v) for v in board.values()), 0)
 
     def test_live_summary_reports_zero_counts_on_a_fresh_repo(self):
@@ -514,6 +519,100 @@ class AggregateEndpointsHttpTests(_LiveFalgunaServerCase):
         self.assertEqual(status, 200)
         self.assertEqual(out["marked"], 0)
         self.assertEqual(self._get_status("/api/notifications/does-not-exist"), 404)
+
+
+class MissionControlArchiveTests(_LiveFalgunaServerCase):
+    """Falguna V2.1: Mission Control count cleanup. Archiving is a pure
+    board-visibility toggle -- these tests prove it never deletes or
+    mutates the underlying run, never lets an actively-running mission be
+    hidden from view, and correctly moves cards in/out of the headline
+    counts (the "0 running / 27 needs you / 55 failed" confusion this
+    feature exists to fix)."""
+
+    port = 8805
+
+    def _create_run(self, status="FAILED"):
+        """Boots a real run through the real control plane (mirroring
+        test_chat_web.py's handoff test), then force-overrides its status
+        directly in the store so each test can target a specific bucket
+        without needing a real worker failure/success to occur."""
+        policy = RunPolicy()
+        ids = self.control.create_mission("fix", "set value to 2", self.repo, policy)
+        run_id = self.control.start(
+            ids["task_id"], ScriptedWorker(lambda *_: WorkerResult(True, "ok", 0)),
+            "scripted", "none", policy, force_stop_after="WORKTREE_READY",
+        )
+        if status is not None:
+            self.store.update("runs", run_id, status=status)
+        return run_id
+
+    def test_archiving_a_failed_run_moves_it_out_of_failed_and_into_archived(self):
+        run_id = self._create_run(status="FAILED")
+        status, board = self._get("/api/missions/board")
+        self.assertEqual({c["run_id"] for c in board["failed"]}, {run_id})
+        self.assertEqual(board["archived"], [])
+
+        status, out = self._post(f"/api/runs/{run_id}/board-archive", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(out, {"run_id": run_id, "archived": True})
+
+        status, board = self._get("/api/missions/board")
+        self.assertEqual(board["failed"], [])
+        self.assertEqual({c["run_id"] for c in board["archived"]}, {run_id})
+        self.assertTrue(board["archived"][0]["archived"])
+
+    def test_unarchiving_restores_a_run_to_its_real_status_bucket(self):
+        run_id = self._create_run(status="FAILED")
+        self._post(f"/api/runs/{run_id}/board-archive", {})
+        status, out = self._post(f"/api/runs/{run_id}/board-unarchive", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(out, {"run_id": run_id, "archived": False})
+
+        status, board = self._get("/api/missions/board")
+        self.assertEqual({c["run_id"] for c in board["failed"]}, {run_id})
+        self.assertEqual(board["archived"], [])
+
+    def test_archiving_never_deletes_or_mutates_the_underlying_run(self):
+        run_id = self._create_run(status="CANCELLED")
+        status, before = self._get(f"/api/runs/{run_id}")
+        self.assertEqual(status, 200)
+
+        status, _ = self._post(f"/api/runs/{run_id}/board-archive", {})
+        self.assertEqual(status, 200)
+
+        # Still fully reachable by id, with the same real status -- archiving
+        # touched only the board-visibility flag, nothing else.
+        status, after = self._get(f"/api/runs/{run_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(after["status"], "CANCELLED")
+
+    def test_an_actively_running_mission_cannot_be_archived(self):
+        run_id = self._create_run(status="WORKING")
+        status, out = self._post(f"/api/runs/{run_id}/board-archive", {})
+        self.assertEqual(status, 400)
+        self.assertIn("actively running", out["error"].lower())
+
+        # And it must stay fully visible in the running bucket, never
+        # silently dropped from the board.
+        status, board = self._get("/api/missions/board")
+        self.assertEqual({c["run_id"] for c in board["running"]}, {run_id})
+        self.assertEqual(board["archived"], [])
+
+    def test_live_summary_excludes_archived_runs_from_its_counts(self):
+        needs_you_run = self._create_run(status="PAUSED")
+        failed_run = self._create_run(status="FAILED")
+
+        status, live = self._get("/api/live-summary")
+        self.assertEqual(live["needs_you"], 1)
+        self.assertEqual(live["failed"], 1)
+
+        self._post(f"/api/runs/{needs_you_run}/board-archive", {})
+        self._post(f"/api/runs/{failed_run}/board-archive", {})
+
+        status, live = self._get("/api/live-summary")
+        self.assertEqual(live["needs_you"], 0)
+        self.assertEqual(live["failed"], 0)
 
 
 if __name__ == "__main__":

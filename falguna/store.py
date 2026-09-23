@@ -135,7 +135,24 @@ class StateStore:
             # handoff panel's suggestion was silently always empty. Additive,
             # nullable column so this can actually be stored and surfaced.
             ("suggested_objective", "TEXT"),
+            # Falguna V2.1 (sanitized error UX): `error` stays the safe,
+            # user-facing sentence a FalgunaModelError/ChatError already
+            # composed -- never raw provider stdout. `error_category` is one
+            # of falguna.providers.ErrorCategory, driving which recovery
+            # actions the UI offers (Retry / Change model / Use local model /
+            # Open Settings). `error_detail` is the raw technical text (if
+            # any) for an expandable "technical details" panel only -- never
+            # rendered by default, never included in `error`.
+            ("error_category", "TEXT"), ("error_detail", "TEXT"),
         ],
+        # Falguna V2.1 (Mission Control count cleanup): a run can be
+        # explicitly archived off the active board -- this is a
+        # board-visibility flag only, never a merge/reject/approve decision
+        # and never a delete; the run row, its checkpoints, approvals, and
+        # audit trail are completely unchanged. NULL/0 (every run created
+        # before this column existed) means "not archived", i.e. counted in
+        # the board's active buckets exactly as before.
+        "runs": [("mc_archived", "INTEGER")],
         # Per-conversation/per-research model and work-mode overrides
         # (Sections 5-6). NULL means "use the global default", identical to
         # every conversation/research row created before these existed.
@@ -185,7 +202,9 @@ class StateStore:
             "co_escalations", "co_timeline_events", "co_traceability_links", "co_memory", "co_failures",
             "co_cost_estimates", "co_goal_feedback_events", "co_daily_loops", "co_weekly_reviews",
             # Falguna Product Experience V2
-            "attachments", "notifications"}
+            "attachments", "notifications",
+            # Falguna V2.1: UX Hardening + Provider Independence Foundation
+            "model_settings"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

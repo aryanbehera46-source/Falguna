@@ -16,8 +16,12 @@ from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL, Resilie
 from .continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
 from .discovery import ProjectDiscovery
 from .gateway import OpenAICompatibleGateway
+from .model_router import (
+    DEFAULT_REGISTRY_SETTINGS, ModelRegistry, ModelRouter, PRIVACY_MODES, build_providers, provider_status_snapshot,
+)
 from .models import CommandSpec, RunPolicy
 from .notifications import NotificationStore
+from .providers import ALL_ERROR_CATEGORIES, ErrorCategory, FalgunaModelError
 from .research import ResearchError, ResearchResponder, ResearchStore, rank_sources
 from .review import ModelSemanticReviewer
 from .runtime import open_control_plane
@@ -66,6 +70,19 @@ def _model_choice(value) -> str:
 def _build_transport(codex_path, codex_home, timeout_seconds: int, use_fallback: bool):
     base = CodexCliJSONTransport(Path(codex_path), codex_home, timeout_seconds=timeout_seconds)
     return ResilientCodexTransport(base) if use_fallback else base
+
+
+def _build_router(store, use_fallback: bool = True) -> ModelRouter:
+    """Falguna V2.1: the provider-neutral seam Chat/Research/Work now all
+    construct their transport through, instead of hard-coding a Codex-only
+    OpenAICompatibleGateway+CodexCliJSONTransport pair. `_build_transport`
+    above is kept only because a couple of narrow call sites (mission
+    resume) still use it directly against Codex specifically; every other
+    call site below goes through this router so a local (Ollama) or
+    explicitly-enabled external provider is tried using the same
+    Explicit -> Preferred-local -> Other-local -> External -> None policy,
+    honoring whatever Privacy Mode is currently configured."""
+    return ModelRouter.from_registry(ModelRegistry(store), codex_use_fallback=use_fallback)
 
 
 class DiscoveryUncertain(ValueError):
@@ -121,13 +138,26 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             return self._html(INDEX_HTML)
         if path == "/api/config":
             profiles = load_profiles(self.app_root)
+            control, store = open_control_plane(self.app_root)
+            try:
+                privacy_mode = ModelRegistry(store).load()["privacy_mode"]
+            finally:
+                store.close()
             return self._json({
                 "product": "Falguna Engineering", "stage": "internal alpha", "profiles": profiles, "model": MODEL,
                 "available_models": sorted(SUPPORTED_CODEX_MODELS), "codex_runtime_found": bool(shutil.which("codex")),
                 "work_modes": list(WORK_MODE_SETTINGS), "default_work_mode": DEFAULT_WORK_MODE,
+                # Falguna V2.1: Codex remains listed above for full backward
+                # compatibility (every conversation's model_override is still
+                # a bare Codex model id unless the person explicitly picks a
+                # provider/model pair), but it is no longer the only runtime
+                # -- see /api/models for the full, live, multi-provider view.
+                "privacy_mode": privacy_mode,
             })
         if path == "/api/settings":
             return self._settings()
+        if path == "/api/models":
+            return self._models_status()
         if path == "/api/search":
             query = parse_qs(parsed.query).get("q", [""])[0]
             return self._search(query)
@@ -217,6 +247,59 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             ],
         })
 
+    def _models_status(self):
+        """Settings -> Models (Falguna V2.1): live health + model list for
+        every currently-enabled provider, plus the persisted registry
+        (privacy mode, preferred local model, provider config) -- safe to
+        return verbatim, since ModelRegistry.public_view() and
+        provider_status_snapshot() never include a secret value, only the
+        name of the environment variable a credential would come from."""
+        control, store = open_control_plane(self.app_root)
+        try:
+            registry = ModelRegistry(store)
+            settings = registry.load()
+            providers = build_providers(settings)
+            return self._json({
+                "privacy_modes": list(PRIVACY_MODES),
+                "registry": registry.public_view(),
+                "providers": provider_status_snapshot(providers),
+            })
+        finally:
+            store.close()
+
+    def _update_model_settings(self, body):
+        """Explicit-only provider/privacy configuration (Section: no silent
+        external default). Every field the person did not send is left
+        untouched -- this is a merge onto the persisted registry, never a
+        blind overwrite, so toggling Privacy Mode from Settings can never
+        accidentally wipe out a Provider Setup the person configured
+        earlier in the same session."""
+        control, store = open_control_plane(self.app_root)
+        try:
+            registry = ModelRegistry(store)
+            settings = registry.load()
+            if "privacy_mode" in body:
+                mode = str(body.get("privacy_mode") or "").upper()
+                if mode not in PRIVACY_MODES:
+                    raise ValueError(f"privacy_mode must be one of {', '.join(PRIVACY_MODES)}")
+                settings["privacy_mode"] = mode
+            if "preferred_local_model" in body:
+                value = body.get("preferred_local_model")
+                settings["preferred_local_model"] = (str(value).strip() or None) if value is not None else None
+            incoming_providers = body.get("providers")
+            if isinstance(incoming_providers, dict):
+                for provider_id, patch in incoming_providers.items():
+                    if not isinstance(patch, dict):
+                        continue
+                    current = settings["providers"].setdefault(provider_id, {})
+                    for key in ("enabled", "base_url", "is_local", "api_key_env", "model_allowlist", "display_name"):
+                        if key in patch:
+                            current[key] = patch[key]
+            registry.save(settings)
+            return self._json({"registry": registry.public_view()})
+        finally:
+            store.close()
+
     def _search(self, query):
         control, store = open_control_plane(self.app_root)
         try:
@@ -285,7 +368,16 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             profiles_by_repo = {p["repository"]: p["name"] for p in load_profiles(self.app_root)}
             chat_store = ConversationStore(store)
             research_store = ResearchStore(store)
-            board = {"running": [], "needs_you": [], "completed": [], "failed": [], "cancelled": []}
+            # Falguna V2.1: an "archived" bucket for a run the person has
+            # explicitly dismissed from the active board (Settings has no
+            # equivalent -- this is a per-run action from the Mission
+            # Control card itself). Archiving never deletes anything and
+            # never counts as a merge decision; it only moves a resolved
+            # run's card out of the headline active-count buckets, which is
+            # what the "0 running / 27 needs you / 55 failed" confusion was
+            # actually about -- every run this repo has ever produced was
+            # counted forever, with no way to say "seen, done with this".
+            board = {"running": [], "needs_you": [], "completed": [], "failed": [], "cancelled": [], "archived": []}
             for run in reversed(store.list("runs")[-200:]):
                 task = store.get("tasks", run["task_id"])
                 requirement = store.get("requirements", task["requirement_id"])
@@ -308,8 +400,15 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                     "started_at": run["created_at"], "last_activity": run["updated_at"],
                     "cost_usd": round(sum(float(c["amount_usd"]) for c in costs), 8),
                     "evidence_count": len(artifacts), "merge_approval": merge_status, "current_step": current_step,
+                    "archived": bool(run.get("mc_archived")),
                 }
-                if run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"}:
+                is_actively_running = run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"}
+                if card["archived"] and not is_actively_running:
+                    # An actively-running mission is never archived even if
+                    # the flag was somehow set (defensive: it must stay
+                    # visible and monitorable while real work is happening).
+                    board["archived"].append(card)
+                elif is_actively_running:
                     board["running"].append(card)
                 elif run["status"] == "PAUSED" or (run["status"] == "DONE_CANDIDATE" and merge_status == "PENDING"):
                     board["needs_you"].append(card)
@@ -323,11 +422,39 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
+    def _archive_run_from_board(self, run_id, archived):
+        """Mission Control's dismiss/restore action (Falguna V2.1). Purely a
+        board-visibility flag -- never a merge/reject/approve decision, and
+        the run row, checkpoints, approvals, and audit log are completely
+        untouched either way, so an archived run is still fully reachable
+        (the Archived bucket, or by run id directly) and nothing about its
+        history is lost."""
+        control, store = open_control_plane(self.app_root)
+        try:
+            run = store.get("runs", run_id)
+            if not run:
+                return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
+            if archived and run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"}:
+                return self._json({"error": "An actively running mission can't be archived -- pause or wait for it to finish first"}, HTTPStatus.BAD_REQUEST)
+            store.update("runs", run_id, mc_archived=1 if archived else 0)
+            return self._json({"run_id": run_id, "archived": bool(archived)})
+        finally:
+            store.close()
+
     def _live_summary(self):
         control, store = open_control_plane(self.app_root)
         try:
             running = needs_you = failed = 0
             for run in store.list("runs")[-200:]:
+                # Falguna V2.1: an archived run (dismissed from the Mission
+                # Control board, never deleted -- see _archive_run_from_board)
+                # is excluded from this header indicator too, for the same
+                # reason: this count is supposed to mean "needs your
+                # attention right now", not "every run of this kind that has
+                # ever existed". An actively-running mission is exempted from
+                # archiving itself, so it is never wrongly excluded here.
+                if run.get("mc_archived") and run["status"] not in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"}:
+                    continue
                 approvals = store.list("approvals", "run_id=? AND kind=?", (run["id"], "PROTECTED_BRANCH_MERGE"))
                 merge_status = approvals[-1]["status"] if approvals else "NOT_REQUESTED"
                 if run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"}:
@@ -459,6 +586,9 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                     _operations[token] = {"state": "STARTING", "run_id": run_id}
                 threading.Thread(target=_resume_mission, args=(self.app_root, token, run_id), daemon=True).start()
                 return self._json({"operation": token, "state": "STARTING"}, HTTPStatus.ACCEPTED)
+            if path.startswith("/api/runs/") and path.endswith(("/board-archive", "/board-unarchive")):
+                run_id = path.split("/")[3]
+                return self._archive_run_from_board(run_id, path.endswith("/board-archive"))
             if path.startswith("/api/runs/") and path.endswith(("/pause", "/cancel")):
                 run_id = path.split("/")[3]
                 action = path.rsplit("/", 1)[-1].upper()
@@ -509,6 +639,8 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 return self._mark_notification_read(segments[3])
             if path == "/api/notifications/read-all":
                 return self._mark_all_notifications_read()
+            if path == "/api/models/settings":
+                return self._update_model_settings(body)
             if path == "/api/research":
                 return self._run_research(body)
             if path.startswith("/api/research/") and path.endswith("/continue-chat"):
@@ -798,15 +930,13 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             try:
                 provider_result = SEARCH_PROVIDER.search(query_text, max_results=6)
                 sources = rank_sources(provider_result.sources)
-                codex = shutil.which("codex")
-                if sources and not codex:
-                    raise ResearchError("MODEL_UNAVAILABLE: authenticated Codex executable not found")
-                if codex:
-                    gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
-                    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-                    transport = _build_transport(codex, codex_home, settings["research_timeout"], settings["fallback"])
-                else:
-                    gateway = transport = None  # only reachable when sources is empty; reply() never touches these in that case
+                # ResearchResponder.reply() itself never touches gateway/transport
+                # when `sources` is empty (see research.py) -- always building
+                # them here is cheap (no I/O happens at construction time) and
+                # removes the need for this handler to special-case "is Codex
+                # installed" the way it used to.
+                gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
+                transport = _build_router(store, use_fallback=settings["fallback"])
                 outcome = ResearchResponder(gateway, transport, model, timeout_seconds=settings["research_timeout"]).reply(query_text, sources)
                 rs.save_result(research_id, outcome["answer"], sources, outcome["citations"], outcome["suggested_objective"], model_call=outcome["model_call"])
                 NotificationStore(store).notify_once("RESEARCH_COMPLETE", f"Research ready: {query_text[:70]}", "", "research", research_id)
@@ -921,12 +1051,12 @@ def _run_mission(app_root, token, profile, objective, editable, commands, cap, d
         dependency_path = Path(profile["repository"]) / profile.get("package_root", ".") / "node_modules"
         browser_applicable = browser_e2e_applicable(objective, editable, profile)
         policy = RunPolicy(allowed_write_globs=editable, verification_commands=commands, max_cost_usd=cap, dependency_node_path=str(dependency_path) if dependency_path.is_dir() else None, verification_write_regexes=profile.get("verification_write_regexes", []), browser_applicable=browser_applicable, browser_base_url=profile.get("browser_base_url") if browser_applicable else None, browser_project_roots=profile.get("browser_project_roots", ["."]), browser_cached_install_allowed=bool(profile.get("browser_cached_install_allowed", False)), browser_external_probe_required=bool(profile.get("browser_external_probe_required", False)), require_implementation_change=discovery.get("objective_kind") == "FEATURE_CHANGE", implementation_files=discovery.get("implementation_files", []), max_attempts=settings["max_attempts"])
-        codex = shutil.which("codex")
-        if not codex:
-            raise RuntimeError("authenticated Codex executable not found")
         gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
-        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-        transport = _build_transport(codex, codex_home, settings["mission_timeout"], settings["fallback"])
+        transport = _build_router(store, use_fallback=settings["fallback"])
+        try:
+            transport.resolve(model)  # fail fast, before a mission/run is ever created -- same contract as the old "no codex, no mission" check, now honestly covering every configured provider instead of only Codex
+        except FalgunaModelError as exc:
+            raise RuntimeError(exc.message) from exc
         worker = StructuredEditWorker(gateway, editable, timeout_seconds=settings["mission_timeout"], transport=transport)
         control.reviewer = ModelSemanticReviewer(gateway, timeout_seconds=settings["mission_timeout"], transport=transport)
         ids = control.create_mission(objective[:80], objective, Path(profile["repository"]), policy)
@@ -971,12 +1101,12 @@ def _resume_mission(app_root, token, run_id):
         raw = json.loads(task["policy_json"])
         raw["verification_commands"] = [CommandSpec(**item) for item in raw.get("verification_commands", [])]
         policy = RunPolicy(**raw)
-        codex = shutil.which("codex")
-        if not codex:
-            raise RuntimeError("authenticated Codex executable not found")
         gateway = OpenAICompatibleGateway(run["model"], "http://127.0.0.1:1/v1", "")
-        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-        transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=300))
+        transport = _build_router(store, use_fallback=True)
+        try:
+            transport.resolve(run["model"])
+        except FalgunaModelError as exc:
+            raise RuntimeError(exc.message) from exc
         worker = StructuredEditWorker(gateway, policy.allowed_write_globs, timeout_seconds=300, transport=transport)
         control.reviewer = ModelSemanticReviewer(gateway, timeout_seconds=300, transport=transport)
         with _operations_lock:
@@ -1006,24 +1136,27 @@ def _run_chat_reply(app_root, token, conversation_id, message_id, history, model
         with _operations_lock:
             _operations[token]["state"] = "THINKING"
         chat.mark_generating(message_id)
-        codex = shutil.which("codex")
-        if not codex:
-            raise ChatError("MODEL_UNAVAILABLE: authenticated Codex executable not found")
         gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
-        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-        transport = _build_transport(codex, codex_home, settings["chat_timeout"], settings["fallback"])
+        transport = _build_router(store, use_fallback=settings["fallback"])
         outcome = ChatResponder(gateway, transport, model, timeout_seconds=settings["chat_timeout"]).reply(history)
         applied = chat.complete_message(message_id, outcome["reply"], outcome["model_call"], outcome["suggested_objective"])
         with _operations_lock:
             _operations[token] = {**_operations.get(token, {}), "state": "COMPLETE" if applied else "CANCELLED", "message_id": message_id}
     except ChatError as exc:
-        applied = chat.fail_message(message_id, str(exc))
+        # exc's own str() is already the sanitized, user-safe message (see
+        # chat.ChatError.__init__) -- exc.category/exc.technical_detail carry
+        # the machine-readable category and any raw provider text, persisted
+        # separately so the UI can offer contextual recovery actions and an
+        # expandable technical-details panel without ever showing raw
+        # provider stdout in the primary bubble.
+        applied = chat.fail_message(message_id, str(exc), category=exc.category, detail=exc.technical_detail)
         with _operations_lock:
             _operations[token] = {**_operations.get(token, {}), "state": "FAILED" if applied else "CANCELLED", "error": str(exc), "message_id": message_id}
     except Exception as exc:
-        chat.fail_message(message_id, f"UNEXPECTED_FAILURE: {exc}")
+        safe_message = "Falguna hit an unexpected internal error generating this reply."
+        chat.fail_message(message_id, safe_message, category=ErrorCategory.UNEXPECTED_FAILURE, detail=str(exc))
         with _operations_lock:
-            _operations[token] = {**_operations.get(token, {}), "state": "FAILED", "error": str(exc), "message_id": message_id}
+            _operations[token] = {**_operations.get(token, {}), "state": "FAILED", "error": safe_message, "message_id": message_id}
     finally:
         store.close()
 
@@ -1052,7 +1185,7 @@ INDEX_HTML = r'''<!doctype html>
   --bg:#161310;--bg-glow:#241d12;--side:#1b1712;--panel:#211c15;--soft:#2a231a;--soft2:#332b1e;
   --line:#3c3325;--text:#f7f0e3;--muted:#ab9c86;--muted-dim:#7c7060;
   --accent:#e8a33d;--accent-hi:#f4bd63;--accent-ink:#2a1707;--accent-dim:#4d3a1e;--accent-soft:#332818;
-  --warn:#f0c752;--bad:#ff8f78;--bad-dim:#4a2c25;--good:#7fd99a;
+  --warn:#f0c752;--bad:#ff8f78;--bad-dim:#4a2c25;--bad-ink:#ffd4c9;--good:#7fd99a;
   --user-bg:#2c2519;--user-ink:#e9dcc6;--shadow:#000c;--shadow-lite:#000a;--scrim:#0009;
 }
 @media (prefers-color-scheme:light){
@@ -1061,7 +1194,7 @@ INDEX_HTML = r'''<!doctype html>
     --bg:#faf6ee;--bg-glow:#fff9ec;--side:#f4eedb;--panel:#ffffff;--soft:#f1e7d3;--soft2:#e9dabf;
     --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#8c7c60;
     --accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;
-    --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--good:#1e7a43;
+    --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--bad-ink:#7a2415;--good:#1e7a43;
     --user-bg:#efe0c2;--user-ink:#241c10;--shadow:#0002;--shadow-lite:#0001;--scrim:#0004;
   }
 }
@@ -1070,7 +1203,7 @@ INDEX_HTML = r'''<!doctype html>
   --bg:#faf6ee;--bg-glow:#fff9ec;--side:#f4eedb;--panel:#ffffff;--soft:#f1e7d3;--soft2:#e9dabf;
   --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#8c7c60;
   --accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;
-  --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--good:#1e7a43;
+  --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--bad-ink:#7a2415;--good:#1e7a43;
   --user-bg:#efe0c2;--user-ink:#241c10;--shadow:#0002;--shadow-lite:#0001;--scrim:#0004;
 }
 *{box-sizing:border-box}
@@ -1091,7 +1224,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .new-chat:hover{background:var(--soft2);border-color:#4a3d28}
 .new-chat svg{color:var(--accent)}
 .nav{display:grid;gap:1px;flex:none;margin-top:16px}
-.nav-item{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:7px 9px;border-radius:8px;color:#cdbfa9;text-align:left;cursor:pointer;font-size:13px;transition:background .12s,color .12s}
+.nav-item{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:7px 9px;border-radius:8px;color:var(--muted);text-align:left;cursor:pointer;font-size:13px;transition:background .12s,color .12s}
 .nav-item:hover{background:var(--soft);color:var(--text)}
 .nav-item.active{background:var(--accent-soft);color:var(--accent-hi);font-weight:650}
 .nav-icon{width:16px;height:16px;display:grid;place-items:center;color:var(--muted-dim);flex:none}
@@ -1112,7 +1245,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .workspace{min-width:0;min-height:0;display:grid;grid-template-rows:54px minmax(0,1fr);overflow:hidden}
 .topbar{border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 22px;background:linear-gradient(180deg,#1a1610,transparent)}
 .topbar-title{display:flex;align-items:center;gap:10px;min-width:0}
-.topbar-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650;font-size:14px;color:#e7dcc7}
+.topbar-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650;font-size:14px;color:var(--text)}
 .menu-button{display:none;border:0;background:transparent;color:var(--text);padding:6px;border-radius:7px;cursor:pointer}
 .model-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:5px 11px 5px 9px;font-size:11.5px;white-space:nowrap}
 .model-pill .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
@@ -1145,7 +1278,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .pill-btn{border:1px solid var(--line);background:var(--soft);color:var(--text);border-radius:999px;padding:7px 13px;font-size:12px;cursor:pointer}
 .pill-btn:hover{background:var(--soft2);border-color:#4a3d28}
 .settings-list{display:grid;gap:7px;margin:14px 0 28px}
-.settings-list div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 14px;font-size:12.5px;color:#d8cbb4}
+.settings-list div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 14px;font-size:12.5px;color:var(--text)}
 .settings-note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:12px 15px;color:var(--muted);font-size:12.5px;margin-bottom:22px}
 .section-label{font-size:12.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted-dim);font-weight:700;margin:26px 0 4px}
 .status-pill{display:inline-block;border-radius:999px;padding:2px 9px;font-size:10.5px;text-transform:capitalize;border:1px solid var(--line)}
@@ -1153,16 +1286,46 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .status-pill.failed,.status-pill.quarantined{color:var(--bad);border-color:#5c332c}
 .status-pill.pending,.status-pill.working,.status-pill.reviewing,.status-pill.verifying,.status-pill.planning{color:var(--warn);border-color:#5c4c2a}
 
+/* ---------- Settings -> Models (Falguna V2.1: provider independence) ---------- */
+.privacy-mode-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:9px;margin:10px 0 24px}
+.privacy-mode-card{text-align:left;border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:12px 14px;cursor:pointer;display:flex;flex-direction:column;gap:4px;transition:border-color .12s,background .12s}
+.privacy-mode-card b{font-size:13px;color:var(--text)}
+.privacy-mode-card span{font-size:11.5px;color:var(--muted);line-height:1.4}
+.privacy-mode-card.active{border-color:var(--accent);background:var(--accent-soft)}
+.privacy-mode-card.active b{color:var(--accent-hi)}
+.provider-cards{display:grid;gap:10px;margin:10px 0 24px}
+.provider-card{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:13px 15px}
+.provider-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.provider-name{font-weight:650;font-size:13px;color:var(--text)}
+.provider-meta{color:var(--muted-dim);font-size:11px;margin-top:2px}
+.provider-detail{color:var(--muted);font-size:12px;margin-top:7px}
+.provider-models{color:var(--muted);font-size:11.5px;margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+.provider-models.muted{color:var(--muted-dim);font-style:italic}
+.health-pill{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 10px;font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.04em;border:1px solid var(--line);white-space:nowrap}
+.health-pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.health-healthy{color:var(--good);border-color:var(--good)}
+.health-degraded{color:var(--warn);border-color:var(--warn)}
+.health-rate_limited{color:var(--warn);border-color:var(--warn)}
+.health-auth_required{color:var(--bad);border-color:var(--bad)}
+.health-offline{color:var(--muted-dim);border-color:var(--line)}
+.health-unsupported{color:var(--muted-dim);border-color:var(--line)}
+.provider-setup{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:13px 15px;margin-bottom:24px}
+.provider-setup summary{cursor:pointer;font-weight:650;font-size:12.5px;color:var(--text)}
+.settings-form{display:grid;gap:11px;margin-top:14px}
+.settings-form label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--muted)}
+.settings-form label input[type=text],.settings-form label input:not([type]){background:var(--soft);border:1px solid var(--line);color:var(--text);border-radius:9px;padding:9px 11px;font-size:12.5px}
+.settings-form label.checkbox-row{flex-direction:row;align-items:center;gap:8px;font-size:12.5px;color:var(--text)}
+
 /* ---------- Chat view ---------- */
 .chat-view{display:grid;grid-template-rows:minmax(0,1fr) auto;min-height:0;height:100%}
 .chat-scroll{min-height:0;overflow:auto;padding:0 max(22px,calc((100vw - 264px - 760px)/2))}
 .chat-welcome{max-width:600px;margin:9vh auto 0;text-align:center}
 .chat-welcome .glow{width:54px;height:54px;margin:0 auto 20px;border-radius:16px;background:linear-gradient(155deg,var(--accent-hi),var(--accent));display:grid;place-items:center;box-shadow:0 18px 44px -14px #e8a33d55}
 .chat-welcome .glow svg{color:var(--accent-ink);width:26px;height:26px}
-.chat-welcome h1{font-size:26px;margin:0 0 8px;font-weight:650;letter-spacing:-.015em;color:#f7f0e3}
+.chat-welcome h1{font-size:26px;margin:0 0 8px;font-weight:650;letter-spacing:-.015em;color:var(--text)}
 .chat-welcome p{color:var(--muted);font-size:14px;margin:0 0 26px}
 .chip-row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
-.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 15px;cursor:pointer;color:#d8cbb4;font-size:12.5px;display:inline-flex;align-items:center;gap:7px;transition:border-color .12s,background .12s}
+.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 15px;cursor:pointer;color:var(--muted);font-size:12.5px;display:inline-flex;align-items:center;gap:7px;transition:border-color .12s,background .12s}
 .chip:hover{border-color:#4a3d28;background:var(--soft)}
 .chip svg{width:13px;height:13px;color:var(--muted-dim)}
 .thread{max-width:760px;margin:0 auto;padding:26px 0 8px;display:grid;gap:18px}
@@ -1172,7 +1335,15 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .msg.assistant .avatar{background:linear-gradient(155deg,var(--accent-hi),var(--accent));color:var(--accent-ink)}
 .msg .bubble{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:12px 15px;overflow-wrap:anywhere;min-width:0;flex:1;font-size:13.5px}
 .msg.user .bubble{background:var(--user-bg);border-color:#463a27}
-.msg .bubble.error{border-color:#5c332c;background:var(--bad-dim);color:#ffd4c9}
+.msg .bubble.error{border-color:#5c332c;background:var(--bad-dim);color:var(--bad-ink)}
+.msg .bubble.error .error-cat{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;opacity:.75;margin-bottom:4px}
+.msg .bubble.error .error-detail{margin-top:8px;padding-top:8px;border-top:1px solid var(--bad-ink);opacity:.82;font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.msg .bubble.error .error-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:9px}
+.msg .bubble.error .error-actions button{border:1px solid var(--bad-ink);background:transparent;color:var(--bad-ink);border-radius:8px;padding:4px 10px;font-size:11.5px;cursor:pointer}
+.msg .bubble.error .error-actions a{color:var(--bad-ink);font-size:11.5px;text-decoration:underline}
+.msg .bubble.error .error-actions details{width:100%}
+.msg .bubble.error .error-actions summary{cursor:pointer;color:var(--bad-ink);font-size:11.5px;list-style:none}
+.msg .bubble.error .error-actions summary::-webkit-details-marker{display:none}
 .msg .who{color:var(--muted-dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;font-weight:650}
 .thinking{color:var(--muted);font-style:italic;display:flex;align-items:center;gap:6px}
 .thinking .tdot{width:5px;height:5px;border-radius:50%;background:var(--accent);animation:tpulse 1.1s ease-in-out infinite}
@@ -1202,12 +1373,26 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .handoff-panel h3 svg{width:14px;height:14px;color:var(--accent)}
 .handoff-panel .sub{color:var(--muted-dim);font-size:11.5px;margin:0 0 12px}
 .handoff-panel label{display:block;color:var(--muted);font-size:11.5px;margin:10px 0 5px;font-weight:600}
-.handoff-panel input,.handoff-panel select,.handoff-panel textarea{width:100%;color:var(--text);background:#120e08;border:1px solid var(--line);border-radius:9px;padding:9px 10px}
+.handoff-panel input,.handoff-panel select,.handoff-panel textarea{width:100%;color:var(--text);background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:9px 10px}
 .handoff-panel textarea{min-height:60px;resize:vertical}
+/* Falguna V2.1: compact Chat -> Work trigger replacing the always-expanded
+   panel above -- a single pill the person clicks when they actually want
+   to hand off, never auto-opened (in particular, never opened just because
+   a reply FAILED -- see renderMessageRow's error bubble, which only ever
+   offers Retry / Change model, not this). */
+.handoff-trigger-row{max-width:760px;margin:0 auto 10px;padding:0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.handoff-trigger{display:inline-flex;align-items:center;gap:7px;color:var(--accent-hi)}
+.handoff-trigger svg{color:var(--accent)}
+.handoff-prior{color:var(--muted-dim);font-size:11.5px}
+.handoff-prior a{color:var(--muted)}
+.modal.handoff-modal{max-width:480px;text-align:left}
+.modal.handoff-modal label{display:block;color:var(--muted);font-size:11.5px;margin:10px 0 5px;font-weight:600}
+.modal.handoff-modal select,.modal.handoff-modal textarea{width:100%;color:var(--text);background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:9px 10px}
+.modal.handoff-modal textarea{min-height:80px;resize:vertical}
 .handoff-actions{display:flex;gap:9px;margin-top:13px;flex-wrap:wrap}
 button.action{border:0;border-radius:9px;padding:9px 14px;font-weight:650;cursor:pointer;background:var(--accent);color:var(--accent-ink);font-size:13px}
 button.action.secondary{background:var(--soft2);color:var(--text)}
-button.action.danger{background:var(--bad-dim);color:#ffd9cf}
+button.action.danger{background:var(--bad-dim);color:var(--bad-ink)}
 button.action:disabled{opacity:.5;cursor:not-allowed}
 
 /* ---------- Work view ---------- */
@@ -1217,17 +1402,17 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
 .work-empty p{color:var(--muted);font-size:14px;margin:0 0 24px}
 .mission-form{max-width:600px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;text-align:left}
 .mission-form label{display:block;color:var(--muted);font-size:11.5px;margin:12px 0 5px;font-weight:600}
-.mission-form input,.mission-form select,.mission-form textarea{width:100%;color:var(--text);background:#120e08;border:1px solid var(--line);border-radius:9px;padding:10px}
+.mission-form input,.mission-form select,.mission-form textarea{width:100%;color:var(--text);background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:10px}
 .mission-form textarea{min-height:92px;resize:vertical}
 .mission-form .risk-note{margin-top:8px;color:var(--muted-dim);font-size:11.5px}
 .work-thread{max-width:820px;margin:auto}
-.origin-banner{border:1px solid var(--accent-dim);background:var(--accent-soft);border-radius:11px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#e8dcc6;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+.origin-banner{border:1px solid var(--accent-dim);background:var(--accent-soft);border-radius:11px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:var(--text);display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
 .work-header{border:1px solid var(--line);background:var(--panel);border-radius:16px;padding:19px;margin-bottom:16px}
 .work-header .objective{color:var(--muted);font-size:12.5px;margin-bottom:10px}
 .status-line{font-size:19px;font-weight:700;margin:2px 0 8px;text-transform:capitalize}
 .error{color:var(--bad);overflow-wrap:anywhere;font-size:13px}
 .timeline{display:flex;gap:7px;flex-wrap:wrap;margin-top:6px}
-.step{border:1px solid var(--line);border-radius:999px;padding:5px 10px;color:#cbbea4;font-size:11.5px}
+.step{border:1px solid var(--line);border-radius:999px;padding:5px 10px;color:var(--muted);font-size:11.5px}
 .step:last-child{border-color:var(--accent-dim);color:var(--accent-hi)}
 .cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:14px}
 .card{background:var(--soft);border:1px solid var(--line);border-radius:11px;padding:12px;min-width:0}
@@ -1310,6 +1495,13 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
 .mc-card .mc-controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
 .mc-card .mc-controls button{font-size:11px;padding:5px 9px}
 .mc-empty-bucket{color:var(--muted-dim);font-size:12.5px;padding:14px 0}
+.mc-card.archived{opacity:.68}
+.mc-archived-bucket{margin-top:8px;border-top:1px solid var(--line);padding-top:14px}
+.mc-archived-bucket summary{cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-dim);list-style:none}
+.mc-archived-bucket summary::-webkit-details-marker{display:none}
+.mc-archived-bucket summary .count{background:var(--soft);border-radius:999px;padding:1px 8px;color:var(--text);font-weight:650}
+.mc-archived-bucket[open] summary{margin-bottom:9px}
+.mc-archived-bucket .mc-grid{margin-top:9px}
 
 /* ---------- Files (Section 14) */
 .files-view{max-width:900px;margin:0 auto;padding:34px 24px 60px}
@@ -1949,8 +2141,22 @@ function renderMessageRow(m,attachments,isLast){
       ${isLast?`<div class="msg-actions"><button type="button" class="msg-action-btn" data-regen-id="${esc(m.id)}">${icon('retry',12)}Retry</button></div>`:''}</div>`;
   }
   if(status==='FAILED'||m.error){
-    return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">${esc(m.error||'This reply failed.')}</div>
-      ${isLast?`<div class="msg-actions"><button type="button" class="msg-action-btn" data-regen-id="${esc(m.id)}">${icon('retry',12)}Retry</button></div>`:''}</div>`;
+    // Falguna V2.1 sanitized error UX: m.error is already the safe,
+    // user-facing sentence a FalgunaModelError/ChatError composed (see
+    // falguna/providers.py + falguna/chat.py) -- never raw provider
+    // stdout. m.error_category picks which recovery actions make sense;
+    // m.error_detail (if any) is raw diagnostic text, shown only behind
+    // an explicit "Technical details" toggle, never by default.
+    const hint=ERROR_CATEGORY_HINTS[m.error_category]||ERROR_CATEGORY_HINTS.TRANSPORT_FAILURE;
+    return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">
+        ${m.error_category?`<div class="error-cat">${esc(hint.label)}</div>`:''}
+        <div>${esc(m.error||'This reply failed.')}</div>
+        <div class="error-actions">
+          ${isLast?`<button type="button" data-regen-id="${esc(m.id)}">${icon('retry',11)}Retry</button>`:''}
+          ${hint.showSettingsLink?'<a href="#/settings/models">Change model &rarr;</a>':''}
+          ${m.error_detail?`<details><summary>Technical details</summary><div class="error-detail">${esc(m.error_detail)}</div></details>`:''}
+        </div>
+      </div></div>`;
   }
   return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble">${renderMarkdown(m.content)}</div>
     <div class="msg-actions">
@@ -2032,29 +2238,50 @@ function renderThread(id,data){
   $('thread').closest('.chat-scroll').scrollTop=9e6;
 }
 function renderHandoffPanel(conversation,suggested,handoffs){
+  // Falguna V2.1: a compact trigger, not an always-expanded form -- see the
+  // .handoff-trigger-row CSS comment. Clicking it is the only way this
+  // modal ever opens; nothing here is wired to a chat error state.
   const mount=$('handoffMount');
+  const priorRuns=(handoffs||[]).map(h=>`<a href="#/work/${esc(h.run_id)}">${esc(new Date(h.created_at).toLocaleString())}</a>`).join(' &middot; ');
+  mount.innerHTML=`<div class="handoff-trigger-row">
+    <button type="button" class="pill-btn handoff-trigger" id="handoffTriggerBtn">${icon('handoff',13)}Continue in Work</button>
+    ${priorRuns?`<span class="handoff-prior">Already started: ${priorRuns}</span>`:''}
+  </div>`;
+  $('handoffTriggerBtn').onclick=()=>openHandoffModal(conversation,suggested);
+}
+
+function openHandoffModal(conversation,suggested){
   const openOptions=profileList.map(p=>`<option value="${esc(p.id)}" ${p.id===conversation.project_id?'selected':''}>${esc(p.name)}</option>`).join('');
-  const priorRuns=(handoffs||[]).map(h=>`<a href="#/work/${esc(h.run_id)}">${esc(new Date(h.created_at).toLocaleString())}</a>`).join(' · ');
-  mount.innerHTML=`<div class="handoff-panel">
-    <h3>${icon('handoff',15)}Hand off to Work</h3>
-    <div class="sub">Chat can't touch a repository itself. Work runs in an isolated worktree with verification, review, and a human approval gate.${priorRuns?` Already started: ${priorRuns}`:''}</div>
+  const scrim=document.createElement('div');
+  scrim.className='modal-scrim';
+  scrim.innerHTML=`<div class="modal handoff-modal">
+    <h3>${icon('handoff',15)}Continue in Work</h3>
+    <p>Chat can't touch a repository itself. Work runs in an isolated worktree with verification, review, and a human approval gate -- nothing merges without your decision.</p>
     <label>Approved project</label>
     <select id="handoffProject">${openOptions}</select>
     <label>Bounded objective for Work</label>
-    <textarea id="handoffObjective" placeholder="Describe one small, testable outcome.">${esc(suggested)}</textarea>
-    <div class="handoff-actions"><button class="action" id="handoffBtn" type="button">Start Work mission</button></div>
+    <textarea id="handoffObjective" placeholder="Describe one small, testable outcome.">${esc(suggested||'')}</textarea>
+    <div class="modal-actions"><button type="button" class="pill-btn" id="handoffCancel">Cancel</button><button type="button" class="action" id="handoffStart">Start Work mission</button></div>
   </div>`;
-  $('handoffBtn').onclick=async()=>{
+  document.body.appendChild(scrim);
+  const close=()=>{scrim.remove();document.removeEventListener('keydown',onKey)};
+  function onKey(e){if(e.key==='Escape')close()}
+  document.addEventListener('keydown',onKey);
+  scrim.addEventListener('click',e=>{if(e.target===scrim)close()});
+  scrim.querySelector('#handoffCancel').onclick=close;
+  scrim.querySelector('#handoffStart').onclick=async()=>{
     const project_id=$('handoffProject').value;
     const objective=$('handoffObjective').value.trim();
     if(!project_id||objective.length<12){showToast('Choose a project and describe a bounded objective (12+ characters).',{error:true});return}
-    $('handoffBtn').disabled=true;$('handoffBtn').textContent='Starting…';
+    const btn=scrim.querySelector('#handoffStart');
+    btn.disabled=true;btn.textContent='Starting…';
     try{
       const {id}=currentRoute();
       const out=await api(`/api/conversations/${id}/handoff`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id,objective})});
+      close();
       watchOperation(out.operation,runId=>go('#/work/'+runId));
     }catch(err){
-      $('handoffBtn').disabled=false;$('handoffBtn').textContent='Start Work mission';
+      btn.disabled=false;btn.textContent='Start Work mission';
       showToast(err.message+(err.data&&err.data.discovery?' -- discovery needs a narrower objective.':''),{error:true});
     }
   };
@@ -2320,15 +2547,22 @@ async function renderProjectsView(){
 /* ------------------------------------------------------ Mission Control view */
 
 function mcControlsHtml(c){
-  if(c.status==='PAUSED')return `<button type="button" class="pill-btn" data-mc-action="resume" data-run-id="${esc(c.run_id)}">Resume</button><button type="button" class="pill-btn" data-mc-action="cancel" data-run-id="${esc(c.run_id)}">Cancel</button>`;
-  if(c.status==='DONE_CANDIDATE'&&c.merge_approval==='PENDING')return `<button type="button" class="pill-btn" data-mc-action="approve" data-run-id="${esc(c.run_id)}">Approve</button><button type="button" class="pill-btn" data-mc-action="reject" data-run-id="${esc(c.run_id)}">Reject</button><button type="button" class="pill-btn" data-mc-action="request-changes" data-run-id="${esc(c.run_id)}">Changes</button>`;
+  // Falguna V2.1: Archive/Restore is a board-visibility toggle only (see
+  // _archive_run_from_board) -- available on any resolved card, alongside
+  // whatever decision/retry controls that status already offers. It is
+  // never available on an actively-running mission.
+  const archiveBtn=c.archived
+    ?`<button type="button" class="pill-btn" data-mc-action="unarchive" data-run-id="${esc(c.run_id)}">Restore</button>`
+    :(['PLANNING','WORKING','VERIFYING','REVIEWING'].includes(c.status)?'':`<button type="button" class="pill-btn" data-mc-action="archive" data-run-id="${esc(c.run_id)}">Archive</button>`);
+  if(c.status==='PAUSED')return `<button type="button" class="pill-btn" data-mc-action="resume" data-run-id="${esc(c.run_id)}">Resume</button><button type="button" class="pill-btn" data-mc-action="cancel" data-run-id="${esc(c.run_id)}">Cancel</button>${archiveBtn}`;
+  if(c.status==='DONE_CANDIDATE'&&c.merge_approval==='PENDING')return `<button type="button" class="pill-btn" data-mc-action="approve" data-run-id="${esc(c.run_id)}">Approve</button><button type="button" class="pill-btn" data-mc-action="reject" data-run-id="${esc(c.run_id)}">Reject</button><button type="button" class="pill-btn" data-mc-action="request-changes" data-run-id="${esc(c.run_id)}">Changes</button>${archiveBtn}`;
   if(['PLANNING','WORKING','VERIFYING','REVIEWING'].includes(c.status))return `<button type="button" class="pill-btn" data-mc-action="pause" data-run-id="${esc(c.run_id)}">Pause</button><button type="button" class="pill-btn" data-mc-action="cancel" data-run-id="${esc(c.run_id)}">Cancel</button>`;
-  if(['FAILED','QUARANTINED'].includes(c.status))return `<button type="button" class="pill-btn" data-mc-action="resume" data-run-id="${esc(c.run_id)}">Retry</button>`;
-  return '';
+  if(['FAILED','QUARANTINED'].includes(c.status))return `<button type="button" class="pill-btn" data-mc-action="resume" data-run-id="${esc(c.run_id)}">Retry</button>${archiveBtn}`;
+  return archiveBtn;
 }
 function mcCard(c){
   const needsYou=(c.status==='DONE_CANDIDATE'&&c.merge_approval==='PENDING')||c.status==='PAUSED';
-  return `<div class="mc-card ${needsYou?'needs-you':''}" data-open-run="${esc(c.run_id)}">
+  return `<div class="mc-card ${needsYou?'needs-you':''}${c.archived?' archived':''}" data-open-run="${esc(c.run_id)}">
     <div class="mc-title">${esc(c.title)}</div>
     <div class="mc-meta"><span class="status-pill ${esc((c.status||'').toLowerCase())}">${esc(String(c.status||'').replaceAll('_',' '))}</span><span>${esc(c.project||'')}</span><span>${esc(c.origin||'')}</span><span>${esc(timeAgo(c.last_activity))}</span>${c.cost_usd?`<span>$${esc(c.cost_usd)}</span>`:''}</div>
     <div class="mc-step">${esc(String(c.current_step||'').replaceAll('_',' '))}</div>
@@ -2343,7 +2577,10 @@ function wireMcControls(){
     e.stopPropagation();
     const runId=b.dataset.runId,action=b.dataset.mcAction;
     try{
-      if(action==='pause'||action==='cancel'){
+      if(action==='archive'||action==='unarchive'){
+        await api(`/api/runs/${runId}/board-${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        await refreshMissionControl();
+      }else if(action==='pause'||action==='cancel'){
         await api(`/api/runs/${runId}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
         await refreshMissionControl();
       }else if(action==='resume'){
@@ -2364,10 +2601,19 @@ async function refreshMissionControl(){
   if(!host)return;
   let board;
   try{board=await api('/api/missions/board')}catch(err){host.innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
-  host.innerHTML=MC_BUCKETS.map(([key,label,cls])=>{
+  const activeHtml=MC_BUCKETS.map(([key,label,cls])=>{
     const items=board[key]||[];
     return `<div><div class="mc-bucket-title ${cls}">${esc(label)}<span class="count">${items.length}</span></div>${items.length?`<div class="mc-grid">${items.map(mcCard).join('')}</div>`:'<div class="mc-empty-bucket">Nothing here.</div>'}</div>`;
   }).join('');
+  // Falguna V2.1: the Archived bucket is collapsed by default and kept
+  // visually de-emphasized -- it exists so a dismissed run is never truly
+  // gone, not to compete with the buckets that actually need attention.
+  const archivedItems=board.archived||[];
+  const archivedHtml=`<details class="mc-archived-bucket">
+    <summary>Archived<span class="count">${archivedItems.length}</span></summary>
+    ${archivedItems.length?`<div class="mc-grid">${archivedItems.map(mcCard).join('')}</div>`:'<div class="mc-empty-bucket">Nothing archived yet.</div>'}
+  </details>`;
+  host.innerHTML=activeHtml+archivedHtml;
   wireMcControls();
 }
 async function renderMissionControlView(){
@@ -2450,6 +2696,29 @@ async function renderHistoryView(){
 /* ----------------------------------------------------------- Settings view */
 
 const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
+// Falguna V2.1: Privacy Mode is a routing boundary the Model Router enforces
+// structurally (see falguna/model_router.py) -- Local Only never even
+// contacts an external provider, it is not merely hidden from the result.
+const PRIVACY_MODE_INFO=[
+  ['LOCAL_ONLY','Local Only','Only a local runtime on this machine may ever be used. An external provider is never contacted, even if one is configured.'],
+  ['HYBRID','Hybrid (default)','Prefers a local model when one is available; falls back to an explicitly-enabled external provider only when no local model can answer.'],
+  ['EXTERNAL_ALLOWED','External Allowed','Same preference order as Hybrid, offered as a separate mode so "external is allowed" is always a deliberate, visible choice rather than an implicit default.'],
+];
+function healthLabel(state){return {HEALTHY:'Healthy',DEGRADED:'Degraded',RATE_LIMITED:'Rate limited',AUTH_REQUIRED:'Needs auth',OFFLINE:'Offline',UNSUPPORTED:'Not set up'}[state]||state}
+// One entry per falguna.providers.ErrorCategory -- a short label plus
+// whether a "Change model" link to Settings -> Models is a sensible next
+// step for that category (never shown for a plain rate-limit/timeout,
+// where Retry alone is the honest recovery action).
+const ERROR_CATEGORY_HINTS={
+  RATE_LIMITED:{label:'Rate limited',showSettingsLink:false},
+  AUTH_REQUIRED:{label:'Needs authentication',showSettingsLink:true},
+  PROVIDER_OFFLINE:{label:'Provider offline',showSettingsLink:true},
+  MODEL_UNSUPPORTED:{label:'Model unavailable',showSettingsLink:true},
+  TIMEOUT:{label:'Timed out',showSettingsLink:false},
+  TRANSPORT_FAILURE:{label:'Connection problem',showSettingsLink:false},
+  NO_COMPATIBLE_MODEL:{label:'No model available',showSettingsLink:true},
+  UNEXPECTED_FAILURE:{label:'Unexpected error',showSettingsLink:false},
+};
 async function renderSettingsView(tab){
   tab=(tab&&SETTINGS_TABS.some(([id])=>id===tab))?tab:'appearance';
   const vp=$('viewport');
@@ -2475,12 +2744,54 @@ async function renderSettingsView(tab){
     <div class="settings-note">Approval boundaries, verification, review, isolation, and audit are enforced in the control plane and are not editable from the UI.</div>`;
     document.querySelectorAll('.theme-card').forEach(b=>b.onclick=()=>applyTheme(b.dataset.theme));
   }else if(tab==='models'){
+    const models=await api('/api/models');
+    const reg=models.registry;
+    const ext=reg.providers.openai_compatible||{};
+    const providerCard=p=>`<div class="provider-card">
+        <div class="provider-card-head">
+          <span class="provider-name">${esc(p.display_name)}</span>
+          <span class="health-pill health-${p.health.state.toLowerCase()}">${esc(healthLabel(p.health.state))}</span>
+        </div>
+        <div class="provider-meta">${p.is_local?'Local &middot; inference happens on this machine, nothing leaves it':'External &middot; requests leave this machine'}</div>
+        <div class="provider-detail">${esc(p.health.detail)}</div>
+        ${p.models.length?`<div class="provider-models">${p.models.slice(0,8).map(m=>esc(m.display_name||m.model_id)).join(', ')}${p.models.length>8?` +${p.models.length-8} more`:''}</div>`:'<div class="provider-models muted">No model available yet</div>'}
+      </div>`;
     body.innerHTML=`<div class="settings-section">
-      <div class="section-label" style="margin-top:0">Available models</div>
-      <div class="settings-list">${cfg.available_models.map(m=>`<div>${esc(m)}${m===cfg.model?' &middot; default':''}</div>`).join('')}</div>
-      <div class="settings-list"><div>Authenticated Codex runtime detected on this machine: <b>${cfg.codex_runtime_found?'Yes':'No'}</b></div></div>
-      <p class="lede">Each chat picks its own model (or Auto, which uses Falguna's resilient fallback-aware routing) from the selector above its composer -- there is no single global default to change here.</p>
+      <div class="section-label" style="margin-top:0">Privacy Mode</div>
+      <p class="lede" style="margin:0 0 4px">Controls whether Falguna may ever reach an external model provider. This is enforced by the router itself, not a filter applied afterward.</p>
+      <div class="privacy-mode-options">${PRIVACY_MODE_INFO.map(([id,label,desc])=>`<button type="button" class="privacy-mode-card ${reg.privacy_mode===id?'active':''}" data-mode="${id}"><b>${esc(label)}</b><span>${esc(desc)}</span></button>`).join('')}</div>
+      <div class="section-label">Providers</div>
+      <div class="provider-cards">${models.providers.map(providerCard).join('')||'<div class="empty-state">No provider is enabled.</div>'}</div>
+      <p class="lede" style="margin-top:-10px">Local models run through <b>Ollama</b> if it's running on this machine (127.0.0.1:11434) -- Falguna only ever lists and uses a model already pulled there; it never downloads one for you. <b>Codex</b> stays available as an optional, subscription-billed adapter -- Falguna does not require it to run.</p>
+      <details class="provider-setup">
+        <summary>Provider Setup: custom OpenAI-compatible endpoint</summary>
+        <div class="settings-form">
+          <label>Display name<input id="mpDisplayName" value="${esc(ext.display_name||'Custom OpenAI-compatible')}" placeholder="My provider"></label>
+          <label>Base URL<input id="mpBaseUrl" value="${esc(ext.base_url||'')}" placeholder="https://your-server/v1 or http://127.0.0.1:8080/v1"></label>
+          <label>Model id(s), comma-separated<input id="mpModels" value="${esc((ext.model_allowlist||[]).join(', '))}" placeholder="my-model-name"></label>
+          <label>API key environment variable (optional)<input id="mpKeyEnv" value="${esc(ext.api_key_env||'')}" placeholder="MY_PROVIDER_API_KEY"></label>
+          <label class="checkbox-row"><input type="checkbox" id="mpIsLocal" ${ext.is_local?'checked':''}> This endpoint is self-hosted on my own machine/network (counts as local for Privacy Mode)</label>
+          <label class="checkbox-row"><input type="checkbox" id="mpEnabled" ${ext.enabled?'checked':''}> Enable this provider</label>
+          <div class="handoff-actions"><button type="button" class="action" id="mpSave">Save provider settings</button></div>
+          <p class="lede" style="margin:0">Falguna never enables an external provider, auto-selects a model, or downloads anything on your behalf -- every field above is off until you turn it on. An API key is never typed here: Falguna only reads it from the environment variable you name.</p>
+        </div>
+      </details>
     </div>`;
+    document.querySelectorAll('.privacy-mode-card').forEach(b=>b.onclick=async()=>{
+      try{await api('/api/models/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({privacy_mode:b.dataset.mode})});showToast('Privacy Mode updated');renderSettingsView('models')}
+      catch(err){showToast(err.message,{error:true})}
+    });
+    const mpSave=$('mpSave');
+    if(mpSave)mpSave.onclick=async()=>{
+      const model_allowlist=$('mpModels').value.split(',').map(s=>s.trim()).filter(Boolean);
+      try{
+        await api('/api/models/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({providers:{openai_compatible:{
+          display_name:$('mpDisplayName').value.trim()||'Custom OpenAI-compatible', base_url:$('mpBaseUrl').value.trim(),
+          model_allowlist, api_key_env:$('mpKeyEnv').value.trim(), is_local:$('mpIsLocal').checked, enabled:$('mpEnabled').checked,
+        }}})});
+        showToast('Provider settings saved');renderSettingsView('models');
+      }catch(err){showToast(err.message,{error:true})}
+    };
   }else if(tab==='work'){
     body.innerHTML=`<div class="settings-section">
       <div class="section-label" style="margin-top:0">Work Mode</div>

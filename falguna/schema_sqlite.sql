@@ -22,6 +22,11 @@ CREATE INDEX IF NOT EXISTS idx_supervisor_run ON supervisor_states(run_id, creat
 -- Falguna Chat: persistent conversations that can hand off into Work missions
 CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, project_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS chat_messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), role TEXT NOT NULL, content TEXT NOT NULL, model_call_json TEXT, error TEXT, created_at TEXT NOT NULL);
+-- Additive columns for chat_messages (status/superseded/edited_at/updated_at/
+-- suggested_objective/error_category/error_detail) are applied for every
+-- database -- new or pre-existing -- via StateStore._ADDITIVE_COLUMNS, since
+-- CREATE TABLE IF NOT EXISTS above is a no-op once this table already
+-- exists; see store.py.
 CREATE TABLE IF NOT EXISTS conversation_handoffs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), run_id TEXT NOT NULL REFERENCES runs(id), objective TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, created_at);
@@ -330,3 +335,16 @@ CREATE INDEX IF NOT EXISTS idx_co_cost_estimates_ref ON co_cost_estimates(ref_ty
 CREATE INDEX IF NOT EXISTS idx_co_goal_feedback_events_goal ON co_goal_feedback_events(goal_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_co_daily_loops_run_date ON co_daily_loops(run_date);
 CREATE INDEX IF NOT EXISTS idx_co_weekly_reviews_week_start ON co_weekly_reviews(week_start);
+
+-- Falguna V2.1: UX Hardening + Provider Independence Foundation. One
+-- generic, additive key/value table for the model-provider registry and
+-- routing settings (falguna/providers.py, falguna/model_router.py) -- the
+-- same shape as the pre-existing rh_settings table, deliberately kept
+-- separate from it so Chat/Research/Work model configuration is never
+-- coupled to the unrelated Revenue Hunter subsystem that owns rh_settings.
+-- A row's value_json never contains a secret in plaintext: an API key is
+-- stored only as a reference to where Falguna should read it from (an
+-- environment variable name or a file path), exactly like the pre-existing
+-- OpenAICompatibleGateway.api_key_file convention -- see providers.py.
+CREATE TABLE IF NOT EXISTS model_settings (id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, value_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_model_settings_key ON model_settings(key);

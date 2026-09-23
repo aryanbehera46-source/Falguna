@@ -14,6 +14,7 @@ mission does.
 import json
 from typing import Callable, List, Optional
 
+from .providers import ErrorCategory, FalgunaModelError
 from .store import StateStore, utcnow
 
 
@@ -43,7 +44,19 @@ CHAT_REPLY_SCHEMA = {
 
 
 class ChatError(RuntimeError):
-    """Raised for a user-facing chat failure (bad input or model/transport failure)."""
+    """Raised for a user-facing chat failure (bad input or model/transport
+    failure). `message` (this exception's str()) must always be safe to
+    show verbatim -- never raw provider stdout/stderr. `category` is one
+    of falguna.providers.ErrorCategory (defaults to TRANSPORT_FAILURE for
+    a caller that didn't specify one, e.g. a plain validation error keeps
+    working exactly as before this field existed). `technical_detail` may
+    carry raw diagnostic text and is surfaced only in an expandable
+    "technical details" panel, never in the primary bubble text."""
+
+    def __init__(self, message: str, category: Optional[str] = None, technical_detail: str = ""):
+        super().__init__(message)
+        self.category = category or ErrorCategory.TRANSPORT_FAILURE
+        self.technical_detail = technical_detail or ""
 
 
 class ConversationStore:
@@ -189,11 +202,15 @@ class ConversationStore:
         self.store.update("conversations", row["conversation_id"], updated_at=utcnow())
         return True
 
-    def fail_message(self, message_id: str, error: str) -> bool:
+    def fail_message(self, message_id: str, error: str, category: Optional[str] = None,
+                      detail: Optional[str] = None) -> bool:
         row = self.store.get("chat_messages", message_id)
         if not row or row.get("status") == "CANCELLED":
             return False
-        self.store.update("chat_messages", message_id, content="", error=str(error), status="FAILED")
+        self.store.update(
+            "chat_messages", message_id, content="", error=str(error), status="FAILED",
+            error_category=category, error_detail=detail,
+        )
         return True
 
     def cancel_message(self, message_id: str) -> dict:
@@ -357,15 +374,30 @@ class ChatResponder:
         }
         try:
             decoded = self.transport(config, payload, self.timeout_seconds)
+        except FalgunaModelError as exc:
+            # Already a sanitized, user-safe message/category from the
+            # provider or router -- pass it through unchanged rather than
+            # re-wrapping it in a generic string (that re-wrap is exactly
+            # how raw transport text used to leak into the chat bubble).
+            raise ChatError(exc.message, category=exc.category, technical_detail=exc.technical_detail) from exc
         except Exception as exc:
-            raise ChatError(f"MODEL_UNAVAILABLE: {exc}") from exc
+            # An unexpected failure from a transport that isn't provider-
+            # aware yet (e.g. a bare Callable in a test) -- still never
+            # dumps the raw exception into the user-facing message.
+            raise ChatError(
+                "Falguna couldn't reach the model provider for this reply.",
+                category=ErrorCategory.TRANSPORT_FAILURE, technical_detail=str(exc),
+            ) from exc
         message = decoded["choices"][0]["message"]
         if message.get("refusal"):
-            raise ChatError("The model declined to respond to this message.")
+            raise ChatError("The model declined to respond to this message.", category=ErrorCategory.TRANSPORT_FAILURE)
         try:
             parsed = json.loads(message["content"])
         except json.JSONDecodeError as exc:
-            raise ChatError("The model returned a response Falguna could not parse.") from exc
+            raise ChatError(
+                "The model returned a response Falguna could not parse.",
+                category=ErrorCategory.TRANSPORT_FAILURE, technical_detail=str(message.get("content", ""))[:2000],
+            ) from exc
         return {
             "reply": parsed["reply"],
             "suggested_objective": parsed.get("suggested_objective"),

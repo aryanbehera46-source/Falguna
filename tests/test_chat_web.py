@@ -286,12 +286,22 @@ class ChatHttpLayerTests(_LiveFalgunaServerCase):
         self.assertEqual(out["assistant"]["status"], "PENDING")
         op = self._wait_operation(out["operation"])
         self.assertEqual(op["state"], "FAILED")
-        self.assertIn("MODEL_UNAVAILABLE", op["error"])
+        # Falguna V2.1: no configured provider (Codex unauthenticated, no
+        # local Ollama runtime, no external provider enabled) is honestly
+        # reported through falguna.model_router.ModelRouter as
+        # NO_COMPATIBLE_MODEL, with a sanitized, human-readable message --
+        # never the raw "MODEL_UNAVAILABLE: <exception>" string this used to
+        # assert, which could embed raw Codex CLI stdout/stderr.
+        self.assertIn("provider", op["error"].lower())
 
         status, detail = self._get(f"/api/conversations/{conversation_id}")
         self.assertEqual(len(detail["messages"]), 2)
         self.assertEqual(detail["messages"][1]["status"], "FAILED")
-        self.assertIn("MODEL_UNAVAILABLE", detail["messages"][1]["error"])
+        self.assertEqual(detail["messages"][1]["error_category"], "NO_COMPATIBLE_MODEL")
+        self.assertIn("provider", detail["messages"][1]["error"].lower())
+        # The sanitized message never leaks a Python traceback or raw stdout.
+        self.assertNotIn("Traceback", detail["messages"][1]["error"])
+        self.assertNotIn("stdout=", detail["messages"][1]["error"])
         self.assertEqual(self._get_status(f"/api/conversations/{conversation_id}/messages"), 404)  # GET not allowed on this path
 
         status, err = self._post("/api/conversations/does-not-exist/messages", {"content": "hi"})

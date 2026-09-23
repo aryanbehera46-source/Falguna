@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Protocol
 from urllib.parse import urlparse
 
+from .providers import FalgunaModelError
 from .store import StateStore, utcnow
 
 
@@ -355,8 +356,12 @@ class ResearchResponder:
         }
         try:
             decoded = self.transport(config, payload, self.timeout_seconds)
+        except FalgunaModelError as exc:
+            # Sanitized, user-safe message already -- see falguna/providers.py.
+            # Never re-wrap it in a generic string carrying raw provider text.
+            raise ResearchError(exc.message) from exc
         except Exception as exc:
-            raise ResearchError(f"MODEL_UNAVAILABLE: {exc}") from exc
+            raise ResearchError("Falguna couldn't reach the model provider for this research query.") from exc
         message = decoded["choices"][0]["message"]
         if message.get("refusal"):
             raise ResearchError("The model declined to synthesize an answer for this query.")
