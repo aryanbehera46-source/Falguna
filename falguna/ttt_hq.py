@@ -63,6 +63,15 @@ NEEDS_ARYAN_KINDS = {
     "venture_creation_approval", "venture_budget_allocation", "venture_launch_approval",
     "venture_resource_shift_approval", "venture_pause_recommendation", "venture_kill_recommendation",
     "venture_risk_escalation", "venture_large_spend_override",
+    # Added for TTT Group OS / Company Orchestrator v2 (Section 17: Needs
+    # Aryan V2). These are company-wide, cross-venture/cross-department
+    # decisions the Company Orchestrator itself surfaces -- distinct from
+    # the venture-scoped kinds above, which Venture Studio's own
+    # recommendation engine raises. `budget_override` (Finance/Capital) and
+    # the two venture_pause/kill kinds above are reused as-is per the spec's
+    # own instruction, rather than duplicated under a new name.
+    "strategic_decision", "resource_reallocation_approval", "major_client_risk",
+    "policy_exception", "major_reprioritization",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 # A run in one of these statuses cannot become actionable again through
@@ -81,6 +90,8 @@ class BoardroomStore:
         self, title: str, summary: str, actor: str,
         proposed_category: Optional[str] = None, proposed_phase: Optional[str] = None,
         proposed_priority: Optional[str] = None, proposed_revenue_impact: Optional[str] = None,
+        linked_objective_id: Optional[str] = None, linked_venture_id: Optional[str] = None,
+        linked_risk_id: Optional[str] = None, discussion_summary: Optional[str] = None,
     ) -> str:
         if not title or not title.strip():
             raise ValueError("title is required")
@@ -91,10 +102,53 @@ class BoardroomStore:
             "title": title.strip(), "summary": summary.strip(), "status": "OPEN",
             "proposed_category": proposed_category, "proposed_phase": proposed_phase,
             "proposed_priority": proposed_priority, "proposed_revenue_impact": proposed_revenue_impact,
+            "linked_objective_id": linked_objective_id, "linked_venture_id": linked_venture_id,
+            "linked_risk_id": linked_risk_id, "discussion_summary": discussion_summary, "follow_up": None,
             "created_by": actor, "created_at": now, "updated_at": now,
         })
         self.audit.append("BOARDROOM_TOPIC_CREATED", {"topic_id": topic_id, "title": title, "actor": actor})
         return topic_id
+
+    def link(
+        self, topic_id: str, actor: str, linked_objective_id: Optional[str] = None,
+        linked_venture_id: Optional[str] = None, linked_risk_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Attach this Boardroom topic to a Company OS objective, a venture,
+        and/or a risk -- Section 18's persistent decision history is meant to
+        be traceable back to the work it concerns. Only the fields the
+        caller actually supplies are changed."""
+        if not self.store.get("boardroom_topics", topic_id):
+            raise ValueError("topic not found")
+        changes = {}
+        if linked_objective_id is not None:
+            changes["linked_objective_id"] = linked_objective_id
+        if linked_venture_id is not None:
+            changes["linked_venture_id"] = linked_venture_id
+        if linked_risk_id is not None:
+            changes["linked_risk_id"] = linked_risk_id
+        if not changes:
+            raise ValueError("at least one of linked_objective_id, linked_venture_id, linked_risk_id is required")
+        self.store.update("boardroom_topics", topic_id, **changes)
+        self.audit.append("BOARDROOM_TOPIC_LINKED", {"topic_id": topic_id, "changes": changes, "actor": actor})
+        return self.get_topic(topic_id)
+
+    def set_discussion_summary(self, topic_id: str, discussion_summary: str, actor: str) -> Dict[str, Any]:
+        if not self.store.get("boardroom_topics", topic_id):
+            raise ValueError("topic not found")
+        if not discussion_summary or not discussion_summary.strip():
+            raise ValueError("discussion_summary is required")
+        self.store.update("boardroom_topics", topic_id, discussion_summary=discussion_summary.strip())
+        self.audit.append("BOARDROOM_DISCUSSION_SUMMARY_SET", {"topic_id": topic_id, "actor": actor})
+        return self.get_topic(topic_id)
+
+    def set_follow_up(self, topic_id: str, follow_up: str, actor: str) -> Dict[str, Any]:
+        if not self.store.get("boardroom_topics", topic_id):
+            raise ValueError("topic not found")
+        if not follow_up or not follow_up.strip():
+            raise ValueError("follow_up is required")
+        self.store.update("boardroom_topics", topic_id, follow_up=follow_up.strip())
+        self.audit.append("BOARDROOM_FOLLOW_UP_SET", {"topic_id": topic_id, "actor": actor})
+        return self.get_topic(topic_id)
 
     def add_contribution(self, topic_id: str, perspective: str, content: str) -> str:
         if perspective not in PERSPECTIVES:

@@ -253,3 +253,65 @@ CREATE INDEX IF NOT EXISTS idx_vs_graveyard_venture ON vs_graveyard(venture_id);
 CREATE INDEX IF NOT EXISTS idx_vs_assets_venture ON vs_assets(venture_id, asset_type);
 CREATE INDEX IF NOT EXISTS idx_vs_relationships_a ON vs_relationships(venture_a_id);
 CREATE INDEX IF NOT EXISTS idx_vs_relationships_b ON vs_relationships(venture_b_id);
+
+-- TTT Group OS / Company Orchestrator v2. `co_` prefix, additive-only
+-- CREATE TABLE IF NOT EXISTS, same convention as every prior pass. See
+-- falguna/company_os.py for the stores/engines. This is the top-level
+-- operating intelligence that coordinates the whole company -- it reuses
+-- every existing execution engine (Revenue Hunter, Digital Workforce,
+-- Media/Growth, Falguna Engineering, Finance/Capital, Venture Studio,
+-- Trading Lab) rather than duplicating any of them; these tables hold only
+-- what is genuinely new: objectives, plans, priorities, department
+-- decomposition, venture alignment, resource/capital recommendations, the
+-- event bus, replanning, decisions, policies, escalations, the timeline,
+-- traceability links, company memory, failure/blocker records, cost
+-- estimates, goal feedback, and the daily/weekly operating loops.
+CREATE TABLE IF NOT EXISTS co_objectives (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, owner TEXT, priority TEXT, target TEXT, deadline TEXT, status TEXT NOT NULL, linked_goals_json TEXT, linked_ventures_json TEXT, linked_departments_json TEXT, budget_scope TEXT, risk_tolerance TEXT, evidence TEXT, current_progress TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_objective_status_events (id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES co_objectives(id), from_status TEXT, to_status TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, evidence_json TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_plans (id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES co_objectives(id), desired_outcome TEXT NOT NULL, milestones_json TEXT, dependencies_json TEXT, ventures_json TEXT, departments_json TEXT, capital_requirement TEXT, workforce_requirement TEXT, falguna_work_requirement TEXT, sales_media_needs TEXT, risks_json TEXT, approvals_json TEXT, expected_evidence TEXT, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_priority_evaluations (id TEXT PRIMARY KEY, ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, inputs_json TEXT NOT NULL, priority TEXT NOT NULL, rationale TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_department_objectives (id TEXT PRIMARY KEY, company_objective_id TEXT NOT NULL REFERENCES co_objectives(id), department TEXT NOT NULL, title TEXT NOT NULL, owner TEXT, due_date TEXT, expected_output TEXT, evidence TEXT, dependencies_json TEXT, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_venture_links (id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES co_objectives(id), venture_id TEXT NOT NULL, contribution TEXT, dependency TEXT, priority TEXT, budget_impact TEXT, execution_health TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_resource_recommendations (id TEXT PRIMARY KEY, scope TEXT NOT NULL, department TEXT, finding TEXT NOT NULL, recommendation TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_capital_recommendations (id TEXT PRIMARY KEY, objective_id TEXT, recommendation TEXT NOT NULL, rationale TEXT NOT NULL, amount REAL, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_events (id TEXT PRIMARY KEY, event_type TEXT NOT NULL, source TEXT NOT NULL, ref_type TEXT, ref_id TEXT, payload_json TEXT, idempotency_key TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_replans (id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES co_objectives(id), original_plan_id TEXT, new_plan_id TEXT, reason TEXT NOT NULL, changed_assumptions_json TEXT, original_plan_snapshot_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_decisions (id TEXT PRIMARY KEY, question TEXT NOT NULL, options_json TEXT NOT NULL, evidence TEXT, risks TEXT, cost TEXT, expected_impact TEXT, recommendation TEXT, confidence TEXT, status TEXT NOT NULL, decided_by TEXT, decision_note TEXT, ref_type TEXT, ref_id TEXT, needs_aryan_id TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, decided_at TEXT);
+CREATE TABLE IF NOT EXISTS co_policies (id TEXT PRIMARY KEY, domain TEXT NOT NULL, title TEXT NOT NULL, rule_json TEXT NOT NULL, requires_needs_aryan INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_escalations (id TEXT PRIMARY KEY, ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, impact TEXT, risk TEXT, cost TEXT, irreversibility TEXT, external_commitment TEXT, decision TEXT NOT NULL, needs_aryan_id TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_timeline_events (id TEXT PRIMARY KEY, event_type TEXT NOT NULL, title TEXT NOT NULL, description TEXT, ref_type TEXT, ref_id TEXT, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_traceability_links (id TEXT PRIMARY KEY, from_type TEXT NOT NULL, from_id TEXT NOT NULL, to_type TEXT NOT NULL, to_id TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_memory (id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_id TEXT, kind TEXT NOT NULL, content TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_failures (id TEXT PRIMARY KEY, ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, description TEXT NOT NULL, dependency TEXT, retried INTEGER NOT NULL DEFAULT 0, rerouted INTEGER NOT NULL DEFAULT 0, escalated INTEGER NOT NULL DEFAULT 0, needs_aryan_id TEXT, status TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_cost_estimates (id TEXT PRIMARY KEY, ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, estimated_ai_cost REAL, estimated_api_cost REAL, estimated_workforce_cost REAL, estimated_project_cost REAL, actual_ai_cost REAL, actual_api_cost REAL, actual_workforce_cost REAL, actual_project_cost REAL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_goal_feedback_events (id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, target REAL, actual REAL, variance REAL, likely_reason TEXT, recommended_adjustment TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_daily_loops (id TEXT PRIMARY KEY, run_date TEXT NOT NULL, state_snapshot_json TEXT NOT NULL, changes_json TEXT, blockers_json TEXT, priorities_json TEXT, recommended_actions_json TEXT, department_actions_json TEXT, ceo_brief_ref TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS co_weekly_reviews (id TEXT PRIMARY KEY, week_start TEXT NOT NULL, week_end TEXT NOT NULL, objective_progress_json TEXT, venture_performance_json TEXT, sales_json TEXT, delivery_json TEXT, media_json TEXT, workforce_json TEXT, finance_json TEXT, risks_json TEXT, resource_allocation_json TEXT, recommendations_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_co_objectives_status ON co_objectives(status, priority);
+CREATE INDEX IF NOT EXISTS idx_co_objective_status_events_objective ON co_objective_status_events(objective_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_plans_objective ON co_plans(objective_id, status);
+CREATE INDEX IF NOT EXISTS idx_co_priority_evaluations_ref ON co_priority_evaluations(ref_type, ref_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_department_objectives_company_objective ON co_department_objectives(company_objective_id, department);
+CREATE INDEX IF NOT EXISTS idx_co_department_objectives_department ON co_department_objectives(department, status);
+CREATE INDEX IF NOT EXISTS idx_co_venture_links_objective ON co_venture_links(objective_id);
+CREATE INDEX IF NOT EXISTS idx_co_venture_links_venture ON co_venture_links(venture_id);
+CREATE INDEX IF NOT EXISTS idx_co_resource_recommendations_scope ON co_resource_recommendations(scope, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_capital_recommendations_objective ON co_capital_recommendations(objective_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_events_type ON co_events(event_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_events_ref ON co_events(ref_type, ref_id);
+CREATE INDEX IF NOT EXISTS idx_co_events_idempotency ON co_events(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_co_replans_objective ON co_replans(objective_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_decisions_status ON co_decisions(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_decisions_ref ON co_decisions(ref_type, ref_id);
+CREATE INDEX IF NOT EXISTS idx_co_policies_domain ON co_policies(domain, status);
+CREATE INDEX IF NOT EXISTS idx_co_escalations_ref ON co_escalations(ref_type, ref_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_timeline_events_occurred ON co_timeline_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_co_traceability_links_from ON co_traceability_links(from_type, from_id);
+CREATE INDEX IF NOT EXISTS idx_co_traceability_links_to ON co_traceability_links(to_type, to_id);
+CREATE INDEX IF NOT EXISTS idx_co_memory_subject ON co_memory(subject_type, subject_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_failures_ref ON co_failures(ref_type, ref_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_failures_status ON co_failures(status);
+CREATE INDEX IF NOT EXISTS idx_co_cost_estimates_ref ON co_cost_estimates(ref_type, ref_id);
+CREATE INDEX IF NOT EXISTS idx_co_goal_feedback_events_goal ON co_goal_feedback_events(goal_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_daily_loops_run_date ON co_daily_loops(run_date);
+CREATE INDEX IF NOT EXISTS idx_co_weekly_reviews_week_start ON co_weekly_reviews(week_start);

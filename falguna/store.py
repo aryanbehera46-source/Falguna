@@ -96,9 +96,24 @@ class StateStore:
         "cc_ledger_entries": [("venture_id", "TEXT")],
         "cc_goals": [("venture_id", "TEXT")],
         "cc_risks": [("venture_id", "TEXT")],
-        "wf_tasks": [("venture_id", "TEXT")],
-        "missions": [("venture_id", "TEXT")],
+        # Company OS traceability (Section 24): a wf_task/mission can
+        # optionally be tagged with the company objective it exists to
+        # serve, on top of its existing venture_id -- NULL means "not yet
+        # traced to a company objective", fully backward compatible.
+        "wf_tasks": [("venture_id", "TEXT"), ("co_objective_id", "TEXT")],
+        "missions": [("venture_id", "TEXT"), ("co_objective_id", "TEXT")],
         "media_brands": [("venture_id", "TEXT")],
+        # TTT Group OS / Company Orchestrator v2 (Section 18: Boardroom v2) --
+        # every Boardroom topic can now carry a structured link to the
+        # company-objective/venture/risk it concerns, and a persisted
+        # discussion summary/follow-up, without altering the existing
+        # boardroom_topics/boardroom_decisions read/write paths at all. NULL
+        # (not linked) is fully backward compatible with every topic created
+        # before this column existed.
+        "boardroom_topics": [
+            ("linked_objective_id", "TEXT"), ("linked_venture_id", "TEXT"), ("linked_risk_id", "TEXT"),
+            ("discussion_summary", "TEXT"), ("follow_up", "TEXT"),
+        ],
     }
 
     def migrate(self) -> None:
@@ -135,7 +150,13 @@ class StateStore:
             "tl_trades", "tl_performance_snapshots", "tl_reviews", "tl_council_decisions", "tl_graveyard",
             "vs_ventures", "vs_venture_status_events", "vs_experiments", "vs_validation_signals",
             "vs_capital_allocations", "vs_resource_requests", "vs_recommendations", "vs_graveyard",
-            "vs_assets", "vs_relationships"}
+            "vs_assets", "vs_relationships",
+            # TTT Group OS / Company Orchestrator v2 (falguna/company_os.py)
+            "co_objectives", "co_objective_status_events", "co_plans", "co_priority_evaluations",
+            "co_department_objectives", "co_venture_links", "co_resource_recommendations",
+            "co_capital_recommendations", "co_events", "co_replans", "co_decisions", "co_policies",
+            "co_escalations", "co_timeline_events", "co_traceability_links", "co_memory", "co_failures",
+            "co_cost_estimates", "co_goal_feedback_events", "co_daily_loops", "co_weekly_reviews"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

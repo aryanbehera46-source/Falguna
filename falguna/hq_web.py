@@ -40,6 +40,14 @@ from .analytics_growth import AnalyticsError, AnalyticsStore, GrowthAgent, Growt
 from .application_executor import ApplicationExecutor, ApplicationExecutorError
 from .billing import BillingError, BillingStore, CompletionError, CompletionService, RetentionError, RetentionStore
 from .command_center import CEOBriefStore, command_center_snapshot, kpi_snapshot
+from .company_os import (
+    CompanyMemoryStore, CompanyOSError, CompanyPolicyStore, CostEstimateStore, DecisionStore,
+    DepartmentObjectiveStore, EventBus, ExecutionOrchestrator, FailureStore, ObjectiveStore, PlanStore,
+    PriorityStore, ReplanStore, ResourceRecommendationStore, TimelineStore, VentureAlignmentStore,
+    capital_orchestration_snapshot, ceo_command_center_v2_snapshot, company_os_home, company_state_snapshot,
+    compute_priority, escalate_if_warranted, evaluate_policy, goal_feedback, list_daily_loops,
+    list_weekly_reviews, resource_allocation_snapshot, run_daily_loop, run_weekly_review, trace_objective,
+)
 from .department_performance import ai_workforce_performance, department_performance
 from .goals import GoalError, GoalStore
 from .finance_ledger import LedgerError, LedgerStore, cash_and_runway, client_profitability
@@ -581,6 +589,107 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 query = parse_qs(urlparse(self.path).query)
                 department = (query.get("department") or [None])[0]
                 return self._json({"items": ResourceAllocationStore(store, control.audit).list(department=department)})
+
+            # -----------------------------------------------------------
+            # TTT Group OS / Company Orchestrator v2 (falguna/company_os.py)
+            # -----------------------------------------------------------
+            if path == "/api/co/home":
+                return self._json(company_os_home(store))
+            if path == "/api/co/state":
+                return self._json(company_state_snapshot(store))
+            if path == "/api/co/ceo-v2":
+                return self._json(ceo_command_center_v2_snapshot(store))
+            if path == "/api/co/objectives":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": ObjectiveStore(store, control.audit).list(status=status)})
+            if path.startswith("/api/co/objectives/") and path.endswith("/trace"):
+                objective_id = path.split("/")[4]
+                return self._json(trace_objective(store, objective_id))
+            if path.startswith("/api/co/objectives/") and path.endswith("/plans"):
+                objective_id = path.split("/")[4]
+                return self._json({"items": PlanStore(store, control.audit).list_for_objective(objective_id)})
+            if path.startswith("/api/co/objectives/") and path.endswith("/department-objectives"):
+                objective_id = path.split("/")[4]
+                return self._json({"items": DepartmentObjectiveStore(store, control.audit).list_for_objective(objective_id)})
+            if path.startswith("/api/co/objectives/") and path.endswith("/venture-links"):
+                objective_id = path.split("/")[4]
+                return self._json({"items": VentureAlignmentStore(store, control.audit).list_for_objective(objective_id)})
+            if path.startswith("/api/co/objectives/") and path.endswith("/replans"):
+                objective_id = path.split("/")[4]
+                return self._json({"items": ReplanStore(store, control.audit).list_for_objective(objective_id)})
+            if path.startswith("/api/co/objectives/") and path.endswith("/history"):
+                objective_id = path.split("/")[4]
+                return self._json({"items": ObjectiveStore(store, control.audit).history(objective_id)})
+            if path.startswith("/api/co/objectives/") and len(path.split("/")) == 5:
+                objective_id = path.rsplit("/", 1)[-1]
+                objective = ObjectiveStore(store, control.audit).get(objective_id)
+                return self._json(objective or {"error": "objective not found"}, HTTPStatus.OK if objective else HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/co/plans/") and len(path.split("/")) == 5:
+                plan_id = path.rsplit("/", 1)[-1]
+                plan = PlanStore(store, control.audit).get(plan_id)
+                return self._json(plan or {"error": "plan not found"}, HTTPStatus.OK if plan else HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/co/department-objectives/") and path.endswith("/dependencies"):
+                dept_objective_id = path.split("/")[4]
+                return self._json(DepartmentObjectiveStore(store, control.audit).dependencies_satisfied(dept_objective_id))
+            if path == "/api/co/department-objectives":
+                query = parse_qs(urlparse(self.path).query)
+                department = (query.get("department") or [None])[0]
+                status = (query.get("status") or [None])[0]
+                dept_store = DepartmentObjectiveStore(store, control.audit)
+                items = dept_store.list_for_department(department, status=status) if department else store.list("co_department_objectives")
+                return self._json({"items": list(reversed(items)) if not department else items})
+            if path == "/api/co/priorities":
+                query = parse_qs(urlparse(self.path).query)
+                ref_type = (query.get("ref_type") or [None])[0]
+                ref_id = (query.get("ref_id") or [None])[0]
+                priorities = PriorityStore(store, control.audit)
+                if ref_type and ref_id:
+                    return self._json({"latest": priorities.latest(ref_type, ref_id), "history": priorities.history(ref_type, ref_id)})
+                return self._json({"items": list(reversed(store.list("co_priority_evaluations")))[:100]})
+            if path == "/api/co/resource-allocation":
+                return self._json(resource_allocation_snapshot(store))
+            if path == "/api/co/resource-recommendations":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or ["OPEN"])[0]
+                return self._json({"items": ResourceRecommendationStore(store, control.audit).list(status=status or None)})
+            if path == "/api/co/capital-orchestration":
+                return self._json(capital_orchestration_snapshot(store))
+            if path == "/api/co/capital-recommendations":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or ["OPEN"])[0]
+                return self._json({"items": store.list("co_capital_recommendations")[::-1] if not status else [r for r in reversed(store.list("co_capital_recommendations")) if r["status"] == status]})
+            if path == "/api/co/timeline":
+                return self._json({"items": TimelineStore(store, control.audit).list()})
+            if path == "/api/co/decisions":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": DecisionStore(store, control.audit).list(status=status)})
+            if path == "/api/co/policies":
+                query = parse_qs(urlparse(self.path).query)
+                domain = (query.get("domain") or [None])[0]
+                status = (query.get("status") or ["ACTIVE"])[0]
+                return self._json({"items": CompanyPolicyStore(store, control.audit).list(domain=domain, status=status)})
+            if path == "/api/co/daily-loops":
+                return self._json({"items": list_daily_loops(store)})
+            if path == "/api/co/weekly-reviews":
+                return self._json({"items": list_weekly_reviews(store)})
+            if path == "/api/co/failures":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or ["OPEN"])[0]
+                return self._json({"items": FailureStore(store, control.audit).list(status=status or None)})
+            if path == "/api/co/events":
+                query = parse_qs(urlparse(self.path).query)
+                event_type = (query.get("event_type") or [None])[0]
+                return self._json({"items": EventBus(store, control.audit).list(event_type=event_type)})
+            if path == "/api/co/memory":
+                query = parse_qs(urlparse(self.path).query)
+                subject_type = (query.get("subject_type") or [None])[0]
+                subject_id = (query.get("subject_id") or [None])[0]
+                memory = CompanyMemoryStore(store, control.audit)
+                items = memory.list_for(subject_type, subject_id) if (subject_type and subject_id) else memory.list_all()
+                return self._json({"items": items})
+
             if path.startswith("/api/vs/ventures/"):
                 venture_id = path.rsplit("/", 1)[-1]
                 venture = VentureStore(store, control.audit).get(venture_id)
@@ -602,6 +711,8 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         body.get("title", ""), body.get("summary", ""), body.get("actor", "Aryan"),
                         proposed_category=body.get("proposed_category"), proposed_phase=body.get("proposed_phase"),
                         proposed_priority=body.get("proposed_priority"), proposed_revenue_impact=body.get("proposed_revenue_impact"),
+                        linked_objective_id=body.get("linked_objective_id"), linked_venture_id=body.get("linked_venture_id"),
+                        linked_risk_id=body.get("linked_risk_id"), discussion_summary=body.get("discussion_summary"),
                     )
                     return self._json({"topic_id": topic_id}, HTTPStatus.CREATED)
                 if path.startswith("/api/boardroom/") and path.endswith("/contribution"):
@@ -613,6 +724,21 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     backlog = BacklogStore(store, control.audit)
                     result = BoardroomStore(store, control.audit).decide(topic_id, body.get("action", ""), body.get("actor", "Aryan"), note=body.get("note"), backlog_store=backlog)
                     return self._json(result)
+                if path.startswith("/api/boardroom/") and path.endswith("/link"):
+                    topic_id = path.split("/")[3]
+                    topic = BoardroomStore(store, control.audit).link(
+                        topic_id, body.get("actor", "Aryan"), linked_objective_id=body.get("linked_objective_id"),
+                        linked_venture_id=body.get("linked_venture_id"), linked_risk_id=body.get("linked_risk_id"),
+                    )
+                    return self._json(topic)
+                if path.startswith("/api/boardroom/") and path.endswith("/discussion-summary"):
+                    topic_id = path.split("/")[3]
+                    topic = BoardroomStore(store, control.audit).set_discussion_summary(topic_id, body.get("discussion_summary", ""), body.get("actor", "Aryan"))
+                    return self._json(topic)
+                if path.startswith("/api/boardroom/") and path.endswith("/follow-up"):
+                    topic_id = path.split("/")[3]
+                    topic = BoardroomStore(store, control.audit).set_follow_up(topic_id, body.get("follow_up", ""), body.get("actor", "Aryan"))
+                    return self._json(topic)
                 if path == "/api/backlog":
                     item_id = BacklogStore(store, control.audit).create_item(
                         body.get("title", ""), body.get("actor", "Aryan"), category=body.get("category"),
@@ -1431,6 +1557,205 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     )
                     return self._json({"task_id": task_id}, HTTPStatus.CREATED)
 
+                # -----------------------------------------------------------
+                # TTT Group OS / Company Orchestrator v2 (falguna/company_os.py)
+                # -----------------------------------------------------------
+                if path == "/api/co/objectives":
+                    objective_id = ObjectiveStore(store, control.audit).create(
+                        body.get("title", ""), actor=body.get("actor", "Aryan"), description=body.get("description"),
+                        owner=body.get("owner"), priority=body.get("priority"), target=body.get("target"),
+                        deadline=body.get("deadline"), linked_goals=body.get("linked_goals"),
+                        linked_ventures=body.get("linked_ventures"), linked_departments=body.get("linked_departments"),
+                        budget_scope=body.get("budget_scope"), risk_tolerance=body.get("risk_tolerance"),
+                        evidence=body.get("evidence"),
+                    )
+                    return self._json({"objective_id": objective_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/objectives/") and path.endswith("/transition"):
+                    objective_id = path.split("/")[4]
+                    objective = ObjectiveStore(store, control.audit).transition(
+                        objective_id, body.get("to_status", ""), body.get("actor", "Aryan"), reason=body.get("reason"),
+                    )
+                    return self._json(objective)
+                if path.startswith("/api/co/objectives/") and path.endswith("/progress"):
+                    objective_id = path.split("/")[4]
+                    objective = ObjectiveStore(store, control.audit).update_progress(
+                        objective_id, body.get("current_progress", ""), body.get("actor", "Aryan"),
+                    )
+                    return self._json(objective)
+                if path.startswith("/api/co/objectives/") and path.endswith("/plans"):
+                    objective_id = path.split("/")[4]
+                    plan_id = PlanStore(store, control.audit).create(
+                        objective_id, body.get("desired_outcome", ""), actor=body.get("actor", "Aryan"),
+                        milestones=body.get("milestones"), dependencies=body.get("dependencies"),
+                        ventures=body.get("ventures"), departments=body.get("departments"),
+                        capital_requirement=body.get("capital_requirement"), workforce_requirement=body.get("workforce_requirement"),
+                        falguna_work_requirement=body.get("falguna_work_requirement"), sales_media_needs=body.get("sales_media_needs"),
+                        risks=body.get("risks"), approvals=body.get("approvals"), expected_evidence=body.get("expected_evidence"),
+                    )
+                    return self._json({"plan_id": plan_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/objectives/") and path.endswith("/department-objectives"):
+                    objective_id = path.split("/")[4]
+                    dept_objective_id = DepartmentObjectiveStore(store, control.audit).create(
+                        objective_id, body.get("department", ""), body.get("title", ""), actor=body.get("actor", "Aryan"),
+                        owner=body.get("owner"), due_date=body.get("due_date"), expected_output=body.get("expected_output"),
+                        evidence=body.get("evidence"), dependencies=body.get("dependencies"),
+                    )
+                    return self._json({"dept_objective_id": dept_objective_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/objectives/") and path.endswith("/venture-links"):
+                    objective_id = path.split("/")[4]
+                    link_id = VentureAlignmentStore(store, control.audit).link(
+                        objective_id, body.get("venture_id", ""), actor=body.get("actor", "Aryan"),
+                        contribution=body.get("contribution"), dependency=body.get("dependency"),
+                        priority=body.get("priority"), budget_impact=body.get("budget_impact"),
+                        execution_health=body.get("execution_health"),
+                    )
+                    return self._json({"link_id": link_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/objectives/") and path.endswith("/replan"):
+                    objective_id = path.split("/")[4]
+                    replan = ReplanStore(store, control.audit).replan(
+                        objective_id, body.get("reason", ""), actor=body.get("actor", "Aryan"),
+                        changed_assumptions=body.get("changed_assumptions"),
+                    )
+                    return self._json(replan, HTTPStatus.CREATED)
+                if path.startswith("/api/co/replans/") and path.endswith("/link-new-plan"):
+                    replan_id = path.split("/")[4]
+                    replan = ReplanStore(store, control.audit).link_new_plan(replan_id, body.get("new_plan_id", ""), body.get("actor", "Aryan"))
+                    return self._json(replan)
+                if path.startswith("/api/co/plans/") and path.endswith("/status"):
+                    plan_id = path.split("/")[4]
+                    plan = PlanStore(store, control.audit).set_status(plan_id, body.get("status", ""), body.get("actor", "Aryan"))
+                    return self._json(plan)
+                if path.startswith("/api/co/plans/") and path.endswith("/route"):
+                    plan_id = path.split("/")[4]
+                    result = ExecutionOrchestrator(store, control.audit).route_plan(plan_id, actor=body.get("actor", "system"))
+                    return self._json(result, HTTPStatus.CREATED)
+                if path.startswith("/api/co/department-objectives/") and path.endswith("/status"):
+                    dept_objective_id = path.split("/")[4]
+                    dept_objective = DepartmentObjectiveStore(store, control.audit).set_status(
+                        dept_objective_id, body.get("status", ""), body.get("actor", "Aryan"),
+                    )
+                    return self._json(dept_objective)
+                if path == "/api/co/priorities/evaluate":
+                    result = PriorityStore(store, control.audit).evaluate(
+                        body.get("ref_type", ""), body.get("ref_id", ""), body.get("inputs") or {}, actor=body.get("actor", "system"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+                if path == "/api/co/resource-allocation/scan":
+                    result = resource_allocation_snapshot(
+                        store, recommendations=ResourceRecommendationStore(store, control.audit), actor=body.get("actor", "system"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+                if path.startswith("/api/co/resource-recommendations/") and path.endswith("/acknowledge"):
+                    rec_id = path.split("/")[4]
+                    rec = ResourceRecommendationStore(store, control.audit).acknowledge(rec_id, body.get("actor", "Aryan"))
+                    return self._json(rec)
+                if path == "/api/co/capital-recommendations":
+                    from .company_os import CapitalRecommendationStore
+                    rec_id = CapitalRecommendationStore(store, control.audit).record(
+                        body.get("recommendation", ""), body.get("rationale", ""), actor=body.get("actor", "system"),
+                        objective_id=body.get("objective_id"), amount=body.get("amount"),
+                    )
+                    return self._json({"rec_id": rec_id}, HTTPStatus.CREATED)
+                if path == "/api/co/decisions":
+                    decision_id = DecisionStore(store, control.audit, needs_aryan=needs_aryan_q).create(
+                        body.get("question", ""), body.get("options") or [], actor=body.get("actor", "Aryan"),
+                        evidence=body.get("evidence"), risks=body.get("risks"), cost=body.get("cost"),
+                        expected_impact=body.get("expected_impact"), recommendation=body.get("recommendation"),
+                        confidence=body.get("confidence"), ref_type=body.get("ref_type"), ref_id=body.get("ref_id"),
+                        high_impact=bool(body.get("high_impact")),
+                    )
+                    return self._json({"decision_id": decision_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/decisions/") and path.endswith("/decide"):
+                    decision_id = path.split("/")[4]
+                    decision = DecisionStore(store, control.audit).decide(
+                        decision_id, body.get("status", ""), body.get("actor", "Aryan"), note=body.get("note"),
+                    )
+                    return self._json(decision)
+                if path == "/api/co/policies":
+                    policy_id = CompanyPolicyStore(store, control.audit).create(
+                        body.get("domain", ""), body.get("title", ""), body.get("rule") or {},
+                        actor=body.get("actor", "Aryan"), requires_needs_aryan=body.get("requires_needs_aryan", True),
+                    )
+                    return self._json({"policy_id": policy_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/policies/") and path.endswith("/archive"):
+                    policy_id = path.split("/")[4]
+                    policy = CompanyPolicyStore(store, control.audit).archive(policy_id, body.get("actor", "Aryan"))
+                    return self._json(policy)
+                if path == "/api/co/policies/evaluate":
+                    result = evaluate_policy(store, body.get("domain", ""), body.get("context") or {})
+                    return self._json(result)
+                if path == "/api/co/escalate":
+                    result = escalate_if_warranted(
+                        store, needs_aryan_q, body.get("ref_type", ""), body.get("ref_id", ""),
+                        body.get("kind", "risky_action"), body.get("title", ""), body.get("what_is_needed", ""),
+                        actor=body.get("actor", "system"), impact=body.get("impact"), risk=body.get("risk"),
+                        cost=body.get("cost"), irreversibility=body.get("irreversibility"),
+                        external_commitment=bool(body.get("external_commitment")), rationale=body.get("rationale"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+                if path == "/api/co/failures":
+                    failure_id = FailureStore(store, control.audit, needs_aryan=needs_aryan_q).record(
+                        body.get("ref_type", ""), body.get("ref_id", ""), body.get("description", ""),
+                        actor=body.get("actor", "system"), dependency=body.get("dependency"),
+                    )
+                    return self._json({"failure_id": failure_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/failures/") and path.endswith("/retry"):
+                    failure_id = path.split("/")[4]
+                    return self._json(FailureStore(store, control.audit).retry(failure_id, body.get("actor", "Aryan"), note=body.get("note")))
+                if path.startswith("/api/co/failures/") and path.endswith("/reroute"):
+                    failure_id = path.split("/")[4]
+                    return self._json(FailureStore(store, control.audit).reroute(failure_id, body.get("actor", "Aryan"), note=body.get("note")))
+                if path.startswith("/api/co/failures/") and path.endswith("/escalate"):
+                    failure_id = path.split("/")[4]
+                    result = FailureStore(store, control.audit, needs_aryan=needs_aryan_q).escalate(
+                        failure_id, body.get("actor", "Aryan"), body.get("title", ""), body.get("what_is_needed", ""),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/co/failures/") and path.endswith("/resolve"):
+                    failure_id = path.split("/")[4]
+                    return self._json(FailureStore(store, control.audit).resolve(failure_id, body.get("actor", "Aryan"), note=body.get("note")))
+                if path == "/api/co/timeline":
+                    event_id = TimelineStore(store, control.audit).record(
+                        body.get("event_type", ""), body.get("title", ""), actor=body.get("actor", "Aryan"),
+                        description=body.get("description"), ref_type=body.get("ref_type"), ref_id=body.get("ref_id"),
+                        occurred_at=body.get("occurred_at"),
+                    )
+                    return self._json({"event_id": event_id}, HTTPStatus.CREATED)
+                if path == "/api/co/memory":
+                    memory_id = CompanyMemoryStore(store, control.audit).record(
+                        body.get("subject_type", ""), body.get("kind", ""), body.get("content", ""),
+                        actor=body.get("actor", "Aryan"), subject_id=body.get("subject_id"),
+                    )
+                    return self._json({"memory_id": memory_id}, HTTPStatus.CREATED)
+                if path == "/api/co/cost-estimates":
+                    cost_id = CostEstimateStore(store, control.audit).set_estimate(
+                        body.get("ref_type", ""), body.get("ref_id", ""), actor=body.get("actor", "system"),
+                        estimated_ai_cost=body.get("estimated_ai_cost"), estimated_api_cost=body.get("estimated_api_cost"),
+                        estimated_workforce_cost=body.get("estimated_workforce_cost"), estimated_project_cost=body.get("estimated_project_cost"),
+                    )
+                    return self._json({"cost_id": cost_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/co/cost-estimates/") and path.endswith("/actual"):
+                    cost_id = path.split("/")[4]
+                    result = CostEstimateStore(store, control.audit).record_actual(
+                        cost_id, body.get("actor", "system"), actual_ai_cost=body.get("actual_ai_cost"),
+                        actual_api_cost=body.get("actual_api_cost"), actual_workforce_cost=body.get("actual_workforce_cost"),
+                        actual_project_cost=body.get("actual_project_cost"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/co/goals/") and path.endswith("/feedback"):
+                    goal_id = path.split("/")[4]
+                    result = goal_feedback(store, control.audit, goal_id, actor=body.get("actor", "system"))
+                    return self._json(result, HTTPStatus.CREATED)
+                if path == "/api/co/daily-loop/run":
+                    result = run_daily_loop(store, control.audit, actor=body.get("actor", "system"))
+                    return self._json(result, HTTPStatus.CREATED)
+                if path == "/api/co/weekly-review/run":
+                    result = run_weekly_review(
+                        store, control.audit, actor=body.get("actor", "system"),
+                        week_start=body.get("week_start"), week_end=body.get("week_end"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
+
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             finally:
                 store.close()
@@ -1481,6 +1806,18 @@ HQ_INDEX_HTML = r'''<!doctype html>
 @media(max-width:820px){.app{grid-template-columns:1fr;height:auto;min-height:100dvh}aside{flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}aside .brand{width:100%;padding:2px 4px 10px}aside .navsec,aside .boundary{display:none}aside .navitem{padding:6px 10px;font-size:12px}main{padding:20px 16px}.row{flex-direction:column}}
 </style></head><body><div class="app"><aside>
 <div class="brand"><span class="mark">TT</span>Twenty Two Technologies</div>
+<div class="navsec">Company OS</div>
+<button class="navitem" data-view="coHome">Company OS Home</button>
+<button class="navitem" data-view="coCeoV2">CEO Command Center v2</button>
+<button class="navitem" data-view="coObjectives">Objectives</button>
+<button class="navitem" data-view="coPlans">Plans</button>
+<button class="navitem" data-view="coPriorities">Priorities</button>
+<button class="navitem" data-view="coDeptObjectives">Department Objectives</button>
+<button class="navitem" data-view="coResourceAllocation">Resource Allocation</button>
+<button class="navitem" data-view="coTimeline">Company Timeline</button>
+<button class="navitem" data-view="coDecisions">Decisions</button>
+<button class="navitem" data-view="coPolicies">Policies</button>
+<button class="navitem" data-view="coOperatingReviews">Operating Reviews</button>
 <div class="navsec">Command Center</div>
 <button class="navitem active" data-view="commandCenter">Command Center</button>
 <div class="navsec">Trading Lab (PAPER)</div>
@@ -1724,7 +2061,7 @@ HQ_INDEX_HTML = r'''<!doctype html>
 </div>
 <div class="view" id="view-boardroom">
 <h1>Boardroom</h1>
-<div class="pageintro">Strategy / Technology / Revenue / Finance-Risk / Operations -- discuss, then decide. Decisions persist and are never in-memory only.</div>
+<div class="pageintro">Strategy / Technology / Revenue / Finance-Risk / Operations -- discuss, then decide. Decisions persist and are never in-memory only. A topic may link to a Company OS objective, venture, or risk, and carry a discussion summary and a follow-up, for a traceable company decision history.</div>
 <div class="list" id="boardroomList"></div>
 <div class="form">
 <input id="brTitle" placeholder="Topic title">
@@ -1732,6 +2069,10 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="row">
 <select id="brCategory"><option value="">Category (optional)</option><option>Revenue</option><option>Engineering</option><option>Operations</option><option>Strategy</option></select>
 <select id="brPriority"><option value="">Priority (optional)</option><option>Low</option><option>Medium</option><option>High</option></select>
+</div>
+<div class="row">
+<input id="brLinkedObjective" placeholder="Linked Company OS objective id (optional)">
+<input id="brLinkedVenture" placeholder="Linked venture id (optional)">
 </div>
 <div class="actions"><button id="brCreate" type="button">Open topic</button></div>
 </div>
@@ -2005,6 +2346,166 @@ HQ_INDEX_HTML = r'''<!doctype html>
 </div>
 <div class="list" id="vsGraveyardList"></div>
 </div>
+
+<div class="view" id="view-coHome">
+<h1>Company OS Home</h1>
+<div class="pageintro">What matters now, what is running, what is blocked, what changed, what needs Aryan, what should happen next -- the single operational home for the whole company. Read-only; the daily loop below is the only thing that updates state, and it never sends, spends, or signs anything on its own.</div>
+<div class="section"><h2>Run the daily operating loop</h2><div class="sub">Reads company state, refreshes priorities, surfaces blockers, and recommends next actions. No external actions are ever taken automatically.</div><div class="actions"><button id="coRunDailyLoop" type="button">Run daily loop now</button></div></div>
+<div class="section"><h2>What matters now</h2><div class="list" id="coHomeMatters"></div></div>
+<div class="section"><h2>What is running</h2><div class="list" id="coHomeRunning"></div></div>
+<div class="section"><h2>What is blocked</h2><div class="list" id="coHomeBlocked"></div></div>
+<div class="section"><h2>What changed (last daily loop)</h2><div class="list" id="coHomeChanged"></div></div>
+<div class="section"><h2>What needs Aryan</h2><div class="list" id="coHomeNeedsAryan"></div></div>
+<div class="section"><h2>What should happen next</h2><div class="list" id="coHomeNextActions"></div></div>
+</div>
+
+<div class="view" id="view-coCeoV2">
+<h1>CEO Command Center v2</h1>
+<div class="pageintro">Top company objectives, priorities, active ventures, major clients, revenue/cash, blocked work, resource conflicts, risks, decisions required, Needs Aryan, today, and the next 7 days -- reshaped from the existing Command Center and Company OS snapshots, nothing recomputed with new assumptions.</div>
+<div class="section"><h2>Top company objectives</h2><div class="list" id="ccv2Objectives"></div></div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="ccv2Cash">$0</h2><div class="sub">Cash in to date</div></div>
+<div class="section" style="flex:1"><h2 id="ccv2Receivables">$0</h2><div class="sub">Outstanding receivables</div></div>
+<div class="section" style="flex:1"><h2 id="ccv2Revenue">$0</h2><div class="sub">Won revenue lifetime</div></div>
+</div>
+<div class="section"><h2>Active ventures</h2><div class="list" id="ccv2Ventures"></div></div>
+<div class="section"><h2>Major clients</h2><div class="list" id="ccv2Clients"></div></div>
+<div class="section"><h2>Blocked work</h2><div class="list" id="ccv2Blocked"></div></div>
+<div class="section"><h2>Resource conflicts</h2><div class="list" id="ccv2ResourceConflicts"></div></div>
+<div class="section"><h2>Risks</h2><div class="list" id="ccv2Risks"></div></div>
+<div class="section"><h2>Decisions required</h2><div class="list" id="ccv2Decisions"></div></div>
+<div class="section"><h2>Needs Aryan</h2><div class="list" id="ccv2NeedsAryan"></div></div>
+<div class="section"><h2>Obligations due in the next 7 days</h2><div class="list" id="ccv2Next7"></div></div>
+</div>
+
+<div class="view" id="view-coObjectives">
+<h1>Company Objectives</h1>
+<div class="pageintro">First-class company objectives: title, owner, priority, target, deadline, status, linked goals/ventures/departments, evidence, progress. Aryan approves an objective (DRAFT -&gt; ACTIVE) before a plan can be built against it.</div>
+<div class="list" id="coObjectivesList"></div>
+<div id="coObjectiveDetail"></div>
+<div class="section"><h2>New company objective</h2>
+<div class="form">
+<input id="coObjTitle" placeholder="Title">
+<textarea id="coObjDescription" placeholder="Description (optional)"></textarea>
+<div class="row">
+<input id="coObjOwner" placeholder="Owner (optional)">
+<select id="coObjPriority"><option value="">no priority set</option><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option><option>PARKED</option></select>
+</div>
+<div class="row">
+<input id="coObjTarget" placeholder="Target (free text, e.g. '2x revenue by Q4')">
+<input id="coObjDeadline" type="date">
+</div>
+<input id="coObjDepartments" placeholder="Linked departments, comma-separated (Sales, Delivery, Digital Workforce, Media/Growth, Falguna Engineering, Finance, Venture Studio, Research)">
+<div class="actions"><button id="coObjCreate" type="button">Create objective (DRAFT)</button></div>
+</div>
+</div>
+</div>
+
+<div class="view" id="view-coPlans">
+<h1>Company Plans</h1>
+<div class="pageintro">Converts an approved (ACTIVE) objective into a structured plan -- milestones, dependencies, ventures/departments involved, capital/workforce/Falguna/sales-media needs, risks, approvals, expected evidence. Nothing here invents certainty; every field is exactly what is entered.</div>
+<div class="form">
+<select id="coPlanObjectiveSelect"></select>
+<div class="actions"><button id="coPlanLoad" type="button">Load plans for this objective</button></div>
+</div>
+<div class="list" id="coPlansList"></div>
+<div class="section"><h2>New plan for the selected objective</h2>
+<div class="form">
+<input id="coPlanOutcome" placeholder="Desired outcome">
+<input id="coPlanDepartments" placeholder="Departments involved, comma-separated">
+<input id="coPlanCapital" placeholder="Capital requirement (optional)">
+<input id="coPlanWorkforce" placeholder="Workforce requirement (optional)">
+<textarea id="coPlanRisks" placeholder="Risks, one per line (optional)"></textarea>
+<input id="coPlanEvidence" placeholder="Expected evidence (optional)">
+<div class="actions"><button id="coPlanCreate" type="button">Create plan (DRAFT)</button></div>
+</div>
+</div>
+</div>
+
+<div class="view" id="view-coPriorities">
+<h1>Priority Engine</h1>
+<div class="pageintro">Transparent, rule-based prioritization -- a small integer point total with a plain-text rationale listing exactly which inputs contributed, never a fabricated precision score. Inputs are optional; an input you don't supply contributes nothing.</div>
+<div class="section"><h2>Evaluate a priority</h2>
+<div class="form">
+<div class="row"><input id="coPrioRefType" placeholder="ref_type (e.g. co_objectives)"><input id="coPrioRefId" placeholder="ref_id"></div>
+<div class="row">
+<select id="coPrioStrategic"><option value="">strategic_importance: unset</option><option value="critical">critical</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select>
+<select id="coPrioUrgency"><option value="">urgency: unset</option><option value="critical">critical</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select>
+</div>
+<div class="row">
+<select id="coPrioRisk"><option value="">risk: unset</option><option value="critical">critical</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select>
+<input id="coPrioDeadlineDays" type="number" placeholder="deadline_days (optional)">
+</div>
+<div class="actions"><button id="coPrioEvaluate" type="button">Evaluate</button></div>
+</div>
+</div>
+<div class="section"><h2>Recent evaluations</h2><div class="list" id="coPrioritiesList"></div></div>
+</div>
+
+<div class="view" id="view-coDeptObjectives">
+<h1>Department Objectives</h1>
+<div class="pageintro">Company objectives decomposed into department-level work -- each retains its parent link, owner, due date, expected output, and dependencies. A department objective with unmet dependencies is flagged, never silently allowed to look ready.</div>
+<div class="list" id="coDeptObjectivesList"></div>
+</div>
+
+<div class="view" id="view-coResourceAllocation">
+<h1>Resource &amp; Capital Allocation</h1>
+<div class="pageintro">Company-wide capacity (budget, workforce, media, sales attention, research) and the existing Finance/Capital Engine's cash/reserves/committed-obligations view. Recommendations only -- nothing here reallocates budget, capacity, or capital automatically.</div>
+<div class="section"><h2>Resource findings</h2><div class="actions"><button id="coResScan" type="button">Scan now (persists findings)</button></div><div class="list" id="coResFindings"></div></div>
+<div class="section"><h2>Open resource recommendations</h2><div class="list" id="coResRecommendations"></div></div>
+<div class="section"><h2>Capital orchestration snapshot</h2><div class="list" id="coCapSnapshot"></div></div>
+</div>
+
+<div class="view" id="view-coTimeline">
+<h1>Company Timeline</h1>
+<div class="pageintro">A persistent timeline of major company events -- decisions, wins, losses, launches, failures, capital allocations, risk events, milestones.</div>
+<div class="section"><h2>Record an event</h2>
+<div class="form">
+<div class="row"><input id="coTlEventType" placeholder="event_type (e.g. MILESTONE, LAUNCH, WIN, LOSS, RISK)"><input id="coTlTitle" placeholder="Title"></div>
+<textarea id="coTlDescription" placeholder="Description (optional)"></textarea>
+<div class="actions"><button id="coTlCreate" type="button">Record event</button></div>
+</div>
+</div>
+<div class="list" id="coTimelineList"></div>
+</div>
+
+<div class="view" id="view-coDecisions">
+<h1>Decision Engine</h1>
+<div class="pageintro">Structured decisions -- question, options, evidence, risks, cost, expected impact, recommendation, confidence. A high-impact decision escalates to Needs Aryan the moment it's created.</div>
+<div class="section"><h2>Propose a decision</h2>
+<div class="form">
+<input id="coDecQuestion" placeholder="Decision question">
+<input id="coDecOptions" placeholder="Options, comma-separated">
+<textarea id="coDecEvidence" placeholder="Evidence (optional)"></textarea>
+<div class="row"><input id="coDecRisks" placeholder="Risks (optional)"><input id="coDecCost" placeholder="Cost (optional)"></div>
+<input id="coDecRecommendation" placeholder="Recommendation (optional)">
+<label style="font-size:12px;color:var(--muted)"><input type="checkbox" id="coDecHighImpact" style="width:auto"> High impact (escalate to Needs Aryan now)</label>
+<div class="actions"><button id="coDecCreate" type="button">Propose decision</button></div>
+</div>
+</div>
+<div class="list" id="coDecisionsList"></div>
+</div>
+
+<div class="view" id="view-coPolicies">
+<h1>Policy Engine</h1>
+<div class="pageintro">Reusable company policies for spending, client commitments, sales discounts, venture budgets, risk thresholds, external communication, and destructive actions. No policy configured for a domain fails closed -- Needs Aryan is required by default.</div>
+<div class="section"><h2>New policy</h2>
+<div class="form">
+<select id="coPolDomain"><option value="spending">spending</option><option value="client_commitments">client_commitments</option><option value="sales_discounts">sales_discounts</option><option value="venture_budgets">venture_budgets</option><option value="risk_thresholds">risk_thresholds</option><option value="external_communication">external_communication</option><option value="destructive_actions">destructive_actions</option></select>
+<input id="coPolTitle" placeholder="Title">
+<input id="coPolAutonomousMaxAmount" type="number" step="any" placeholder="autonomous_max_amount (optional -- leave blank to require Needs Aryan always)">
+<div class="actions"><button id="coPolCreate" type="button">Create policy</button></div>
+</div>
+</div>
+<div class="list" id="coPoliciesList"></div>
+</div>
+
+<div class="view" id="view-coOperatingReviews">
+<h1>Operating Reviews</h1>
+<div class="pageintro">The daily operating loop and the weekly operating review -- both persisted, so history is never lost. Neither takes an external action; both only read, evaluate, and recommend.</div>
+<div class="section"><h2>Daily loops</h2><div class="actions"><button id="coRunDailyLoop2" type="button">Run daily loop now</button></div><div class="list" id="coDailyLoopsList"></div></div>
+<div class="section"><h2>Weekly reviews</h2><div class="actions"><button id="coRunWeeklyReview" type="button">Run weekly review now</button></div><div class="list" id="coWeeklyReviewsList"></div></div>
+</div>
 </div>
 </main>
 </div>
@@ -2013,7 +2514,7 @@ const $=id=>document.getElementById(id);
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadCommandCenter(),loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
 async function loadCommandCenter(){
@@ -2219,8 +2720,10 @@ $('tlRiskCreate').onclick=async()=>{
 async function loadBoardroom(){const d=await api('/api/boardroom');renderBoardroom(d.topics||[])}
 function renderBoardroom(topics){$('boardroomList').innerHTML=topics.length?topics.map(t=>`<div class="item" data-topic="${esc(t.id)}">
 <h3>${esc(t.title)}</h3>
-<div class="meta"><span>${esc(t.status)}</span>${t.proposed_category?`<span>${esc(t.proposed_category)}</span>`:''}${t.proposed_priority?`<span>${esc(t.proposed_priority)}</span>`:''}</div>
+<div class="meta"><span>${esc(t.status)}</span>${t.proposed_category?`<span>${esc(t.proposed_category)}</span>`:''}${t.proposed_priority?`<span>${esc(t.proposed_priority)}</span>`:''}${t.linked_objective_id?`<span>objective: ${esc(t.linked_objective_id)}</span>`:''}${t.linked_venture_id?`<span>venture: ${esc(t.linked_venture_id)}</span>`:''}${t.linked_risk_id?`<span>risk: ${esc(t.linked_risk_id)}</span>`:''}</div>
 <div>${esc(t.summary)}</div>
+${t.discussion_summary?`<div class="contrib"><b>Discussion summary:</b> ${esc(t.discussion_summary)}</div>`:''}
+${t.follow_up?`<div class="contrib"><b>Follow-up:</b> ${esc(t.follow_up)}</div>`:''}
 <div class="hqcontribs" id="contribs-${esc(t.id)}"></div>
 ${t.status==='OPEN'?`<div class="form">
 <select class="pv"><option value="">Add a perspective…</option><option>Strategy</option><option>Technology</option><option>Revenue</option><option>Finance-Risk</option><option>Operations</option></select>
@@ -2233,12 +2736,18 @@ ${t.status==='OPEN'?`<div class="form">
 <button class="danger dec" data-topic="${esc(t.id)}" data-action="reject">Reject</button>
 </div>
 </div>`:''}
+<div class="actions">
+<button class="secondary brsummary" data-topic="${esc(t.id)}">Set discussion summary</button>
+<button class="secondary brfollowup" data-topic="${esc(t.id)}">Set follow-up</button>
+</div>
 </div>`).join(''):'<div class="empty">No Boardroom topics yet.</div>';
 topics.forEach(t=>loadTopicHistory(t.id));
 document.querySelectorAll('.addc').forEach(b=>b.onclick=async()=>{const item=b.closest('.item');const perspective=item.querySelector('.pv').value;const content=item.querySelector('.ct').value.trim();if(!perspective||!content)return alert('Pick a perspective and write something first.');await api(`/api/boardroom/${b.dataset.topic}/contribution`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({perspective,content})});await loadBoardroom()});
-document.querySelectorAll('.dec[data-topic]').forEach(b=>b.onclick=async()=>{const note=prompt('Note for this decision (optional):')||'';await api(`/api/boardroom/${b.dataset.topic}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadBoardroom();await loadBacklog()})}
+document.querySelectorAll('.dec[data-topic]').forEach(b=>b.onclick=async()=>{const note=prompt('Note for this decision (optional):')||'';await api(`/api/boardroom/${b.dataset.topic}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadBoardroom();await loadBacklog()});
+document.querySelectorAll('.brsummary').forEach(b=>b.onclick=async()=>{const v=prompt('Discussion summary:');if(!v)return;await api(`/api/boardroom/${b.dataset.topic}/discussion-summary`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({discussion_summary:v,actor:'Aryan'})});await loadBoardroom()});
+document.querySelectorAll('.brfollowup').forEach(b=>b.onclick=async()=>{const v=prompt('Follow-up:');if(!v)return;await api(`/api/boardroom/${b.dataset.topic}/follow-up`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({follow_up:v,actor:'Aryan'})});await loadBoardroom()})}
 async function loadTopicHistory(id){try{const t=await api('/api/boardroom/'+id);const el=$('contribs-'+id);if(!el)return;el.innerHTML=(t.contributions||[]).map(c=>`<div class="contrib"><b>${esc(c.perspective)}:</b> ${esc(c.content)}</div>`).join('')+(t.decisions||[]).map(d=>`<div class="contrib"><b>${esc(d.action)}</b> by ${esc(d.decided_by)}${d.note?': '+esc(d.note):''}</div>`).join('')}catch(e){}}
-$('brCreate').onclick=async()=>{const title=$('brTitle').value.trim();const summary=$('brSummary').value.trim();if(!title||!summary)return alert('Title and summary are required.');await api('/api/boardroom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,summary,actor:'Aryan',proposed_category:$('brCategory').value||null,proposed_priority:$('brPriority').value||null})});$('brTitle').value='';$('brSummary').value='';await loadBoardroom()};
+$('brCreate').onclick=async()=>{const title=$('brTitle').value.trim();const summary=$('brSummary').value.trim();if(!title||!summary)return alert('Title and summary are required.');await api('/api/boardroom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,summary,actor:'Aryan',proposed_category:$('brCategory').value||null,proposed_priority:$('brPriority').value||null,linked_objective_id:$('brLinkedObjective').value.trim()||null,linked_venture_id:$('brLinkedVenture').value.trim()||null})});$('brTitle').value='';$('brSummary').value='';$('brLinkedObjective').value='';$('brLinkedVenture').value='';await loadBoardroom()};
 $('ccGenerateBrief').onclick=async()=>{const b=await api('/api/cc/ceo-brief/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});renderCeoBrief(b)};
 async function loadBacklog(){const d=await api('/api/backlog');renderBacklog(d.items||[])}
 function renderBacklog(items){$('backlogList').innerHTML=items.length?items.map(i=>`<div class="item">
@@ -2681,6 +3190,222 @@ ${assetsProduced.length?`<div class="meta">${assetsProduced.map(a=>`<span>${esc(
 }).join(''):'<div class="empty">No ventures have been closed yet.</div>';
 }
 $('vgCheckSimilar').onclick=async()=>{const thesis=$('vgThesisCheck').value.trim();if(!thesis)return alert('Paste a thesis to check.');const r=await api('/api/vs/graveyard/check-similar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({thesis})});$('vgSimilarResults').innerHTML=(r.items||[]).length?r.items.map(h=>`<div class="item"><h3>Similar to a past venture</h3><div class="meta"><span>${esc(h.reason_killed)}</span></div><div>overlap: ${h.overlap_words.map(esc).join(', ')}</div></div>`).join(''):'<div class="empty">No overlapping past theses found (advisory only, not a block).</div>'};
+
+// -----------------------------------------------------------------------
+// TTT Group OS / Company Orchestrator v2
+// -----------------------------------------------------------------------
+async function loadCoHome(){
+const d=await api('/api/co/home');
+$('coHomeMatters').innerHTML=(d.what_matters_now||[]).length?d.what_matters_now.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.status)}</span><span>${esc(o.priority||'no priority')}</span></div></div>`).join(''):'<div class="empty">Nothing currently active.</div>';
+$('coHomeRunning').innerHTML=(d.what_is_running||[]).length?d.what_is_running.map(t=>`<div class="item"><h3>${esc(t.objective)}</h3><div class="meta"><span>${esc(t.department)}</span></div></div>`).join(''):'<div class="empty">Nothing currently executing.</div>';
+const blocked=d.what_is_blocked||{};
+const blockedItems=[...(blocked.workforce||[]).map(t=>({title:t.objective,tag:'workforce: '+t.status})),...(blocked.objectives||[]).map(o=>({title:o.title,tag:'objective: BLOCKED'})),...(blocked.failures||[]).map(f=>({title:f.description,tag:'failure: '+f.status}))];
+$('coHomeBlocked').innerHTML=blockedItems.length?blockedItems.map(b=>`<div class="item"><h3>${esc(b.title)}</h3><div class="meta"><span>${esc(b.tag)}</span></div></div>`).join(''):'<div class="empty">Nothing blocked.</div>';
+$('coHomeChanged').innerHTML=(d.what_changed||[]).length?d.what_changed.map(c=>`<div class="item"><h3>${esc(c.title||c.metric||'change')}</h3><div class="meta"><span>${esc(c.change||((c.from!==undefined)?(c.from+' -> '+c.to):''))}</span></div></div>`).join(''):'<div class="empty">No daily loop has run yet, or nothing changed since the last one.</div>';
+$('coHomeNeedsAryan').innerHTML=(d.what_needs_aryan||[]).length?d.what_needs_aryan.map(n=>`<div class="item"><h3>${esc(n.title)}</h3><div class="meta"><span>${esc(n.kind)}</span></div></div>`).join(''):'<div class="empty">Nothing pending.</div>';
+$('coHomeNextActions').innerHTML=(d.what_should_happen_next||[]).length?d.what_should_happen_next.map(a=>`<div class="item">${esc(a)}</div>`).join(''):'<div class="empty">No recommended actions yet -- run the daily loop.</div>';
+}
+$('coRunDailyLoop').onclick=async()=>{try{await api('/api/co/daily-loop/run',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadCoHome()}catch(e){alert(e.message)}};
+
+async function loadCoCeoV2(){
+const d=await api('/api/co/ceo-v2');
+$('ccv2Objectives').innerHTML=(d.top_company_objectives||[]).length?d.top_company_objectives.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.status)}</span><span>${esc(o.priority||'no priority')}</span><span>${esc(o.deadline||'no deadline')}</span></div></div>`).join(''):'<div class="empty">No active objectives.</div>';
+$('ccv2Cash').textContent='$'+(d.revenue_cash.cash.cash_in_to_date??0);
+$('ccv2Receivables').textContent='$'+(d.revenue_cash.receivables.outstanding_total??0);
+$('ccv2Revenue').textContent='$'+(d.revenue_cash.revenue.won_revenue_lifetime??0);
+$('ccv2Ventures').innerHTML=(d.active_ventures||[]).length?d.active_ventures.map(v=>`<div class="item"><h3>${esc(v.name)}</h3><div class="meta"><span>${esc(v.status)}</span></div></div>`).join(''):'<div class="empty">No active ventures.</div>';
+$('ccv2Clients').innerHTML=(d.major_clients||[]).length?d.major_clients.map(c=>`<div class="item"><h3>${esc(c.name)}</h3><div class="meta"><span>total won $${esc(c.total_won_value)}</span></div></div>`).join(''):'<div class="empty">No clients yet.</div>';
+const blockedWf=(d.blocked_work.workforce||[]);const blockedDo=(d.blocked_work.department_objectives||[]);
+$('ccv2Blocked').innerHTML=(blockedWf.length+blockedDo.length)?[...blockedWf.map(t=>`<div class="item"><h3>${esc(t.objective)}</h3><div class="meta"><span>workforce: ${esc(t.status)}</span></div></div>`),...blockedDo.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>department objective: BLOCKED</span></div></div>`)].join(''):'<div class="empty">Nothing blocked.</div>';
+$('ccv2ResourceConflicts').innerHTML=(d.resource_conflicts||[]).length?d.resource_conflicts.map(f=>`<div class="item"><h3>${esc(f.finding)}</h3><div class="meta"><span>${esc(f.severity)}</span></div><div>${esc(f.recommendation)}</div></div>`).join(''):'<div class="empty">No resource conflicts detected.</div>';
+$('ccv2Risks').innerHTML=(d.risks||[]).length?d.risks.map(r=>`<div class="item"><h3>${esc(r.title)}</h3><div class="meta"><span>${esc(r.category)}</span><span>${esc(r.severity)}</span></div></div>`).join(''):'<div class="empty">No open risks.</div>';
+$('ccv2Decisions').innerHTML=(d.decisions_required||[]).length?d.decisions_required.map(x=>`<div class="item"><h3>${esc(x.question)}</h3><div class="meta"><span>${esc(x.status)}</span></div></div>`).join(''):'<div class="empty">No decisions pending.</div>';
+$('ccv2NeedsAryan').innerHTML=(d.needs_aryan||[]).length?d.needs_aryan.map(n=>`<div class="item"><h3>${esc(n.title)}</h3><div class="meta"><span>${esc(n.kind)}</span></div></div>`).join(''):'<div class="empty">Nothing pending.</div>';
+$('ccv2Next7').innerHTML=(d.next_7_days.obligations_due||[]).length?d.next_7_days.obligations_due.map(o=>`<div class="item"><h3>${esc(o.kind)}</h3><div class="meta"><span>due ${esc(o.due_date)}</span></div></div>`).join(''):'<div class="empty">Nothing due in the next 7 days.</div>';
+}
+
+function populateCoPlanObjectiveSelect(items){
+const sel=$('coPlanObjectiveSelect');if(!sel)return;
+sel.innerHTML=items.map(o=>`<option value="${o.id}">${esc(o.title)} (${esc(o.status)})</option>`).join('');
+}
+async function loadCoObjectives(){
+const d=await api('/api/co/objectives');const items=d.items||[];
+$('coObjectivesList').innerHTML=items.length?items.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.status)}</span><span>${esc(o.priority||'no priority')}</span><span>${esc(o.deadline||'no deadline')}</span></div><div class="actions"><button type="button" class="secondary coObjOpen" data-id="${o.id}">Open</button></div></div>`).join(''):'<div class="empty">No company objectives yet.</div>';
+document.querySelectorAll('.coObjOpen').forEach(b=>b.onclick=()=>selectCoObjective(b.dataset.id));
+populateCoPlanObjectiveSelect(items);
+}
+async function selectCoObjective(id){
+const [objective,plans,depts,links,replans,trace]=await Promise.all([
+api(`/api/co/objectives/${id}`),api(`/api/co/objectives/${id}/plans`),api(`/api/co/objectives/${id}/department-objectives`),
+api(`/api/co/objectives/${id}/venture-links`),api(`/api/co/objectives/${id}/replans`),api(`/api/co/objectives/${id}/trace`),
+]);
+const validNext=({DRAFT:['ACTIVE','CANCELLED'],ACTIVE:['AT_RISK','BLOCKED','COMPLETED','CANCELLED'],AT_RISK:['ACTIVE','BLOCKED','COMPLETED','CANCELLED'],BLOCKED:['ACTIVE','AT_RISK','CANCELLED'],COMPLETED:[],CANCELLED:[]})[objective.status]||[];
+$('coObjectiveDetail').innerHTML=`<div class="section">
+<h2>${esc(objective.title)}</h2>
+<div class="meta"><span>${esc(objective.status)}</span><span>${esc(objective.priority||'no priority')}</span><span>${esc(objective.deadline||'no deadline')}</span></div>
+${objective.description?`<div>${esc(objective.description)}</div>`:''}
+<div class="meta">${(objective.linked_departments||[]).map(d=>`<span>${esc(d)}</span>`).join('')}</div>
+<div class="form">
+<select id="coObjNextStatus">${validNext.map(s=>`<option>${s}</option>`).join('')}</select>
+<input id="coObjTransitionReason" placeholder="Reason for transition">
+<div class="actions"><button id="coObjTransitionBtn" type="button">Transition</button></div>
+</div>
+<div class="form">
+<input id="coObjProgressText" placeholder="Current progress (free text)" value="${esc(objective.current_progress||'')}">
+<div class="actions"><button id="coObjProgressBtn" type="button">Update progress</button></div>
+</div>
+<div class="form">
+<textarea id="coObjReplanReason" placeholder="Replan reason (deadline slip, budget change, venture failure, ...)"></textarea>
+<div class="actions"><button id="coObjReplanBtn" type="button">Trigger replan</button></div>
+</div>
+<div class="form">
+<input id="coObjVentureId" placeholder="venture_id to align">
+<input id="coObjVentureContribution" placeholder="contribution (optional)">
+<div class="actions"><button id="coObjLinkVentureBtn" type="button">Link venture</button></div>
+</div>
+</div>
+<div class="section"><h2>Plans</h2><div class="list">${plans.items.length?plans.items.map(p=>`<div class="item"><h3>${esc(p.desired_outcome)}</h3><div class="meta"><span>${esc(p.status)}</span></div><div class="actions">${p.status==='DRAFT'?`<button type="button" class="coPlanApprove" data-id="${p.id}">Approve</button>`:''}${p.status==='APPROVED'?`<button type="button" class="coPlanRoute" data-id="${p.id}">Route to execution</button>`:''}</div></div>`).join(''):'<div class="empty">No plans yet.</div>'}</div></div>
+<div class="section"><h2>Department objectives</h2><div class="list">${depts.items.length?depts.items.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.department)}</span><span>${esc(o.status)}</span></div></div>`).join(''):'<div class="empty">None yet -- route an approved plan to create them.</div>'}</div></div>
+<div class="section"><h2>Venture links</h2><div class="list">${links.items.length?links.items.map(l=>`<div class="item"><h3>venture ${esc(l.venture_id)}</h3><div class="meta"><span>${esc(l.contribution||'')}</span></div></div>`).join(''):'<div class="empty">No ventures linked.</div>'}</div></div>
+<div class="section"><h2>Replans</h2><div class="list">${replans.items.length?replans.items.map(r=>`<div class="item"><h3>${esc(r.reason)}</h3><div class="meta"><span>${esc(r.created_at)}</span></div></div>`).join(''):'<div class="empty">No replans yet.</div>'}</div></div>
+<div class="section"><h2>Traceability</h2><div class="sub">${trace.evidence.length} evidence record(s), ${trace.wf_tasks.length} workforce task(s), ${trace.linked_goals.length} linked goal(s).</div></div>`;
+$('coObjTransitionBtn').onclick=async()=>{try{await api(`/api/co/objectives/${id}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to_status:$('coObjNextStatus').value,reason:$('coObjTransitionReason').value.trim()||null,actor:'Aryan'})});await selectCoObjective(id);await loadCoObjectives()}catch(e){alert(e.message)}};
+$('coObjProgressBtn').onclick=async()=>{try{await api(`/api/co/objectives/${id}/progress`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_progress:$('coObjProgressText').value.trim(),actor:'Aryan'})});await selectCoObjective(id)}catch(e){alert(e.message)}};
+$('coObjReplanBtn').onclick=async()=>{const reason=$('coObjReplanReason').value.trim();if(!reason)return alert('A reason is required.');try{await api(`/api/co/objectives/${id}/replan`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason,actor:'Aryan'})});await selectCoObjective(id)}catch(e){alert(e.message)}};
+$('coObjLinkVentureBtn').onclick=async()=>{const venture_id=$('coObjVentureId').value.trim();if(!venture_id)return alert('venture_id is required.');try{await api(`/api/co/objectives/${id}/venture-links`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({venture_id,contribution:$('coObjVentureContribution').value.trim()||null,actor:'Aryan'})});await selectCoObjective(id)}catch(e){alert(e.message)}};
+document.querySelectorAll('.coPlanApprove').forEach(b=>b.onclick=async()=>{try{await api(`/api/co/plans/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'APPROVED',actor:'Aryan'})});await selectCoObjective(id)}catch(e){alert(e.message)}});
+document.querySelectorAll('.coPlanRoute').forEach(b=>b.onclick=async()=>{try{const r=await api(`/api/co/plans/${b.dataset.id}/route`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'system'})});await selectCoObjective(id);alert(`Routed: ${r.created_dept_objectives.length} department objective(s), ${r.created_wf_tasks.length} workforce task(s) created.`)}catch(e){alert(e.message)}});
+}
+$('coObjCreate').onclick=async()=>{
+const title=$('coObjTitle').value.trim();if(!title)return alert('Title is required.');
+const departments=$('coObjDepartments').value.split(',').map(s=>s.trim()).filter(Boolean);
+try{
+await api('/api/co/objectives',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+title,description:$('coObjDescription').value.trim()||null,owner:$('coObjOwner').value.trim()||null,
+priority:$('coObjPriority').value||null,target:$('coObjTarget').value.trim()||null,deadline:$('coObjDeadline').value||null,
+linked_departments:departments.length?departments:null,actor:'Aryan',
+})});
+['coObjTitle','coObjDescription','coObjOwner','coObjTarget','coObjDeadline','coObjDepartments'].forEach(id=>$(id).value='');
+await loadCoObjectives();
+}catch(e){alert(e.message)}
+};
+
+async function loadCoPlans(){
+await loadCoObjectives();
+$('coPlansList').innerHTML='<div class="empty">Choose an objective above and click "Load plans for this objective".</div>';
+}
+$('coPlanLoad').onclick=async()=>{
+const objective_id=$('coPlanObjectiveSelect').value;if(!objective_id)return alert('No objective selected -- create one first.');
+const d=await api(`/api/co/objectives/${objective_id}/plans`);
+$('coPlansList').innerHTML=(d.items||[]).length?d.items.map(p=>`<div class="item"><h3>${esc(p.desired_outcome)}</h3><div class="meta"><span>${esc(p.status)}</span></div>${p.capital_requirement?`<div>Capital: ${esc(p.capital_requirement)}</div>`:''}${p.workforce_requirement?`<div>Workforce: ${esc(p.workforce_requirement)}</div>`:''}</div>`).join(''):'<div class="empty">No plans yet for this objective.</div>';
+};
+$('coPlanCreate').onclick=async()=>{
+const objective_id=$('coPlanObjectiveSelect').value;if(!objective_id)return alert('No objective selected -- create one first.');
+const desired_outcome=$('coPlanOutcome').value.trim();if(!desired_outcome)return alert('Desired outcome is required.');
+const departments=$('coPlanDepartments').value.split(',').map(s=>s.trim()).filter(Boolean);
+const risks=$('coPlanRisks').value.split('\n').map(s=>s.trim()).filter(Boolean);
+try{
+await api(`/api/co/objectives/${objective_id}/plans`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+desired_outcome,departments:departments.length?departments:null,capital_requirement:$('coPlanCapital').value.trim()||null,
+workforce_requirement:$('coPlanWorkforce').value.trim()||null,risks:risks.length?risks:null,expected_evidence:$('coPlanEvidence').value.trim()||null,actor:'Aryan',
+})});
+['coPlanOutcome','coPlanDepartments','coPlanCapital','coPlanWorkforce','coPlanRisks','coPlanEvidence'].forEach(id=>$(id).value='');
+$('coPlanLoad').click();
+}catch(e){alert(e.message)}
+};
+
+async function loadCoPriorities(){
+const d=await api('/api/co/priorities');const items=d.items||[];
+$('coPrioritiesList').innerHTML=items.length?items.map(p=>`<div class="item"><h3>${esc(p.ref_type)}:${esc(p.ref_id)}</h3><div class="meta"><span>${esc(p.priority)}</span><span>${esc(p.created_at)}</span></div><div>${esc(p.rationale)}</div></div>`).join(''):'<div class="empty">No priority evaluations yet.</div>';
+}
+$('coPrioEvaluate').onclick=async()=>{
+const ref_type=$('coPrioRefType').value.trim();const ref_id=$('coPrioRefId').value.trim();
+if(!ref_type||!ref_id)return alert('ref_type and ref_id are required.');
+const inputs={};
+if($('coPrioStrategic').value)inputs.strategic_importance=$('coPrioStrategic').value;
+if($('coPrioUrgency').value)inputs.urgency=$('coPrioUrgency').value;
+if($('coPrioRisk').value)inputs.risk=$('coPrioRisk').value;
+if($('coPrioDeadlineDays').value)inputs.deadline_days=parseInt($('coPrioDeadlineDays').value,10);
+try{
+const r=await api('/api/co/priorities/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ref_type,ref_id,inputs,actor:'Aryan'})});
+alert(`Priority: ${r.priority}\n\n${r.rationale}`);
+await loadCoPriorities();
+}catch(e){alert(e.message)}
+};
+
+async function loadCoDeptObjectives(){
+const d=await api('/api/co/department-objectives');const items=d.items||[];
+$('coDeptObjectivesList').innerHTML=items.length?items.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.department)}</span><span>${esc(o.status)}</span>${o.due_date?`<span>due ${esc(o.due_date)}</span>`:''}${(o.dependencies&&o.dependencies.length)?'<span class="badge">has dependencies</span>':''}</div></div>`).join(''):'<div class="empty">No department objectives yet.</div>';
+}
+
+async function loadCoResourceAllocation(){
+const [snapshot,recs,capital]=await Promise.all([api('/api/co/resource-allocation'),api('/api/co/resource-recommendations'),api('/api/co/capital-orchestration')]);
+$('coResFindings').innerHTML=(snapshot.findings||[]).length?snapshot.findings.map(f=>`<div class="item"><h3>${esc(f.finding)}</h3><div class="meta"><span>${esc(f.scope)}</span><span>${esc(f.severity)}</span>${f.department?`<span>${esc(f.department)}</span>`:''}</div><div>${esc(f.recommendation)}</div></div>`).join(''):'<div class="empty">No findings from the last live read -- click Scan to persist a fresh check.</div>';
+$('coResRecommendations').innerHTML=(recs.items||[]).length?recs.items.map(r=>`<div class="item"><h3>${esc(r.finding)}</h3><div class="meta"><span>${esc(r.scope)}</span><span>${esc(r.severity)}</span></div><div>${esc(r.recommendation)}</div><div class="actions"><button type="button" class="secondary coResAck" data-id="${r.id}">Acknowledge</button></div></div>`).join(''):'<div class="empty">No open recommendations.</div>';
+document.querySelectorAll('.coResAck').forEach(b=>b.onclick=async()=>{try{await api(`/api/co/resource-recommendations/${b.dataset.id}/acknowledge`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCoResourceAllocation()}catch(e){alert(e.message)}});
+$('coCapSnapshot').innerHTML=`<div class="item"><h3>Cash</h3><div class="meta"><span>cash in to date $${esc(capital.cash.cash_in_to_date)}</span></div></div><div class="item"><h3>Committed obligations</h3><div class="meta"><span>$${esc(capital.committed_obligations.value)}</span></div></div><div class="item"><h3>Experimental capital available</h3><div class="meta"><span>$${esc(capital.experimental_capital.available)}</span></div></div>`;
+}
+$('coResScan').onclick=async()=>{try{await api('/api/co/resource-allocation/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCoResourceAllocation()}catch(e){alert(e.message)}};
+
+async function loadCoTimeline(){
+const d=await api('/api/co/timeline');const items=d.items||[];
+$('coTimelineList').innerHTML=items.length?items.map(t=>`<div class="item"><h3>${esc(t.title)}</h3><div class="meta"><span>${esc(t.event_type)}</span><span>${esc(t.occurred_at)}</span></div>${t.description?`<div>${esc(t.description)}</div>`:''}</div>`).join(''):'<div class="empty">No timeline events yet.</div>';
+}
+$('coTlCreate').onclick=async()=>{
+const event_type=$('coTlEventType').value.trim();const title=$('coTlTitle').value.trim();
+if(!event_type||!title)return alert('event_type and title are required.');
+try{
+await api('/api/co/timeline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({event_type,title,description:$('coTlDescription').value.trim()||null,actor:'Aryan'})});
+['coTlEventType','coTlTitle','coTlDescription'].forEach(id=>$(id).value='');
+await loadCoTimeline();
+}catch(e){alert(e.message)}
+};
+
+async function loadCoDecisions(){
+const d=await api('/api/co/decisions');const items=d.items||[];
+$('coDecisionsList').innerHTML=items.length?items.map(x=>`<div class="item"><h3>${esc(x.question)}</h3><div class="meta"><span>${esc(x.status)}</span>${x.needs_aryan_id?'<span class="badge">escalated to Needs Aryan</span>':''}</div>${x.recommendation?`<div><b>Recommendation:</b> ${esc(x.recommendation)}</div>`:''}<div class="meta">${(x.options||[]).map(o=>`<span>${esc(o.label||JSON.stringify(o))}</span>`).join('')}</div>${x.status==='PROPOSED'?`<div class="actions"><button type="button" class="coDecApprove" data-id="${x.id}">Approve</button><button type="button" class="secondary coDecReject" data-id="${x.id}">Reject</button><button type="button" class="secondary coDecDefer" data-id="${x.id}">Defer</button></div>`:''}</div>`).join(''):'<div class="empty">No decisions yet.</div>';
+document.querySelectorAll('.coDecApprove').forEach(b=>b.onclick=async()=>{try{await api(`/api/co/decisions/${b.dataset.id}/decide`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'APPROVED',actor:'Aryan'})});await loadCoDecisions()}catch(e){alert(e.message)}});
+document.querySelectorAll('.coDecReject').forEach(b=>b.onclick=async()=>{try{await api(`/api/co/decisions/${b.dataset.id}/decide`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'REJECTED',actor:'Aryan'})});await loadCoDecisions()}catch(e){alert(e.message)}});
+document.querySelectorAll('.coDecDefer').forEach(b=>b.onclick=async()=>{try{await api(`/api/co/decisions/${b.dataset.id}/decide`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'DEFERRED',actor:'Aryan'})});await loadCoDecisions()}catch(e){alert(e.message)}});
+}
+$('coDecCreate').onclick=async()=>{
+const question=$('coDecQuestion').value.trim();if(!question)return alert('Question is required.');
+const options=$('coDecOptions').value.split(',').map(s=>s.trim()).filter(Boolean).map(label=>({label}));
+if(!options.length)return alert('At least one option is required.');
+try{
+await api('/api/co/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+question,options,evidence:$('coDecEvidence').value.trim()||null,risks:$('coDecRisks').value.trim()||null,cost:$('coDecCost').value.trim()||null,
+recommendation:$('coDecRecommendation').value.trim()||null,high_impact:$('coDecHighImpact').checked,actor:'Aryan',
+})});
+['coDecQuestion','coDecOptions','coDecEvidence','coDecRisks','coDecCost','coDecRecommendation'].forEach(id=>$(id).value='');
+$('coDecHighImpact').checked=false;
+await loadCoDecisions();
+}catch(e){alert(e.message)}
+};
+
+async function loadCoPolicies(){
+const d=await api('/api/co/policies');const items=d.items||[];
+$('coPoliciesList').innerHTML=items.length?items.map(p=>`<div class="item"><h3>${esc(p.title)}</h3><div class="meta"><span>${esc(p.domain)}</span><span>${p.requires_needs_aryan?'requires Needs Aryan':'autonomous within bounds'}</span></div><div class="actions"><button type="button" class="secondary coPolArchive" data-id="${p.id}">Archive</button></div></div>`).join(''):'<div class="empty">No active policies -- every domain defaults to requiring Needs Aryan.</div>';
+document.querySelectorAll('.coPolArchive').forEach(b=>b.onclick=async()=>{try{await api(`/api/co/policies/${b.dataset.id}/archive`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCoPolicies()}catch(e){alert(e.message)}});
+}
+$('coPolCreate').onclick=async()=>{
+const domain=$('coPolDomain').value;const title=$('coPolTitle').value.trim();if(!title)return alert('Title is required.');
+const maxAmount=$('coPolAutonomousMaxAmount').value;
+const rule=maxAmount?{autonomous_max_amount:parseFloat(maxAmount)}:{};
+try{
+await api('/api/co/policies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain,title,rule,requires_needs_aryan:!maxAmount,actor:'Aryan'})});
+['coPolTitle','coPolAutonomousMaxAmount'].forEach(id=>$(id).value='');
+await loadCoPolicies();
+}catch(e){alert(e.message)}
+};
+
+async function loadCoOperatingReviews(){
+const [daily,weekly]=await Promise.all([api('/api/co/daily-loops'),api('/api/co/weekly-reviews')]);
+$('coDailyLoopsList').innerHTML=(daily.items||[]).length?daily.items.map(l=>`<div class="item"><h3>${esc(l.run_date)}</h3><div class="meta"><span>${esc((l.changes||[]).length)} change(s)</span><span>${esc((l.recommended_actions||[]).length)} recommendation(s)</span></div></div>`).join(''):'<div class="empty">No daily loops run yet.</div>';
+$('coWeeklyReviewsList').innerHTML=(weekly.items||[]).length?weekly.items.map(w=>`<div class="item"><h3>${esc(w.week_start)} to ${esc(w.week_end)}</h3><div class="meta"><span>${esc((w.objective_progress||[]).length)} objective(s)</span><span>${esc((w.recommendations||[]).length)} recommendation(s)</span></div></div>`).join(''):'<div class="empty">No weekly reviews run yet.</div>';
+}
+$('coRunDailyLoop2').onclick=async()=>{try{await api('/api/co/daily-loop/run',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadCoOperatingReviews()}catch(e){alert(e.message)}};
+$('coRunWeeklyReview').onclick=async()=>{try{await api('/api/co/weekly-review/run',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadCoOperatingReviews()}catch(e){alert(e.message)}};
 
 loadAll().catch(e=>{$('boardroomList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`});
 </script></body></html>'''
