@@ -36,6 +36,21 @@ CREATE INDEX IF NOT EXISTS idx_research_sources_research ON research_sources(res
 CREATE INDEX IF NOT EXISTS idx_research_citations_research ON research_citations(research_id);
 CREATE INDEX IF NOT EXISTS idx_research_handoffs_research ON research_handoffs(research_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_research_handoffs_run ON research_handoffs(run_id);
+
+-- Falguna Product Experience V2: real, additive-only support for Files,
+-- Notifications, and per-conversation model/work-mode selection. Nothing
+-- here replaces an existing table or write path -- attachments are stored
+-- once on disk under .falguna/attachments/ and referenced by id; a
+-- notification is only ever created from a real state transition Falguna
+-- already produced (a run reaching a terminal status, a research query
+-- finishing), never a fabricated event.
+CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, conversation_id TEXT, message_id TEXT, filename TEXT NOT NULL, content_type TEXT, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_rel_path TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_attachments_conversation ON attachments(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT, ref_type TEXT, ref_id TEXT, read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_ref ON notifications(ref_type, ref_id, kind);
+
 -- TTT HQ: Boardroom, Master Vision Backlog, Needs Aryan (PASS 1 consolidation)
 CREATE TABLE IF NOT EXISTS boardroom_topics (id TEXT PRIMARY KEY, title TEXT NOT NULL, summary TEXT NOT NULL, proposed_category TEXT, proposed_phase TEXT, proposed_priority TEXT, proposed_revenue_impact TEXT, status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS boardroom_contributions (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES boardroom_topics(id), perspective TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);

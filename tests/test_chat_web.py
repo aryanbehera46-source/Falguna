@@ -243,6 +243,15 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
 
+    def _wait_operation(self, token, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status, op = self._get(f"/api/operations/{token}")
+            if op.get("state") in {"COMPLETE", "FAILED", "CANCELLED"}:
+                return op
+            time.sleep(0.05)
+        self.fail(f"operation {token} never reached a terminal state")
+
 
 class ChatHttpLayerTests(_LiveFalgunaServerCase):
     def test_conversation_create_list_and_fetch_round_trip_over_real_http(self):
@@ -263,20 +272,26 @@ class ChatHttpLayerTests(_LiveFalgunaServerCase):
         self.assertEqual(self._get_status("/api/conversations/does-not-exist"), 404)
 
     def test_posting_a_message_without_an_authenticated_codex_runtime_degrades_gracefully(self):
-        # No `codex` executable is installed in this test environment. The
-        # message endpoint must still persist the user's message and return
-        # 200 with a clearly-errored assistant turn -- never a 500, and never
-        # a fabricated reply.
+        # No `codex` executable is installed in this test environment.
+        # Product Experience V2 (Sections 3-4): posting a message is now
+        # asynchronous -- the endpoint persists the user's message and a
+        # PENDING assistant placeholder immediately (202, never a 500 and
+        # never a fabricated reply), and the caller polls the returned
+        # operation token for the real terminal state.
         status, created = self._post("/api/conversations", {"title": "Chat"})
         conversation_id = created["id"]
         status, out = self._post(f"/api/conversations/{conversation_id}/messages", {"content": "hello Falguna"})
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 202)
         self.assertEqual(out["message"]["content"], "hello Falguna")
-        self.assertIsNotNone(out["assistant"]["error"])
-        self.assertIn("MODEL_UNAVAILABLE", out["assistant"]["error"])
+        self.assertEqual(out["assistant"]["status"], "PENDING")
+        op = self._wait_operation(out["operation"])
+        self.assertEqual(op["state"], "FAILED")
+        self.assertIn("MODEL_UNAVAILABLE", op["error"])
 
         status, detail = self._get(f"/api/conversations/{conversation_id}")
         self.assertEqual(len(detail["messages"]), 2)
+        self.assertEqual(detail["messages"][1]["status"], "FAILED")
+        self.assertIn("MODEL_UNAVAILABLE", detail["messages"][1]["error"])
         self.assertEqual(self._get_status(f"/api/conversations/{conversation_id}/messages"), 404)  # GET not allowed on this path
 
         status, err = self._post("/api/conversations/does-not-exist/messages", {"content": "hi"})

@@ -160,7 +160,8 @@ class ResearchStore:
         self.store = store
 
     def create_query(self, query: str, provider_name: str, project_id: Optional[str] = None,
-                      conversation_id: Optional[str] = None) -> str:
+                      conversation_id: Optional[str] = None, model_override: Optional[str] = None,
+                      work_mode: Optional[str] = None) -> str:
         query = (query or "").strip()
         if not query:
             raise ResearchError("Research query cannot be empty")
@@ -176,10 +177,14 @@ class ResearchStore:
             "error": None,
             "created_at": now,
             "updated_at": now,
+            "model_override": model_override,
+            "work_mode": work_mode,
+            "model_call_json": None,
         })
 
     def save_result(self, research_id: str, answer: str, sources: List[SourceResult],
-                     citations: List[dict], suggested_objective: Optional[str] = None) -> None:
+                     citations: List[dict], suggested_objective: Optional[str] = None,
+                     model_call: Optional[dict] = None) -> None:
         """citations: [{"source_index": int (1-based into `sources`), "claim": str}, ...].
         A citation whose source_index is out of range is dropped rather than
         raising -- a malformed model reply must never crash persistence."""
@@ -207,7 +212,10 @@ class ResearchStore:
                 "claim": str(citation.get("claim") or "")[:500],
                 "created_at": utcnow(),
             })
-        self.store.update("research_queries", research_id, answer=answer, suggested_objective=suggested_objective, status="DONE", updated_at=utcnow())
+        self.store.update(
+            "research_queries", research_id, answer=answer, suggested_objective=suggested_objective,
+            status="DONE", model_call_json=json.dumps(model_call, sort_keys=True) if model_call else None,
+        )
 
     def save_failure(self, research_id: str, error: str) -> None:
         self.store.update("research_queries", research_id, status="FAILED", error=str(error), updated_at=utcnow())

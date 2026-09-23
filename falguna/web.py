@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import secrets
 import shutil
 import threading
@@ -9,18 +10,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .attachments import AttachmentError, AttachmentStore
 from .chat import ChatError, ChatResponder, ConversationStore, search_missions
-from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL, ResilientCodexTransport
+from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL, ResilientCodexTransport, SUPPORTED_CODEX_MODELS
 from .continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
 from .discovery import ProjectDiscovery
 from .gateway import OpenAICompatibleGateway
 from .models import CommandSpec, RunPolicy
+from .notifications import NotificationStore
 from .research import ResearchError, ResearchResponder, ResearchStore, rank_sources
 from .review import ModelSemanticReviewer
 from .runtime import open_control_plane
 from .search_providers import DuckDuckGoHTMLSearchProvider
 from .store import utcnow
-from .usability import evidence_summary, mission_view
+from .usability import MILESTONES, evidence_summary, mission_view
 from .workers import StructuredEditWorker
 
 
@@ -33,6 +36,36 @@ MODEL = DEFAULT_CODEX_MODEL
 SEARCH_PROVIDER = DuckDuckGoHTMLSearchProvider()
 _operations = {}
 _operations_lock = threading.Lock()
+
+# Product Experience V2 -- Work Mode (Section 6). Falguna does not control
+# any model's internal reasoning depth and never claims to; these three
+# modes instead adjust the real knobs the system already has: how long a
+# call is allowed to run, whether a failed/unsupported model attempt is
+# allowed to fall back to another configured model (ResilientCodexTransport),
+# and -- for Work missions only -- how many bounded repair attempts a run
+# gets (RunPolicy.max_attempts, unchanged from today's default under
+# BALANCED). Fast trades resilience for a quick, single-attempt answer;
+# Deep trades time for more budget and more retries.
+DEFAULT_WORK_MODE = "BALANCED"
+WORK_MODE_SETTINGS = {
+    "FAST": {"chat_timeout": 30, "research_timeout": 30, "mission_timeout": 150, "max_attempts": 1, "fallback": False},
+    "BALANCED": {"chat_timeout": 60, "research_timeout": 60, "mission_timeout": 300, "max_attempts": 2, "fallback": True},
+    "DEEP": {"chat_timeout": 120, "research_timeout": 120, "mission_timeout": 600, "max_attempts": 3, "fallback": True},
+}
+
+
+def _work_mode(value) -> str:
+    value = str(value or "").upper()
+    return value if value in WORK_MODE_SETTINGS else DEFAULT_WORK_MODE
+
+
+def _model_choice(value) -> str:
+    return value if value in SUPPORTED_CODEX_MODELS else MODEL
+
+
+def _build_transport(codex_path, codex_home, timeout_seconds: int, use_fallback: bool):
+    base = CodexCliJSONTransport(Path(codex_path), codex_home, timeout_seconds=timeout_seconds)
+    return ResilientCodexTransport(base) if use_fallback else base
 
 
 class DiscoveryUncertain(ValueError):
@@ -88,12 +121,29 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             return self._html(INDEX_HTML)
         if path == "/api/config":
             profiles = load_profiles(self.app_root)
-            return self._json({"product": "Falguna Engineering", "stage": "internal alpha", "profiles": profiles, "model": MODEL})
+            return self._json({
+                "product": "Falguna Engineering", "stage": "internal alpha", "profiles": profiles, "model": MODEL,
+                "available_models": sorted(SUPPORTED_CODEX_MODELS), "codex_runtime_found": bool(shutil.which("codex")),
+                "work_modes": list(WORK_MODE_SETTINGS), "default_work_mode": DEFAULT_WORK_MODE,
+            })
         if path == "/api/settings":
             return self._settings()
         if path == "/api/search":
             query = parse_qs(parsed.query).get("q", [""])[0]
             return self._search(query)
+        if path == "/api/missions/board":
+            return self._missions_board()
+        if path == "/api/live-summary":
+            return self._live_summary()
+        if path == "/api/usage":
+            return self._usage()
+        if path == "/api/files":
+            return self._files()
+        if path == "/api/notifications":
+            return self._list_notifications()
+        if path.startswith("/api/attachments/"):
+            attachment_id = path.rsplit("/", 1)[-1]
+            return self._download_attachment(attachment_id)
         if path == "/api/research":
             return self._list_research()
         if path.startswith("/api/research/"):
@@ -217,7 +267,172 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 "conversation": conversation,
                 "messages": chat.list_messages(conversation_id),
                 "handoffs": chat.list_handoffs(conversation_id),
+                "attachments": AttachmentStore(store, self.app_root).list_for_conversation(conversation_id),
             })
+        finally:
+            store.close()
+
+    # ------------------------------------------------------- Product V2: GET
+
+    def _missions_board(self):
+        """Mission Control (Section 7): every run bucketed by real status --
+        never a UI-only classification. `needs_you` is PAUSED or a
+        DONE_CANDIDATE run whose merge decision is still PENDING (Falguna's
+        equivalent of a Needs-Aryan item, Section 32); nothing here is
+        merged, deployed, or otherwise decided by this endpoint."""
+        control, store = open_control_plane(self.app_root)
+        try:
+            profiles_by_repo = {p["repository"]: p["name"] for p in load_profiles(self.app_root)}
+            chat_store = ConversationStore(store)
+            research_store = ResearchStore(store)
+            board = {"running": [], "needs_you": [], "completed": [], "failed": [], "cancelled": []}
+            for run in reversed(store.list("runs")[-200:]):
+                task = store.get("tasks", run["task_id"])
+                requirement = store.get("requirements", task["requirement_id"])
+                mission = store.get("missions", requirement["mission_id"])
+                costs = store.list("cost_events", "run_id=?", (run["id"],))
+                artifacts = store.list("artifacts", "run_id=?", (run["id"],))
+                approvals = store.list("approvals", "run_id=? AND kind=?", (run["id"], "PROTECTED_BRANCH_MERGE"))
+                merge_status = approvals[-1]["status"] if approvals else "NOT_REQUESTED"
+                origin = "Direct"
+                if chat_store.handoffs_for_run(run["id"]):
+                    origin = "Chat"
+                elif research_store.handoffs_for_run(run["id"]):
+                    origin = "Search"
+                checkpoints = store.list("checkpoints", "run_id=?", (run["id"],))
+                current_step = MILESTONES.get(checkpoints[-1]["stage"], run["status"]) if checkpoints else run["status"]
+                card = {
+                    "run_id": run["id"], "title": mission["title"], "status": run["status"],
+                    "project": profiles_by_repo.get(task["repository"], task["repository"]),
+                    "worker": run["worker"], "model": run["model"], "origin": origin,
+                    "started_at": run["created_at"], "last_activity": run["updated_at"],
+                    "cost_usd": round(sum(float(c["amount_usd"]) for c in costs), 8),
+                    "evidence_count": len(artifacts), "merge_approval": merge_status, "current_step": current_step,
+                }
+                if run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"}:
+                    board["running"].append(card)
+                elif run["status"] == "PAUSED" or (run["status"] == "DONE_CANDIDATE" and merge_status == "PENDING"):
+                    board["needs_you"].append(card)
+                elif run["status"] in {"FAILED", "QUARANTINED"}:
+                    board["failed"].append(card)
+                elif run["status"] == "CANCELLED":
+                    board["cancelled"].append(card)
+                else:
+                    board["completed"].append(card)
+            return self._json(board)
+        finally:
+            store.close()
+
+    def _live_summary(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            running = needs_you = failed = 0
+            for run in store.list("runs")[-200:]:
+                approvals = store.list("approvals", "run_id=? AND kind=?", (run["id"], "PROTECTED_BRANCH_MERGE"))
+                merge_status = approvals[-1]["status"] if approvals else "NOT_REQUESTED"
+                if run["status"] in {"PLANNING", "WORKING", "VERIFYING", "REVIEWING"}:
+                    running += 1
+                elif run["status"] == "PAUSED" or (run["status"] == "DONE_CANDIDATE" and merge_status == "PENDING"):
+                    needs_you += 1
+                elif run["status"] in {"FAILED", "QUARANTINED"}:
+                    failed += 1
+            return self._json({
+                "running": running, "needs_you": needs_you, "failed": failed,
+                "unread_notifications": NotificationStore(store).unread_count(),
+            })
+        finally:
+            store.close()
+
+    def _usage(self):
+        """Usage/Cost (Section 26): real, recorded token counts and costs
+        only -- never invented billing data. Falguna's only wired transport
+        today is the subscription-based Codex CLI, which always reports
+        cost_usd=0.0 (see codex_transport.py); the note below says so
+        explicitly rather than implying a real dollar figure is being
+        hidden or estimated."""
+        control, store = open_control_plane(self.app_root)
+        try:
+            totals = {
+                "chat": {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0},
+                "research": {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0},
+                "work": {"cost_usd": 0.0, "calls": 0},
+            }
+            for message in store.list("chat_messages"):
+                if message.get("model_call_json"):
+                    call = json.loads(message["model_call_json"])
+                    totals["chat"]["cost_usd"] += float(call.get("cost_usd", 0) or 0)
+                    totals["chat"]["input_tokens"] += int(call.get("input_tokens", 0) or 0)
+                    totals["chat"]["output_tokens"] += int(call.get("output_tokens", 0) or 0)
+                    totals["chat"]["calls"] += 1
+            for query in store.list("research_queries"):
+                if query.get("model_call_json"):
+                    call = json.loads(query["model_call_json"])
+                    totals["research"]["cost_usd"] += float(call.get("cost_usd", 0) or 0)
+                    totals["research"]["input_tokens"] += int(call.get("input_tokens", 0) or 0)
+                    totals["research"]["output_tokens"] += int(call.get("output_tokens", 0) or 0)
+                    totals["research"]["calls"] += 1
+            for call in store.list("model_calls"):
+                totals["work"]["cost_usd"] += float(call["cost_usd"])
+                totals["work"]["calls"] += 1
+            for key in totals:
+                totals[key]["cost_usd"] = round(totals[key]["cost_usd"], 8)
+            return self._json({
+                "totals": totals,
+                "note": ("Falguna's configured runtime is the subscription-based Codex CLI, which has no "
+                         "additional per-call cash cost, so cost_usd is 0 for every real call today. Token "
+                         "counts are real recorded usage, not an estimate."),
+            })
+        finally:
+            store.close()
+
+    def _files(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            uploads = [
+                {"type": "upload", "id": a["id"], "filename": a["filename"], "content_type": a["content_type"],
+                 "size_bytes": a["size_bytes"], "conversation_id": a["conversation_id"], "created_at": a["created_at"]}
+                for a in AttachmentStore(store, self.app_root).list_all()
+            ]
+            generated = []
+            for run in reversed(store.list("runs")[-100:]):
+                task = store.get("tasks", run["task_id"])
+                requirement = store.get("requirements", task["requirement_id"])
+                mission = store.get("missions", requirement["mission_id"])
+                for artifact in store.list("artifacts", "run_id=?", (run["id"],)):
+                    generated.append({
+                        "type": "artifact", "id": artifact["id"], "filename": Path(artifact["path"]).name,
+                        "kind": artifact["kind"], "run_id": run["id"], "mission_title": mission["title"],
+                        "created_at": artifact["created_at"],
+                    })
+            generated.sort(key=lambda x: x["created_at"], reverse=True)
+            return self._json({"uploads": uploads, "generated": generated[:200]})
+        finally:
+            store.close()
+
+    def _download_attachment(self, attachment_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            attachments = AttachmentStore(store, self.app_root)
+            row = attachments.get(attachment_id)
+            data = attachments.read_bytes(attachment_id) if row else None
+            if data is None or not row:
+                return self._json({"error": "attachment not found"}, HTTPStatus.NOT_FOUND)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", row.get("content_type") or "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            safe_name = re.sub(r'[\r\n"]', "", row.get("filename") or "file")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        finally:
+            store.close()
+
+    def _list_notifications(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            notifications = NotificationStore(store)
+            return self._json({"notifications": notifications.list_notifications(), "unread": notifications.unread_count()})
         finally:
             store.close()
 
@@ -267,29 +482,52 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                     store.close()
             if path == "/api/conversations":
                 return self._create_conversation(body)
+            segments = path.split("/")
             if path.startswith("/api/conversations/") and path.endswith("/messages"):
-                return self._post_message(path.split("/")[3], body)
+                return self._post_message(segments[3], body)
+            if path.startswith("/api/conversations/") and len(segments) >= 7 and segments[4] == "messages" and segments[6] == "stop":
+                return self._stop_message(segments[3], segments[5])
+            if path.startswith("/api/conversations/") and len(segments) >= 7 and segments[4] == "messages" and segments[6] == "regenerate":
+                return self._regenerate_message(segments[3], segments[5])
+            if path.startswith("/api/conversations/") and len(segments) >= 7 and segments[4] == "messages" and segments[6] == "edit":
+                return self._edit_message(segments[3], segments[5], body)
             if path.startswith("/api/conversations/") and path.endswith("/rename"):
-                return self._rename_conversation(path.split("/")[3], body)
+                return self._rename_conversation(segments[3], body)
+            if path.startswith("/api/conversations/") and path.endswith("/archive"):
+                return self._archive_conversation(segments[3])
+            if path.startswith("/api/conversations/") and path.endswith("/delete"):
+                return self._delete_conversation(segments[3])
+            if path.startswith("/api/conversations/") and path.endswith("/model"):
+                return self._set_conversation_model(segments[3], body)
+            if path.startswith("/api/conversations/") and path.endswith("/work-mode"):
+                return self._set_conversation_work_mode(segments[3], body)
+            if path.startswith("/api/conversations/") and path.endswith("/attachments"):
+                return self._upload_attachment(segments[3], body)
             if path.startswith("/api/conversations/") and path.endswith("/handoff"):
-                return self._handoff(path.split("/")[3], body)
+                return self._handoff(segments[3], body)
+            if path.startswith("/api/notifications/") and path.endswith("/read"):
+                return self._mark_notification_read(segments[3])
+            if path == "/api/notifications/read-all":
+                return self._mark_all_notifications_read()
             if path == "/api/research":
                 return self._run_research(body)
             if path.startswith("/api/research/") and path.endswith("/continue-chat"):
-                return self._research_to_chat(path.split("/")[3], body)
+                return self._research_to_chat(segments[3], body)
             if path.startswith("/api/research/") and path.endswith("/handoff"):
-                return self._research_to_work(path.split("/")[3], body)
+                return self._research_to_work(segments[3], body)
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except DiscoveryUncertain as exc:
             return self._json({"error": str(exc), "discovery": exc.evidence}, HTTPStatus.CONFLICT)
-        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+        except (ValueError, KeyError, json.JSONDecodeError, ChatError) as exc:
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def _start(self, body):
-        token = self._launch(body.get("project"), body.get("objective", ""), body.get("max_cost_usd"))
+        token = self._launch(body.get("project"), body.get("objective", ""), body.get("max_cost_usd"),
+                              work_mode=body.get("work_mode"), model=body.get("model"))
         return self._json({"operation": token, "state": "STARTING"}, HTTPStatus.ACCEPTED)
 
-    def _launch(self, project_id, objective, max_cost_usd, conversation_id=None, research_id=None):
+    def _launch(self, project_id, objective, max_cost_usd, conversation_id=None, research_id=None,
+                work_mode=None, model=None):
         """Shared by /api/runs, Chat -> Work handoff, and Search -> Work handoff. All
         three paths go through the identical discovery/policy/worktree pipeline --
         a handoff cannot skip discovery, widen scope, or start a run without it.
@@ -327,7 +565,8 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             _operations[token]["discovery"] = discovery
         thread = threading.Thread(
             target=_run_mission,
-            args=(self.app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id, research_id),
+            args=(self.app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id, research_id,
+                  _model_choice(model), _work_mode(work_mode)),
             daemon=True,
         )
         thread.start()
@@ -356,9 +595,20 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             store.close()
 
     def _post_message(self, conversation_id, body):
+        """Product Experience V2 (Sections 3-4): posting a message is now
+        asynchronous, exactly like starting a Work mission -- the HTTP
+        response returns as soon as the user's message (and a PENDING
+        assistant placeholder) are persisted, and the reply is generated on
+        a background thread. The client polls the returned operation token
+        (the same GET /api/operations/<token> endpoint missions already
+        use) and shows the real QUEUED -> THINKING -> COMPLETED/FAILED/
+        CANCELLED state -- never a fabricated progress indicator."""
         content = str(body.get("content", "")).strip()
         if not content:
             raise ValueError("Message cannot be empty")
+        attachment_ids = body.get("attachment_ids") or []
+        if not isinstance(attachment_ids, list):
+            raise ValueError("attachment_ids must be a list")
         control, store = open_control_plane(self.app_root)
         try:
             chat = ConversationStore(store)
@@ -366,21 +616,145 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             if not conversation:
                 return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
             user_message = chat.add_message(conversation_id, "user", content)
-            history = [{"role": m["role"], "content": m["content"]} for m in chat.list_messages(conversation_id) if m["role"] in {"user", "assistant"}]
-            try:
-                codex = shutil.which("codex")
-                if not codex:
-                    raise ChatError("MODEL_UNAVAILABLE: authenticated Codex executable not found")
-                gateway = OpenAICompatibleGateway(MODEL, "http://127.0.0.1:1/v1", "")
-                codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-                transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=60))
-                outcome = ChatResponder(gateway, transport, MODEL, timeout_seconds=60).reply(history)
-                assistant_message = chat.add_message(conversation_id, "assistant", outcome["reply"], model_call=outcome["model_call"])
-                assistant_message["suggested_objective"] = outcome["suggested_objective"]
-            except ChatError as exc:
-                assistant_message = chat.add_message(conversation_id, "assistant", "", error=str(exc))
-                assistant_message["suggested_objective"] = None
-            return self._json({"message": user_message, "assistant": assistant_message})
+            if attachment_ids:
+                AttachmentStore(store, self.app_root).attach_to_message(attachment_ids, conversation_id, user_message["id"])
+            pending = chat.add_pending_message(conversation_id)
+            history = self._chat_history(chat, conversation_id, exclude_message_id=pending["id"])
+        finally:
+            store.close()
+        token = self._spawn_chat_reply(conversation_id, conversation, pending, history)
+        return self._json({"message": user_message, "assistant": pending, "operation": token}, HTTPStatus.ACCEPTED)
+
+    @staticmethod
+    def _chat_history(chat, conversation_id, exclude_message_id=None):
+        return [
+            {"role": m["role"], "content": m["content"]}
+            for m in chat.list_messages(conversation_id)
+            if m["role"] in {"user", "assistant"} and m["id"] != exclude_message_id and m.get("status", "COMPLETED") == "COMPLETED"
+        ]
+
+    def _spawn_chat_reply(self, conversation_id, conversation, pending, history):
+        work_mode = _work_mode(conversation.get("work_mode"))
+        model = _model_choice(conversation.get("model_override"))
+        token = secrets.token_urlsafe(16)
+        with _operations_lock:
+            _operations[token] = {"state": "QUEUED", "conversation_id": conversation_id, "message_id": pending["id"], "started_at": utcnow()}
+        threading.Thread(
+            target=_run_chat_reply,
+            args=(self.app_root, token, conversation_id, pending["id"], history, model, work_mode),
+            daemon=True,
+        ).start()
+        return token
+
+    def _stop_message(self, conversation_id, message_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            row = ConversationStore(store).cancel_message(message_id)
+            return self._json(row)
+        finally:
+            store.close()
+
+    def _regenerate_message(self, conversation_id, message_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            conversation = chat.get_conversation(conversation_id)
+            if not conversation:
+                return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+            chat.prepare_regenerate(conversation_id, message_id)
+            pending = chat.add_pending_message(conversation_id)
+            history = self._chat_history(chat, conversation_id, exclude_message_id=pending["id"])
+        finally:
+            store.close()
+        token = self._spawn_chat_reply(conversation_id, conversation, pending, history)
+        return self._json({"assistant": pending, "operation": token}, HTTPStatus.ACCEPTED)
+
+    def _edit_message(self, conversation_id, message_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            conversation = chat.get_conversation(conversation_id)
+            if not conversation:
+                return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+            chat.edit_user_message(conversation_id, message_id, body.get("content", ""))
+            pending = chat.add_pending_message(conversation_id)
+            history = self._chat_history(chat, conversation_id, exclude_message_id=pending["id"])
+        finally:
+            store.close()
+        token = self._spawn_chat_reply(conversation_id, conversation, pending, history)
+        return self._json({"assistant": pending, "operation": token}, HTTPStatus.ACCEPTED)
+
+    def _archive_conversation(self, conversation_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            chat.archive_conversation(conversation_id)
+            return self._json(chat.get_conversation(conversation_id))
+        finally:
+            store.close()
+
+    def _delete_conversation(self, conversation_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            ConversationStore(store).delete_conversation(conversation_id)
+            return self._json({"id": conversation_id, "status": "DELETED"})
+        finally:
+            store.close()
+
+    def _set_conversation_model(self, conversation_id, body):
+        model = body.get("model")
+        if model not in (None, "", "auto") and model not in SUPPORTED_CODEX_MODELS:
+            raise ValueError("Unsupported model")
+        model = model if model in SUPPORTED_CODEX_MODELS else None
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            if not chat.get_conversation(conversation_id):
+                return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+            store.update("conversations", conversation_id, model_override=model)
+            return self._json(chat.get_conversation(conversation_id))
+        finally:
+            store.close()
+
+    def _set_conversation_work_mode(self, conversation_id, body):
+        mode = _work_mode(body.get("work_mode"))
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            if not chat.get_conversation(conversation_id):
+                return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+            store.update("conversations", conversation_id, work_mode=mode)
+            return self._json(chat.get_conversation(conversation_id))
+        finally:
+            store.close()
+
+    def _upload_attachment(self, conversation_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            chat = ConversationStore(store)
+            if not chat.get_conversation(conversation_id):
+                return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
+            record = AttachmentStore(store, self.app_root).save_base64(
+                body.get("filename", "file"), body.get("content_type"), body.get("data_base64", ""),
+                conversation_id=conversation_id,
+            )
+            return self._json(record, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _mark_notification_read(self, notification_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            NotificationStore(store).mark_read(notification_id)
+            return self._json({"id": notification_id, "read": True})
+        finally:
+            store.close()
+
+    def _mark_all_notifications_read(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            count = NotificationStore(store).mark_all_read()
+            return self._json({"marked": count})
         finally:
             store.close()
 
@@ -393,7 +767,8 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         if not conversation:
             return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
         project_id = body.get("project_id") or conversation.get("project_id")
-        token = self._launch(project_id, body.get("objective", ""), body.get("max_cost_usd"), conversation_id=conversation_id)
+        token = self._launch(project_id, body.get("objective", ""), body.get("max_cost_usd"), conversation_id=conversation_id,
+                              work_mode=body.get("work_mode"), model=body.get("model"))
         return self._json({"operation": token, "state": "STARTING", "conversation_id": conversation_id}, HTTPStatus.ACCEPTED)
 
     def _run_research(self, body):
@@ -407,6 +782,9 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             raise ValueError("Provide a research query")
         project_id = body.get("project_id")
         conversation_id = body.get("conversation_id")
+        model = _model_choice(body.get("model"))
+        mode = _work_mode(body.get("work_mode"))
+        settings = WORK_MODE_SETTINGS[mode]
         if project_id:
             profiles = {item["id"] for item in load_profiles(self.app_root)}
             if project_id not in profiles:
@@ -416,7 +794,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             if conversation_id and not ConversationStore(store).get_conversation(conversation_id):
                 raise ValueError("conversation not found")
             rs = ResearchStore(store)
-            research_id = rs.create_query(query_text, SEARCH_PROVIDER.name, project_id, conversation_id)
+            research_id = rs.create_query(query_text, SEARCH_PROVIDER.name, project_id, conversation_id, model_override=model, work_mode=mode)
             try:
                 provider_result = SEARCH_PROVIDER.search(query_text, max_results=6)
                 sources = rank_sources(provider_result.sources)
@@ -424,15 +802,17 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 if sources and not codex:
                     raise ResearchError("MODEL_UNAVAILABLE: authenticated Codex executable not found")
                 if codex:
-                    gateway = OpenAICompatibleGateway(MODEL, "http://127.0.0.1:1/v1", "")
+                    gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
                     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-                    transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=60))
+                    transport = _build_transport(codex, codex_home, settings["research_timeout"], settings["fallback"])
                 else:
                     gateway = transport = None  # only reachable when sources is empty; reply() never touches these in that case
-                outcome = ResearchResponder(gateway, transport, MODEL, timeout_seconds=60).reply(query_text, sources)
-                rs.save_result(research_id, outcome["answer"], sources, outcome["citations"], outcome["suggested_objective"])
+                outcome = ResearchResponder(gateway, transport, model, timeout_seconds=settings["research_timeout"]).reply(query_text, sources)
+                rs.save_result(research_id, outcome["answer"], sources, outcome["citations"], outcome["suggested_objective"], model_call=outcome["model_call"])
+                NotificationStore(store).notify_once("RESEARCH_COMPLETE", f"Research ready: {query_text[:70]}", "", "research", research_id)
             except ResearchError as exc:
                 rs.save_failure(research_id, str(exc))
+                NotificationStore(store).notify_once("RESEARCH_FAILED", f"Research failed: {query_text[:70]}", str(exc), "research", research_id)
             record = rs.get_query(research_id)
             return self._json({
                 "research": record,
@@ -478,12 +858,17 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         if not research:
             return self._json({"error": "research query not found"}, HTTPStatus.NOT_FOUND)
         project_id = body.get("project_id") or research.get("project_id")
-        token = self._launch(project_id, body.get("objective", ""), body.get("max_cost_usd"), research_id=research_id)
+        token = self._launch(project_id, body.get("objective", ""), body.get("max_cost_usd"), research_id=research_id,
+                              work_mode=body.get("work_mode"), model=body.get("model"))
         return self._json({"operation": token, "state": "STARTING", "research_id": research_id}, HTTPStatus.ACCEPTED)
 
     def _body(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 65536:
+        # 16MB covers the largest legitimate request this server accepts --
+        # a base64-encoded attachment (Section 14) up to AttachmentStore's
+        # own MAX_ATTACHMENT_BYTES=10MB decoded cap, inflated ~1.34x by
+        # base64 -- while still bounding every other, much smaller request.
+        if length > 16 * 1024 * 1024:
             raise ValueError("request too large")
         return json.loads(self.rfile.read(length) or b"{}")
 
@@ -507,20 +892,43 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def _run_mission(app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id=None, research_id=None):
+def _notify_run_terminal(store, run_id, objective):
+    """Fires a Notification Center entry (Section 13) only for a real
+    terminal state a run actually reached -- never a fabricated event.
+    DONE_CANDIDATE with a pending merge decision is Falguna's Needs-You /
+    approval-required state (Section 32); FAILED/QUARANTINED is a task
+    failure. notify_once dedupes so a resumed run that lands on the same
+    terminal status twice does not spam the center."""
+    run = store.get("runs", run_id)
+    if not run:
+        return
+    notifications = NotificationStore(store)
+    if run["status"] == "DONE_CANDIDATE":
+        approvals = store.list("approvals", "run_id=? AND kind=?", (run_id, "PROTECTED_BRANCH_MERGE"))
+        if not approvals or approvals[-1]["status"] == "PENDING":
+            notifications.notify_once("APPROVAL_REQUIRED", f"Ready for your review: {objective[:70]}",
+                                       "Falguna finished this mission and needs your merge decision. Nothing is merged until you decide.",
+                                       "run", run_id)
+    elif run["status"] in {"FAILED", "QUARANTINED"}:
+        notifications.notify_once("TASK_FAILED", f"Mission failed: {objective[:70]}", run.get("error") or "", "run", run_id)
+
+
+def _run_mission(app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id=None,
+                  research_id=None, model=DEFAULT_CODEX_MODEL, work_mode=DEFAULT_WORK_MODE):
     control, store = open_control_plane(app_root)
+    settings = WORK_MODE_SETTINGS.get(work_mode, WORK_MODE_SETTINGS[DEFAULT_WORK_MODE])
     try:
         dependency_path = Path(profile["repository"]) / profile.get("package_root", ".") / "node_modules"
         browser_applicable = browser_e2e_applicable(objective, editable, profile)
-        policy = RunPolicy(allowed_write_globs=editable, verification_commands=commands, max_cost_usd=cap, dependency_node_path=str(dependency_path) if dependency_path.is_dir() else None, verification_write_regexes=profile.get("verification_write_regexes", []), browser_applicable=browser_applicable, browser_base_url=profile.get("browser_base_url") if browser_applicable else None, browser_project_roots=profile.get("browser_project_roots", ["."]), browser_cached_install_allowed=bool(profile.get("browser_cached_install_allowed", False)), browser_external_probe_required=bool(profile.get("browser_external_probe_required", False)), require_implementation_change=discovery.get("objective_kind") == "FEATURE_CHANGE", implementation_files=discovery.get("implementation_files", []))
+        policy = RunPolicy(allowed_write_globs=editable, verification_commands=commands, max_cost_usd=cap, dependency_node_path=str(dependency_path) if dependency_path.is_dir() else None, verification_write_regexes=profile.get("verification_write_regexes", []), browser_applicable=browser_applicable, browser_base_url=profile.get("browser_base_url") if browser_applicable else None, browser_project_roots=profile.get("browser_project_roots", ["."]), browser_cached_install_allowed=bool(profile.get("browser_cached_install_allowed", False)), browser_external_probe_required=bool(profile.get("browser_external_probe_required", False)), require_implementation_change=discovery.get("objective_kind") == "FEATURE_CHANGE", implementation_files=discovery.get("implementation_files", []), max_attempts=settings["max_attempts"])
         codex = shutil.which("codex")
         if not codex:
             raise RuntimeError("authenticated Codex executable not found")
-        gateway = OpenAICompatibleGateway(MODEL, "http://127.0.0.1:1/v1", "")
+        gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-        transport = ResilientCodexTransport(CodexCliJSONTransport(Path(codex), codex_home, timeout_seconds=300))
-        worker = StructuredEditWorker(gateway, editable, timeout_seconds=300, transport=transport)
-        control.reviewer = ModelSemanticReviewer(gateway, timeout_seconds=300, transport=transport)
+        transport = _build_transport(codex, codex_home, settings["mission_timeout"], settings["fallback"])
+        worker = StructuredEditWorker(gateway, editable, timeout_seconds=settings["mission_timeout"], transport=transport)
+        control.reviewer = ModelSemanticReviewer(gateway, timeout_seconds=settings["mission_timeout"], transport=transport)
         ids = control.create_mission(objective[:80], objective, Path(profile["repository"]), policy)
         def created(run_id):
             evidence_dir = app_root / ".falguna" / "evidence" / run_id
@@ -536,12 +944,19 @@ def _run_mission(app_root, token, profile, objective, editable, commands, cap, d
                 ResearchStore(store).record_handoff(research_id, run_id, objective)
             with _operations_lock:
                 _operations[token] = {"state": "RUNNING", "run_id": run_id, "discovery": discovery}
-        run_id = control.start(ids["task_id"], worker, "structured-codex", MODEL, policy, on_run_created=created)
+        run_id = control.start(ids["task_id"], worker, "structured-codex", model, policy, on_run_created=created)
+        _notify_run_terminal(store, run_id, objective)
         with _operations_lock:
             _operations[token] = {"state": "COMPLETE", "run_id": run_id, "discovery": discovery}
     except Exception as exc:
         with _operations_lock:
-            _operations[token] = {"state": "FAILED", "run_id": _operations[token].get("run_id"), "error": str(exc)}
+            run_id = _operations.get(token, {}).get("run_id")
+            _operations[token] = {"state": "FAILED", "run_id": run_id, "error": str(exc)}
+        if run_id:
+            try:
+                _notify_run_terminal(store, run_id, objective)
+            except Exception:
+                pass
     finally:
         store.close()
 
@@ -567,11 +982,48 @@ def _resume_mission(app_root, token, run_id):
         with _operations_lock:
             _operations[token] = {"state": "RUNNING", "run_id": run_id, "resumed": True}
         control.resume(run_id, worker, policy)
+        requirement_body = store.get("requirements", task["requirement_id"])
+        _notify_run_terminal(store, run_id, requirement_body["body"] if requirement_body else "")
         with _operations_lock:
             _operations[token] = {"state": "COMPLETE", "run_id": run_id, "resumed": True}
     except Exception as exc:
         with _operations_lock:
             _operations[token] = {"state": "FAILED", "run_id": run_id, "error": str(exc), "resumed": True}
+    finally:
+        store.close()
+
+
+def _run_chat_reply(app_root, token, conversation_id, message_id, history, model, work_mode):
+    """Background worker for the async Chat pipeline (Sections 3-4) --
+    structurally identical to _run_mission: the HTTP handler has already
+    returned, and this thread is the only thing that ever writes the
+    reply. Every operation-state write below reflects a state this call
+    actually reached; there is no fabricated "typing" percentage."""
+    control, store = open_control_plane(app_root)
+    settings = WORK_MODE_SETTINGS.get(work_mode, WORK_MODE_SETTINGS[DEFAULT_WORK_MODE])
+    chat = ConversationStore(store)
+    try:
+        with _operations_lock:
+            _operations[token]["state"] = "THINKING"
+        chat.mark_generating(message_id)
+        codex = shutil.which("codex")
+        if not codex:
+            raise ChatError("MODEL_UNAVAILABLE: authenticated Codex executable not found")
+        gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        transport = _build_transport(codex, codex_home, settings["chat_timeout"], settings["fallback"])
+        outcome = ChatResponder(gateway, transport, model, timeout_seconds=settings["chat_timeout"]).reply(history)
+        applied = chat.complete_message(message_id, outcome["reply"], outcome["model_call"], outcome["suggested_objective"])
+        with _operations_lock:
+            _operations[token] = {**_operations.get(token, {}), "state": "COMPLETE" if applied else "CANCELLED", "message_id": message_id}
+    except ChatError as exc:
+        applied = chat.fail_message(message_id, str(exc))
+        with _operations_lock:
+            _operations[token] = {**_operations.get(token, {}), "state": "FAILED" if applied else "CANCELLED", "error": str(exc), "message_id": message_id}
+    except Exception as exc:
+        chat.fail_message(message_id, f"UNEXPECTED_FAILURE: {exc}")
+        with _operations_lock:
+            _operations[token] = {**_operations.get(token, {}), "state": "FAILED", "error": str(exc), "message_id": message_id}
     finally:
         store.close()
 
@@ -587,21 +1039,48 @@ def serve(root: Path, host="127.0.0.1", port=8765):
 
 INDEX_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<script>(function(){try{var t=localStorage.getItem('falguna-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}})();</script>
 <title>Falguna</title><style>
+/* ---------- theme (Sections 19-20): System follows the OS/browser
+   preference; an explicit choice is persisted in localStorage and applied
+   via [data-theme] on <html> before first paint by the inline script
+   above, so there is no flash of the wrong theme. Both palettes keep the
+   same warm-amber accent identity -- light is a real, separately designed
+   palette, not an inverted dark theme. */
 :root{
   color-scheme:dark;
-  --bg:#161310;--side:#1b1712;--panel:#211c15;--soft:#2a231a;--soft2:#332b1e;
+  --bg:#161310;--bg-glow:#241d12;--side:#1b1712;--panel:#211c15;--soft:#2a231a;--soft2:#332b1e;
   --line:#3c3325;--text:#f7f0e3;--muted:#ab9c86;--muted-dim:#7c7060;
   --accent:#e8a33d;--accent-hi:#f4bd63;--accent-ink:#2a1707;--accent-dim:#4d3a1e;--accent-soft:#332818;
-  --warn:#f0c752;--bad:#ff8f78;--bad-dim:#4a2c25;
-  --user-bg:#2c2519;--user-ink:#e9dcc6;
+  --warn:#f0c752;--bad:#ff8f78;--bad-dim:#4a2c25;--good:#7fd99a;
+  --user-bg:#2c2519;--user-ink:#e9dcc6;--shadow:#000c;--shadow-lite:#000a;--scrim:#0009;
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){
+    color-scheme:light;
+    --bg:#faf6ee;--bg-glow:#fff9ec;--side:#f4eedb;--panel:#ffffff;--soft:#f1e7d3;--soft2:#e9dabf;
+    --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#8c7c60;
+    --accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;
+    --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--good:#1e7a43;
+    --user-bg:#efe0c2;--user-ink:#241c10;--shadow:#0002;--shadow-lite:#0001;--scrim:#0004;
+  }
+}
+:root[data-theme="light"]{
+  color-scheme:light;
+  --bg:#faf6ee;--bg-glow:#fff9ec;--side:#f4eedb;--panel:#ffffff;--soft:#f1e7d3;--soft2:#e9dabf;
+  --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#8c7c60;
+  --accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;
+  --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--good:#1e7a43;
+  --user-bg:#efe0c2;--user-ink:#241c10;--shadow:#0002;--shadow-lite:#0001;--scrim:#0004;
 }
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:radial-gradient(120% 140% at 18% -10%,#241d12 0%,var(--bg) 46%);color:var(--text);font:14.5px/1.6 "Inter var",Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:radial-gradient(120% 140% at 18% -10%,var(--bg-glow) 0%,var(--bg) 46%);color:var(--text);font:14.5px/1.6 "Inter var",Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased;transition:background .15s,color .15s}
 button,input,select,textarea{font:inherit;color:inherit}
 a{color:var(--accent-hi)}
 svg{display:block}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
 .app{height:100dvh;display:grid;grid-template-columns:264px minmax(0,1fr);overflow:hidden}
 
 /* ---------- sidebar ---------- */
@@ -702,7 +1181,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 
 /* ---------- composer ---------- */
 .composer-wrap{padding:10px max(18px,calc((100vw - 264px - 760px)/2)) 20px;flex:none}
-.composer{max-width:760px;margin:auto;background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:6px 8px 8px;box-shadow:0 20px 50px -20px #000c}
+.composer{max-width:760px;margin:auto;background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:6px 8px 8px;box-shadow:0 20px 50px -20px var(--shadow)}
 .composer:focus-within{border-color:#4a3d28}
 .composer textarea{display:block;width:100%;min-height:46px;max-height:180px;resize:none;border:0;outline:0;background:transparent;color:var(--text);padding:9px 8px 4px;font-size:14px}
 .composer textarea::placeholder{color:var(--muted-dim)}
@@ -776,13 +1255,116 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
 .disclosure summary::-webkit-details-marker{display:none}
 .research-actions{display:flex;gap:9px;margin-top:16px;flex-wrap:wrap}
 
+/* ---------- topbar: live indicator + notification bell (Sections 12-13) */
+.topbar-right{display:flex;align-items:center;gap:8px}
+.indicator-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:5px 11px;font-size:11.5px;cursor:pointer;white-space:nowrap}
+.indicator-pill:hover{border-color:var(--accent-dim)}
+.indicator-pill b{color:var(--text);font-weight:650}
+.indicator-pill .warn-count{color:var(--warn)}
+.indicator-pill .bad-count{color:var(--bad)}
+.bell-btn{position:relative;border:1px solid var(--line);background:var(--panel);color:var(--muted);width:32px;height:32px;border-radius:9px;display:grid;place-items:center;cursor:pointer}
+.bell-btn:hover{color:var(--text);border-color:var(--accent-dim)}
+.bell-dot{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--bad)}
+.notif-panel{position:absolute;top:52px;right:22px;width:340px;max-width:calc(100vw - 30px);max-height:70vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 20px 50px -20px var(--shadow);z-index:30;padding:6px}
+.notif-panel-head{display:flex;align-items:center;justify-content:space-between;padding:8px 8px 6px;font-weight:650;font-size:12.5px}
+.notif-panel-head button{border:0;background:none;color:var(--accent-hi);font-size:11.5px;cursor:pointer}
+.notif-row{padding:9px 8px;border-radius:9px;font-size:12.5px;cursor:default}
+.notif-row.unread{background:var(--accent-soft)}
+.notif-row .n-title{font-weight:600}
+.notif-row .n-body{color:var(--muted);margin-top:2px;font-size:11.5px}
+.notif-row .n-time{color:var(--muted-dim);margin-top:3px;font-size:10.5px}
+
+/* ---------- toast (Section 27: error experience) */
+.toast-stack{position:fixed;bottom:18px;right:18px;z-index:50;display:grid;gap:8px;max-width:min(92vw,380px)}
+.toast{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:11px 13px;box-shadow:0 14px 34px -16px var(--shadow);font-size:12.5px;display:grid;gap:5px}
+.toast.error{border-color:#7a3f33}
+.toast .t-msg{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.toast .t-msg button{border:0;background:none;color:var(--muted-dim);cursor:pointer;font-size:14px;line-height:1;padding:0}
+.toast details{margin-top:2px}
+.toast summary{cursor:pointer;color:var(--muted-dim);font-size:11px}
+.toast pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:10.5px;color:var(--muted);margin:5px 0 0;max-height:140px;overflow:auto}
+
+/* ---------- modal (delete/archive confirmation etc.) */
+.modal-scrim{position:fixed;inset:0;background:var(--scrim);z-index:60;display:grid;place-items:center;padding:20px}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;max-width:420px;width:100%;box-shadow:0 24px 60px -20px var(--shadow)}
+.modal h3{margin:0 0 8px;font-size:15px}
+.modal p{margin:0 0 16px;color:var(--muted);font-size:13px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px}
+
+/* ---------- Mission Control (Sections 7-12) */
+.mc-view{padding:30px max(22px,calc((100vw - 264px - 1080px)/2)) 60px}
+.mc-head{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+.mc-buckets{display:grid;gap:22px}
+.mc-bucket-title{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-dim);margin-bottom:9px}
+.mc-bucket-title .count{background:var(--soft);border-radius:999px;padding:1px 8px;color:var(--text);font-weight:650}
+.mc-bucket-title.needs-you{color:var(--warn)}
+.mc-bucket-title.needs-you .count{background:var(--accent-soft);color:var(--accent-hi)}
+.mc-bucket-title.failed{color:var(--bad)}
+.mc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+.mc-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;cursor:pointer;text-align:left;display:grid;gap:7px;min-width:0}
+.mc-card:hover{border-color:var(--accent-dim)}
+.mc-card.needs-you{border-color:var(--accent-dim);background:var(--accent-soft)}
+.mc-card .mc-title{font-weight:650;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mc-card .mc-meta{color:var(--muted-dim);font-size:11px;display:flex;flex-wrap:wrap;gap:6px 10px}
+.mc-card .mc-step{color:var(--muted);font-size:12px}
+.mc-card .mc-controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+.mc-card .mc-controls button{font-size:11px;padding:5px 9px}
+.mc-empty-bucket{color:var(--muted-dim);font-size:12.5px;padding:14px 0}
+
+/* ---------- Files (Section 14) */
+.files-view{max-width:900px;margin:0 auto;padding:34px 24px 60px}
+.files-tabs{display:flex;gap:6px;margin-bottom:16px}
+.files-tabs button{border:1px solid var(--line);background:var(--soft);color:var(--muted);border-radius:999px;padding:6px 14px;font-size:12px;cursor:pointer}
+.files-tabs button.active{background:var(--accent-soft);color:var(--accent-hi);border-color:var(--accent-dim)}
+.file-row{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:11px 14px}
+.file-row .f-name{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-row .f-meta{color:var(--muted-dim);font-size:11px;margin-top:2px}
+
+/* ---------- Chat V2: message state, actions, markdown, attachments */
+.msg .status-note{color:var(--muted-dim);font-size:10.5px;margin-top:6px;display:flex;align-items:center;gap:6px}
+.msg-actions{display:flex;gap:4px;margin-top:7px;opacity:0;transition:opacity .1s}
+.msg:hover .msg-actions,.msg:focus-within .msg-actions{opacity:1}
+.msg-action-btn{border:1px solid transparent;background:none;color:var(--muted-dim);padding:4px 7px;border-radius:7px;font-size:11px;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.msg-action-btn:hover{background:var(--soft);color:var(--text)}
+.bubble pre{background:#00000030;border:1px solid var(--line);border-radius:9px;padding:10px 12px;overflow:auto;font-size:12px;margin:8px 0}
+:root[data-theme="light"] .bubble pre,@media (prefers-color-scheme:light){:root:not([data-theme="dark"]) .bubble pre{background:#0000000d}}
+.bubble code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em}
+.bubble :not(pre)>code{background:var(--soft2);border-radius:4px;padding:1px 5px}
+.bubble p{margin:0 0 8px}
+.bubble p:last-child{margin-bottom:0}
+.bubble strong{font-weight:700}
+.bubble em{font-style:italic}
+.msg.editing textarea{width:100%;min-height:60px;background:var(--panel);border:1px solid var(--accent-dim);border-radius:10px;padding:9px 10px;resize:vertical}
+.msg.editing .edit-actions{display:flex;gap:8px;margin-top:8px}
+.attach-chip-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.attach-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--soft);border-radius:999px;padding:4px 10px 4px 8px;font-size:11px;text-decoration:none;color:inherit}
+.attach-chip:hover{border-color:var(--accent-dim)}
+.attach-chip .x{cursor:pointer;color:var(--muted-dim)}
+.composer-attach-row{display:flex;gap:6px;flex-wrap:wrap;padding:0 8px 6px}
+.selector-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:0 2px 6px}
+.tiny-select{border:1px solid var(--line);background:var(--soft);color:var(--muted);border-radius:999px;padding:5px 9px;font-size:11px}
+
+/* ---------- Settings V2 ---------- */
+.settings-nav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:22px;position:sticky;top:0;background:var(--bg);padding:4px 0;z-index:2}
+.settings-nav button{border:1px solid var(--line);background:var(--soft);color:var(--muted);border-radius:999px;padding:6px 13px;font-size:12px;cursor:pointer}
+.settings-nav button.active{background:var(--accent-soft);color:var(--accent-hi);border-color:var(--accent-dim)}
+.settings-section{margin-bottom:30px}
+.theme-options{display:flex;gap:10px;flex-wrap:wrap}
+.theme-card{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:12px 16px;cursor:pointer;font-size:12.5px;display:flex;align-items:center;gap:8px}
+.theme-card.active{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-hi)}
+.usage-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:14px 0}
+.usage-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.usage-card span{display:block;color:var(--muted-dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px}
+.usage-card b{font-size:18px}
+.usage-card small{display:block;color:var(--muted-dim);font-size:10.5px;margin-top:3px}
+
 @media(max-width:850px){
   .app{grid-template-columns:1fr}
   .workspace{grid-column:1}
   .menu-button{display:inline-grid;place-items:center}
-  aside{display:flex;position:fixed;inset:0 auto 0 0;width:min(86vw,290px);z-index:20;transform:translateX(-102%);transition:transform .18s ease;box-shadow:20px 0 50px #000a}
+  aside{display:flex;position:fixed;inset:0 auto 0 0;width:min(86vw,290px);z-index:20;transform:translateX(-102%);transition:transform .18s ease;box-shadow:20px 0 50px var(--shadow-lite)}
   aside.open{transform:translateX(0)}
-  .scrim{position:fixed;inset:0;background:#0009;z-index:15}
+  .scrim{position:fixed;inset:0;background:var(--scrim);z-index:15}
   .scrim.open{display:block}
   .chat-scroll,.composer-wrap,.work-view{padding-left:15px;padding-right:15px}
   .cards{grid-template-columns:1fr 1fr}
@@ -809,18 +1391,103 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
   <main class="workspace">
     <header class="topbar">
       <div class="topbar-title"><button class="menu-button" id="menuButton" aria-label="Open navigation" aria-expanded="false"></button><strong id="viewTitle">Chat</strong></div>
-      <div class="model-pill" id="modelPill"><span class="dot"></span><span class="label">Falguna</span></div>
+      <div class="topbar-right">
+        <button class="indicator-pill hidden" id="indicatorPill" type="button"></button>
+        <div style="position:relative">
+          <button class="bell-btn" id="bellBtn" type="button" aria-label="Notifications"></button>
+          <div class="notif-panel hidden" id="notifPanel"></div>
+        </div>
+        <div class="model-pill" id="modelPill"><span class="dot"></span><span class="label">Falguna</span></div>
+      </div>
     </header>
     <section class="viewport" id="viewport"></section>
   </main>
 </div>
+<div class="toast-stack" id="toastStack"></div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const nl2br=s=>esc(s).replace(/\n/g,'<br>');
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 let profiles={};
 let profileList=[];
 let settingsModel='';
+
+/* ---------------------------------------------------------- misc helpers */
+function formatBytes(n){
+  n=Number(n)||0;
+  if(n<1024)return n+' B';
+  if(n<1024*1024)return (n/1024).toFixed(1)+' KB';
+  return (n/1024/1024).toFixed(2)+' MB';
+}
+function formatDuration(ms){
+  const s=Math.max(0,Math.floor(ms/1000));
+  if(s<60)return s+'s';
+  const m=Math.floor(s/60),rs=s%60;
+  if(m<60)return m+'m '+String(rs).padStart(2,'0')+'s';
+  const h=Math.floor(m/60),rm=m%60;
+  return h+'h '+String(rm).padStart(2,'0')+'m';
+}
+setInterval(()=>{
+  document.querySelectorAll('[data-since]').forEach(el=>{
+    const t=new Date(el.dataset.since).getTime();
+    if(!isNaN(t))el.textContent=formatDuration(Date.now()-t);
+  });
+},1000);
+
+/* -------------------------------------------------------------- toasts */
+function showToast(message,opts){
+  opts=opts||{};
+  const stack=$('toastStack');
+  if(!stack)return;
+  const el=document.createElement('div');
+  el.className='toast'+(opts.error?' error':'');
+  const detail=opts.detail?`<details><summary>Details</summary><pre>${esc(opts.detail)}</pre></details>`:'';
+  el.innerHTML=`<div class="t-msg"><span>${esc(message)}</span><button type="button" aria-label="Dismiss">&times;</button></div>${detail}`;
+  el.querySelector('button').onclick=()=>el.remove();
+  stack.appendChild(el);
+  setTimeout(()=>{el.remove()},opts.error?9000:5000);
+}
+
+/* --------------------------------------------------------- confirm modal */
+function confirmModal(opts){
+  return new Promise(resolve=>{
+    const scrim=document.createElement('div');
+    scrim.className='modal-scrim';
+    scrim.innerHTML=`<div class="modal"><h3>${esc(opts.title||'Are you sure?')}</h3><p>${esc(opts.body||'')}</p>
+      <div class="modal-actions"><button type="button" class="pill-btn" id="mCancel">Cancel</button><button type="button" class="action${opts.danger?' danger':''}" id="mOk">${esc(opts.confirmLabel||'Confirm')}</button></div></div>`;
+    document.body.appendChild(scrim);
+    const finish=result=>{scrim.remove();document.removeEventListener('keydown',onKey);resolve(result)};
+    function onKey(e){if(e.key==='Escape')finish(false)}
+    document.addEventListener('keydown',onKey);
+    scrim.addEventListener('click',e=>{if(e.target===scrim)finish(false)});
+    scrim.querySelector('#mCancel').onclick=()=>finish(false);
+    scrim.querySelector('#mOk').onclick=()=>finish(true);
+    scrim.querySelector('#mOk').focus();
+  });
+}
+
+/* ---------------------------------------------------- lightweight markdown */
+function renderMarkdown(raw){
+  const text=esc(raw==null?'':String(raw));
+  const blocks=[];
+  let out=text.replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g,(m,lang,code)=>{
+    const idx=blocks.length;
+    blocks.push(`<pre><code${lang?` class="lang-${esc(lang)}"`:''}>${code}</code></pre>`);
+    return `\u0000B${idx}\u0000`;
+  });
+  out=out.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  out=out.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>');
+  out=out.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?]|$)/g,'$1<em>$2</em>');
+  const paras=out.split(/\n{2,}/);
+  out=paras.map(p=>{
+    const t=p.trim();
+    const bm=t.match(/^\u0000B(\d+)\u0000$/);
+    if(bm)return blocks[Number(bm[1])];
+    return t?`<p>${t.replace(/\n/g,'<br>')}</p>`:'';
+  }).join('');
+  return out||'';
+}
 
 /* ------------------------------------------------------------------ icons */
 const ICON={
@@ -836,20 +1503,119 @@ const ICON={
   spark:'<path d="M10 2.5c.6 3 1.8 4.4 4.8 5-3 .6-4.2 2-4.8 5-.6-3-1.8-4.4-4.8-5 3-.6 4.2-2 4.8-5Z" stroke="currentColor" stroke-width="1.1" fill="currentColor" fill-opacity=".18" stroke-linejoin="round"/>',
   menu:'<path d="M3 5.5h14M3 10h14M3 14.5h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
   handoff:'<path d="M4 10h9M9 5.5 13.5 10 9 14.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+  mission:'<circle cx="10" cy="10" r="6.4" stroke="currentColor" stroke-width="1.3" fill="none"/><circle cx="10" cy="10" r="2.6" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M10 2v2.6M10 15.4V18M2 10h2.6M15.4 10H18" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
+  files:'<path d="M4.6 3.6h6.4l3.2 3.2v9.2a.6.6 0 0 1-.6.6H4.6a.6.6 0 0 1-.6-.6V4.2a.6.6 0 0 1 .6-.6Z" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/><path d="M11 3.6v3.2h3.2" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/>',
+  bell:'<path d="M6 8.4a4 4 0 0 1 8 0v3l1.3 2.4H4.7L6 11.4v-3Z" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/><path d="M8.3 15.8a1.7 1.7 0 0 0 3.4 0" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/>',
+  copy:'<rect x="7.3" y="7.3" width="8.2" height="9.6" rx="1.6" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M4.5 12.5V5.1a1.6 1.6 0 0 1 1.6-1.6h7.1" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/>',
+  edit:'<path d="M12.3 4.3 15.7 7.7 6.6 16.8 3 17.5l.7-3.6 8.6-9.6Z" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/>',
+  retry:'<path d="M15.8 8.4A6 6 0 1 0 16.4 11" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/><path d="M16.4 4.6v4.4h-4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+  stop:'<rect x="6" y="6" width="8" height="8" rx="1.4" fill="currentColor"/>',
+  trash:'<path d="M4.5 6.2h11M8.2 6.2V4.6a1 1 0 0 1 1-1h1.6a1 1 0 0 1 1 1v1.6M6.3 6.2 6.9 16a1 1 0 0 0 1 .9h4.2a1 1 0 0 0 1-.9l.6-9.8" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+  archive2:'<rect x="3.4" y="4" width="13.2" height="3.4" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M4.6 7.4v7.4a1.4 1.4 0 0 0 1.4 1.4h8a1.4 1.4 0 0 0 1.4-1.4V7.4M8.2 10.6h3.6" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/>',
+  close:'<path d="M5 5l10 10M15 5 5 15" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  sun:'<circle cx="10" cy="10" r="3.4" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M10 2.6v2M10 15.4v2M2.6 10h2M15.4 10h2M4.6 4.6l1.4 1.4M14 14l1.4 1.4M4.6 15.4 6 14M14 6l1.4-1.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
+  moon:'<path d="M15.5 12.3A6.2 6.2 0 1 1 7.7 4.5a5 5 0 0 0 7.8 7.8Z" stroke="currentColor" stroke-width="1.3" fill="currentColor" fill-opacity=".12" stroke-linejoin="round"/>',
+  monitor:'<rect x="3" y="4.5" width="14" height="9" rx="1.3" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M7.5 16.5h5M10 13.5v3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
+  download:'<path d="M10 3.5v9M6.2 9.2 10 13l3.8-3.8" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15.5h12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
 };
 const icon=(name,size=16)=>`<svg width="${size}" height="${size}" viewBox="0 0 20 20" fill="none">${ICON[name]||''}</svg>`;
 
 $('newChatBtn').innerHTML=icon('plus',15)+'New chat';
 $('menuButton').innerHTML=icon('menu',17);
+$('bellBtn').innerHTML=icon('bell',16)+'<span class="bell-dot hidden" id="bellDot"></span>';
 $('nav').innerHTML=[
-  ['chat','Chat'],['work','Work'],['search','Search'],['projects','Projects'],['history','History'],['settings','Settings'],
+  ['chat','Chat'],['search','Search'],['work','Work'],['mission','Mission Control'],['projects','Projects'],['files','Files'],['history','History'],['settings','Settings'],
 ].map(([id,label])=>`<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`).join('');
 
 function closeSidebar(){$('sidebar').classList.remove('open');$('scrim').classList.remove('open');$('menuButton').setAttribute('aria-expanded','false')}
 function toggleSidebar(){const open=!$('sidebar').classList.contains('open');$('sidebar').classList.toggle('open',open);$('scrim').classList.toggle('open',open);$('menuButton').setAttribute('aria-expanded',String(open))}
 $('menuButton').onclick=toggleSidebar;$('scrim').onclick=closeSidebar;
-window.addEventListener('keydown',e=>{if(e.key==='Escape')closeSidebar()});
+window.addEventListener('keydown',e=>{if(e.key==='Escape'){closeSidebar();stopBellPanel()}});
 $('newChatBtn').onclick=()=>{location.hash='#/chat';closeSidebar()};
+
+/* --------------------------------------------------------------- theme */
+function currentThemeMode(){
+  try{const t=localStorage.getItem('falguna-theme');if(t==='light'||t==='dark')return t}catch(e){}
+  return 'system';
+}
+function applyTheme(mode){
+  try{
+    if(mode==='system'){localStorage.removeItem('falguna-theme');delete document.documentElement.dataset.theme}
+    else{localStorage.setItem('falguna-theme',mode);document.documentElement.dataset.theme=mode}
+  }catch(e){
+    if(mode==='system')delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme=mode;
+  }
+  document.querySelectorAll('.theme-card').forEach(b=>b.classList.toggle('active',b.dataset.theme===mode));
+}
+
+/* -------------------------------------------------- notifications / live */
+let notifPanelOpen=false;
+function stopBellPanel(){notifPanelOpen=false;const p=$('notifPanel');if(p)p.classList.add('hidden')}
+async function toggleNotifPanel(){
+  notifPanelOpen=!notifPanelOpen;
+  $('notifPanel').classList.toggle('hidden',!notifPanelOpen);
+  if(notifPanelOpen)await loadNotifications();
+}
+function notifTarget(n){
+  if(n.ref_type==='run')return '#/work/'+n.ref_id;
+  if(n.ref_type==='research')return '#/search/'+n.ref_id;
+  return '';
+}
+async function loadNotifications(){
+  const panel=$('notifPanel');
+  panel.innerHTML='<div class="notif-panel-head"><span>Notifications</span></div><div class="empty-state" style="padding:14px 0">Loading&hellip;</div>';
+  let data;
+  try{data=await api('/api/notifications')}catch(err){panel.innerHTML=`<div class="notif-panel-head"><span>Notifications</span></div><div class="empty-state error">${esc(err.message)}</div>`;return}
+  renderNotifPanel(data.notifications||[]);
+}
+function renderNotifPanel(list){
+  const panel=$('notifPanel');
+  panel.innerHTML=`<div class="notif-panel-head"><span>Notifications</span><button type="button" id="notifMarkAll">Mark all read</button></div>`+
+    (list.length?list.map(n=>`<button type="button" class="notif-row ${n.read?'':'unread'}" data-notif-open="${esc(notifTarget(n))}" data-notif-id="${esc(n.id)}">
+        <div class="n-title">${esc(n.title)}</div>${n.body?`<div class="n-body">${esc(n.body)}</div>`:''}<div class="n-time">${esc(timeAgo(n.created_at))}</div>
+      </button>`).join(''):'<div class="empty-state" style="padding:14px 0">Nothing yet.</div>');
+  $('notifMarkAll').onclick=async e=>{
+    e.stopPropagation();
+    try{await api('/api/notifications/read-all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadNotifications();pollLive()}
+    catch(err){showToast(err.message,{error:true})}
+  };
+  document.querySelectorAll('[data-notif-open]').forEach(b=>b.onclick=async()=>{
+    const id=b.dataset.notifId,target=b.dataset.notifOpen;
+    try{await api(`/api/notifications/${id}/read`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(err){}
+    stopBellPanel();pollLive();
+    if(target)go(target);
+  });
+}
+$('indicatorPill').onclick=()=>go('#/mission');
+$('bellBtn').onclick=e=>{e.stopPropagation();toggleNotifPanel()};
+document.addEventListener('click',e=>{
+  const panel=$('notifPanel');
+  if(notifPanelOpen&&panel&&!panel.contains(e.target)&&e.target!==$('bellBtn')&&!$('bellBtn').contains(e.target))stopBellPanel();
+});
+async function pollLive(){
+  let s;
+  try{s=await api('/api/live-summary')}catch(err){return}
+  const pill=$('indicatorPill');
+  const running=s.running||0,needsYou=s.needs_you||0,failed=s.failed||0;
+  if(running+needsYou>0){
+    pill.classList.remove('hidden');
+    pill.innerHTML=`<b>${running}</b> running`+(needsYou?` &middot; <span class="warn-count">${needsYou} needs you</span>`:'')+(failed?` &middot; <span class="bad-count">${failed} failed</span>`:'');
+  }else if(failed>0){
+    pill.classList.remove('hidden');
+    pill.innerHTML=`<span class="bad-count">${failed} failed</span>`;
+  }else{
+    pill.classList.add('hidden');
+  }
+  const dot=$('bellDot');
+  if(dot)dot.classList.toggle('hidden',!(s.unread_notifications>0));
+}
+let liveTimer=null;
+function startLivePolling(){
+  pollLive();
+  clearInterval(liveTimer);
+  liveTimer=setInterval(()=>{if(document.visibilityState==='visible')pollLive()},6000);
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')pollLive()});
+}
 
 /* ---------------------------------------------------------------- router */
 
@@ -859,24 +1625,29 @@ function currentRoute(){
   return {view:parts[0]||'chat', id:parts[1]?decodeURIComponent(parts[1]):null};
 }
 function go(hash){location.hash=hash}
+const VIEW_TITLES={chat:'Chat',search:'Search',work:'Work',mission:'Mission Control',projects:'Projects',files:'Files',history:'History',settings:'Settings'};
 function setActiveNav(view){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
-  const titles={chat:'Chat',work:'Work',search:'Search',projects:'Projects',history:'History',settings:'Settings'};
-  $('viewTitle').textContent=titles[view]||'Falguna';
+  $('viewTitle').textContent=VIEW_TITLES[view]||'Falguna';
 }
 document.querySelectorAll('.nav-item').forEach(b=>b.onclick=()=>{go('#/'+b.dataset.view);closeSidebar()});
 
+let mcTimer=null;
 async function router(){
   const {view,id}=currentRoute();
   setActiveNav(view);
+  clearInterval(mcTimer);
+  stopBellPanel();
   const vp=$('viewport');
   try{
     if(view==='chat'){await renderSideChats();return renderChatView(id)}
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
     if(view==='search'){await renderSideResearch();return renderSearchView(id)}
+    if(view==='mission'){hideSideList();return renderMissionControlView()}
     if(view==='projects'){hideSideList();return renderProjectsView()}
+    if(view==='files'){hideSideList();return renderFilesView(id)}
     if(view==='history'){hideSideList();return renderHistoryView()}
-    if(view==='settings'){hideSideList();return renderSettingsView()}
+    if(view==='settings'){hideSideList();return renderSettingsView(id)}
     go('#/chat');
   }catch(err){
     vp.innerHTML=`<div class="page"><div class="empty-state error">${esc(err.message)}</div></div>`;
@@ -961,9 +1732,14 @@ const STARTERS=[
   ['handoff','Turn an idea into a Work objective'],
 ];
 
+let pendingAttachments=[];
+let currentConversationData=null,currentConversationId=null,editingMessageId=null;
+let chatPollGen=0;
+
 async function renderChatView(id){
   await loadProfiles();
   const vp=$('viewport');
+  pendingAttachments=[];editingMessageId=null;currentConversationData=null;currentConversationId=id;
   if(!id){
     vp.innerHTML=`
       <div class="chat-view">
@@ -973,9 +1749,9 @@ async function renderChatView(id){
           <p>Ask a question, think something through, or describe what you're working on. Need current information from the web? Try <a href="#/search">Search</a>.</p>
           <div class="chip-row">${STARTERS.map(([ic,label])=>`<button class="chip" data-starter="${esc(label)}">${icon(ic,13)}${esc(label)}</button>`).join('')}</div>
         </div></div>
-        ${composerHtml('Start chat')}
+        ${composerHtml('Start chat',false)}
       </div>`;
-    wireComposerChrome();
+    wireComposerChrome(false);
     document.querySelectorAll('[data-starter]').forEach(b=>b.onclick=()=>{$('composerInput').value=b.dataset.starter;$('composerInput').focus()});
     $('composer').addEventListener('submit',async e=>{
       e.preventDefault();
@@ -986,12 +1762,14 @@ async function renderChatView(id){
         const conv=await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:content.slice(0,60)})});
         await api(`/api/conversations/${conv.id}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});
         go('#/chat/'+conv.id);
-      }catch(err){$('sendBtn').disabled=false;alert(err.message)}
+      }catch(err){$('sendBtn').disabled=false;showToast(err.message,{error:true})}
     });
     return;
   }
-  vp.innerHTML=`<div class="chat-view"><div class="chat-scroll"><div class="thread" id="thread"><div class="empty-state">Loading conversation&hellip;</div></div></div><div id="handoffMount"></div>${composerHtml('Send')}</div>`;
-  wireComposerChrome();
+  vp.innerHTML=`<div class="chat-view"><div class="chat-scroll"><div class="selector-row" id="chatToolbar"></div><div class="thread" id="thread"><div class="empty-state">Loading conversation&hellip;</div></div></div><div id="handoffMount"></div>${composerHtml('Send',true)}</div>`;
+  wireComposerChrome(true);
+  wireAttachUpload(id);
+  renderPendingAttachRow();
   let data;
   try{
     data=await api('/api/conversations/'+id);
@@ -999,69 +1777,257 @@ async function renderChatView(id){
     $('thread').innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;
     return;
   }
-  renderThread(data);
+  renderChatToolbar(id,data.conversation);
+  renderThread(id,data);
+  const last=data.messages[data.messages.length-1];
+  if(last&&last.role==='assistant'&&['PENDING','GENERATING'].includes(last.status)){
+    pollConversationUntilSettled(id);
+  }
   $('composer').addEventListener('submit',async e=>{
     e.preventDefault();
     const content=$('composerInput').value.trim();
     if(!content)return;
-    $('composerInput').value='';
+    const attachIds=pendingAttachments.map(a=>a.id);
+    const attachSnapshot=pendingAttachments.slice();
+    $('composerInput').value='';$('composerInput').style.height='auto';
+    pendingAttachments=[];renderPendingAttachRow();
     $('sendBtn').disabled=true;
-    appendOptimisticUserBubble(content);
+    appendOptimisticUserBubble(content,attachSnapshot);
     try{
-      await api(`/api/conversations/${id}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});
-      data=await api('/api/conversations/'+id);
-      renderThread(data);
-      renderSideChats();
+      await api(`/api/conversations/${id}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,attachment_ids:attachIds})});
+      pollConversationUntilSettled(id);
     }catch(err){
-      appendErrorBubble(err.message);
+      document.querySelectorAll('[data-optimistic]').forEach(n=>n.remove());
+      const row=$('thinkingRow');if(row)row.remove();
+      $('composerInput').value=content;
+      showToast(err.message,{error:true});
     }finally{
       $('sendBtn').disabled=false;
     }
   });
 }
-function composerHtml(sendLabel){
-  return `<div class="composer-wrap"><form class="composer" id="composer">
+
+async function renderChatToolbar(id,conversation){
+  const bar=$('chatToolbar');
+  if(!bar)return;
+  let cfg;
+  try{cfg=await api('/api/config')}catch(err){cfg={available_models:[],work_modes:['FAST','BALANCED','DEEP'],default_work_mode:'BALANCED'}}
+  bar.innerHTML=`
+    <select class="tiny-select" id="convModel" title="Model for this chat">
+      <option value="">Auto (fallback-aware)</option>
+      ${cfg.available_models.map(m=>`<option value="${esc(m)}" ${conversation.model_override===m?'selected':''}>${esc(m)}</option>`).join('')}
+    </select>
+    <select class="tiny-select" id="convWorkMode" title="Work mode for this chat">
+      ${cfg.work_modes.map(w=>`<option value="${esc(w)}" ${(conversation.work_mode||cfg.default_work_mode)===w?'selected':''}>${esc(w.charAt(0)+w.slice(1).toLowerCase())}</option>`).join('')}
+    </select>
+    <div class="compose-spacer" style="flex:1"></div>
+    <button type="button" class="msg-action-btn" id="archiveConvBtn">${icon('archive2',12)}Archive</button>
+    <button type="button" class="msg-action-btn" id="deleteConvBtn">${icon('trash',12)}Delete</button>
+  `;
+  $('convModel').onchange=async e=>{
+    try{await api(`/api/conversations/${id}/model`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:e.target.value||'auto'})})}
+    catch(err){showToast(err.message,{error:true})}
+  };
+  $('convWorkMode').onchange=async e=>{
+    try{await api(`/api/conversations/${id}/work-mode`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_mode:e.target.value})})}
+    catch(err){showToast(err.message,{error:true})}
+  };
+  $('archiveConvBtn').onclick=async()=>{
+    if(!await confirmModal({title:'Archive this chat?',body:'You can still find it again through search afterward.',confirmLabel:'Archive'}))return;
+    try{await api(`/api/conversations/${id}/archive`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderSideChats();go('#/chat')}
+    catch(err){showToast(err.message,{error:true})}
+  };
+  $('deleteConvBtn').onclick=async()=>{
+    if(!await confirmModal({title:'Delete this chat?',body:'This removes it from your chat list.',confirmLabel:'Delete',danger:true}))return;
+    try{await api(`/api/conversations/${id}/delete`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderSideChats();go('#/chat')}
+    catch(err){showToast(err.message,{error:true})}
+  };
+}
+
+function composerHtml(sendLabel,withExtras){
+  return `<div class="composer-wrap">
+    ${withExtras?'<div class="composer-attach-row" id="pendingAttachRow"></div>':''}
+    <form class="composer" id="composer">
     <textarea id="composerInput" required placeholder="Message Falguna&hellip;" rows="1"></textarea>
     <div class="compose-row">
-      <button type="button" class="icon-btn" id="attachBtn" title="Attachments (coming soon)">${icon('clip',16)}</button>
+      <button type="button" class="icon-btn" id="attachBtn" title="${withExtras?'Attach a file':'Attachments are available once a chat exists'}">${icon('clip',16)}</button>
       <span class="mode-chip">${icon('chat',12)}Chat</span>
       <div class="compose-spacer"></div>
       <button class="send-btn" id="sendBtn" type="submit" aria-label="${esc(sendLabel)}">${icon('send',14)}</button>
     </div>
-  </form><div class="compose-foot">Falguna can be wrong. Hand off to Work for changes that need to be verified.</div></div>`;
+  </form>${withExtras?'<input type="file" id="fileInput" multiple hidden>':''}<div class="compose-foot">Falguna can be wrong. Hand off to Work for changes that need to be verified.</div></div>`;
 }
-function wireComposerChrome(){
+function wireComposerChrome(withExtras){
   const ta=$('composerInput');
   ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,180)+'px'});
   ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit()}});
-  const attach=$('attachBtn');
-  if(attach)attach.onclick=()=>alert('Attachments are not part of this release yet.');
+  if(!withExtras){
+    const attach=$('attachBtn');
+    if(attach)attach.onclick=()=>showToast('Start the chat first, then attach a file to it.');
+  }
 }
-function appendOptimisticUserBubble(content){
+function renderPendingAttachRow(){
+  const row=$('pendingAttachRow');
+  if(!row)return;
+  row.innerHTML=pendingAttachments.map(a=>`<span class="attach-chip">${icon('clip',11)}${esc(a.filename)}<span class="x" data-remove-pending="${esc(a.id)}">${icon('close',10)}</span></span>`).join('');
+  document.querySelectorAll('[data-remove-pending]').forEach(b=>b.onclick=()=>{pendingAttachments=pendingAttachments.filter(a=>a.id!==b.dataset.removePending);renderPendingAttachRow()});
+}
+function wireAttachUpload(conversationId){
+  const input=$('fileInput'),btn=$('attachBtn');
+  if(!input||!btn)return;
+  btn.onclick=()=>input.click();
+  input.onchange=async()=>{
+    const files=Array.from(input.files||[]);
+    input.value='';
+    for(const file of files){
+      if(file.size>10*1024*1024){showToast(`${file.name} is larger than the 10MB attachment limit.`,{error:true});continue}
+      try{
+        const dataUrl=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)});
+        const base64=String(dataUrl).split(',')[1]||'';
+        const rec=await api(`/api/conversations/${conversationId}/attachments`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,content_type:file.type||'application/octet-stream',data_base64:base64})});
+        pendingAttachments.push(rec);
+        renderPendingAttachRow();
+      }catch(err){showToast(err.message,{error:true})}
+    }
+  };
+}
+function appendOptimisticUserBubble(content,attachments){
   const t=$('thread');
-  t.insertAdjacentHTML('beforeend',`<div class="msg user"><div class="avatar">Y</div><div class="bubble">${esc(content)}</div></div><div class="msg assistant" id="thinkingRow"><div class="avatar">F</div><div class="bubble thinking"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></div></div>`);
-  $('thread').closest('.chat-scroll').scrollTop=9e6;
+  if(t.querySelector('.empty-state'))t.innerHTML='';
+  const chips=(attachments||[]).length?`<div class="attach-chip-row">${attachments.map(a=>`<span class="attach-chip">${icon('clip',11)}${esc(a.filename)}</span>`).join('')}</div>`:'';
+  t.insertAdjacentHTML('beforeend',`<div class="msg user" data-optimistic="1"><div class="avatar">Y</div><div class="bubble">${nl2br(content)}${chips}</div></div><div class="msg assistant" id="thinkingRow"><div class="avatar">F</div><div class="bubble thinking"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></div></div>`);
+  t.closest('.chat-scroll').scrollTop=9e6;
 }
-function appendErrorBubble(message){
-  const row=$('thinkingRow');
-  if(row)row.remove();
-  $('thread').insertAdjacentHTML('beforeend',`<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">${esc(message)}</div></div>`);
+
+/* Chat state is polled from the conversation itself (never from a
+   remembered operation token) -- this is what makes it safe to navigate
+   away mid-generation and come back: the thread just shows whatever the
+   real chat_messages.status is, truthfully, until it reaches a terminal
+   state. See ConversationStore.add_pending_message's docstring. */
+function pollConversationUntilSettled(id){
+  const gen=++chatPollGen;
+  const tick=async()=>{
+    if(gen!==chatPollGen)return;
+    let data;
+    try{data=await api('/api/conversations/'+id)}catch(err){return}
+    if(gen!==chatPollGen)return;
+    if(currentRoute().view==='chat'&&currentRoute().id===id)renderThread(id,data);
+    const last=data.messages[data.messages.length-1];
+    if(last&&last.role==='assistant'&&['PENDING','GENERATING'].includes(last.status)){
+      setTimeout(tick,900);
+    }else if(currentRoute().view==='chat'&&currentRoute().id===id){
+      renderSideChats();
+    }
+  };
+  tick();
 }
-function renderThread(data){
-  const {conversation,messages,handoffs}=data;
+
+function renderMessageRow(m,attachments,isLast){
+  if(editingMessageId===m.id){
+    return `<div class="msg ${esc(m.role)} editing"><div class="avatar">${m.role==='user'?'Y':'F'}</div><div class="bubble">
+      <textarea id="editArea">${esc(m.content)}</textarea>
+      <div class="edit-actions"><button type="button" class="pill-btn" data-cancel-edit="1">Cancel</button><button type="button" class="action" data-save-edit="${esc(m.id)}">Save &amp; resubmit</button></div>
+    </div></div>`;
+  }
+  const chips=(attachments||[]).length?`<div class="attach-chip-row">${attachments.map(a=>`<a class="attach-chip" href="/api/attachments/${esc(a.id)}" download>${icon('clip',11)}${esc(a.filename)}</a>`).join('')}</div>`:'';
+  if(m.role==='user'){
+    return `<div class="msg user"><div class="avatar">Y</div><div class="bubble">${nl2br(m.content)}${chips}</div>
+      <div class="msg-actions">
+        <button type="button" class="msg-action-btn" data-copy-text="${esc(m.content)}">${icon('copy',12)}Copy</button>
+        <button type="button" class="msg-action-btn" data-edit-id="${esc(m.id)}">${icon('edit',12)}Edit</button>
+      </div></div>`;
+  }
+  const status=m.status||'COMPLETED';
+  if(status==='PENDING'||status==='GENERATING'){
+    return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble thinking"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></div>
+      <div class="status-note">${status==='PENDING'?'Queued':'Thinking'}&hellip; <span data-since="${esc(m.created_at)}">0s</span>
+        <button type="button" class="msg-action-btn" data-stop-id="${esc(m.id)}">${icon('stop',11)}Stop</button>
+      </div></div>`;
+  }
+  if(status==='CANCELLED'){
+    return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">Generation stopped.</div>
+      ${isLast?`<div class="msg-actions"><button type="button" class="msg-action-btn" data-regen-id="${esc(m.id)}">${icon('retry',12)}Retry</button></div>`:''}</div>`;
+  }
+  if(status==='FAILED'||m.error){
+    return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">${esc(m.error||'This reply failed.')}</div>
+      ${isLast?`<div class="msg-actions"><button type="button" class="msg-action-btn" data-regen-id="${esc(m.id)}">${icon('retry',12)}Retry</button></div>`:''}</div>`;
+  }
+  return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble">${renderMarkdown(m.content)}</div>
+    <div class="msg-actions">
+      <button type="button" class="msg-action-btn" data-copy-text="${esc(m.content)}">${icon('copy',12)}Copy</button>
+      ${isLast?`<button type="button" class="msg-action-btn" data-regen-id="${esc(m.id)}">${icon('retry',12)}Regenerate</button>`:''}
+    </div></div>`;
+}
+
+function wireThreadActions(id){
+  const t=$('thread');
+  if(!t||t.dataset.wired)return;
+  t.dataset.wired='1';
+  t.addEventListener('click',async e=>{
+    const copyBtn=e.target.closest('[data-copy-text]');
+    if(copyBtn){
+      try{await navigator.clipboard.writeText(copyBtn.dataset.copyText);showToast('Copied to clipboard')}
+      catch(err){showToast('Could not copy automatically -- select the text and copy it manually.',{error:true})}
+      return;
+    }
+    const editBtn=e.target.closest('[data-edit-id]');
+    if(editBtn){
+      editingMessageId=editBtn.dataset.editId;
+      renderThread(id,currentConversationData);
+      const area=$('editArea');
+      if(area){area.focus();area.setSelectionRange(area.value.length,area.value.length)}
+      return;
+    }
+    const cancelEdit=e.target.closest('[data-cancel-edit]');
+    if(cancelEdit){editingMessageId=null;renderThread(id,currentConversationData);return}
+    const saveEdit=e.target.closest('[data-save-edit]');
+    if(saveEdit){
+      const mid=saveEdit.dataset.saveEdit;
+      const content=$('editArea').value.trim();
+      if(!content){showToast('Message cannot be empty',{error:true});return}
+      editingMessageId=null;
+      try{
+        await api(`/api/conversations/${id}/messages/${mid}/edit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});
+        pollConversationUntilSettled(id);
+      }catch(err){showToast(err.message,{error:true});renderThread(id,currentConversationData)}
+      return;
+    }
+    const stopBtn=e.target.closest('[data-stop-id]');
+    if(stopBtn){
+      stopBtn.disabled=true;
+      try{await api(`/api/conversations/${id}/messages/${stopBtn.dataset.stopId}/stop`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}
+      catch(err){/* 400 just means it already reached a terminal state first -- not a real error */}
+      pollConversationUntilSettled(id);
+      return;
+    }
+    const regenBtn=e.target.closest('[data-regen-id]');
+    if(regenBtn){
+      regenBtn.disabled=true;
+      try{
+        await api(`/api/conversations/${id}/messages/${regenBtn.dataset.regenId}/regenerate`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        pollConversationUntilSettled(id);
+      }catch(err){showToast(err.message,{error:true})}
+      return;
+    }
+  });
+}
+
+function renderThread(id,data){
+  currentConversationData=data;currentConversationId=id;
+  const {conversation,messages,handoffs,attachments}=data;
   document.title='Falguna · '+conversation.title;
+  const attachByMsg={};
+  (attachments||[]).forEach(a=>{if(a.message_id)(attachByMsg[a.message_id]=attachByMsg[a.message_id]||[]).push(a)});
   const t=$('thread');
   if(!messages.length){
     t.innerHTML='<div class="empty-state">Say something to get started.</div>';
   }else{
-    t.innerHTML=messages.map(m=>{
-      if(m.role==='user')return `<div class="msg user"><div class="avatar">Y</div><div class="bubble">${esc(m.content)}</div></div>`;
-      if(m.error)return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble error">${esc(m.error)}</div></div>`;
-      return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble">${esc(m.content)}</div></div>`;
-    }).join('');
+    const lastId=messages[messages.length-1].id;
+    t.innerHTML=messages.map(m=>renderMessageRow(m,attachByMsg[m.id]||[],m.id===lastId)).join('');
   }
+  wireThreadActions(id);
   const last=messages[messages.length-1];
-  const suggestion=last&&last.role==='assistant'&&last.suggested_objective;
+  const suggestion=last&&last.role==='assistant'&&last.status==='COMPLETED'&&last.suggested_objective;
   renderHandoffPanel(conversation,suggestion||'',handoffs);
   $('thread').closest('.chat-scroll').scrollTop=9e6;
 }
@@ -1081,7 +2047,7 @@ function renderHandoffPanel(conversation,suggested,handoffs){
   $('handoffBtn').onclick=async()=>{
     const project_id=$('handoffProject').value;
     const objective=$('handoffObjective').value.trim();
-    if(!project_id||objective.length<12){alert('Choose a project and describe a bounded objective (12+ characters).');return}
+    if(!project_id||objective.length<12){showToast('Choose a project and describe a bounded objective (12+ characters).',{error:true});return}
     $('handoffBtn').disabled=true;$('handoffBtn').textContent='Starting…';
     try{
       const {id}=currentRoute();
@@ -1089,7 +2055,7 @@ function renderHandoffPanel(conversation,suggested,handoffs){
       watchOperation(out.operation,runId=>go('#/work/'+runId));
     }catch(err){
       $('handoffBtn').disabled=false;$('handoffBtn').textContent='Start Work mission';
-      alert(err.message+(err.data&&err.data.discovery?' -- discovery needs a narrower objective.':''));
+      showToast(err.message+(err.data&&err.data.discovery?' -- discovery needs a narrower objective.':''),{error:true});
     }
   };
 }
@@ -1120,7 +2086,7 @@ async function renderWorkView(runId){
       try{
         const out=await api('/api/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:$('project').value,objective:$('objective').value,max_cost_usd:Number($('cost').value)})});
         watchOperation(out.operation,id=>go('#/work/'+id));
-      }catch(err){$('run').disabled=false;alert(err.message)}
+      }catch(err){$('run').disabled=false;showToast(err.message,{error:true})}
     });
     return;
   }
@@ -1178,15 +2144,26 @@ function renderEvidence(runId,d){
 function wireWorkActions(runId){
   document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{
     const reason=prompt('Reason for this decision:');if(!reason)return;
-    await api(`/api/runs/${runId}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,reason})});
-    await refreshWork(runId);
+    try{
+      await api(`/api/runs/${runId}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,reason})});
+      await refreshWork(runId);pollLive();
+    }catch(err){showToast(err.message,{error:true})}
   });
   const resumeBtn=$('resume');
-  if(resumeBtn)resumeBtn.onclick=async()=>{const out=await api(`/api/runs/${runId}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});resumeBtn.disabled=true;watchOperation(out.operation,()=>refreshWork(runId))};
+  if(resumeBtn)resumeBtn.onclick=async()=>{
+    try{const out=await api(`/api/runs/${runId}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});resumeBtn.disabled=true;watchOperation(out.operation,()=>{refreshWork(runId);pollLive()})}
+    catch(err){showToast(err.message,{error:true})}
+  };
   const pauseBtn=$('pause');
-  if(pauseBtn)pauseBtn.onclick=async()=>{await api(`/api/runs/${runId}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refreshWork(runId)};
+  if(pauseBtn)pauseBtn.onclick=async()=>{
+    try{await api(`/api/runs/${runId}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refreshWork(runId);pollLive()}
+    catch(err){showToast(err.message,{error:true})}
+  };
   const cancelBtn=$('cancel');
-  if(cancelBtn)cancelBtn.onclick=async()=>{await api(`/api/runs/${runId}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refreshWork(runId)};
+  if(cancelBtn)cancelBtn.onclick=async()=>{
+    try{await api(`/api/runs/${runId}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await refreshWork(runId);pollLive()}
+    catch(err){showToast(err.message,{error:true})}
+  };
 }
 let operationTimer=null;
 async function watchOperation(token,onRunId){
@@ -1194,10 +2171,10 @@ async function watchOperation(token,onRunId){
   try{
     const op=await api('/api/operations/'+token);
     if(op.run_id&&onRunId){onRunId(op.run_id);onRunId=null}
-    if(op.state==='FAILED'){alert(op.error);return}
+    if(op.state==='FAILED'){showToast(op.error||'Operation failed',{error:true});return}
     if(op.state!=='COMPLETE')operationTimer=setTimeout(()=>watchOperation(token,onRunId),800);
-    else{renderSideMissions()}
-  }catch(err){alert(err.message)}
+    else{renderSideMissions();pollLive()}
+  }catch(err){showToast(err.message,{error:true})}
 }
 
 /* ------------------------------------------------------------- Search view */
@@ -1235,7 +2212,7 @@ async function renderSearchView(id){
         go('#/search/'+out.research.id);
       }catch(err){
         $('researchGo').disabled=false;$('researchGo').innerHTML=icon('search',13)+'Research';
-        alert(err.message);
+        showToast(err.message,{error:true});
       }
     });
     const runQuick=async()=>{
@@ -1299,19 +2276,19 @@ function renderResearchDetail(id,data){
     try{
       const out=await api(`/api/research/${id}/continue-chat`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
       go('#/chat/'+out.conversation_id);
-    }catch(err){$('continueChatBtn').disabled=false;alert(err.message)}
+    }catch(err){$('continueChatBtn').disabled=false;showToast(err.message,{error:true})}
   };
   $('researchHandoffBtn').onclick=async()=>{
     const project_id=$('researchHandoffProject').value;
     const objective=$('researchHandoffObjective').value.trim();
-    if(!project_id||objective.length<12){alert('Choose a project and describe a bounded objective (12+ characters).');return}
+    if(!project_id||objective.length<12){showToast('Choose a project and describe a bounded objective (12+ characters).',{error:true});return}
     $('researchHandoffBtn').disabled=true;$('researchHandoffBtn').textContent='Starting…';
     try{
       const out=await api(`/api/research/${id}/handoff`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id,objective})});
       watchOperation(out.operation,runId=>go('#/work/'+runId));
     }catch(err){
       $('researchHandoffBtn').disabled=false;$('researchHandoffBtn').textContent='Start Work mission';
-      alert(err.message+(err.data&&err.data.discovery?' -- discovery needs a narrower objective.':''));
+      showToast(err.message+(err.data&&err.data.discovery?' -- discovery needs a narrower objective.':''),{error:true});
     }
   };
 }
@@ -1340,43 +2317,223 @@ async function renderProjectsView(){
   document.querySelectorAll('[data-newmission]').forEach(b=>b.onclick=()=>go('#/work'));
 }
 
+/* ------------------------------------------------------ Mission Control view */
+
+function mcControlsHtml(c){
+  if(c.status==='PAUSED')return `<button type="button" class="pill-btn" data-mc-action="resume" data-run-id="${esc(c.run_id)}">Resume</button><button type="button" class="pill-btn" data-mc-action="cancel" data-run-id="${esc(c.run_id)}">Cancel</button>`;
+  if(c.status==='DONE_CANDIDATE'&&c.merge_approval==='PENDING')return `<button type="button" class="pill-btn" data-mc-action="approve" data-run-id="${esc(c.run_id)}">Approve</button><button type="button" class="pill-btn" data-mc-action="reject" data-run-id="${esc(c.run_id)}">Reject</button><button type="button" class="pill-btn" data-mc-action="request-changes" data-run-id="${esc(c.run_id)}">Changes</button>`;
+  if(['PLANNING','WORKING','VERIFYING','REVIEWING'].includes(c.status))return `<button type="button" class="pill-btn" data-mc-action="pause" data-run-id="${esc(c.run_id)}">Pause</button><button type="button" class="pill-btn" data-mc-action="cancel" data-run-id="${esc(c.run_id)}">Cancel</button>`;
+  if(['FAILED','QUARANTINED'].includes(c.status))return `<button type="button" class="pill-btn" data-mc-action="resume" data-run-id="${esc(c.run_id)}">Retry</button>`;
+  return '';
+}
+function mcCard(c){
+  const needsYou=(c.status==='DONE_CANDIDATE'&&c.merge_approval==='PENDING')||c.status==='PAUSED';
+  return `<div class="mc-card ${needsYou?'needs-you':''}" data-open-run="${esc(c.run_id)}">
+    <div class="mc-title">${esc(c.title)}</div>
+    <div class="mc-meta"><span class="status-pill ${esc((c.status||'').toLowerCase())}">${esc(String(c.status||'').replaceAll('_',' '))}</span><span>${esc(c.project||'')}</span><span>${esc(c.origin||'')}</span><span>${esc(timeAgo(c.last_activity))}</span>${c.cost_usd?`<span>$${esc(c.cost_usd)}</span>`:''}</div>
+    <div class="mc-step">${esc(String(c.current_step||'').replaceAll('_',' '))}</div>
+    <div class="mc-controls">${mcControlsHtml(c)}</div>
+  </div>`;
+}
+function wireMcControls(){
+  document.querySelectorAll('.mc-card').forEach(card=>{
+    card.onclick=e=>{if(e.target.closest('[data-mc-action]'))return;go('#/work/'+card.dataset.openRun)};
+  });
+  document.querySelectorAll('[data-mc-action]').forEach(b=>b.onclick=async e=>{
+    e.stopPropagation();
+    const runId=b.dataset.runId,action=b.dataset.mcAction;
+    try{
+      if(action==='pause'||action==='cancel'){
+        await api(`/api/runs/${runId}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        await refreshMissionControl();
+      }else if(action==='resume'){
+        const out=await api(`/api/runs/${runId}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        watchOperation(out.operation,()=>refreshMissionControl());
+      }else{
+        const reason=prompt('Reason for this decision:');if(!reason)return;
+        await api(`/api/runs/${runId}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reason})});
+        await refreshMissionControl();
+      }
+      pollLive();
+    }catch(err){showToast(err.message,{error:true})}
+  });
+}
+const MC_BUCKETS=[['needs_you','Needs you','needs-you'],['running','Running',''],['failed','Failed','failed'],['completed','Completed',''],['cancelled','Cancelled','']];
+async function refreshMissionControl(){
+  const host=$('mcBuckets');
+  if(!host)return;
+  let board;
+  try{board=await api('/api/missions/board')}catch(err){host.innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
+  host.innerHTML=MC_BUCKETS.map(([key,label,cls])=>{
+    const items=board[key]||[];
+    return `<div><div class="mc-bucket-title ${cls}">${esc(label)}<span class="count">${items.length}</span></div>${items.length?`<div class="mc-grid">${items.map(mcCard).join('')}</div>`:'<div class="mc-empty-bucket">Nothing here.</div>'}</div>`;
+  }).join('');
+  wireMcControls();
+}
+async function renderMissionControlView(){
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="mc-view">
+    <div class="mc-head"><div><h1 style="margin:0;font-size:21px;font-weight:650">Mission Control</h1><p class="lede" style="margin:4px 0 0">Every Work mission, grouped by what it actually needs from you next.</p></div></div>
+    <div class="mc-buckets" id="mcBuckets"><div class="empty-state">Loading&hellip;</div></div>
+  </div>`;
+  await refreshMissionControl();
+  clearInterval(mcTimer);
+  mcTimer=setInterval(()=>{
+    if(currentRoute().view==='mission')refreshMissionControl();else clearInterval(mcTimer);
+  },5000);
+}
+
+/* ------------------------------------------------------------------ Files view */
+
+let filesTab='uploads';
+async function renderFilesView(tab){
+  filesTab=tab||filesTab||'uploads';
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="files-view">
+    <h1 style="font-size:21px;margin:0 0 4px;font-weight:650">Files</h1>
+    <p class="lede">Chat attachments and mission-generated artifacts Falguna already has on disk.</p>
+    <div class="files-tabs">
+      <button type="button" data-ftab="uploads" class="${filesTab==='uploads'?'active':''}">Uploads</button>
+      <button type="button" data-ftab="generated" class="${filesTab==='generated'?'active':''}">Generated</button>
+    </div>
+    <div class="result-list" id="filesList"><div class="empty-state">Loading&hellip;</div></div>
+  </div>`;
+  document.querySelectorAll('[data-ftab]').forEach(b=>b.onclick=()=>go('#/files/'+b.dataset.ftab));
+  let data;
+  try{data=await api('/api/files')}catch(err){$('filesList').innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
+  const rows=filesTab==='generated'?(data.generated||[]):(data.uploads||[]);
+  $('filesList').innerHTML=rows.length?rows.map(f=>f.type==='upload'
+    ?`<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.content_type||'')} &middot; ${esc(formatBytes(f.size_bytes))} &middot; ${esc(timeAgo(f.created_at))}</div></div><div style="display:flex;gap:8px;flex:none">${f.conversation_id?`<a class="pill-btn" href="#/chat/${esc(f.conversation_id)}">Open chat</a>`:''}<a class="pill-btn" href="/api/attachments/${esc(f.id)}" download title="Download">${icon('download',12)}</a></div></div>`
+    :`<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.kind||'')} &middot; ${esc(f.mission_title||'')} &middot; ${esc(timeAgo(f.created_at))}</div></div><a class="pill-btn" href="#/work/${esc(f.run_id)}">Open mission</a></div>`
+  ).join(''):`<div class="empty-state">No ${filesTab==='generated'?'generated files':'uploads'} yet.</div>`;
+}
+
 /* ------------------------------------------------------------ History view */
 
 async function renderHistoryView(){
   const vp=$('viewport');
-  vp.innerHTML=`<div class="page"><h1>History</h1><p class="lede">Every chat, search, and mission, most recent first.</p><div class="result-list" id="historyList"></div></div>`;
+  vp.innerHTML=`<div class="page"><h1>History</h1><p class="lede">Every chat, search, and mission, most recent first.</p>
+    <div class="searchbar"><input id="histFilter" placeholder="Filter by title&hellip;"></div>
+    <div class="files-tabs" id="histTabs">
+      <button type="button" data-htab="all" class="active">All</button>
+      <button type="button" data-htab="conversation">Chats</button>
+      <button type="button" data-htab="research">Search</button>
+      <button type="button" data-htab="mission">Work</button>
+    </div>
+    <div class="result-list" id="historyList"></div></div>`;
   const [{conversations},{runs},{research}]=await Promise.all([api('/api/conversations'),api('/api/runs'),api('/api/research')]);
   const items=[
     ...(conversations||[]).map(c=>({type:'conversation',id:c.id,title:c.title,updated_at:c.updated_at})),
     ...(runs||[]).map(r=>({type:'mission',run_id:r.run_id,title:r.title,status:r.status,updated_at:r.updated_at,repository:r.repository})),
     ...(research||[]).map(r=>({type:'research',id:r.id,title:r.query,status:r.status,updated_at:r.updated_at})),
   ].sort((a,b)=>new Date(b.updated_at)-new Date(a.updated_at));
-  $('historyList').innerHTML=items.length?items.map(r=>{
-    if(r.type==='conversation')return `<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
-    if(r.type==='research')return `<button class="result-row" data-open="#/search/${esc(r.id)}"><div class="kind">Search · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
-    return `<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
-  }).join(''):'<div class="empty-state">Nothing yet. Start a chat, a search, or a mission.</div>';
-  document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
+  let activeTab='all';
+  function renderList(){
+    const q=$('histFilter').value.trim().toLowerCase();
+    const rows=items.filter(r=>(activeTab==='all'||r.type===activeTab)&&(!q||r.title.toLowerCase().includes(q)));
+    $('historyList').innerHTML=rows.length?rows.map(r=>{
+      if(r.type==='conversation')return `<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+      if(r.type==='research')return `<button class="result-row" data-open="#/search/${esc(r.id)}"><div class="kind">Search · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+      return `<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work · <span class="status-pill ${esc((r.status||'').toLowerCase())}">${esc(String(r.status||'').replaceAll('_',' '))}</span></div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+    }).join(''):'<div class="empty-state">Nothing matches.</div>';
+    document.querySelectorAll('#historyList [data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
+  }
+  $('histFilter').addEventListener('input',renderList);
+  document.querySelectorAll('#histTabs button').forEach(b=>b.onclick=()=>{
+    activeTab=b.dataset.htab;
+    document.querySelectorAll('#histTabs button').forEach(x=>x.classList.toggle('active',x===b));
+    renderList();
+  });
+  renderList();
 }
 
 /* ----------------------------------------------------------- Settings view */
 
-async function renderSettingsView(){
+const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
+async function renderSettingsView(tab){
+  tab=(tab&&SETTINGS_TABS.some(([id])=>id===tab))?tab:'appearance';
   const vp=$('viewport');
-  const s=await api('/api/settings');
-  vp.innerHTML=`<div class="page"><h1>Settings</h1><p class="lede">Informational only in this release &mdash; nothing here can change Falguna's safety policy from the browser.</p>
-    <div class="settings-note">Approval boundaries, verification, review, isolation, and audit are enforced in the control plane and are not editable from the UI.</div>
-    <div class="settings-list">
-      <div><span style="color:var(--muted-dim)">Model:</span> ${esc(s.model)}</div>
-      <div><span style="color:var(--muted-dim)">Approved projects:</span> ${esc(s.profiles.length)}</div>
-    </div>
-    <div class="section-label">Safety boundaries preserved in this release</div>
-    <div class="settings-list">${s.boundaries.map(b=>`<div>${esc(b)}</div>`).join('')}</div>
-    <div class="section-label">Approved projects</div>
-    <div class="settings-list">${s.profiles.map(p=>`<div><b>${esc(p.name)}</b> &middot; ${esc(p.repository)} &middot; cap $${esc(p.default_budget_usd)}</div>`).join('')}</div>
+  const [s,cfg]=await Promise.all([api('/api/settings'),api('/api/config')]);
+  vp.innerHTML=`<div class="page">
+    <h1>Settings</h1>
+    <p class="lede">Informational only in this release &mdash; nothing here can change Falguna's safety policy from the browser.</p>
+    <div class="settings-nav" id="settingsNav">${SETTINGS_TABS.map(([id,label])=>`<button type="button" data-tab="${id}" class="${id===tab?'active':''}">${esc(label)}</button>`).join('')}</div>
+    <div id="settingsBody"><div class="empty-state">Loading&hellip;</div></div>
   </div>`;
+  document.querySelectorAll('#settingsNav button').forEach(b=>b.onclick=()=>go('#/settings/'+b.dataset.tab));
+  const body=$('settingsBody');
+  if(tab==='appearance'){
+    const mode=currentThemeMode();
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Theme</div>
+      <div class="theme-options">
+        <button type="button" class="theme-card ${mode==='system'?'active':''}" data-theme="system">${icon('monitor',15)}System</button>
+        <button type="button" class="theme-card ${mode==='light'?'active':''}" data-theme="light">${icon('sun',15)}Light</button>
+        <button type="button" class="theme-card ${mode==='dark'?'active':''}" data-theme="dark">${icon('moon',15)}Dark</button>
+      </div>
+    </div>
+    <div class="settings-note">Approval boundaries, verification, review, isolation, and audit are enforced in the control plane and are not editable from the UI.</div>`;
+    document.querySelectorAll('.theme-card').forEach(b=>b.onclick=()=>applyTheme(b.dataset.theme));
+  }else if(tab==='models'){
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Available models</div>
+      <div class="settings-list">${cfg.available_models.map(m=>`<div>${esc(m)}${m===cfg.model?' &middot; default':''}</div>`).join('')}</div>
+      <div class="settings-list"><div>Authenticated Codex runtime detected on this machine: <b>${cfg.codex_runtime_found?'Yes':'No'}</b></div></div>
+      <p class="lede">Each chat picks its own model (or Auto, which uses Falguna's resilient fallback-aware routing) from the selector above its composer -- there is no single global default to change here.</p>
+    </div>`;
+  }else if(tab==='work'){
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Work Mode</div>
+      <p class="lede" style="margin-bottom:14px">Fast / Balanced / Deep change real, verifiable knobs -- request timeout, whether Falguna's resilient fallback-model routing is used, and how many attempts a call gets. This is never a claim about hidden reasoning depth.</p>
+      <div class="settings-list">
+        <div><b>Fast</b> &middot; 30s timeout &middot; no fallback routing &middot; 1 attempt</div>
+        <div><b>Balanced</b> (default) &middot; 60s timeout &middot; fallback routing on &middot; 2 attempts</div>
+        <div><b>Deep</b> &middot; 120s timeout &middot; fallback routing on &middot; 3 attempts</div>
+      </div>
+    </div>`;
+  }else if(tab==='files'){
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Attachments</div>
+      <div class="settings-list"><div>Per-file limit: <b>10 MB</b></div><div>Stored on disk under this project's local <code>.falguna/attachments</code> folder, indexed in the <a href="#/files">Files</a> view.</div></div>
+    </div>`;
+  }else if(tab==='notifications'){
+    const notifs=await api('/api/notifications');
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Notifications</div>
+      <div class="settings-list"><div>${esc(notifs.unread)} unread of ${esc(notifs.notifications.length)} shown.</div></div>
+      <div class="handoff-actions"><button type="button" class="action secondary" id="markAllReadSettings">Mark all as read</button></div>
+    </div>`;
+    $('markAllReadSettings').onclick=async()=>{
+      try{await api('/api/notifications/read-all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderSettingsView('notifications');pollLive()}
+      catch(err){showToast(err.message,{error:true})}
+    };
+  }else if(tab==='privacy'){
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Safety boundaries preserved in this release</div>
+      <div class="settings-list">${s.boundaries.map(b=>`<div>${esc(b)}</div>`).join('')}</div>
+    </div>`;
+  }else if(tab==='usage'){
+    const usage=await api('/api/usage');
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Usage &amp; cost</div>
+      <div class="usage-cards">
+        <div class="usage-card"><span>Chat</span><b>${esc(usage.totals.chat.calls)}</b><small>${esc(usage.totals.chat.input_tokens)}+${esc(usage.totals.chat.output_tokens)} tok &middot; $${usage.totals.chat.cost_usd.toFixed(4)}</small></div>
+        <div class="usage-card"><span>Search</span><b>${esc(usage.totals.research.calls)}</b><small>${esc(usage.totals.research.input_tokens)}+${esc(usage.totals.research.output_tokens)} tok &middot; $${usage.totals.research.cost_usd.toFixed(4)}</small></div>
+        <div class="usage-card"><span>Work</span><b>${esc(usage.totals.work.calls)}</b><small>$${usage.totals.work.cost_usd.toFixed(4)}</small></div>
+      </div>
+      <p class="lede">${esc(usage.note)}</p>
+    </div>`;
+  }else{
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Product</div>
+      <div class="settings-list"><div>${esc(s.product)} &middot; default model ${esc(s.model)}</div></div>
+      <div class="section-label">Approved projects</div>
+      <div class="settings-list">${s.profiles.map(p=>`<div><b>${esc(p.name)}</b> &middot; ${esc(p.repository)} &middot; cap $${esc(p.default_budget_usd)}</div>`).join('')}</div>
+    </div>`;
+  }
 }
 
 router().catch(e=>{$('viewport').innerHTML=`<div class="page"><div class="empty-state error">${esc(e.message)}</div></div>`});
+startLivePolling();
 </script></body></html>
 '''

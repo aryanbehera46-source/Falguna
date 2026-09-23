@@ -114,6 +114,33 @@ class StateStore:
             ("linked_objective_id", "TEXT"), ("linked_venture_id", "TEXT"), ("linked_risk_id", "TEXT"),
             ("discussion_summary", "TEXT"), ("follow_up", "TEXT"),
         ],
+        # Falguna Product Experience V2: chat_messages gets a truthful,
+        # explicit generation-state column (Section 4) and soft-delete/edit
+        # markers for regenerate/edit-resubmit (Section 3), all additive and
+        # NULL-safe against every message ever created before this column
+        # existed -- application code treats NULL status as "COMPLETED" and
+        # NULL/0 superseded as "still visible", exactly the old behavior.
+        "chat_messages": [
+            ("status", "TEXT"), ("superseded", "INTEGER"), ("edited_at", "TEXT"),
+            # StateStore.update() always stamps updated_at -- chat_messages
+            # never needed one before (only ever created, never updated),
+            # but the V2 message-state transitions (mark_generating,
+            # complete_message, fail_message, cancel_message,
+            # edit_user_message) are the first callers to update() an
+            # existing row, so the column has to exist.
+            ("updated_at", "TEXT"),
+            # Pre-existing latent gap: ChatResponder.reply() always computed a
+            # suggested_objective (mirroring research_queries) but there was
+            # nowhere on chat_messages to persist it, so the Chat->Work
+            # handoff panel's suggestion was silently always empty. Additive,
+            # nullable column so this can actually be stored and surfaced.
+            ("suggested_objective", "TEXT"),
+        ],
+        # Per-conversation/per-research model and work-mode overrides
+        # (Sections 5-6). NULL means "use the global default", identical to
+        # every conversation/research row created before these existed.
+        "conversations": [("model_override", "TEXT"), ("work_mode", "TEXT")],
+        "research_queries": [("model_override", "TEXT"), ("work_mode", "TEXT"), ("model_call_json", "TEXT")],
     }
 
     def migrate(self) -> None:
@@ -156,7 +183,9 @@ class StateStore:
             "co_department_objectives", "co_venture_links", "co_resource_recommendations",
             "co_capital_recommendations", "co_events", "co_replans", "co_decisions", "co_policies",
             "co_escalations", "co_timeline_events", "co_traceability_links", "co_memory", "co_failures",
-            "co_cost_estimates", "co_goal_feedback_events", "co_daily_loops", "co_weekly_reviews"}
+            "co_cost_estimates", "co_goal_feedback_events", "co_daily_loops", "co_weekly_reviews",
+            # Falguna Product Experience V2
+            "attachments", "notifications"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

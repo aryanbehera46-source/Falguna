@@ -117,10 +117,16 @@ class ConversationStore:
         self.store.update("conversations", conversation_id, status="ARCHIVED")
 
     def list_messages(self, conversation_id: str) -> List[dict]:
-        return self.store.list("chat_messages", "conversation_id=?", (conversation_id,))
+        """Every message ever created before the `superseded` column existed
+        has a NULL value there, which this filter treats as "not superseded"
+        -- so this stays exactly backward compatible with every existing
+        caller/test that never superseded anything."""
+        rows = self.store.list("chat_messages", "conversation_id=?", (conversation_id,))
+        return [r for r in rows if not r.get("superseded")]
 
     def add_message(self, conversation_id: str, role: str, content: str,
-                     model_call: Optional[dict] = None, error: Optional[str] = None) -> dict:
+                     model_call: Optional[dict] = None, error: Optional[str] = None,
+                     status: Optional[str] = None) -> dict:
         if role not in {"user", "assistant"}:
             raise ChatError("invalid message role")
         content = (content or "").strip()
@@ -133,10 +139,117 @@ class ConversationStore:
             "model_call_json": json.dumps(model_call, sort_keys=True) if model_call else None,
             "error": error,
             "created_at": utcnow(),
+            "status": status or ("FAILED" if error else "COMPLETED"),
+            "superseded": 0,
+            "edited_at": None,
         }
         message_id = self.store.create("chat_messages", record)
         self.store.update("conversations", conversation_id, updated_at=utcnow())
         return {"id": message_id, **record}
+
+    # ---------------------------------------------------- message state (V2)
+    # Explicit, truthful message states (Section 4): PENDING (queued, worker
+    # not yet started) -> GENERATING (transport call in flight) ->
+    # COMPLETED / FAILED / CANCELLED. Every transition below only ever
+    # writes a state Falguna actually reached -- there is no fabricated
+    # progress percentage or fake intermediate step.
+
+    def add_pending_message(self, conversation_id: str) -> dict:
+        """Creates the placeholder assistant row a background worker will
+        fill in. Exists from the first HTTP response onward so a page
+        refresh mid-generation shows a truthful PENDING/GENERATING bubble
+        instead of nothing."""
+        record = {
+            "conversation_id": conversation_id, "role": "assistant", "content": "",
+            "model_call_json": None, "error": None, "created_at": utcnow(),
+            "status": "PENDING", "superseded": 0, "edited_at": None,
+        }
+        message_id = self.store.create("chat_messages", record)
+        return {"id": message_id, **record}
+
+    def mark_generating(self, message_id: str) -> None:
+        row = self.store.get("chat_messages", message_id)
+        if row and row.get("status") == "PENDING":
+            self.store.update("chat_messages", message_id, status="GENERATING")
+
+    def complete_message(self, message_id: str, content: str, model_call: Optional[dict],
+                          suggested_objective: Optional[str] = None) -> bool:
+        """Only applies the result if the message has not already been
+        cancelled (Stop generation) -- returns False when a cancel raced it,
+        in which case the caller must not surface the (already-discarded)
+        reply as if it were delivered."""
+        row = self.store.get("chat_messages", message_id)
+        if not row or row.get("status") == "CANCELLED":
+            return False
+        self.store.update(
+            "chat_messages", message_id, content=content, error=None, status="COMPLETED",
+            model_call_json=json.dumps(model_call, sort_keys=True) if model_call else None,
+            suggested_objective=suggested_objective,
+        )
+        self.store.update("conversations", row["conversation_id"], updated_at=utcnow())
+        return True
+
+    def fail_message(self, message_id: str, error: str) -> bool:
+        row = self.store.get("chat_messages", message_id)
+        if not row or row.get("status") == "CANCELLED":
+            return False
+        self.store.update("chat_messages", message_id, content="", error=str(error), status="FAILED")
+        return True
+
+    def cancel_message(self, message_id: str) -> dict:
+        """Stop generation. Marks the message CANCELLED so a still-running
+        background call cannot later overwrite it with a delivered reply --
+        Falguna cannot kill an in-flight Codex CLI subprocess call, so this
+        is an honest "discard the result, never apply it" cancel rather than
+        a claim that the underlying call was interrupted."""
+        row = self.store.get("chat_messages", message_id)
+        if not row:
+            raise ChatError("message not found")
+        if row["role"] != "assistant":
+            raise ChatError("only an assistant message can be cancelled")
+        if row.get("status") not in {"PENDING", "GENERATING"}:
+            raise ChatError("message is not currently generating")
+        self.store.update("chat_messages", message_id, status="CANCELLED", content="", error="Cancelled by user")
+        return self.store.get("chat_messages", message_id)
+
+    def edit_user_message(self, conversation_id: str, message_id: str, content: str) -> dict:
+        """Edit-and-resubmit: updates a user message's text in place and
+        supersedes (soft-deletes from the visible thread) every message that
+        came after it, so a fresh reply can be generated against the edited
+        history. Superseded rows are kept, never deleted, for audit."""
+        content = (content or "").strip()
+        if not content:
+            raise ChatError("Message cannot be empty")
+        row = self.store.get("chat_messages", message_id)
+        if not row or row["conversation_id"] != conversation_id:
+            raise ChatError("message not found")
+        if row["role"] != "user":
+            raise ChatError("only a user message can be edited")
+        self.store.update("chat_messages", message_id, content=content, edited_at=utcnow())
+        for later in self.store.list("chat_messages", "conversation_id=? AND created_at>?", (conversation_id, row["created_at"])):
+            self.store.update("chat_messages", later["id"], superseded=1)
+        return self.store.get("chat_messages", message_id)
+
+    def prepare_regenerate(self, conversation_id: str, message_id: str) -> dict:
+        """Regenerate / Retry: supersedes the given assistant message (which
+        must be the latest visible message) so a fresh PENDING reply can
+        replace it. Works identically for a COMPLETED reply the person wants
+        reworded and a FAILED one they want retried."""
+        visible = self.list_messages(conversation_id)
+        if not visible or visible[-1]["id"] != message_id:
+            raise ChatError("only the most recent assistant message can be regenerated")
+        row = visible[-1]
+        if row["role"] != "assistant":
+            raise ChatError("only an assistant message can be regenerated")
+        if row.get("status") == "GENERATING":
+            raise ChatError("message is still generating")
+        self.store.update("chat_messages", message_id, superseded=1)
+        return row
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        if not self.get_conversation(conversation_id):
+            raise ChatError("conversation not found")
+        self.store.update("conversations", conversation_id, status="DELETED")
 
     def record_handoff(self, conversation_id: str, run_id: str, objective: str) -> str:
         return self.store.create("conversation_handoffs", {
