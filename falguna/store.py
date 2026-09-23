@@ -158,6 +158,13 @@ class StateStore:
         # every conversation/research row created before these existed.
         "conversations": [("model_override", "TEXT"), ("work_mode", "TEXT")],
         "research_queries": [("model_override", "TEXT"), ("work_mode", "TEXT"), ("model_call_json", "TEXT")],
+        # Falguna Browser + Computer Use V1: a screenshot or download an
+        # AttachmentStore.save_base64 call records can optionally be linked
+        # back to the browser session that produced it (Section 26). NULL
+        # for every attachment created before this column existed, and for
+        # every ordinary Chat upload -- identical to how conversation_id was
+        # already optional.
+        "attachments": [("browser_session_id", "TEXT")],
     }
 
     def migrate(self) -> None:
@@ -204,7 +211,9 @@ class StateStore:
             # Falguna Product Experience V2
             "attachments", "notifications",
             # Falguna V2.1: UX Hardening + Provider Independence Foundation
-            "model_settings"}
+            "model_settings",
+            # Falguna Browser + Computer Use V1
+            "browser_sessions", "browser_tabs", "browser_actions", "browser_downloads"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

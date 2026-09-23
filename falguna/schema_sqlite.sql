@@ -348,3 +348,37 @@ CREATE INDEX IF NOT EXISTS idx_co_weekly_reviews_week_start ON co_weekly_reviews
 -- OpenAICompatibleGateway.api_key_file convention -- see providers.py.
 CREATE TABLE IF NOT EXISTS model_settings (id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, value_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_model_settings_key ON model_settings(key);
+
+-- Falguna Browser + Computer Use V1 (falguna/browser_runtime.py): a real,
+-- persistent, Playwright-backed browser session, first-class in Mission
+-- Control. `browser_settings`/`browser_registry`-style scalar settings
+-- reuse the existing generic model_settings key/value table (a new row
+-- under key "browser_settings") rather than a second single-row settings
+-- table -- see falguna/browser_planner.py's BrowserSettingsStore.
+CREATE TABLE IF NOT EXISTS browser_sessions (
+    id TEXT PRIMARY KEY, objective TEXT NOT NULL, task_type TEXT NOT NULL, project_id TEXT,
+    status TEXT NOT NULL, headless INTEGER NOT NULL DEFAULT 1, privacy_mode TEXT, plan_json TEXT,
+    current_url TEXT, active_tab_id TEXT, needs_aryan_reason TEXT,
+    error TEXT, error_category TEXT, error_detail TEXT,
+    conversation_id TEXT, research_id TEXT, mc_archived INTEGER,
+    actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    started_at TEXT, completed_at TEXT, next_step_index INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_status ON browser_sessions(status, created_at);
+CREATE TABLE IF NOT EXISTS browser_tabs (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES browser_sessions(id), tab_index INTEGER NOT NULL,
+    url TEXT, title TEXT, opened_by_action_id TEXT, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_browser_tabs_session ON browser_tabs(session_id, tab_index);
+CREATE TABLE IF NOT EXISTS browser_actions (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES browser_sessions(id), tab_id TEXT, seq INTEGER NOT NULL,
+    action_type TEXT NOT NULL, target TEXT, value TEXT, result TEXT NOT NULL, detail TEXT,
+    screenshot_attachment_id TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_browser_actions_session ON browser_actions(session_id, seq);
+CREATE TABLE IF NOT EXISTS browser_downloads (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES browser_sessions(id), filename TEXT NOT NULL,
+    source_url TEXT, attachment_id TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_browser_downloads_session ON browser_downloads(session_id, created_at);

@@ -38,7 +38,8 @@ class AttachmentStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def save_base64(self, filename: str, content_type: Optional[str], data_base64: str,
-                     conversation_id: Optional[str] = None, message_id: Optional[str] = None) -> dict:
+                     conversation_id: Optional[str] = None, message_id: Optional[str] = None,
+                     browser_session_id: Optional[str] = None) -> dict:
         try:
             data = base64.b64decode(data_base64, validate=True)
         except Exception as exc:
@@ -59,7 +60,7 @@ class AttachmentStore:
             "conversation_id": conversation_id, "message_id": message_id, "filename": display_name,
             "content_type": content_type, "size_bytes": len(data), "sha256": sha,
             "storage_rel_path": str(storage_path.relative_to(Path(self.store.path).parent)),
-            "created_at": utcnow(),
+            "created_at": utcnow(), "browser_session_id": browser_session_id,
         }
         self.store.create("attachments", record, record_id=record_id)
         return {"id": record_id, **record}
@@ -85,6 +86,9 @@ class AttachmentStore:
 
     def list_for_conversation(self, conversation_id: str) -> List[dict]:
         return self.store.list("attachments", "conversation_id=?", (conversation_id,))
+
+    def list_for_browser_session(self, browser_session_id: str) -> List[dict]:
+        return self.store.list("attachments", "browser_session_id=?", (browser_session_id,))
 
     def list_all(self, limit: int = 200) -> List[dict]:
         rows = self.store.list("attachments")

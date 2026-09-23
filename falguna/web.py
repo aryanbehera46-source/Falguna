@@ -11,7 +11,19 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .attachments import AttachmentError, AttachmentStore
+from .browser_planner import BrowserSettingsStore, plan_steps_from_objective
+from .browser_runtime import (
+    ACTIVELY_RUNNING_STATUSES as BROWSER_ACTIVELY_RUNNING_STATUSES,
+    ALL_ACTION_TYPES as BROWSER_ALL_ACTION_TYPES,
+    BrowserRuntimeError,
+    BrowserSessionStatus,
+    BrowserSessionStore,
+    PlaywrightBrowserRuntime,
+    TERMINAL_STATUSES as BROWSER_TERMINAL_STATUSES,
+    classify_sensitive_action,
+)
 from .chat import ChatError, ChatResponder, ConversationStore, search_missions
+from .computer_use import build_computer_channel, computer_use_available
 from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL, ResilientCodexTransport, SUPPORTED_CODEX_MODELS
 from .continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
 from .discovery import ProjectDiscovery
@@ -119,6 +131,59 @@ def validate_editable(values: list) -> list:
     return cleaned
 
 
+def _browser_session_bucket(status: str, archived: bool) -> str:
+    """Falguna Browser + Computer Use V1 (Section 25): the exact same board
+    bucket vocabulary Engineering Worker runs already occupy
+    (running/needs_you/completed/failed/cancelled/archived) -- a browser
+    session is never a second, parallel task system, only a second `kind`
+    of card feeding the same buckets."""
+    if archived and status not in BROWSER_ACTIVELY_RUNNING_STATUSES:
+        return "archived"
+    if status in BROWSER_ACTIVELY_RUNNING_STATUSES:  # CREATED, RUNNING, WAITING
+        return "running"
+    if status in (BrowserSessionStatus.NEEDS_ARYAN, BrowserSessionStatus.PAUSED):
+        return "needs_you"
+    if status == BrowserSessionStatus.FAILED:
+        return "failed"
+    if status == BrowserSessionStatus.CANCELLED:
+        return "cancelled"
+    return "completed"
+
+
+def _resolve_project_name(project_id, profiles_by_id: dict):
+    if not project_id:
+        return None
+    profile = profiles_by_id.get(project_id)
+    return profile["name"] if profile else None
+
+
+def _browser_session_card(row: dict, chat_store, research_store, evidence_count: int, profiles_by_id: dict) -> dict:
+    origin = "Direct"
+    if row.get("conversation_id") and chat_store.get_conversation(row["conversation_id"]):
+        origin = "Chat"
+    elif row.get("research_id"):
+        origin = "Search"
+    title = (row.get("objective") or "Browser task").strip()
+    # Computer-use sessions live in this exact same browser_sessions table
+    # (Section: "never a parallel task system" applies just as much to
+    # computer-use as it did to browser) -- task_type is the only thing
+    # that distinguishes them, so Mission Control's `kind` field derives
+    # from it rather than a new column.
+    kind = "computer" if row.get("task_type") == "computer_use" else "browser"
+    project_id = row.get("project_id")
+    project_name = _resolve_project_name(project_id, profiles_by_id)
+    return {
+        "id": row["id"], "run_id": row["id"], "kind": kind, "title": title[:120],
+        "status": row["status"], "project": project_name or project_id or "—", "project_id": project_id,
+        "worker": kind, "model": None, "origin": origin, "started_at": row["created_at"],
+        "last_activity": row["updated_at"], "cost_usd": 0.0, "evidence_count": evidence_count,
+        "merge_approval": "NOT_REQUIRED",
+        "current_step": row.get("current_url") or row.get("needs_aryan_reason") or row.get("task_type") or row["status"],
+        "archived": bool(row.get("mc_archived")), "needs_aryan_reason": row.get("needs_aryan_reason"),
+        "error": row.get("error"), "headless": bool(row.get("headless")),
+    }
+
+
 class FalgunaHandler(BaseHTTPRequestHandler):
     server_version = "FalgunaLocal/1.2"
 
@@ -163,6 +228,15 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             return self._search(query)
         if path == "/api/missions/board":
             return self._missions_board()
+        if path == "/api/browser/sessions":
+            return self._list_browser_sessions()
+        if path == "/api/browser/settings":
+            return self._browser_settings_get()
+        if path.startswith("/api/browser/sessions/"):
+            session_id = path.rsplit("/", 1)[-1]
+            return self._get_browser_session(session_id)
+        if path == "/api/computer/status":
+            return self._computer_status()
         if path == "/api/live-summary":
             return self._live_summary()
         if path == "/api/usage":
@@ -394,6 +468,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 checkpoints = store.list("checkpoints", "run_id=?", (run["id"],))
                 current_step = MILESTONES.get(checkpoints[-1]["stage"], run["status"]) if checkpoints else run["status"]
                 card = {
+                    "id": run["id"], "kind": "engineering",
                     "run_id": run["id"], "title": mission["title"], "status": run["status"],
                     "project": profiles_by_repo.get(task["repository"], task["repository"]),
                     "worker": run["worker"], "model": run["model"], "origin": origin,
@@ -418,6 +493,22 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                     board["cancelled"].append(card)
                 else:
                     board["completed"].append(card)
+
+            # Falguna Browser + Computer Use V1 (Section 25): browser
+            # sessions are a second `kind` of card feeding the SAME buckets
+            # above, never a second board. A brand-new database (or one on
+            # a Falguna build predating this table) has no browser_sessions
+            # table entries -- store.list() over an existing, migrated
+            # table just returns [] in that case, so this never needs a
+            # feature flag to stay safe.
+            browser_sessions = BrowserSessionStore(store)
+            profiles_by_id = {p["id"]: p for p in load_profiles(self.app_root)}
+            for row in browser_sessions.list()[:200]:
+                actions = browser_sessions.list_actions(row["id"])
+                downloads = browser_sessions.list_downloads(row["id"])
+                evidence_count = len([a for a in actions if a.get("screenshot_attachment_id")]) + len(downloads)
+                card = _browser_session_card(row, chat_store, research_store, evidence_count, profiles_by_id)
+                board[_browser_session_bucket(row["status"], bool(row.get("mc_archived")))].append(card)
             return self._json(board)
         finally:
             store.close()
@@ -463,10 +554,281 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                     needs_you += 1
                 elif run["status"] in {"FAILED", "QUARANTINED"}:
                     failed += 1
+            for row in BrowserSessionStore(store).list()[:200]:
+                if row.get("mc_archived") and row["status"] not in BROWSER_ACTIVELY_RUNNING_STATUSES:
+                    continue
+                bucket = _browser_session_bucket(row["status"], False)
+                if bucket == "running":
+                    running += 1
+                elif bucket == "needs_you":
+                    needs_you += 1
+                elif bucket == "failed":
+                    failed += 1
             return self._json({
                 "running": running, "needs_you": needs_you, "failed": failed,
                 "unread_notifications": NotificationStore(store).unread_count(),
             })
+        finally:
+            store.close()
+
+    # -- Falguna Browser + Computer Use V1 (Sections 3, 22, 25) --
+
+    def _browser_session_summary(self, row: dict, profiles_by_id: dict = None) -> dict:
+        if profiles_by_id is None:
+            profiles_by_id = {p["id"]: p for p in load_profiles(self.app_root)}
+        project_id = row.get("project_id")
+        return {
+            "session_id": row["id"], "objective": row["objective"], "task_type": row["task_type"],
+            "kind": "computer" if row.get("task_type") == "computer_use" else "browser",
+            "project_id": project_id, "project_name": _resolve_project_name(project_id, profiles_by_id),
+            "status": row["status"], "current_url": row.get("current_url"),
+            "headless": bool(row.get("headless")), "privacy_mode": row.get("privacy_mode"),
+            "needs_aryan_reason": row.get("needs_aryan_reason"), "error": row.get("error"),
+            "error_category": row.get("error_category"), "next_step_index": row.get("next_step_index", 0),
+            "conversation_id": row.get("conversation_id"), "research_id": row.get("research_id"),
+            "created_at": row["created_at"], "started_at": row.get("started_at"),
+            "completed_at": row.get("completed_at"), "updated_at": row.get("updated_at"),
+            "archived": bool(row.get("mc_archived")),
+        }
+
+    def _list_browser_sessions(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            sessions = BrowserSessionStore(store)
+            profiles_by_id = {p["id"]: p for p in load_profiles(self.app_root)}
+            return self._json({"sessions": [self._browser_session_summary(row, profiles_by_id) for row in sessions.list()]})
+        finally:
+            store.close()
+
+    def _get_browser_session(self, session_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            sessions = BrowserSessionStore(store)
+            row = sessions.get(session_id)
+            if not row:
+                return self._json({"error": "browser session not found"}, HTTPStatus.NOT_FOUND)
+            view = self._browser_session_summary(row)
+            view["plan"] = json.loads(row["plan_json"]) if row.get("plan_json") else []
+            view["tabs"] = sessions.list_tabs(session_id)
+            view["actions"] = sessions.list_actions(session_id)
+            view["downloads"] = sessions.list_downloads(session_id)
+            latest_shot = sessions.latest_action_with_screenshot(session_id)
+            view["latest_screenshot_attachment_id"] = latest_shot["screenshot_attachment_id"] if latest_shot else None
+            return self._json(view)
+        finally:
+            store.close()
+
+    def _browser_settings_get(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json(BrowserSettingsStore(store).load())
+        finally:
+            store.close()
+
+    def _browser_settings_update(self, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            settings_store = BrowserSettingsStore(store)
+            settings_store.save(body)
+            return self._json(settings_store.load())
+        finally:
+            store.close()
+
+    def _start_browser_session(self, body):
+        """Section 2/33: objective in, a real background browser session
+        out. API-first (Section 2's execution hierarchy) is honored simply
+        by this being the ONLY way a browser task starts -- there is no
+        code path here or in browser_runtime.py that would prefer clicking
+        through a web UI over a direct API call Falguna could otherwise
+        make; this module has no such API integrations of its own to
+        prefer yet, so browser is correctly the first tier actually wired."""
+        objective = str(body.get("objective", "")).strip()
+        if not objective:
+            raise ValueError("Provide a browser task objective")
+        task_type = str(body.get("task_type") or "browser_research")
+        project_id = body.get("project_id")
+        if project_id:
+            known = {item["id"] for item in load_profiles(self.app_root)}
+            if project_id not in known:
+                raise ValueError("Select an approved project")
+        conversation_id = body.get("conversation_id")
+        research_id = body.get("research_id")
+        explicit_steps = body.get("steps")
+        control, store = open_control_plane(self.app_root)
+        try:
+            browser_settings = BrowserSettingsStore(store).load()
+            if not browser_settings.get("enabled", True):
+                raise ValueError("Browser execution is turned off in Settings")
+            headless = bool(body.get("headless", browser_settings.get("default_headless", True)))
+            if explicit_steps:
+                steps = [s for s in explicit_steps if isinstance(s, dict) and s.get("action") in BROWSER_ALL_ACTION_TYPES][:20]
+                if not steps:
+                    raise ValueError("No valid browser steps provided")
+            else:
+                # Section 29: the ONLY point in this whole subsystem that
+                # ever touches a model -- an explicit-steps session above
+                # never reaches this branch at all, so it runs with zero
+                # provider calls regardless of what's configured.
+                try:
+                    steps = plan_steps_from_objective(store, objective, task_type, model_override=body.get("model"))
+                except FalgunaModelError as exc:
+                    raise ValueError(exc.message) from exc
+            privacy_mode = ModelRegistry(store).load()["privacy_mode"]
+            sessions = BrowserSessionStore(store)
+            session_id = sessions.create(
+                objective, task_type, project_id, "Aryan (local UI)", headless, privacy_mode,
+                plan=steps, conversation_id=conversation_id, research_id=research_id,
+            )
+            control.audit.append("browser_session_created", {"session_id": session_id, "objective": objective[:200], "steps": len(steps)})
+        finally:
+            store.close()
+        threading.Thread(target=_run_browser_session_background, args=(self.app_root, session_id), daemon=True).start()
+        return self._json({"session_id": session_id, "status": BrowserSessionStatus.CREATED}, HTTPStatus.ACCEPTED)
+
+    def _computer_status(self):
+        """Read-only, side-effect-free (a screenshot attempt is the only
+        real action here, and Section 17 already treats screenshot as
+        always-safe) -- lets the UI, or a person checking from the API,
+        know whether computer-use can actually run right now without first
+        creating and running a whole session. Mirrors GET /api/browser/...
+        health-style reporting rather than inventing a new pattern."""
+        control, store = open_control_plane(self.app_root)
+        try:
+            settings = BrowserSettingsStore(store).load()
+        finally:
+            store.close()
+        availability = computer_use_available()
+        return self._json({"enabled_in_settings": bool(settings.get("computer_use_enabled", False)), **availability})
+
+    def _start_computer_session(self, body):
+        """Real screen/mouse/keyboard control, explicit-steps only in V1 --
+        deliberately no auto-planning via a model here (unlike browser's
+        optional plan_steps_from_objective): the computer-use module's own
+        docstring is explicit that V1 stays "a minimal safe subset" and does
+        NOT build "unrestricted desktop control", and letting a model
+        improvise arbitrary clicks/keystrokes on the real desktop is exactly
+        that. A person (or a caller acting on their exact instruction)
+        supplies the steps; Falguna still gates every click/type through
+        classify_sensitive_action and still requires an explicit approval
+        to cross it, same as browser."""
+        objective = str(body.get("objective", "")).strip()
+        if not objective:
+            raise ValueError("Provide a computer-use task objective")
+        project_id = body.get("project_id")
+        if project_id:
+            known = {item["id"] for item in load_profiles(self.app_root)}
+            if project_id not in known:
+                raise ValueError("Select an approved project")
+        explicit_steps = body.get("steps")
+        if not explicit_steps:
+            raise ValueError("Computer-use tasks require an explicit list of steps in V1")
+        valid_actions = {"screenshot", "click", "type", "key"}
+        steps = []
+        for s in explicit_steps:
+            if not isinstance(s, dict) or s.get("action") not in valid_actions:
+                continue
+            if s["action"] == "click" and not (isinstance(s.get("x"), (int, float)) and isinstance(s.get("y"), (int, float))):
+                continue
+            if s["action"] == "type" and not isinstance(s.get("text"), str):
+                continue
+            if s["action"] == "key" and not isinstance(s.get("combo"), str):
+                continue
+            steps.append(s)
+        steps = steps[:20]
+        if not steps:
+            raise ValueError("No valid computer-use steps provided")
+        control, store = open_control_plane(self.app_root)
+        try:
+            browser_settings = BrowserSettingsStore(store).load()
+            if not browser_settings.get("computer_use_enabled", False):
+                raise ValueError("Computer use is turned off in Settings")
+            privacy_mode = ModelRegistry(store).load()["privacy_mode"]
+            sessions = BrowserSessionStore(store)
+            session_id = sessions.create(
+                objective, "computer_use", project_id, "Aryan (local UI)", False, privacy_mode, plan=steps,
+            )
+            control.audit.append("computer_session_created", {"session_id": session_id, "objective": objective[:200], "steps": len(steps)})
+        finally:
+            store.close()
+        threading.Thread(target=_run_computer_session_background, args=(self.app_root, session_id), daemon=True).start()
+        return self._json({"session_id": session_id, "status": BrowserSessionStatus.CREATED}, HTTPStatus.ACCEPTED)
+
+    def _approve_browser_gate(self, session_id):
+        """Section 22's "Approve once" -- single-use, never a blanket
+        authorization (see PlaywrightBrowserRuntime.run's
+        approve_gate_for_index docstring). Shared by both browser and
+        computer-use sessions (same table, same NEEDS_ARYAN pause shape) --
+        the only branch is which background runner resumes execution,
+        picked by task_type, never by a second endpoint or a second
+        approval model."""
+        control, store = open_control_plane(self.app_root)
+        try:
+            sessions = BrowserSessionStore(store)
+            session = sessions.get(session_id)
+            if not session:
+                return self._json({"error": "browser session not found"}, HTTPStatus.NOT_FOUND)
+            if session["status"] != BrowserSessionStatus.NEEDS_ARYAN:
+                return self._json({"error": "This browser task is not waiting for your approval"}, HTTPStatus.BAD_REQUEST)
+            resume_index = session.get("next_step_index", 0)
+            is_computer = session.get("task_type") == "computer_use"
+            control.audit.append(
+                "computer_session_approved" if is_computer else "browser_session_approved",
+                {"session_id": session_id, "step_index": resume_index},
+            )
+        finally:
+            store.close()
+        runner = _run_computer_session_background if is_computer else _run_browser_session_background
+        threading.Thread(
+            target=runner, args=(self.app_root, session_id),
+            kwargs={"resume_from_index": resume_index, "approve_gate_for_index": resume_index}, daemon=True,
+        ).start()
+        return self._json({"session_id": session_id, "status": "RESUMING"}, HTTPStatus.ACCEPTED)
+
+    def _reject_browser_gate(self, session_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            sessions = BrowserSessionStore(store)
+            session = sessions.get(session_id)
+            if not session:
+                return self._json({"error": "browser session not found"}, HTTPStatus.NOT_FOUND)
+            if session["status"] != BrowserSessionStatus.NEEDS_ARYAN:
+                return self._json({"error": "This browser task is not waiting for your approval"}, HTTPStatus.BAD_REQUEST)
+            sessions.set_status(session_id, BrowserSessionStatus.CANCELLED, error="Rejected by Aryan", needs_aryan_reason=None)
+            control.audit.append("browser_session_rejected", {"session_id": session_id})
+            return self._json({"session_id": session_id, "status": BrowserSessionStatus.CANCELLED})
+        finally:
+            store.close()
+
+    def _cancel_browser_session(self, session_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            sessions = BrowserSessionStore(store)
+            session = sessions.get(session_id)
+            if not session:
+                return self._json({"error": "browser session not found"}, HTTPStatus.NOT_FOUND)
+            if session["status"] in BROWSER_TERMINAL_STATUSES:
+                return self._json({"error": "This browser task has already finished"}, HTTPStatus.BAD_REQUEST)
+            # Cooperative, bounded cancel (Section 39): flips the row now;
+            # a still-running background thread notices at its next step
+            # boundary (see PlaywrightBrowserRuntime.run's cancellation
+            # checks) rather than being killed mid-action.
+            sessions.set_status(session_id, BrowserSessionStatus.CANCELLED)
+            control.audit.append("browser_session_cancel_requested", {"session_id": session_id})
+            return self._json({"session_id": session_id, "status": BrowserSessionStatus.CANCELLED})
+        finally:
+            store.close()
+
+    def _archive_browser_session(self, session_id, archived):
+        control, store = open_control_plane(self.app_root)
+        try:
+            sessions = BrowserSessionStore(store)
+            row = sessions.get(session_id)
+            if not row:
+                return self._json({"error": "browser session not found"}, HTTPStatus.NOT_FOUND)
+            if archived and row["status"] in BROWSER_ACTIVELY_RUNNING_STATUSES:
+                return self._json({"error": "An actively running browser task can't be archived -- cancel or wait for it to finish first"}, HTTPStatus.BAD_REQUEST)
+            sessions.archive(session_id, archived)
+            return self._json({"session_id": session_id, "archived": bool(archived)})
         finally:
             store.close()
 
@@ -515,10 +877,11 @@ class FalgunaHandler(BaseHTTPRequestHandler):
     def _files(self):
         control, store = open_control_plane(self.app_root)
         try:
+            all_attachments = AttachmentStore(store, self.app_root).list_all()
             uploads = [
                 {"type": "upload", "id": a["id"], "filename": a["filename"], "content_type": a["content_type"],
                  "size_bytes": a["size_bytes"], "conversation_id": a["conversation_id"], "created_at": a["created_at"]}
-                for a in AttachmentStore(store, self.app_root).list_all()
+                for a in all_attachments if not a.get("browser_session_id")
             ]
             generated = []
             for run in reversed(store.list("runs")[-100:]):
@@ -531,6 +894,34 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                         "kind": artifact["kind"], "run_id": run["id"], "mission_title": mission["title"],
                         "created_at": artifact["created_at"],
                     })
+            # Falguna Browser + Computer Use V1 (Section 26): a browser
+            # session's screenshots and downloads are Falguna-GENERATED
+            # evidence, not something the person uploaded -- they belong
+            # here, linked back to the session that produced them, never
+            # mislabeled as an "upload".
+            browser_sessions = BrowserSessionStore(store)
+            session_cache = {}
+            profiles_by_id = {p["id"]: p for p in load_profiles(self.app_root)}
+            for a in all_attachments:
+                session_id = a.get("browser_session_id")
+                if not session_id:
+                    continue
+                if session_id not in session_cache:
+                    session_cache[session_id] = browser_sessions.get(session_id)
+                session = session_cache[session_id] or {}
+                # Files/artifacts inherit project association from the
+                # session that produced them -- resolved from the same
+                # project registry a session's project_id was validated
+                # against at creation, never a second copy of it.
+                project_id = session.get("project_id")
+                generated.append({
+                    "type": "browser_evidence", "id": a["id"], "filename": a["filename"],
+                    "kind": "screenshot" if (a["content_type"] or "").startswith("image/") else "download",
+                    "task_kind": "computer" if session.get("task_type") == "computer_use" else "browser",
+                    "browser_session_id": session_id, "mission_title": session.get("objective", "Browser task"),
+                    "project_id": project_id, "project_name": _resolve_project_name(project_id, profiles_by_id),
+                    "created_at": a["created_at"],
+                })
             generated.sort(key=lambda x: x["created_at"], reverse=True)
             return self._json({"uploads": uploads, "generated": generated[:200]})
         finally:
@@ -598,6 +989,20 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                     return self._json({"run_id": run_id, "action": action, "mode": "safe-boundary"}, HTTPStatus.ACCEPTED)
                 finally:
                     store.close()
+            if path == "/api/browser/sessions":
+                return self._start_browser_session(body)
+            if path == "/api/browser/settings":
+                return self._browser_settings_update(body)
+            if path.startswith("/api/browser/sessions/") and path.endswith("/approve"):
+                return self._approve_browser_gate(path.split("/")[4])
+            if path.startswith("/api/browser/sessions/") and path.endswith("/reject"):
+                return self._reject_browser_gate(path.split("/")[4])
+            if path.startswith("/api/browser/sessions/") and path.endswith("/cancel"):
+                return self._cancel_browser_session(path.split("/")[4])
+            if path.startswith("/api/browser/sessions/") and path.endswith(("/board-archive", "/board-unarchive")):
+                return self._archive_browser_session(path.split("/")[4], path.endswith("/board-archive"))
+            if path == "/api/computer/sessions":
+                return self._start_computer_session(body)
             if path == "/api/continue":
                 profile = {item["id"]: item for item in load_profiles(self.app_root)}.get(body.get("project"))
                 if not profile:
@@ -1123,6 +1528,180 @@ def _resume_mission(app_root, token, run_id):
         store.close()
 
 
+def _run_browser_session_background(app_root, session_id, resume_from_index=0, approve_gate_for_index=None):
+    """Runs (or resumes) a browser session's plan in its own background
+    thread -- exactly the same "kick off a thread, poll the row for state"
+    shape _resume_mission/_run_mission already use for Work missions, so a
+    browser task is a real background task Mission Control can watch, not
+    a blocking HTTP call (Section 25: "appear like any other Falguna
+    task... do not create a parallel task system"). Each thread opens its
+    own StateStore connection, matching every other background runner in
+    this module -- sqlite connections are not shared across threads."""
+    control, store = open_control_plane(app_root)
+    sessions = BrowserSessionStore(store)
+    try:
+        session = sessions.get(session_id)
+        if not session:
+            return
+        steps = json.loads(session["plan_json"]) if session.get("plan_json") else []
+        attachments = AttachmentStore(store, app_root)
+        runtime = PlaywrightBrowserRuntime(app_root, store, sessions, attachments, audit=control.audit)
+        runtime.run(session_id, steps, resume_from_index=resume_from_index, approve_gate_for_index=approve_gate_for_index)
+    except Exception as exc:
+        # PlaywrightBrowserRuntime.run() already converts every real failure
+        # into a clean FAILED status internally -- this is only a last-resort
+        # net so a genuinely unexpected error in the thread itself (not
+        # inside run()) can never leave a session's status stuck at RUNNING
+        # forever with no explanation.
+        try:
+            sessions.set_status(
+                session_id, BrowserSessionStatus.FAILED,
+                error="Falguna hit an unexpected internal error running this browser task.",
+                error_category=BrowserRuntimeError.UNEXPECTED_FAILURE, error_detail=str(exc)[:2000],
+            )
+        except Exception:
+            pass
+    finally:
+        store.close()
+
+
+def _run_computer_session_background(app_root, session_id, resume_from_index=0, approve_gate_for_index=None):
+    """Runs (or resumes) a computer-use session's plan. Deliberately NOT part
+    of falguna/browser_runtime.py or falguna/computer_use.py -- it is pure
+    orchestration glue, reusing the exact same BrowserSessionStore rows,
+    AttachmentStore evidence mechanism, and "kick off a thread, poll the row"
+    shape _run_browser_session_background already uses, so a computer-use
+    task is a real background task on the SAME Mission Control board, never
+    a parallel system. classify_sensitive_action is the same one function
+    browser_runtime.py already applies to browser actions -- one classifier,
+    not a second one invented for this module (mirrors
+    PyAutoGUIComputerChannel's own internal gate, which stays in place as a
+    defense-in-depth default for any other caller of that class).
+
+    Gating happens HERE, at the orchestrator level, exactly like
+    PlaywrightBrowserRuntime.run() gates browser actions before executing
+    them -- never inside the channel -- so a session can pause the whole
+    task as NEEDS_ARYAN and later resume past exactly one approved step
+    (skip_gate=True passed only for that single index, recomputed fresh
+    every call, never cached or reused for a later step)."""
+    control, store = open_control_plane(app_root)
+    sessions = BrowserSessionStore(store)
+    attachments = AttachmentStore(store, app_root)
+    try:
+        session = sessions.get(session_id)
+        if not session:
+            return
+        if session["status"] == BrowserSessionStatus.CANCELLED:
+            return
+        steps = json.loads(session["plan_json"]) if session.get("plan_json") else []
+        browser_settings = BrowserSettingsStore(store).load()
+        channel = build_computer_channel(browser_settings.get("computer_use_enabled", False))
+        sessions.set_status(session_id, BrowserSessionStatus.RUNNING)
+
+        def snapshot(reason: str, seq: int):
+            # Screenshot is always safe/read-only (Section 17) -- capturing
+            # one for evidence never itself needs a gate, even mid-pause.
+            result = channel.screenshot()
+            if result.status != "OK" or "image_base64" not in result.evidence:
+                return None
+            saved = attachments.save_base64(
+                f"computer-{session_id}-{seq:03d}-{reason}.png", "image/png",
+                result.evidence["image_base64"], browser_session_id=session_id,
+            )
+            return saved["id"]
+
+        for idx, step in enumerate(steps[:20]):
+            if idx < resume_from_index:
+                continue
+            live = sessions.get(session_id)
+            if live and live["status"] == BrowserSessionStatus.CANCELLED:
+                return
+            seq = idx + 1
+            action = step.get("action")
+            description = step.get("description") or ""
+
+            if action not in ("screenshot", "click", "type", "key"):
+                continue  # unknown/unsupported action type -- filtered, not fatal (matches browser intake)
+
+            skip_gate = False
+            if action in ("click", "type"):
+                gate_value = step.get("text") if action == "type" else description
+                reason = classify_sensitive_action("click" if action == "click" else "type", description, gate_value)
+                if reason and idx != approve_gate_for_index:
+                    shot = snapshot("pause", seq)
+                    sessions.record_action(session_id, seq, f"computer_{action}", None, gate_value, "PAUSED",
+                                            detail=reason, screenshot_attachment_id=shot)
+                    sessions.set_status(session_id, BrowserSessionStatus.NEEDS_ARYAN,
+                                         needs_aryan_reason=f"sensitive_action:{reason}", next_step_index=idx)
+                    control.audit.append("computer_session_paused", {"session_id": session_id, "reason": reason, "step_index": idx})
+                    return
+                skip_gate = bool(reason and idx == approve_gate_for_index)
+
+            if action == "screenshot":
+                result = channel.screenshot()
+            elif action == "click":
+                result = channel.click(step.get("x"), step.get("y"), description=description, skip_gate=skip_gate)
+            elif action == "type":
+                result = channel.type_text(step.get("text") or "", description=description, skip_gate=skip_gate)
+            else:  # key
+                result = channel.key(step.get("combo") or "", description=description, skip_gate=skip_gate)
+
+            if action == "screenshot" and result.status == "OK" and "image_base64" in result.evidence:
+                saved = attachments.save_base64(
+                    f"computer-{session_id}-{seq:03d}-screenshot.png", "image/png",
+                    result.evidence["image_base64"], browser_session_id=session_id,
+                )
+                evidence_attachment = saved["id"]
+            else:
+                evidence_attachment = snapshot(action, seq)
+
+            target_value = f"{step.get('x')},{step.get('y')}" if action == "click" else (step.get("combo") if action == "key" else None)
+            value_value = step.get("text") if action == "type" else None
+
+            if result.status == "BLOCKED":
+                sessions.record_action(session_id, seq, f"computer_{action}", target_value, value_value, "BLOCKED",
+                                        detail=result.blocked_reason or "", screenshot_attachment_id=evidence_attachment)
+                sessions.set_status(
+                    session_id, BrowserSessionStatus.FAILED,
+                    error=f"This computer-use action was blocked: {result.blocked_reason}.",
+                    error_category="COMPUTER_USE_BLOCKED", next_step_index=idx,
+                )
+                control.audit.append("computer_session_blocked", {"session_id": session_id, "reason": result.blocked_reason, "step_index": idx})
+                return
+            if result.status == "FAILED":
+                sessions.record_action(session_id, seq, f"computer_{action}", target_value, value_value, "FAILED",
+                                        detail=str(result.evidence.get("detail", ""))[:500], screenshot_attachment_id=evidence_attachment)
+                sessions.set_status(
+                    session_id, BrowserSessionStatus.FAILED,
+                    error="A computer-use action failed to execute.", error_category="COMPUTER_USE_FAILED",
+                    error_detail=str(result.evidence.get("detail", ""))[:2000], next_step_index=idx,
+                )
+                return
+
+            sessions.record_action(session_id, seq, f"computer_{action}", target_value, value_value, "OK",
+                                    screenshot_attachment_id=evidence_attachment)
+            live = sessions.get(session_id)
+            if live and live["status"] == BrowserSessionStatus.CANCELLED:
+                return
+            sessions.set_status(session_id, BrowserSessionStatus.RUNNING, next_step_index=idx + 1)
+
+        final_shot = snapshot("completed", len(steps) + 1)
+        sessions.record_action(session_id, len(steps) + 1, "complete", None, None, "OK", screenshot_attachment_id=final_shot)
+        sessions.set_status(session_id, BrowserSessionStatus.COMPLETED, next_step_index=len(steps))
+        control.audit.append("computer_session_completed", {"session_id": session_id})
+    except Exception as exc:
+        try:
+            sessions.set_status(
+                session_id, BrowserSessionStatus.FAILED,
+                error="Falguna hit an unexpected internal error running this computer-use task.",
+                error_category="UNEXPECTED_FAILURE", error_detail=str(exc)[:2000],
+            )
+        except Exception:
+            pass
+    finally:
+        store.close()
+
+
 def _run_chat_reply(app_root, token, conversation_id, message_id, history, model, work_mode):
     """Background worker for the async Chat pipeline (Sections 3-4) --
     structurally identical to _run_mission: the HTTP handler has already
@@ -1161,11 +1740,38 @@ def _run_chat_reply(app_root, token, conversation_id, message_id, history, model
         store.close()
 
 
+def reconcile_browser_sessions_at_startup(app_root: Path):
+    """Call once, before a Falguna process starts accepting requests.
+
+    A browser session's execution lives only in this process's memory. If a
+    prior Falguna process exited -- crash, kill, or a plain restart to pick up
+    new code -- while a session was still CREATED/RUNNING/WAITING, that
+    background thread is gone and nothing will ever move the row again;
+    Mission Control would otherwise show it as running forever. This closes
+    those rows out honestly via BrowserSessionStore.reconcile_after_restart()
+    and never raises, so a database/reconciliation problem can't block the
+    server from starting. Returns the ids it reconciled (empty if none, or if
+    reconciliation itself failed)."""
+    try:
+        control, store = open_control_plane(app_root)
+        try:
+            return BrowserSessionStore(store).reconcile_after_restart()
+        finally:
+            store.close()
+    except Exception as exc:
+        print(f"Falguna: browser session restart-reconciliation skipped ({exc})")
+        return []
+
+
 def serve(root: Path, host="127.0.0.1", port=8765):
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("Falguna v1.1 is local-only")
     server = ThreadingHTTPServer((host, port), FalgunaHandler)
     server.app_root = Path(root).resolve()
+    reconciled = reconcile_browser_sessions_at_startup(server.app_root)
+    if reconciled:
+        print(f"Falguna: {len(reconciled)} browser session(s) were interrupted by restart "
+              f"and marked FAILED: {', '.join(reconciled)}")
     print(f"Falguna Engineering internal alpha: http://{host}:{server.server_port}")
     server.serve_forever()
 
@@ -1836,6 +2442,7 @@ async function router(){
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
     if(view==='search'){await renderSideResearch();return renderSearchView(id)}
     if(view==='mission'){hideSideList();return renderMissionControlView()}
+    if(view==='browser'){hideSideList();return renderBrowserSessionView(id)}
     if(view==='projects'){hideSideList();return renderProjectsView()}
     if(view==='files'){hideSideList();return renderFilesView(id)}
     if(view==='history'){hideSideList();return renderHistoryView()}
@@ -2287,6 +2894,51 @@ function openHandoffModal(conversation,suggested){
   };
 }
 
+function openNewBrowserTaskModal(){
+  // Falguna Browser + Computer Use V1: project scoping for browser tasks
+  // mirrors openHandoffModal's project picker exactly (same profileList,
+  // same approved-project registry -- falguna/project_profiles.json via
+  // load_profiles, never a second project list). Unlike Work's handoff
+  // modal, an unscoped task is allowed here (existing policy: web.py's
+  // _start_browser_session only validates project_id when one is given),
+  // so the picker always offers "No project" as a real, selectable option.
+  loadProfiles().catch(()=>{}).then(()=>{
+    const openOptions=profileList.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+    const scrim=document.createElement('div');
+    scrim.className='modal-scrim';
+    scrim.innerHTML=`<div class="modal handoff-modal">
+      <h3>${icon('handoff',15)}New browser task</h3>
+      <p>Falguna drives a real browser to complete this. Files and evidence it produces inherit whichever project you pick here.</p>
+      <label>Project</label>
+      <select id="nbtProject"><option value="">No project (unscoped)</option>${openOptions}</select>
+      <label>What should Falguna do in the browser?</label>
+      <textarea id="nbtObjective" placeholder="Describe the browser task."></textarea>
+      <div class="modal-actions"><button type="button" class="pill-btn" id="nbtCancel">Cancel</button><button type="button" class="action" id="nbtStart">Start browser task</button></div>
+    </div>`;
+    document.body.appendChild(scrim);
+    const close=()=>{scrim.remove();document.removeEventListener('keydown',onKey)};
+    function onKey(e){if(e.key==='Escape')close()}
+    document.addEventListener('keydown',onKey);
+    scrim.addEventListener('click',e=>{if(e.target===scrim)close()});
+    scrim.querySelector('#nbtCancel').onclick=close;
+    scrim.querySelector('#nbtStart').onclick=async()=>{
+      const project_id=$('nbtProject').value||undefined;
+      const objective=$('nbtObjective').value.trim();
+      if(!objective){showToast('Describe what Falguna should do in the browser.',{error:true});return}
+      const btn=scrim.querySelector('#nbtStart');
+      btn.disabled=true;btn.textContent='Starting…';
+      try{
+        const out=await api('/api/browser/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({objective,project_id})});
+        close();
+        go('#/browser/'+out.session_id);
+      }catch(err){
+        btn.disabled=false;btn.textContent='Start browser task';
+        showToast(err.message,{error:true});
+      }
+    };
+  });
+}
+
 /* --------------------------------------------------------------- Work view */
 
 async function renderWorkView(runId){
@@ -2546,7 +3198,25 @@ async function renderProjectsView(){
 
 /* ------------------------------------------------------ Mission Control view */
 
+function mcBrowserControlsHtml(c){
+  // Falguna Browser + Computer Use V1 (Section 22, 25): same Archive/Restore
+  // board-visibility toggle Engineering Worker cards already have, plus
+  // Approve once/Reject/Cancel task for a NEEDS_ARYAN pause -- never a
+  // blanket future authorization, only ever this one paused step. `kind` is
+  // 'browser' or 'computer' (both stored in browser_sessions, see web.py's
+  // _browser_session_card) -- both use the exact same controls/routes, so
+  // data-mc-kind carries whichever kind this card actually is rather than a
+  // hardcoded 'browser', or a computer-use card would be dispatched wrong.
+  const kind=c.kind==='computer'?'computer':'browser';
+  const archiveBtn=c.archived
+    ?`<button type="button" class="pill-btn" data-mc-action="unarchive" data-mc-kind="${kind}" data-run-id="${esc(c.id)}">Restore</button>`
+    :(['CREATED','RUNNING','WAITING'].includes(c.status)?'':`<button type="button" class="pill-btn" data-mc-action="archive" data-mc-kind="${kind}" data-run-id="${esc(c.id)}">Archive</button>`);
+  if(c.status==='NEEDS_ARYAN')return `<button type="button" class="pill-btn" data-mc-action="approve" data-mc-kind="${kind}" data-run-id="${esc(c.id)}">Approve once</button><button type="button" class="pill-btn" data-mc-action="reject" data-mc-kind="${kind}" data-run-id="${esc(c.id)}">Reject</button><button type="button" class="pill-btn" data-mc-action="cancel" data-mc-kind="${kind}" data-run-id="${esc(c.id)}">Cancel task</button>`;
+  if(['CREATED','RUNNING','WAITING'].includes(c.status))return `<button type="button" class="pill-btn" data-mc-action="cancel" data-mc-kind="${kind}" data-run-id="${esc(c.id)}">Cancel</button>`;
+  return archiveBtn;
+}
 function mcControlsHtml(c){
+  if(c.kind==='browser'||c.kind==='computer')return mcBrowserControlsHtml(c);
   // Falguna V2.1: Archive/Restore is a board-visibility toggle only (see
   // _archive_run_from_board) -- available on any resolved card, alongside
   // whatever decision/retry controls that status already offers. It is
@@ -2561,22 +3231,35 @@ function mcControlsHtml(c){
   return archiveBtn;
 }
 function mcCard(c){
-  const needsYou=(c.status==='DONE_CANDIDATE'&&c.merge_approval==='PENDING')||c.status==='PAUSED';
-  return `<div class="mc-card ${needsYou?'needs-you':''}${c.archived?' archived':''}" data-open-run="${esc(c.run_id)}">
+  const needsYou=(c.status==='DONE_CANDIDATE'&&c.merge_approval==='PENDING')||c.status==='PAUSED'||c.status==='NEEDS_ARYAN';
+  const kindLabel=c.kind==='browser'?'Browser':c.kind==='computer'?'Computer use':'Work';
+  return `<div class="mc-card ${needsYou?'needs-you':''}${c.archived?' archived':''}" data-open-run="${esc(c.id||c.run_id)}" data-mc-kind="${esc(c.kind||'engineering')}">
     <div class="mc-title">${esc(c.title)}</div>
-    <div class="mc-meta"><span class="status-pill ${esc((c.status||'').toLowerCase())}">${esc(String(c.status||'').replaceAll('_',' '))}</span><span>${esc(c.project||'')}</span><span>${esc(c.origin||'')}</span><span>${esc(timeAgo(c.last_activity))}</span>${c.cost_usd?`<span>$${esc(c.cost_usd)}</span>`:''}</div>
+    <div class="mc-meta"><span class="status-pill ${esc((c.status||'').toLowerCase())}">${esc(String(c.status||'').replaceAll('_',' '))}</span><span>${esc(kindLabel)}</span><span>${esc(c.project||'')}</span><span>${esc(c.origin||'')}</span><span>${esc(timeAgo(c.last_activity))}</span>${c.cost_usd?`<span>$${esc(c.cost_usd)}</span>`:''}</div>
     <div class="mc-step">${esc(String(c.current_step||'').replaceAll('_',' '))}</div>
     <div class="mc-controls">${mcControlsHtml(c)}</div>
   </div>`;
 }
 function wireMcControls(){
   document.querySelectorAll('.mc-card').forEach(card=>{
-    card.onclick=e=>{if(e.target.closest('[data-mc-action]'))return;go('#/work/'+card.dataset.openRun)};
+    card.onclick=e=>{
+      if(e.target.closest('[data-mc-action]'))return;
+      const id=card.dataset.openRun;
+      const isBrowserLike=card.dataset.mcKind==='browser'||card.dataset.mcKind==='computer';
+      go(isBrowserLike?'#/browser/'+id:'#/work/'+id);
+    };
   });
   document.querySelectorAll('[data-mc-action]').forEach(b=>b.onclick=async e=>{
     e.stopPropagation();
     const runId=b.dataset.runId,action=b.dataset.mcAction;
     try{
+      if(b.dataset.mcKind==='browser'||b.dataset.mcKind==='computer'){
+        const path=(action==='archive'||action==='unarchive')?`/api/browser/sessions/${runId}/board-${action}`:`/api/browser/sessions/${runId}/${action}`;
+        await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        await refreshMissionControl();
+        pollLive();
+        return;
+      }
       if(action==='archive'||action==='unarchive'){
         await api(`/api/runs/${runId}/board-${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
         await refreshMissionControl();
@@ -2619,14 +3302,79 @@ async function refreshMissionControl(){
 async function renderMissionControlView(){
   const vp=$('viewport');
   vp.innerHTML=`<div class="mc-view">
-    <div class="mc-head"><div><h1 style="margin:0;font-size:21px;font-weight:650">Mission Control</h1><p class="lede" style="margin:4px 0 0">Every Work mission, grouped by what it actually needs from you next.</p></div></div>
+    <div class="mc-head"><div><h1 style="margin:0;font-size:21px;font-weight:650">Mission Control</h1><p class="lede" style="margin:4px 0 0">Every Work mission and browser task, grouped by what it actually needs from you next.</p></div><button type="button" class="pill-btn" id="newBrowserTaskBtn">New browser task</button></div>
     <div class="mc-buckets" id="mcBuckets"><div class="empty-state">Loading&hellip;</div></div>
   </div>`;
+  $('newBrowserTaskBtn').onclick=()=>openNewBrowserTaskModal();
   await refreshMissionControl();
   clearInterval(mcTimer);
   mcTimer=setInterval(()=>{
     if(currentRoute().view==='mission')refreshMissionControl();else clearInterval(mcTimer);
   },5000);
+}
+
+/* ------------------------------------------------------------ Browser session view */
+
+async function renderBrowserSessionView(id){
+  const vp=$('viewport');
+  if(!id){
+    vp.innerHTML=`<div class="page"><div class="empty-state">Open a browser task from Mission Control, or start a new one there.</div></div>`;
+    return;
+  }
+  vp.innerHTML=`<div class="page" id="browserSessionPage"><div class="empty-state">Loading&hellip;</div></div>`;
+  await refreshBrowserSession(id);
+  clearInterval(mcTimer);
+  mcTimer=setInterval(()=>{
+    const r=currentRoute();
+    if(r.view==='browser'&&r.id===id)refreshBrowserSession(id);else clearInterval(mcTimer);
+  },3000);
+}
+async function refreshBrowserSession(id){
+  const host=$('browserSessionPage');
+  if(!host)return;
+  let row;
+  try{row=await api('/api/browser/sessions/'+id)}catch(err){host.innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
+  // Section 23: latest screenshot, recent actions, current URL, status --
+  // observable without blocking, never full video streaming in V1.
+  const shot=row.latest_screenshot_attachment_id
+    ?`<img src="/api/attachments/${esc(row.latest_screenshot_attachment_id)}" alt="latest screenshot" style="max-width:100%;border:1px solid var(--border,#333);border-radius:8px" />`
+    :'<div class="empty-state">No screenshot yet.</div>';
+  const tabsHtml=(row.tabs||[]).map(t=>`<div class="mc-step">Tab ${esc(t.tab_index)}: ${esc(t.url||t.title||'(blank)')}${t.status==='CLOSED'?' (closed)':''}</div>`).join('')||'<div class="mc-step">No tabs yet.</div>';
+  const actionsHtml=(row.actions||[]).slice().reverse().slice(0,30).map(a=>`<div class="mc-step">#${esc(a.seq)} ${esc(a.action_type)}${a.target?' '+esc(a.target):''} &mdash; <span class="status-pill ${esc((a.result||'').toLowerCase())}">${esc(a.result)}</span>${a.detail?' &middot; '+esc(a.detail):''}</div>`).join('')||'<div class="mc-step">No actions yet.</div>';
+  const downloadsHtml=(row.downloads||[]).map(d=>`<div class="mc-step"><a href="/api/attachments/${esc(d.attachment_id)}">${esc(d.filename)}</a> from ${esc(d.source_url||'')}</div>`).join('');
+  let controls='';
+  if(row.status==='NEEDS_ARYAN'){
+    controls=`<button type="button" class="pill-btn" data-bs-action="approve">Approve once</button><button type="button" class="pill-btn" data-bs-action="reject">Reject</button><button type="button" class="pill-btn" data-bs-action="cancel">Cancel task</button>`;
+  }else if(['CREATED','RUNNING','WAITING'].includes(row.status)){
+    controls=`<button type="button" class="pill-btn" data-bs-action="cancel">Cancel</button>`;
+  }else{
+    controls=row.archived
+      ?`<button type="button" class="pill-btn" data-bs-action="unarchive">Restore</button>`
+      :`<button type="button" class="pill-btn" data-bs-action="archive">Archive</button>`;
+  }
+  host.innerHTML=`
+    <h1 style="font-size:21px;margin:0 0 4px;font-weight:650">${esc(row.objective)}</h1>
+    <div class="mc-meta"><span class="status-pill ${esc((row.status||'').toLowerCase())}">${esc(String(row.status||'').replaceAll('_',' '))}</span><span>${esc(row.task_type||'')}</span><span>${esc(row.project_name||'No project')}</span><span>${esc(row.current_url||'')}</span><span>${esc(timeAgo(row.updated_at))}</span></div>
+    ${row.needs_aryan_reason?`<p class="lede">Needs you: ${esc(row.needs_aryan_reason)}</p>`:''}
+    ${row.error?`<p class="lede error">${esc(row.error)}</p>`:''}
+    <div class="mc-controls" style="margin:10px 0">${controls}</div>
+    <h2 style="font-size:16px;margin:16px 0 6px">Latest screenshot</h2>
+    ${shot}
+    <h2 style="font-size:16px;margin:16px 0 6px">Tabs</h2>
+    ${tabsHtml}
+    ${downloadsHtml?`<h2 style="font-size:16px;margin:16px 0 6px">Downloads</h2>${downloadsHtml}`:''}
+    <h2 style="font-size:16px;margin:16px 0 6px">Actions</h2>
+    ${actionsHtml}
+  `;
+  document.querySelectorAll('[data-bs-action]').forEach(b=>b.onclick=async()=>{
+    const action=b.dataset.bsAction;
+    try{
+      const path=(action==='archive'||action==='unarchive')?`/api/browser/sessions/${id}/board-${action}`:`/api/browser/sessions/${id}/${action}`;
+      await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      await refreshBrowserSession(id);
+      pollLive();
+    }catch(err){showToast(err.message,{error:true})}
+  });
 }
 
 /* ------------------------------------------------------------------ Files view */
@@ -2648,10 +3396,11 @@ async function renderFilesView(tab){
   let data;
   try{data=await api('/api/files')}catch(err){$('filesList').innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
   const rows=filesTab==='generated'?(data.generated||[]):(data.uploads||[]);
-  $('filesList').innerHTML=rows.length?rows.map(f=>f.type==='upload'
-    ?`<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.content_type||'')} &middot; ${esc(formatBytes(f.size_bytes))} &middot; ${esc(timeAgo(f.created_at))}</div></div><div style="display:flex;gap:8px;flex:none">${f.conversation_id?`<a class="pill-btn" href="#/chat/${esc(f.conversation_id)}">Open chat</a>`:''}<a class="pill-btn" href="/api/attachments/${esc(f.id)}" download title="Download">${icon('download',12)}</a></div></div>`
-    :`<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.kind||'')} &middot; ${esc(f.mission_title||'')} &middot; ${esc(timeAgo(f.created_at))}</div></div><a class="pill-btn" href="#/work/${esc(f.run_id)}">Open mission</a></div>`
-  ).join(''):`<div class="empty-state">No ${filesTab==='generated'?'generated files':'uploads'} yet.</div>`;
+  $('filesList').innerHTML=rows.length?rows.map(f=>{
+    if(f.type==='upload')return `<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.content_type||'')} &middot; ${esc(formatBytes(f.size_bytes))} &middot; ${esc(timeAgo(f.created_at))}</div></div><div style="display:flex;gap:8px;flex:none">${f.conversation_id?`<a class="pill-btn" href="#/chat/${esc(f.conversation_id)}">Open chat</a>`:''}<a class="pill-btn" href="/api/attachments/${esc(f.id)}" download title="Download">${icon('download',12)}</a></div></div>`;
+    if(f.type==='browser_evidence')return `<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.kind||'')} &middot; ${esc(f.mission_title||'')}${f.project_name?' &middot; '+esc(f.project_name):''} &middot; ${esc(timeAgo(f.created_at))}</div></div><a class="pill-btn" href="#/browser/${esc(f.browser_session_id)}">Open browser task</a></div>`;
+    return `<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.kind||'')} &middot; ${esc(f.mission_title||'')} &middot; ${esc(timeAgo(f.created_at))}</div></div><a class="pill-btn" href="#/work/${esc(f.run_id)}">Open mission</a></div>`;
+  }).join(''):`<div class="empty-state">No ${filesTab==='generated'?'generated files':'uploads'} yet.</div>`;
 }
 
 /* ------------------------------------------------------------ History view */
@@ -2695,7 +3444,7 @@ async function renderHistoryView(){
 
 /* ----------------------------------------------------------- Settings view */
 
-const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
+const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['browser','Browser'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
 // Falguna V2.1: Privacy Mode is a routing boundary the Model Router enforces
 // structurally (see falguna/model_router.py) -- Local Only never even
 // contacts an external provider, it is not merely hidden from the result.
@@ -2817,6 +3566,42 @@ async function renderSettingsView(tab){
     $('markAllReadSettings').onclick=async()=>{
       try{await api('/api/notifications/read-all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderSettingsView('notifications');pollLive()}
       catch(err){showToast(err.message,{error:true})}
+    };
+  }else if(tab==='browser'){
+    const [bset,cstat]=await Promise.all([api('/api/browser/settings'),api('/api/computer/status').catch(()=>null)]);
+    const computerStatusLine=(()=>{
+      if(!cstat)return 'Status: could not be checked just now.';
+      if(!cstat.installed)return `Not usable yet: ${esc(cstat.detail)}`;
+      if(!cstat.usable)return `Installed but not usable: ${esc(cstat.detail)}`;
+      return 'Installed and usable on this machine right now.';
+    })();
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Browser + Computer Use</div>
+      <p class="lede" style="margin:0 0 4px">Falguna's own local browser execution (Playwright) -- never routed through Codex or any external provider. Screenshots and page content never leave this machine in Local Only Privacy Mode.</p>
+      <div class="settings-form">
+        <label class="checkbox-row"><input type="checkbox" id="bsEnabled" ${bset.enabled?'checked':''}> Browser execution enabled</label>
+        <label class="checkbox-row"><input type="checkbox" id="bsHeadless" ${bset.default_headless?'checked':''}> Run headless by default (no visible window) &mdash; a task that needs you to see or complete something in the browser is unaffected by this setting</label>
+        <label class="checkbox-row"><input type="checkbox" id="bsComputerUse" ${bset.computer_use_enabled?'checked':''}> Enable computer-use (screen/mouse/keyboard) foundation &mdash; off by default; every click/type still passes through the same sensitive-action approval gate as browser actions</label>
+        <div class="settings-list" style="margin:0 0 8px"><div>Computer-use status: ${computerStatusLine}</div></div>
+        <label>Maximum concurrent browser sessions<input type="number" id="bsMaxConcurrent" min="1" max="10" value="${esc(bset.max_concurrent_sessions)}"></label>
+        <div class="handoff-actions"><button type="button" class="action" id="bsSave">Save browser settings</button></div>
+      </div>
+      <div class="section-label">Fixed in this release</div>
+      <div class="settings-list">
+        <div>Downloads: saved into this session's own evidence storage and shown in Files, never to an arbitrary local path</div>
+        <div>Approval policy: always visible on a Needs Aryan card -- site, exact action, and reason, never hidden</div>
+        <div>Session persistence: a paused session's browser profile (cookies/login state) is kept until you resume, reject, or cancel it</div>
+      </div>
+    </div>`;
+    $('bsSave').onclick=async()=>{
+      try{
+        await api('/api/browser/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+          enabled:$('bsEnabled').checked, default_headless:$('bsHeadless').checked,
+          computer_use_enabled:$('bsComputerUse').checked,
+          max_concurrent_sessions:Math.max(1,Math.min(10,parseInt($('bsMaxConcurrent').value,10)||1)),
+        })});
+        showToast('Browser settings saved');renderSettingsView('browser');
+      }catch(err){showToast(err.message,{error:true})}
     };
   }else if(tab==='privacy'){
     body.innerHTML=`<div class="settings-section">

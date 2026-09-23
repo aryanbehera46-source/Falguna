@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Falguna Browser Fixture</title></head>
+<body>
+  <h1 id="heading">Falguna Browser Test Fixture</h1>
+  <a id="nav-link" href="/page2.html">Go to page 2</a>
+  <form id="the-form">
+    <input id="name-field" name="name" type="text" placeholder="Your name">
+    <select id="color-select" name="color">
+      <option value="">Choose</option>
+      <option value="red">Red</option>
+      <option value="blue">Blue</option>
+    </select>
+    <input id="agree-checkbox" type="checkbox" name="agree">
+    <button id="submit-btn" type="button" onclick="document.getElementById('result').textContent='submitted'">Submit</button>
+  </form>
+  <div id="result"></div>
+  <button id="buy-now-btn" type="button">Buy Now</button>
+  <button id="delete-account-btn" type="button">Delete Account</button>
+  <input id="password-field" type="password" name="password" placeholder="Password">
+  <a id="download-link" href="/download.txt" download>Download file</a>
+  <input id="file-upload-field" type="file" name="upload">
+  <div id="upload-result"></div>
+  <script>
+    document.getElementById('file-upload-field').addEventListener('change', function (e) {
+      var f = e.target.files[0];
+      document.getElementById('upload-result').textContent = f ? f.name : '';
+    });
+  </script>
+</body>
+</html>
