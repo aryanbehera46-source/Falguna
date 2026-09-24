@@ -216,6 +216,77 @@ def _browser_session_card(row: dict, chat_store, research_store, evidence_count:
     }
 
 
+# Falguna Experience Architecture V1.1 (Section 4): "what changed" for
+# Falguna's own Activity view, mirroring TTT HQ's allowlist approach on the
+# SAME shared audit log (control.audit -- one hash-chained log per --root).
+# Only Falguna-Engineering-native event types are listed here (memory,
+# missions/runs, knowledge, cross-app handoffs) -- TTT HQ's own business
+# events (RH_/CO_/CC_/VS_/MEDIA_/TL_/WF_/BOARDROOM_) are deliberately left
+# out, since those belong on TTT HQ's own What Changed feed, not here.
+# Never fabricates a detail: a template with a missing field falls back to
+# the label with the placeholder dropped, exactly like TTT HQ's version.
+FALGUNA_WHAT_CHANGED_EVENTS = {
+    "MISSION_CREATED": "New engineering mission created",
+    "RUN_CREATED": "New engineering run started",
+    "RUN_FAILED": "An engineering run failed",
+    "RUN_QUARANTINED": "An engineering run was quarantined for review",
+    "RUN_RESUMED": "An engineering run resumed",
+    "DONE_CANDIDATE": "A run finished and is ready for review",
+    "MERGE_DECISION_RECORDED": "Merge decision recorded",
+    "NEEDS_ARYAN_ENGINEERING_ITEM_DEFERRED": "An engineering approval was deferred",
+    "MEMORY_RECORD_SAVED": "New memory saved ({kind})",
+    "MEMORY_RECORD_EDITED": "A memory was edited",
+    "MEMORY_RECORD_FORGOTTEN": "A memory was forgotten",
+    "MEMORY_RECORD_SUPERSEDED": "A memory was superseded",
+    "KNOWLEDGE_DOCUMENT_INGESTED": "Knowledge document ingested",
+    "KNOWLEDGE_DOCUMENT_REJECTED": "Knowledge document rejected ({reason})",
+    "REVENUE_HUNTER_HANDOFF_ACCEPTED": "TTT HQ handoff accepted -- new engineering mission",
+}
+
+
+def _format_falguna_change_event(record: dict):
+    event = record.get("event")
+    template = FALGUNA_WHAT_CHANGED_EVENTS.get(event)
+    if not template:
+        return None
+    data = record.get("data") or {}
+    label = template
+    if "{" in template:
+        try:
+            label = template.format(**data)
+        except (KeyError, IndexError):
+            label = template.split("{", 1)[0].strip(" :(")
+    return {"timestamp": record.get("timestamp"), "event": event, "label": label}
+
+
+def _tail_falguna_audit_events(audit_path: Path, scan_lines: int = 800, limit: int = 30):
+    """Bounded tail-read of the shared audit log (append-only JSONL) --
+    cheap regardless of total file size. Returns [] if unreadable, never
+    fabricated content."""
+    from collections import deque
+
+    try:
+        with Path(audit_path).open() as handle:
+            tail = deque(handle, maxlen=scan_lines)
+    except OSError:
+        return []
+    items = []
+    for line in reversed(tail):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        formatted = _format_falguna_change_event(record)
+        if formatted:
+            items.append(formatted)
+        if len(items) >= limit:
+            break
+    return items
+
+
 class FalgunaHandler(BaseHTTPRequestHandler):
     server_version = "FalgunaLocal/1.2"
 
@@ -312,6 +383,8 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             return self._files()
         if path == "/api/notifications":
             return self._list_notifications()
+        if path == "/api/activity/what-changed":
+            return self._activity_what_changed()
         if path.startswith("/api/attachments/"):
             attachment_id = path.rsplit("/", 1)[-1]
             return self._download_attachment(attachment_id)
@@ -460,6 +533,19 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         try:
             chat = ConversationStore(store)
             results = chat.search_conversations(query) + search_missions(store, query)
+            scopes, _ = self._memory_scope_registry(store)
+            for hit in MemoryStore(store, control.audit).search(scopes, query, limit=8):
+                results.append({
+                    "type": "memory", "id": hit["id"],
+                    "title": (hit.get("content") or "").strip()[:90] or (hit.get("kind") or "Memory"),
+                    "snippet": hit.get("snippet"), "kind": hit.get("kind"),
+                    "scope_type": hit.get("scope_type"), "updated_at": hit.get("updated_at"),
+                })
+            for hit in KnowledgeStore(store, control.audit).search(scopes, query, limit=8):
+                results.append({
+                    "type": "knowledge", "id": hit["document_id"], "title": hit.get("document_title") or "Knowledge document",
+                    "snippet": hit.get("snippet"), "source_type": hit.get("source_type"), "updated_at": None,
+                })
             return self._json({"query": query, "results": results})
         finally:
             store.close()
@@ -1260,6 +1346,13 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         try:
             notifications = NotificationStore(store)
             return self._json({"notifications": notifications.list_notifications(), "unread": notifications.unread_count()})
+        finally:
+            store.close()
+
+    def _activity_what_changed(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json({"items": _tail_falguna_audit_events(control.audit.path)})
         finally:
             store.close()
 
@@ -2317,7 +2410,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .topbar-title{display:flex;align-items:center;gap:10px;min-width:0}
 .topbar-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650;font-size:14px;color:var(--text)}
 .menu-button{display:none;border:0;background:transparent;color:var(--text);padding:6px;border-radius:7px;cursor:pointer}
-.model-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:5px 11px 5px 9px;font-size:11.5px;white-space:nowrap}
+.model-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:5px 11px 5px 9px;font-size:11.5px;white-space:nowrap}.privacy-pill{cursor:default}.privacy-pill .dot{background:var(--muted)}.privacy-pill.mode-local .dot{background:var(--good)}.privacy-pill.mode-external .dot{background:var(--warn)}
 .model-pill .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
 .viewport{min-height:0;overflow:auto;display:flex;flex-direction:column}
 .scrim{display:none}
@@ -2347,6 +2440,29 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .project-actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
 .pill-btn{border:1px solid var(--line);background:var(--soft);color:var(--text);border-radius:999px;padding:7px 13px;font-size:12px;cursor:pointer}
 .pill-btn:hover{background:var(--soft2);border-color:#4a3d28}
+/* ---------- Home (Falguna Experience Architecture V1.1, Section 1) ---------- */
+.home-view{max-width:1080px}
+.home-hero h1{font-size:22px;margin:0 0 4px;font-weight:650;letter-spacing:-.01em}
+.home-composer{display:flex;gap:8px;margin:18px 0 12px}
+.home-composer textarea{flex:1;resize:none;background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:13px;padding:13px 16px;font:inherit;font-size:14px;line-height:1.4;max-height:120px}
+.home-composer textarea:focus{outline:none;border-color:var(--accent-dim)}
+.home-composer button{border:0;background:var(--accent);color:var(--accent-ink);border-radius:12px;padding:0 18px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.home-quick{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:30px}
+.home-quick .pill-btn{display:flex;align-items:center;gap:6px}
+.home-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.home-section{min-width:0}
+.home-section-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}
+.home-section-head h2{font-size:12.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-dim);font-weight:700;margin:0}
+.home-section-head a{font-size:11.5px;color:var(--muted);cursor:pointer;text-decoration:none}
+.home-section-head a:hover{color:var(--text)}
+.home-list{display:grid;gap:7px;min-width:0}
+.home-mc-grid{grid-template-columns:1fr!important}
+.home-row{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:11px 13px;cursor:pointer;text-align:left;display:block;width:100%;min-width:0;box-sizing:border-box}
+.home-row:hover{border-color:#4a3d28;background:var(--soft)}
+.home-row .title{font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.home-row .meta{color:var(--muted);font-size:11.5px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.home-empty{color:var(--muted-dim);font-size:12px;padding:16px 0;text-align:center;background:var(--panel);border:1px dashed var(--line);border-radius:11px}
+@media (max-width:640px){.home-composer{flex-direction:column}.home-composer button{padding:11px;align-self:flex-end}.home-grid{grid-template-columns:1fr}}
 .settings-list{display:grid;gap:7px;margin:14px 0 28px}
 .settings-list div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 14px;font-size:12.5px;color:var(--text)}
 .settings-note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:12px 15px;color:var(--muted);font-size:12.5px;margin-bottom:22px}
@@ -2647,6 +2763,19 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
   .topbar-right{gap:6px}
   .indicator-pill{display:none!important}
 }
+.cmdk-overlay{position:fixed;inset:0;z-index:1000;background:rgba(10,9,8,.45);display:flex;align-items:flex-start;justify-content:center}
+.cmdk-overlay[hidden]{display:none!important}
+.cmdk-box{margin-top:12vh;width:min(560px,92vw);background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.4);overflow:hidden;animation:cmdkIn .12s ease}
+@keyframes cmdkIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+.cmdk-input{width:100%;border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--text);padding:16px 18px;font-size:15px}
+.cmdk-input:focus{outline:none}
+.cmdk-list{max-height:50vh;overflow-y:auto;padding:6px}
+.cmdk-item{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;border-radius:8px;cursor:pointer;font-size:13px}
+.cmdk-item.sel,.cmdk-item:hover{background:var(--soft)}
+.cmdk-item-cat{color:var(--muted);font-size:11px}
+.cmdk-empty{padding:16px 12px;color:var(--muted);font-size:13px}
+.cmdk-hint{display:flex;gap:14px;padding:8px 14px;border-top:1px solid var(--line);color:var(--muted);font-size:11px}
+.cmdk-hint kbd{border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:10px;margin-right:2px}
 </style></head><body>
 <div class="app">
   <aside id="sidebar" aria-label="Falguna navigation">
@@ -2667,13 +2796,20 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
           <button class="bell-btn" id="bellBtn" type="button" aria-label="Notifications"></button>
           <div class="notif-panel hidden" id="notifPanel"></div>
         </div>
-        <div class="model-pill" id="modelPill"><span class="dot"></span><span class="label">Falguna</span></div>
+        <div class="model-pill privacy-pill hidden" id="privacyPill" title=""><span class="dot"></span><span class="label"></span></div><div class="model-pill" id="modelPill"><span class="dot"></span><span class="label">Falguna</span></div>
       </div>
     </header>
     <section class="viewport" id="viewport"></section>
   </main>
 </div>
 <div class="toast-stack" id="toastStack"></div>
+<div id="cmdkOverlay" class="cmdk-overlay" hidden>
+  <div class="cmdk-box" role="dialog" aria-modal="true" aria-label="Command palette">
+    <input id="cmdkInput" class="cmdk-input" type="text" placeholder="Go to a screen, or start something new&hellip;" autocomplete="off" spellcheck="false">
+    <div id="cmdkList" class="cmdk-list" role="listbox"></div>
+    <div class="cmdk-hint"><span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span><span><kbd>&crarr;</kbd> select</span><span><kbd>esc</kbd> close</span></div>
+  </div>
+</div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2681,6 +2817,7 @@ const nl2br=s=>esc(s).replace(/\n/g,'<br>');
 async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
 let profiles={};
 let profileList=[];
+let homeDraftMessage='';
 let settingsModel='';
 
 /* ---------------------------------------------------------- misc helpers */
@@ -2795,7 +2932,7 @@ $('newChatBtn').innerHTML=icon('plus',15)+'New chat';
 $('menuButton').innerHTML=icon('menu',17);
 $('bellBtn').innerHTML=icon('bell',16)+'<span class="bell-dot hidden" id="bellDot"></span>';
 $('nav').innerHTML=[
-  ['chat','Chat'],['search','Search'],['work','Work'],['mission','Mission Control'],['memory','Memory'],['projects','Projects'],['files','Files'],['history','History'],['settings','Settings'],
+  ['home','Home'],['chat','Chat'],['search','Search'],['work','Work'],['mission','Mission Control'],['memory','Memory'],['projects','Projects'],['files','Files'],['history','History'],['settings','Settings'],
 ].map(([id,label])=>`<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`).join('');
 
 function closeSidebar(){$('sidebar').classList.remove('open');$('scrim').classList.remove('open');$('menuButton').setAttribute('aria-expanded','false')}
@@ -2841,7 +2978,7 @@ async function loadNotifications(){
 }
 function renderNotifPanel(list){
   const panel=$('notifPanel');
-  panel.innerHTML=`<div class="notif-panel-head"><span>Notifications</span><button type="button" id="notifMarkAll">Mark all read</button></div>`+
+  panel.innerHTML=`<div class="notif-panel-head"><span>Notifications</span><span><button type="button" id="notifSeeAll">See all</button><button type="button" id="notifMarkAll">Mark all read</button></span></div>`+
     (list.length?list.map(n=>`<button type="button" class="notif-row ${n.read?'':'unread'}" data-notif-open="${esc(notifTarget(n))}" data-notif-id="${esc(n.id)}">
         <div class="n-title">${esc(n.title)}</div>${n.body?`<div class="n-body">${esc(n.body)}</div>`:''}<div class="n-time">${esc(timeAgo(n.created_at))}</div>
       </button>`).join(''):'<div class="empty-state" style="padding:14px 0">Nothing yet.</div>');
@@ -2850,6 +2987,8 @@ function renderNotifPanel(list){
     try{await api('/api/notifications/read-all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadNotifications();pollLive()}
     catch(err){showToast(err.message,{error:true})}
   };
+  const seeAllBtn=$('notifSeeAll');
+  if(seeAllBtn)seeAllBtn.onclick=e=>{e.stopPropagation();stopBellPanel();go('#/activity')};
   document.querySelectorAll('[data-notif-open]').forEach(b=>b.onclick=async()=>{
     const id=b.dataset.notifId,target=b.dataset.notifOpen;
     try{await api(`/api/notifications/${id}/read`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(err){}
@@ -2867,13 +3006,10 @@ async function pollLive(){
   let s;
   try{s=await api('/api/live-summary')}catch(err){return}
   const pill=$('indicatorPill');
-  const running=s.running||0,needsYou=s.needs_you||0,failed=s.failed||0;
+  const running=s.running||0,needsYou=s.needs_you||0;
   if(running+needsYou>0){
     pill.classList.remove('hidden');
-    pill.innerHTML=`<b>${running}</b> running`+(needsYou?` &middot; <span class="warn-count">${needsYou} needs you</span>`:'')+(failed?` &middot; <span class="bad-count">${failed} failed</span>`:'');
-  }else if(failed>0){
-    pill.classList.remove('hidden');
-    pill.innerHTML=`<span class="bad-count">${failed} failed</span>`;
+    pill.innerHTML=`<b>${running}</b> running`+(needsYou?` &middot; <span class="warn-count">${needsYou} needs you</span>`:'');
   }else{
     pill.classList.add('hidden');
   }
@@ -2891,12 +3027,12 @@ function startLivePolling(){
 /* ---------------------------------------------------------------- router */
 
 function currentRoute(){
-  const raw=(location.hash||'#/chat').replace(/^#\/?/,'');
+  const raw=(location.hash||'#/home').replace(/^#\/?/,'');
   const parts=raw.split('/');
-  return {view:parts[0]||'chat', id:parts[1]?decodeURIComponent(parts[1]):null};
+  return {view:parts[0]||'home', id:parts[1]?decodeURIComponent(parts[1]):null};
 }
 function go(hash){location.hash=hash}
-const VIEW_TITLES={chat:'Chat',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings'};
+const VIEW_TITLES={home:'Home',chat:'Chat',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings',activity:'Activity'};
 function setActiveNav(view){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   $('viewTitle').textContent=VIEW_TITLES[view]||'Falguna';
@@ -2911,6 +3047,7 @@ async function router(){
   stopBellPanel();
   const vp=$('viewport');
   try{
+    if(view==='home'){hideSideList();return renderHomeView()}
     if(view==='chat'){await renderSideChats();return renderChatView(id)}
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
     if(view==='search'){await renderSideResearch();return renderSearchView(id)}
@@ -2921,7 +3058,8 @@ async function router(){
     if(view==='files'){hideSideList();return renderFilesView(id)}
     if(view==='history'){hideSideList();return renderHistoryView()}
     if(view==='settings'){hideSideList();return renderSettingsView(id)}
-    go('#/chat');
+    if(view==='activity'){hideSideList();return renderActivityView()}
+    go('#/home');
   }catch(err){
     vp.innerHTML=`<div class="page"><div class="empty-state error">${esc(err.message)}</div></div>`;
   }
@@ -2930,6 +3068,174 @@ window.addEventListener('hashchange',router);
 
 function hideSideList(){$('sideListTitle').textContent='';$('sideList').innerHTML=''}
 
+/* --------------------------------------------------------- Command palette */
+/* Falguna Experience Architecture V1.1 (Section 2): mirrors the sibling
+   HQ app's command-palette pattern -- quick actions plus every real nav
+   destination, keyboard-driven (arrows/Enter/Escape). No screen or action
+   is listed here that doesn't already exist as a real route or handler
+   above. */
+const CMDK_QUICK_ACTIONS=[
+  {label:'New chat',cat:'Action',run:()=>go('#/chat')},
+  {label:'New research',cat:'Action',run:()=>go('#/search')},
+  {label:'New work mission',cat:'Action',run:()=>go('#/work')},
+  {label:'New browser task',cat:'Action',run:()=>openNewBrowserTaskModal()},
+  {label:'Search memory',cat:'Action',run:()=>go('#/memory')},
+];
+function cmdkNavItems(){
+  return Array.from(document.querySelectorAll('.nav-item[data-view]')).map(b=>({
+    label:b.textContent.trim(), cat:'Go to', run:()=>{go('#/'+b.dataset.view);closeSidebar()},
+  }));
+}
+let cmdkItems=[],cmdkSel=0;
+function cmdkOpen(){
+  cmdkItems=[...CMDK_QUICK_ACTIONS,...cmdkNavItems()];
+  $('cmdkOverlay').hidden=false;
+  $('cmdkInput').value='';
+  cmdkRender(cmdkItems);
+  setTimeout(()=>$('cmdkInput').focus(),0);
+}
+function cmdkClose(){$('cmdkOverlay').hidden=true}
+function cmdkRender(items){
+  cmdkSel=0;
+  $('cmdkList').innerHTML=items.length?items.map((it,i)=>`<div class="cmdk-item${i===0?' sel':''}" data-i="${i}" role="option"><span>${esc(it.label)}</span><span class="cmdk-item-cat">${esc(it.cat)}</span></div>`).join(''):'<div class="cmdk-empty">No matches.</div>';
+  document.querySelectorAll('.cmdk-item').forEach(el=>{
+    el.onclick=()=>{items[Number(el.dataset.i)].run();cmdkClose()};
+    el.onmouseenter=()=>{cmdkSel=Number(el.dataset.i);cmdkHighlight()};
+  });
+}
+function cmdkHighlight(){document.querySelectorAll('.cmdk-item').forEach((el,i)=>el.classList.toggle('sel',i===cmdkSel))}
+function cmdkResultItem(r){
+  if(r.type==='conversation')return {label:r.title||'Untitled chat',cat:'Chat',run:()=>go('#/chat/'+r.id)};
+  if(r.type==='mission')return {label:r.title||'Mission',cat:'Work',run:()=>go('#/work/'+r.run_id)};
+  if(r.type==='memory')return {label:r.title||'Memory',cat:'Memory',run:()=>go('#/memory/memories')};
+  if(r.type==='knowledge')return {label:r.title||'Knowledge',cat:'Knowledge',run:()=>go('#/memory/knowledge')};
+  return null;
+}
+let cmdkSearchDebounce=null;
+$('cmdkInput').oninput=()=>{
+  const raw=$('cmdkInput').value.trim();
+  const q=raw.toLowerCase();
+  const filtered=q?cmdkItems.filter(it=>it.label.toLowerCase().includes(q)||it.cat.toLowerCase().includes(q)):cmdkItems;
+  cmdkRender(filtered);
+  clearTimeout(cmdkSearchDebounce);
+  if(raw.length<2)return;
+  cmdkSearchDebounce=setTimeout(async()=>{
+    let results;
+    try{({results}=await api('/api/search?q='+encodeURIComponent(raw)))}catch(err){return}
+    if($('cmdkInput').value.trim()!==raw)return;
+    const remote=results.map(cmdkResultItem).filter(Boolean).slice(0,8);
+    if(remote.length)cmdkRender([...remote,...filtered]);
+  },220);
+};
+$('cmdkInput').onkeydown=(e)=>{
+  const rows=document.querySelectorAll('.cmdk-item');
+  if(e.key==='ArrowDown'){e.preventDefault();cmdkSel=Math.min(cmdkSel+1,rows.length-1);cmdkHighlight();rows[cmdkSel]?.scrollIntoView({block:'nearest'})}
+  else if(e.key==='ArrowUp'){e.preventDefault();cmdkSel=Math.max(cmdkSel-1,0);cmdkHighlight();rows[cmdkSel]?.scrollIntoView({block:'nearest'})}
+  else if(e.key==='Enter'){e.preventDefault();rows[cmdkSel]?.click()}
+  else if(e.key==='Escape'){e.preventDefault();cmdkClose()}
+};
+$('cmdkOverlay').addEventListener('mousedown',(e)=>{if(e.target.id==='cmdkOverlay')cmdkClose()});
+document.addEventListener('keydown',(e)=>{
+  const meta=e.metaKey||e.ctrlKey;
+  if(meta&&e.key.toLowerCase()==='k'){e.preventDefault();if($('cmdkOverlay').hidden)cmdkOpen();else cmdkClose();return}
+  if(e.key==='Escape'&&!$('cmdkOverlay').hidden)cmdkClose();
+});
+
+/* ------------------------------------------------------------------- Home */
+/* Falguna Experience Architecture V1.1 (Section 1): the real landing page.
+   Every section below is read from data that already exists elsewhere in
+   this app -- ConversationStore for Continue, the same Mission Control
+   board for Running/Needs You, the approved-project registry for Projects,
+   MemoryStore + Files for Knowledge. Nothing here is a fabricated metric;
+   an empty section says so plainly instead of inventing content. */
+function homeGreeting(){
+  const h=new Date().getHours();
+  const part=h<5?'Still up, Aryan':h<12?'Good morning, Aryan':h<18?'Good afternoon, Aryan':'Good evening, Aryan';
+  return part;
+}
+async function renderHomeView(){
+  await loadProfiles();
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="page home-view">
+    <div class="home-hero"><h1>${homeGreeting()}</h1><p class="lede">Everywhere you left off, and everything that needs you.</p></div>
+    <form class="home-composer" id="homeComposer">
+      <textarea id="homeComposerInput" rows="1" placeholder="Ask Falguna anything, or describe what you need&hellip;"></textarea>
+      <button type="submit" aria-label="Start chat">${icon('send',15)}</button>
+    </form>
+    <div class="home-quick">
+      <button type="button" class="pill-btn" data-home-go="#/chat">${icon('chat',13)}New chat</button>
+      <button type="button" class="pill-btn" data-home-go="#/search">${icon('search',13)}Research</button>
+      <button type="button" class="pill-btn" data-home-go="#/work">${icon('work',13)}Work mission</button>
+      <button type="button" class="pill-btn" id="homeBrowseBtn">${icon('monitor',13)}Browser task</button>
+      <button type="button" class="pill-btn" data-home-go="#/memory">${icon('memory',13)}Search memory</button>
+    </div>
+    <div class="home-grid" id="homeGrid">
+      <div class="home-section"><div class="home-section-head"><h2>Continue</h2></div><div class="home-empty">Loading&hellip;</div></div>
+    </div>
+  </div>`;
+  const ta=$('homeComposerInput');
+  ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,120)+'px'});
+  ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('homeComposer').requestSubmit()}});
+  $('homeComposer').onsubmit=e=>{
+    e.preventDefault();
+    const val=ta.value.trim();
+    if(!val)return;
+    homeDraftMessage=val;
+    ta.value='';
+    go('#/chat');
+  };
+  document.querySelectorAll('.home-quick [data-home-go]').forEach(b=>b.onclick=()=>go(b.dataset.homeGo));
+  const browseBtn=$('homeBrowseBtn');
+  if(browseBtn)browseBtn.onclick=()=>openNewBrowserTaskModal();
+
+  let conversations=[],board={running:[],needs_you:[]},memRecords=[],files=[];
+  const results=await Promise.allSettled([
+    api('/api/conversations'), api('/api/missions/board'), api('/api/memory?limit=6'), api('/api/files'),
+  ]);
+  if(results[0].status==='fulfilled')conversations=results[0].value.conversations||[];
+  if(results[1].status==='fulfilled')board=results[1].value;
+  if(results[2].status==='fulfilled')memRecords=results[2].value.records||[];
+  if(results[3].status==='fulfilled'){
+    const fv=results[3].value;
+    files=[...(fv.generated||[]),...(fv.uploads||[]).map(u=>({...u,filename:u.filename,created_at:u.created_at}))];
+  }
+  if(currentRoute().view!=='home'||!$('homeGrid'))return;
+
+  const continueItems=conversations.slice(0,5);
+  const continueHtml=continueItems.length?continueItems.map(c=>
+    `<button type="button" class="home-row" data-home-open="#/chat/${esc(c.id)}"><div class="title">${esc(c.title||'Untitled chat')}</div><div class="meta">${esc(c.last_message_preview||'No messages yet')} &middot; ${esc(timeAgo(c.updated_at))}</div></button>`
+  ).join(''):'<div class="home-empty">No conversations yet -- start one above.</div>';
+
+  const runningItems=(board.running||[]).slice(0,4);
+  const runningHtml=runningItems.length?`<div class="mc-grid home-mc-grid">${runningItems.map(mcCard).join('')}</div>`:'<div class="home-empty">Nothing running right now.</div>';
+
+  const needsYouItems=(board.needs_you||[]).slice(0,4);
+  const needsYouHtml=needsYouItems.length?`<div class="mc-grid home-mc-grid">${needsYouItems.map(mcCard).join('')}</div>`:'<div class="home-empty">Nothing needs you right now.</div>';
+
+  const projectItems=profileList.slice(0,4);
+  const projectsHtml=projectItems.length?projectItems.map(p=>
+    `<button type="button" class="home-row" data-home-open="#/projects"><div class="title">${esc(p.name)}</div><div class="meta">${esc(p.repository)}</div></button>`
+  ).join(''):'<div class="home-empty">No approved projects yet.</div>';
+
+  const knowledgeFeed=[
+    ...memRecords.map(r=>({kind:'Memory',ts:r.updated_at,title:(r.content||'').slice(0,90),sub:`${r.kind||'note'} &middot; ${r.scope_type==='project'?'project':(r.scope_type||'personal')}`,href:'#/memory'})),
+    ...files.map(f=>({kind:'File',ts:f.created_at,title:f.filename||'file',sub:f.type==='upload'?'Uploaded':(f.kind||'Generated'),href:'#/files'})),
+  ].filter(k=>k.ts).sort((a,b)=>new Date(b.ts)-new Date(a.ts)).slice(0,5);
+  const knowledgeHtml=knowledgeFeed.length?knowledgeFeed.map(k=>
+    `<button type="button" class="home-row" data-home-open="${esc(k.href)}"><div class="title">${esc(k.kind)} &middot; ${esc(k.title)}</div><div class="meta">${k.sub} &middot; ${esc(timeAgo(k.ts))}</div></button>`
+  ).join(''):'<div class="home-empty">No recent memory or files yet.</div>';
+
+  $('homeGrid').innerHTML=`
+    <div class="home-section"><div class="home-section-head"><h2>Continue</h2><a data-home-open="#/history">See all</a></div><div class="home-list">${continueHtml}</div></div>
+    <div class="home-section"><div class="home-section-head"><h2>Running</h2><a data-home-open="#/mission">See all</a></div>${runningHtml}</div>
+    <div class="home-section"><div class="home-section-head"><h2>Needs you</h2><a data-home-open="#/mission">See all</a></div>${needsYouHtml}</div>
+    <div class="home-section"><div class="home-section-head"><h2>Projects</h2><a data-home-open="#/projects">See all</a></div><div class="home-list">${projectsHtml}</div></div>
+    <div class="home-section"><div class="home-section-head"><h2>Knowledge</h2><a data-home-open="#/memory">See all</a></div><div class="home-list">${knowledgeHtml}</div></div>
+  `;
+  document.querySelectorAll('#homeGrid [data-home-open]').forEach(b=>b.onclick=()=>go(b.dataset.homeOpen));
+  wireMcControls();
+}
+
 async function loadProfiles(){
   if(profileList.length)return;
   const c=await api('/api/config');
@@ -2937,6 +3243,16 @@ async function loadProfiles(){
   settingsModel=c.model;
   c.profiles.forEach(p=>profiles[p.id]=p);
   $('modelPill').innerHTML=`<span class="dot"></span><span class="label">${esc(settingsModel||'Falguna')}</span>`;
+  const pMode=c.privacy_mode;
+  const pInfo=PRIVACY_MODE_INFO.find(([id])=>id===pMode);
+  const pPill=$('privacyPill');
+  if(pPill&&pInfo){
+    pPill.classList.remove('hidden');
+    pPill.classList.toggle('mode-local',pMode==='LOCAL_ONLY');
+    pPill.classList.toggle('mode-external',pMode==='EXTERNAL_ALLOWED');
+    pPill.title=pInfo[2];
+    pPill.querySelector('.label').textContent=pInfo[1];
+  }
 }
 loadProfiles().catch(()=>{});
 
@@ -3026,6 +3342,7 @@ async function renderChatView(id){
       </div>`;
     wireComposerChrome(false);
     document.querySelectorAll('[data-starter]').forEach(b=>b.onclick=()=>{$('composerInput').value=b.dataset.starter;$('composerInput').focus()});
+    if(homeDraftMessage){$('composerInput').value=homeDraftMessage;homeDraftMessage='';$('composerInput').focus();$('composerInput').dispatchEvent(new Event('input'))}
     $('composer').addEventListener('submit',async e=>{
       e.preventDefault();
       const content=$('composerInput').value.trim();
@@ -3636,10 +3953,13 @@ async function renderSearchView(id){
       const q=$('quickQ').value.trim();
       if(!q){$('quickResults').innerHTML='';return}
       const {results}=await api('/api/search?q='+encodeURIComponent(q));
-      $('quickResults').innerHTML=results.length?results.map(r=>r.type==='conversation'
-        ?`<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`
-        :`<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work &middot; ${esc(String(r.status||'').replaceAll('_',' '))}</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.repository||'')}</div></button>`
-      ).join(''):'<div class="empty-state">No matches.</div>';
+      $('quickResults').innerHTML=results.length?results.map(r=>{
+        if(r.type==='conversation')return `<button class="result-row" data-open="#/chat/${esc(r.id)}"><div class="kind">Chat</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+        if(r.type==='mission')return `<button class="result-row" data-open="#/work/${esc(r.run_id)}"><div class="kind">Work &middot; ${esc(String(r.status||'').replaceAll('_',' '))}</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.repository||'')}</div></button>`;
+        if(r.type==='memory')return `<button class="result-row" data-open="#/memory/memories"><div class="kind">Memory &middot; ${esc(r.kind||'note')}</div><div class="title">${esc(r.title)}</div><div class="meta">${esc(timeAgo(r.updated_at))}</div></button>`;
+        if(r.type==='knowledge')return `<button class="result-row" data-open="#/memory/knowledge"><div class="kind">Knowledge</div><div class="title">${esc(r.title)}</div><div class="meta">${r.snippet?esc(r.snippet.replace(/[\[\]]/g,'')):''}</div></button>`;
+        return '';
+      }).join(''):'<div class="empty-state">No matches.</div>';
       document.querySelectorAll('#quickResults [data-open]').forEach(b=>b.onclick=()=>go(b.dataset.open));
     };
     $('quickGo').onclick=runQuick;
@@ -3977,6 +4297,57 @@ async function renderHistoryView(){
     document.querySelectorAll('#histTabs button').forEach(x=>x.classList.toggle('active',x===b));
     renderList();
   });
+  renderList();
+}
+
+/* ---------------------------------------------------------------- Activity */
+/* Falguna Experience Architecture V1.1 (Section 4): one real timeline --
+   real notifications (finished/failed/needs approval, from Falguna's own
+   NotificationStore) merged with the real "what changed" audit feed
+   (Section 4's reuse of the allowlist approach, scoped to Falguna's own
+   event vocabulary). No low-level noise: only allowlisted event types and
+   real notification rows ever appear here. */
+async function renderActivityView(){
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="page"><h1>Activity</h1><p class="lede">What finished, what failed, what needs you, and what changed -- one real timeline, most recent first.</p>
+    <div class="files-tabs" id="activityTabs">
+      <button type="button" data-atab="all" class="active">All</button>
+      <button type="button" data-atab="notif">Notifications</button>
+      <button type="button" data-atab="changed">What changed</button>
+    </div>
+    <div style="margin:14px 0"><button type="button" class="pill-btn" id="activityMarkAll">Mark all notifications read</button></div>
+    <div class="result-list" id="activityList"><div class="empty-state">Loading&hellip;</div></div>
+  </div>`;
+  const [notifRes,changedRes]=await Promise.allSettled([api('/api/notifications'),api('/api/activity/what-changed')]);
+  const notifications=notifRes.status==='fulfilled'?(notifRes.value.notifications||[]):[];
+  const changed=changedRes.status==='fulfilled'?(changedRes.value.items||[]):[];
+  const items=[
+    ...notifications.map(n=>({type:'notif',ts:n.created_at,title:n.title,body:n.body,read:n.read,id:n.id,href:notifTarget(n)})),
+    ...changed.map(c=>({type:'changed',ts:c.timestamp,title:c.label})),
+  ].filter(i=>i.ts).sort((a,b)=>new Date(b.ts)-new Date(a.ts));
+  let activeTab='all';
+  function renderList(){
+    const rows=items.filter(i=>activeTab==='all'||(activeTab==='notif'&&i.type==='notif')||(activeTab==='changed'&&i.type==='changed'));
+    $('activityList').innerHTML=rows.length?rows.map(i=>{
+      if(i.type==='notif')return `<button type="button" class="result-row" data-open="${esc(i.href||'')}" data-notif-id="${esc(i.id)}"><div class="kind">Notification${i.read?'':' &middot; <span class="status-pill pending">unread</span>'}</div><div class="title">${esc(i.title)}</div>${i.body?`<div class="meta">${esc(i.body)}</div>`:''}<div class="meta">${esc(timeAgo(i.ts))}</div></button>`;
+      return `<div class="result-row" style="cursor:default"><div class="kind">Changed</div><div class="title">${esc(i.title)}</div><div class="meta">${esc(timeAgo(i.ts))}</div></div>`;
+    }).join(''):'<div class="empty-state">Nothing yet.</div>';
+    document.querySelectorAll('#activityList [data-open]').forEach(b=>b.onclick=async()=>{
+      const id=b.dataset.notifId,target=b.dataset.open;
+      if(id){try{await api(`/api/notifications/${id}/read`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){}}
+      pollLive();
+      if(target)go(target);
+    });
+  }
+  document.querySelectorAll('#activityTabs button').forEach(b=>b.onclick=()=>{
+    activeTab=b.dataset.atab;
+    document.querySelectorAll('#activityTabs button').forEach(x=>x.classList.toggle('active',x===b));
+    renderList();
+  });
+  $('activityMarkAll').onclick=async()=>{
+    try{await api('/api/notifications/read-all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await renderActivityView();pollLive()}
+    catch(err){showToast(err.message,{error:true})}
+  };
   renderList();
 }
 
