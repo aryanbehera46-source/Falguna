@@ -60,10 +60,21 @@ class HTMLSeparationTests(unittest.TestCase):
         self.assertIn("display:flex", aside_rule)
         self.assertIn("flex-direction:column", aside_rule)
         self.assertIn("padding:18px 12px", aside_rule)
-        # Main content's own independent scrolling must be unaffected.
+        # Main content's own independent scrolling must be unaffected. V1.1
+        # gave `main` a persistent topbar (health/active-work/Ask Falguna)
+        # above the scrolling content, so `main` itself is now a flex column
+        # (topbar + `.col`) and the actual scroll region moved to `.col` --
+        # the same independent-scroll guarantee, just at the correct layer.
         main_rule = re.search(r"main\{[^}]*\}", HQ_INDEX_HTML)
         self.assertIsNotNone(main_rule, "base `main` CSS rule not found")
-        self.assertIn("overflow-y:auto", main_rule.group(0))
+        self.assertIn("display:flex", main_rule.group(0))
+        self.assertIn("flex-direction:column", main_rule.group(0))
+        self.assertIn("min-height:0", main_rule.group(0))
+        col_rule = re.search(r"\.col\{[^}]*\}", HQ_INDEX_HTML)
+        self.assertIsNotNone(col_rule, "base `.col` CSS rule not found")
+        self.assertIn("overflow-y:auto", col_rule.group(0))
+        self.assertIn("flex:1", col_rule.group(0))
+        self.assertIn("min-height:0", col_rule.group(0))
         # The footer boundary text stays part of the sidebar, pinned to the
         # bottom when there's room, scrollable into view when there isn't.
         self.assertIn('<div class="boundary">', HQ_INDEX_HTML)
