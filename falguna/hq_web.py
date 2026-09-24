@@ -1783,6 +1783,7 @@ class TTTHQHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -1801,11 +1802,15 @@ def serve_hq(root, host: str = "127.0.0.1", port: int = 8766, falguna_url: str =
 
 HQ_INDEX_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<script>(function(){try{var t=localStorage.getItem('ttthq-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}})();</script>
 <title>Twenty Two Technologies</title><style>
-:root{color-scheme:dark;--bg:#0b0908;--side:#100c0a;--panel:#181310;--soft:#201a16;--line:#332a23;--text:#f7f3ef;--muted:#a89c8f;--accent:#e2a15c;--warn:#ffc66d;--bad:#ff8c96}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}.app{height:100dvh;display:grid;grid-template-columns:250px minmax(0,1fr);overflow:hidden}aside{background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;min-height:0;overflow-y:auto;overflow-x:hidden}.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 20px;font-weight:750;font-size:16px}.mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#221202;font-weight:900}.navsec{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:16px 8px 6px}.navitem{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text);padding:8px 8px;border-radius:8px;cursor:pointer;font-size:13px}.navitem:hover,.navitem.active{background:var(--soft)}.navitem.disabled{color:#5b5148;cursor:default}.navitem.disabled:hover{background:transparent}.boundary{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px 2px;border-top:1px solid var(--line)}main{min-width:0;overflow-y:auto;padding:28px max(24px,calc((100vw - 250px - 860px)/2))}.col{max-width:860px;margin:0 auto;display:grid;gap:20px}h1{font-size:22px;margin:0 0 2px}.pageintro{color:var(--muted);font-size:13px;margin-bottom:6px}.view{display:none}.view.active{display:block}.section{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:18px;margin-bottom:18px}.section h2{margin:0 0 4px;font-size:17px}.sub{color:var(--muted);font-size:12px;margin-bottom:14px}.list{display:grid;gap:10px}.item{border:1px solid var(--line);background:var(--soft);border-radius:11px;padding:13px}.item h3{margin:0 0 4px;font-size:14px}.meta{color:var(--muted);font-size:11px;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}.meta span{border:1px solid var(--line);border-radius:999px;padding:2px 8px}.empty{color:var(--muted);font-size:12px;padding:6px 0}.form{display:grid;gap:8px;margin-top:12px;border-top:1px solid var(--line);padding-top:12px}.form input,.form select,.form textarea{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}.form textarea{min-height:50px;resize:vertical}.row{display:flex;gap:8px}.row>*{flex:1}.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.actions button{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;cursor:pointer;background:var(--accent);color:#221202}.actions button.secondary{background:#2c241d;color:var(--text)}.actions button.danger{background:#542c34;color:#ffe0e4}.contrib{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin-top:6px;font-size:12px}.contrib b{color:var(--accent)}.badge-actionable{color:var(--accent)}.badge-inspect{color:var(--warn)}.badge{color:var(--warn);font-weight:700;border-color:var(--warn)!important}
-@media(max-width:820px){.app{grid-template-columns:1fr;height:auto;min-height:100dvh}aside{flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}aside .brand{width:100%;padding:2px 4px 10px}aside .navsec,aside .boundary{display:none}aside .navitem{padding:6px 10px;font-size:12px}main{padding:20px 16px}.row{flex-direction:column}}
-</style></head><body><div class="app"><aside>
+:root{color-scheme:dark;--bg:#0a0908;--side:#141210;--panel:#1c1815;--soft:#26201a;--soft2:#302820;--line:#4a3d2e;--text:#f7f3ef;--muted:#a89c8f;--muted-dim:#7d7264;--accent:#e2a15c;--accent-hi:#f0b876;--accent-ink:#241404;--accent-dim:#5c4426;--accent-soft:#332619;--warn:#ffc66d;--bad:#ff8c96;--bad-dim:#3a2226;--bad-ink:#ffd6da;--good:#8fd9a8;--shadow:#000c}@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--bg:#f6f3ee;--side:#efe9dd;--panel:#ffffff;--soft:#f1e9d8;--soft2:#e7dcc3;--line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#7c6c50;--accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;--warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--bad-ink:#7a2415;--good:#1e7a43;--shadow:#0002}}:root[data-theme="light"]{color-scheme:light;--bg:#f6f3ee;--side:#efe9dd;--panel:#ffffff;--soft:#f1e9d8;--soft2:#e7dcc3;--line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#7c6c50;--accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;--warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--bad-ink:#7a2415;--good:#1e7a43;--shadow:#0002}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}.app{height:100dvh;display:grid;grid-template-columns:250px minmax(0,1fr);overflow:hidden}aside{background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;min-height:0;overflow-y:auto;overflow-x:hidden}.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 20px;font-weight:750;font-size:16px}.mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#221202;font-weight:900}.navsec{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:16px 8px 6px}.navitem{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text);padding:8px 8px;border-radius:8px;cursor:pointer;font-size:13px}.navitem:hover,.navitem.active{background:var(--soft)}.navitem.disabled{color:#5b5148;cursor:default}.navitem.disabled:hover{background:transparent}.boundary{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px 2px;border-top:1px solid var(--line)}main{min-width:0;overflow-y:auto;padding:28px max(24px,calc((100vw - 250px - 860px)/2))}.col{max-width:860px;margin:0 auto;display:grid;gap:20px}h1{font-size:22px;margin:0 0 2px}.pageintro{color:var(--muted);font-size:13px;margin-bottom:6px}.view{display:none}.view.active{display:block}.section{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:18px;margin-bottom:18px}.section h2{margin:0 0 4px;font-size:17px}.sub{color:var(--muted);font-size:12px;margin-bottom:14px}.list{display:grid;gap:10px}.item{border:1px solid var(--line);background:var(--soft);border-radius:11px;padding:13px}.item h3{margin:0 0 4px;font-size:14px}.meta{color:var(--muted);font-size:11px;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}.meta span{border:1px solid var(--line);border-radius:999px;padding:2px 8px}.empty{color:var(--muted);font-size:12px;padding:6px 0}.form{display:grid;gap:8px;margin-top:12px;border-top:1px solid var(--line);padding-top:12px}.form input,.form select,.form textarea{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}.form textarea{min-height:50px;resize:vertical}.row{display:flex;gap:8px}.row>*{flex:1}.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.actions button{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;cursor:pointer;background:var(--accent);color:#221202}.actions button.secondary{background:var(--soft2);color:var(--text)}.actions button.danger{background:var(--bad-dim);color:var(--bad-ink)}.contrib{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin-top:6px;font-size:12px}.contrib b{color:var(--accent)}.badge-actionable{color:var(--accent)}.badge-inspect{color:var(--warn)}.badge{color:var(--warn);font-weight:700;border-color:var(--warn)!important}.stat-bad{color:var(--bad)}.stat-warn{color:var(--warn)}.stat-good{color:var(--good)}.theme-toggle{display:flex;align-items:center;gap:6px;width:100%;border:1px solid var(--line);background:var(--panel);color:var(--text);padding:7px 9px;border-radius:8px;cursor:pointer;font-size:12px;margin:8px 0 2px}.theme-toggle:hover{background:var(--soft)}#globalLoadingBar{position:fixed;top:0;left:0;height:2px;width:100%;background:var(--accent);transform-origin:left;transform:scaleX(0);opacity:0;transition:transform .2s ease,opacity .2s ease;z-index:9999;pointer-events:none}#globalLoadingBar.active{opacity:1;transform:scaleX(1)}
+@media(max-width:820px){.app{grid-template-columns:1fr;height:auto;min-height:100dvh}aside{flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}aside .brand{width:100%;padding:2px 4px 10px}aside .navsec,aside .boundary{display:none}aside .navitem{width:auto;display:inline-block;padding:6px 10px;font-size:12px}main{padding:20px 16px}.row{flex-direction:column}}
+</style></head><body><div id="globalLoadingBar" aria-hidden="true"></div><div class="app"><aside>
 <div class="brand"><span class="mark">TT</span>Twenty Two Technologies</div>
+<div class="navsec">Priority</div>
+<button class="navitem active" data-view="commandCenter">Overview</button>
+<button class="navitem" data-view="needsAryan">Needs Aryan</button>
 <div class="navsec">Company OS</div>
 <button class="navitem" data-view="coHome">Company OS Home</button>
 <button class="navitem" data-view="coCeoV2">CEO Command Center v2</button>
@@ -1818,8 +1823,6 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <button class="navitem" data-view="coDecisions">Decisions</button>
 <button class="navitem" data-view="coPolicies">Policies</button>
 <button class="navitem" data-view="coOperatingReviews">Operating Reviews</button>
-<div class="navsec">Command Center</div>
-<button class="navitem active" data-view="commandCenter">Command Center</button>
 <div class="navsec">Trading Lab (PAPER)</div>
 <button class="navitem" data-view="tlOverview">Trading Lab Overview</button>
 <button class="navitem" data-view="tlStrategies">Strategies</button>
@@ -1837,7 +1840,6 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="navsec">Company</div>
 <button class="navitem" data-view="boardroom">Boardroom</button>
 <button class="navitem" data-view="backlog">Master Vision Backlog</button>
-<button class="navitem" data-view="needsAryan">Needs Aryan</button>
 <div class="navsec">Revenue Hunter</div>
 <button class="navitem" data-view="rhToday">Today</button>
 <button class="navitem" data-view="rhSalesManager">Sales Manager</button>
@@ -1862,6 +1864,7 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <button class="navitem" data-view="vsVentures">Ventures</button>
 <button class="navitem" data-view="vsRisks">Venture Risks</button>
 <button class="navitem" data-view="vsGraveyard">Venture Graveyard</button>
+<button type="button" class="theme-toggle" id="themeToggleBtn"></button>
 <div class="boundary">TTT HQ decides · Falguna executes<br>Local-only, no automatic merge or deploy</div>
 </aside>
 <main>
@@ -2245,12 +2248,12 @@ HQ_INDEX_HTML = r'''<!doctype html>
 <div class="list" id="rhSetSources"></div>
 <div class="actions"><button id="rhSetSave" type="button">Save acquisition profile</button></div>
 </div>
-</div>
 <div class="section">
 <h2>Re-qualify existing opportunities</h2>
 <div class="pageintro">Re-runs qualification for every non-terminal opportunity using the current acquisition profile and scoring logic -- e.g. after a relevance hardening pass. Never deletes history; a PURSUE downgrade supersedes its draft proposal and rejects any pending Needs Aryan item for it, an upgrade drafts a proposal exactly as a fresh discovery would.</div>
 <div class="actions"><button id="rhRequalifyAll" type="button">Requalify all</button></div>
 <div class="list" id="rhRequalifyResult"></div>
+</div>
 </div>
 <div class="view" id="view-wfTasks">
 <h1>Workforce Tasks</h1>
@@ -2511,11 +2514,34 @@ HQ_INDEX_HTML = r'''<!doctype html>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-async function api(url,options){const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}
+let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
 const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
+function currentHqThemeMode(){
+  try{const t=localStorage.getItem('ttthq-theme');if(t==='light'||t==='dark')return t}catch(e){}
+  return 'system';
+}
+function applyHqTheme(mode){
+  try{
+    if(mode==='system'){localStorage.removeItem('ttthq-theme');delete document.documentElement.dataset.theme}
+    else{localStorage.setItem('ttthq-theme',mode);document.documentElement.dataset.theme=mode}
+  }catch(e){
+    if(mode==='system')delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme=mode;
+  }
+  const labels={system:'System theme',light:'Light theme',dark:'Dark theme'};
+  const icons={system:'\u25D0',light:'\u2600',dark:'\u263D'};
+  const btn=$('themeToggleBtn');
+  if(btn)btn.textContent=icons[mode]+' '+labels[mode];
+}
+$('themeToggleBtn').onclick=()=>{
+  const order=['system','light','dark'];
+  const next=order[(order.indexOf(currentHqThemeMode())+1)%order.length];
+  applyHqTheme(next);
+};
+applyHqTheme(currentHqThemeMode());
+
 async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadCommandCenter(),loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
 async function loadCommandCenter(){
 const d=await api('/api/cc/snapshot');
@@ -2523,14 +2549,18 @@ $('ccWonRevenue').textContent='$'+d.revenue.won_revenue_lifetime;
 $('ccCashIn').textContent='$'+d.cash.cash_in_to_date;
 $('ccOutstanding').textContent='$'+d.receivables.outstanding_total;
 $('ccOverdue').textContent='$'+d.receivables.overdue_total;
+$('ccOverdue').classList.toggle('stat-bad',Number(d.receivables.overdue_total)>0);
 $('ccPipeline').textContent=d.pipeline.active_count;
 $('ccNegotiating').textContent=d.pipeline.negotiating_count;
 $('ccClients').textContent=d.clients.total;
 $('ccActiveJobs').textContent=d.delivery.active_jobs_total;
 $('ccNeedsAryan').textContent=d.needs_aryan.pending_count;
+$('ccNeedsAryan').classList.toggle('stat-warn',Number(d.needs_aryan.pending_count)>0);
 $('ccWfAttention').textContent=d.workforce.needs_attention_count;
+$('ccWfAttention').classList.toggle('stat-warn',Number(d.workforce.needs_attention_count)>0);
 $('ccMediaFailures').textContent=d.media.publishing_failures_count;
-$('ccRisks').innerHTML=(d.risk_signals||[]).length?d.risk_signals.map(r=>`<div class="item"><h3>${esc(r.summary)}</h3><div class="meta"><span>${esc(r.category)}</span><span>${esc(r.severity)}</span></div></div>`).join(''):'<div class="empty">No active risk signals.</div>';
+$('ccMediaFailures').classList.toggle('stat-bad',Number(d.media.publishing_failures_count)>0);
+$('ccRisks').innerHTML=(d.risk_signals||[]).length?d.risk_signals.map(r=>`<div class="item"><h3>${esc(r.summary)}</h3><div class="meta"><span>${esc(r.category)}</span><span class="stat-warn">${esc(r.severity)}</span></div></div>`).join(''):'<div class="empty stat-good">No active risk signals.</div>';
 $('ccUpcoming').innerHTML=(d.upcoming_obligations||[]).length?d.upcoming_obligations.map(o=>`<div class="item"><h3>${esc(o.kind)}</h3><div class="meta"><span>due ${esc(o.due_date||'')}</span></div></div>`).join(''):'<div class="empty">Nothing due soon.</div>';
 $('ccKeyOpps').innerHTML=(d.pipeline.key_opportunities||[]).length?d.pipeline.key_opportunities.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span><span>${esc(o.client_name||'')}</span></div></div>`).join(''):'<div class="empty">No active opportunities.</div>';
 try{const b=await api('/api/cc/ceo-brief/latest');if(!b.error){renderCeoBrief(b)}}catch(e){}

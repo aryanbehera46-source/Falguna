@@ -1815,6 +1815,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -2261,7 +2262,7 @@ INDEX_HTML = r'''<!doctype html>
   :root:not([data-theme="dark"]){
     color-scheme:light;
     --bg:#faf6ee;--bg-glow:#fff9ec;--side:#f4eedb;--panel:#ffffff;--soft:#f1e7d3;--soft2:#e9dabf;
-    --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#8c7c60;
+    --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#7c6c50;
     --accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;
     --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--bad-ink:#7a2415;--good:#1e7a43;
     --user-bg:#efe0c2;--user-ink:#241c10;--shadow:#0002;--shadow-lite:#0001;--scrim:#0004;
@@ -2270,7 +2271,7 @@ INDEX_HTML = r'''<!doctype html>
 :root[data-theme="light"]{
   color-scheme:light;
   --bg:#faf6ee;--bg-glow:#fff9ec;--side:#f4eedb;--panel:#ffffff;--soft:#f1e7d3;--soft2:#e9dabf;
-  --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#8c7c60;
+  --line:#ddceac;--text:#241c10;--muted:#6e5f45;--muted-dim:#7c6c50;
   --accent:#d98a2c;--accent-hi:#a8620f;--accent-ink:#2a1707;--accent-dim:#e3c896;--accent-soft:#f3e3c3;
   --warn:#8a5a00;--bad:#b23a24;--bad-dim:#f8ddd5;--bad-ink:#7a2415;--good:#1e7a43;
   --user-bg:#efe0c2;--user-ink:#241c10;--shadow:#0002;--shadow-lite:#0001;--scrim:#0004;
@@ -2312,7 +2313,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 
 /* ---------- shell ---------- */
 .workspace{min-width:0;min-height:0;display:grid;grid-template-rows:54px minmax(0,1fr);overflow:hidden}
-.topbar{border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 22px;background:linear-gradient(180deg,#1a1610,transparent)}
+.topbar{border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 22px;background:linear-gradient(180deg,var(--side),transparent)}
 .topbar-title{display:flex;align-items:center;gap:10px;min-width:0}
 .topbar-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650;font-size:14px;color:var(--text)}
 .menu-button{display:none;border:0;background:transparent;color:var(--text);padding:6px;border-radius:7px;cursor:pointer}
@@ -2558,8 +2559,8 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
 .mc-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;cursor:pointer;text-align:left;display:grid;gap:7px;min-width:0}
 .mc-card:hover{border-color:var(--accent-dim)}
 .mc-card.needs-you{border-color:var(--accent-dim);background:var(--accent-soft)}
-.mc-card .mc-title{font-weight:650;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mc-card .mc-meta{color:var(--muted-dim);font-size:11px;display:flex;flex-wrap:wrap;gap:6px 10px}
+.mc-card .mc-title{font-weight:650;font-size:13px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.35}
+.mc-card .mc-meta{color:var(--muted-dim);font-size:11px;display:flex;flex-wrap:wrap;gap:6px 10px}.mc-card.needs-you .mc-meta{color:var(--muted)}
 .mc-card .mc-step{color:var(--muted);font-size:12px}
 .mc-card .mc-controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
 .mc-card .mc-controls button{font-size:11px;padding:5px 9px}
@@ -2642,6 +2643,9 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
   .compose-foot{display:none}
   .work-header,.mission-form,.handoff-panel{padding:14px}
   .model-pill span.label{display:none}
+  .topbar{gap:8px}
+  .topbar-right{gap:6px}
+  .indicator-pill{display:none!important}
 }
 </style></head><body>
 <div class="app">
@@ -3934,7 +3938,7 @@ async function renderFilesView(tab){
     if(f.type==='upload')return `<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.content_type||'')} &middot; ${esc(formatBytes(f.size_bytes))} &middot; ${esc(timeAgo(f.created_at))}</div></div><div style="display:flex;gap:8px;flex:none">${f.conversation_id?`<a class="pill-btn" href="#/chat/${esc(f.conversation_id)}">Open chat</a>`:''}<a class="pill-btn" href="/api/attachments/${esc(f.id)}" download title="Download">${icon('download',12)}</a></div></div>`;
     if(f.type==='browser_evidence')return `<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.kind||'')} &middot; ${esc(f.mission_title||'')}${f.project_name?' &middot; '+esc(f.project_name):''} &middot; ${esc(timeAgo(f.created_at))}</div></div><a class="pill-btn" href="#/browser/${esc(f.browser_session_id)}">Open browser task</a></div>`;
     return `<div class="file-row"><div><div class="f-name">${esc(f.filename)}</div><div class="f-meta">${esc(f.kind||'')} &middot; ${esc(f.mission_title||'')} &middot; ${esc(timeAgo(f.created_at))}</div></div><a class="pill-btn" href="#/work/${esc(f.run_id)}">Open mission</a></div>`;
-  }).join(''):`<div class="empty-state">No ${filesTab==='generated'?'generated files':'uploads'} yet.</div>`;
+  }).join(''):`<div class="empty-state">${filesTab==='generated'?'No generated files yet. Artifacts a Work mission or browser task produces will show up here automatically.':'No uploads yet. Attach a file from Chat to see it here, ready to download or open in its conversation.'}</div>`;
 }
 
 /* ------------------------------------------------------------ History view */
