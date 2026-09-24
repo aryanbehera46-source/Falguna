@@ -14,6 +14,7 @@ mission does.
 import json
 from typing import Callable, List, Optional
 
+from .json_stream import IncrementalReplyExtractor
 from .providers import ErrorCategory, FalgunaModelError
 from .store import StateStore, utcnow
 
@@ -184,6 +185,23 @@ class ConversationStore:
         row = self.store.get("chat_messages", message_id)
         if row and row.get("status") == "PENDING":
             self.store.update("chat_messages", message_id, status="GENERATING")
+
+    def update_streaming_content(self, message_id: str, content: str) -> bool:
+        """Local AI Independence V1.1: persists the growing partial reply
+        text while generation is still in progress -- status stays
+        GENERATING; this never marks a message COMPLETED, so a client
+        that only reads status vs. content already behaves correctly.
+        This is what lets the client poll and render real, incremental
+        model output as it is actually produced -- never a client-side
+        simulated reveal. A no-op, exactly like complete_message/
+        fail_message, once the message has been cancelled (Stop
+        generation), so a still-running background stream can never
+        resurrect content the person already discarded."""
+        row = self.store.get("chat_messages", message_id)
+        if not row or row.get("status") not in ("PENDING", "GENERATING"):
+            return False
+        self.store.update("chat_messages", message_id, content=content, status="GENERATING")
+        return True
 
     def complete_message(self, message_id: str, content: str, model_call: Optional[dict],
                           suggested_objective: Optional[str] = None, memory_context: Optional[dict] = None) -> bool:
@@ -414,6 +432,90 @@ class ChatResponder:
                 "The model returned a response Falguna could not parse.",
                 category=ErrorCategory.TRANSPORT_FAILURE, technical_detail=str(message.get("content", ""))[:2000],
             ) from exc
+        return {
+            "reply": parsed["reply"],
+            "suggested_objective": parsed.get("suggested_objective"),
+            "model_call": _model_call(decoded, config),
+        }
+
+    def reply_stream(self, history: List[dict], on_reply_delta: Callable[[str], None],
+                      cancel_event=None, memory_context: Optional[str] = None,
+                      on_queue_acquired: Optional[Callable[[], None]] = None) -> dict:
+        """Local AI Independence V1.1: streaming counterpart to reply().
+        Same request, same schema, same final result shape and same
+        exception handling -- the only difference is on_reply_delta(text)
+        is called with newly-revealed, fully-decoded characters of the
+        "reply" field as they are extracted from the underlying model's
+        raw JSON-schema-constrained stream (falguna.json_stream.
+        IncrementalReplyExtractor), never raw JSON syntax and never a
+        client-side simulated reveal-by-character.
+
+        When self.transport has no real streaming support for the
+        resolved model (a bare Callable transport used directly in a
+        test, a ModelRouter whose resolved provider lacks
+        generate_stream, or a transport that streamed but for any reason
+        never actually revealed the "reply" value through on_delta),
+        on_reply_delta is instead called exactly once with the complete,
+        real reply text once it is known -- one true delta, never a
+        fabricated typewriter effect."""
+        config = dict(self.gateway.configuration())
+        config["model"] = self.model
+        messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+        if memory_context:
+            messages.append({"role": "system", "content": memory_context})
+        messages += [{"role": m["role"], "content": m["content"]} for m in history[-20:]]
+        payload = {
+            "model": config["model"],
+            "messages": messages,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "chat_reply", "strict": True, "schema": CHAT_REPLY_SCHEMA},
+            },
+        }
+        extractor = IncrementalReplyExtractor()
+
+        def _on_raw_delta(raw_delta: str) -> None:
+            revealed = extractor.feed(raw_delta)
+            if revealed:
+                on_reply_delta(revealed)
+
+        stream_fn = getattr(self.transport, "stream", None)
+        try:
+            if callable(stream_fn):
+                # Local AI Independence V1.1 Pass D: only ModelRouter.stream
+                # understands on_queue_acquired (a bare Callable transport,
+                # used directly in a few unit tests, has no queue at all --
+                # it is called and returns synchronously, so there is
+                # nothing to wait on and nothing to report).
+                decoded = stream_fn(config, payload, self.timeout_seconds, _on_raw_delta, cancel_event, on_queue_acquired=on_queue_acquired)
+            else:
+                if on_queue_acquired is not None:
+                    on_queue_acquired()
+                decoded = self.transport(config, payload, self.timeout_seconds)
+        except FalgunaModelError as exc:
+            raise ChatError(exc.message, category=exc.category, technical_detail=exc.technical_detail) from exc
+        except Exception as exc:
+            raise ChatError(
+                "Falguna couldn't reach the model provider for this reply.",
+                category=ErrorCategory.TRANSPORT_FAILURE, technical_detail=str(exc),
+            ) from exc
+        message = decoded["choices"][0]["message"]
+        if message.get("refusal"):
+            raise ChatError("The model declined to respond to this message.", category=ErrorCategory.TRANSPORT_FAILURE)
+        try:
+            parsed = json.loads(message["content"])
+        except json.JSONDecodeError as exc:
+            raise ChatError(
+                "The model returned a response Falguna could not parse.",
+                category=ErrorCategory.TRANSPORT_FAILURE, technical_detail=str(message.get("content", ""))[:2000],
+            ) from exc
+        if not extractor.done:
+            # Real incremental streaming never actually delivered the
+            # "reply" value (no streaming support on this path, or the
+            # stream ended before the extractor's state machine closed
+            # out) -- self-heal with a single, complete, true delta rather
+            # than leaving the UI with nothing but a final full re-render.
+            on_reply_delta(parsed["reply"])
         return {
             "reply": parsed["reply"],
             "suggested_objective": parsed.get("suggested_objective"),

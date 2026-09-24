@@ -154,6 +154,13 @@ class ModelInfo:
     supports_vision: bool = False
     context_window: Optional[int] = None
     notes: str = ""
+    # Local AI Independence V1.1: true only when the provider's live
+    # metadata positively reports this model as embedding-only (e.g.
+    # Ollama's own /api/tags "capabilities": ["embedding"] with no
+    # "completion") -- never guessed from the model name. A model this is
+    # true for cannot serve a Chat/Work/Research generation request; see
+    # OllamaProvider.list_models() and ModelRouter._embedding_only_model.
+    is_embedding_only: bool = False
 
 
 @dataclass
@@ -283,6 +290,13 @@ class CodexProvider(ModelProvider):
 
 # --------------------------------------------------------------------- Ollama
 
+class _StreamCancelled(Exception):
+    """Internal-only signal used by OllamaProvider.generate_stream to unwind
+    out of a streaming read loop the instant a cancel_event is set -- never
+    raised across the generate_stream() call boundary itself (it is always
+    caught and converted into a sanitized FalgunaModelError there)."""
+
+
 class OllamaProvider(ModelProvider):
     """First-class local provider. Talks to an already-running Ollama
     daemon over plain HTTP (stdlib urllib only -- no new dependency).
@@ -323,10 +337,27 @@ class OllamaProvider(ModelProvider):
             model_id = entry.get("model") or entry.get("name")
             if not model_id:
                 continue
+            # Ollama's /api/tags reports each model's real capabilities
+            # (e.g. ["completion", "tools"] for a chat-capable model,
+            # ["embedding"] for an embedding-only model such as
+            # nomic-embed-text) -- this is live, provider-reported ground
+            # truth, never guessed from the model's name. Only a model that
+            # positively reports "embedding" without "completion" is
+            # treated as embedding-only; an older Ollama build that reports
+            # no capabilities array at all is never blocked (no evidence,
+            # no block -- Falguna never guesses a model out of Chat).
+            capabilities = entry.get("capabilities") or []
+            is_embedding_only = bool(capabilities) and "embedding" in capabilities and "completion" not in capabilities
             out.append(ModelInfo(
                 provider_id=self.provider_id, model_id=model_id, display_name=entry.get("name", model_id),
-                is_local=True, supports_json_schema=True,
-                notes="Already pulled locally -- Falguna never downloads a model without explicit approval.",
+                is_local=True, supports_json_schema=True, supports_streaming=not is_embedding_only,
+                is_embedding_only=is_embedding_only,
+                notes=(
+                    "Embedding-only model -- powers local semantic memory/knowledge search; "
+                    "not available for Chat, Research, or Work generation."
+                    if is_embedding_only else
+                    "Already pulled locally -- Falguna never downloads a model without explicit approval."
+                ),
             ))
         return out
 
@@ -410,6 +441,142 @@ class OllamaProvider(ModelProvider):
             "_falguna_metadata": {
                 "adapter": "ollama-local", "billing": "local-compute-no-cash-cost",
                 "cost_basis": "local-zero-marginal-cost", "routed_model": model_id,
+            },
+        }
+
+    def generate_stream(self, model_id: str, payload: dict, timeout_seconds: int, on_delta, cancel_event=None) -> dict:
+        """Falguna Local AI Independence V1.1: real, incremental token
+        streaming from this local Ollama daemon. Reads Ollama's own NDJSON
+        stream over the wire (one JSON object per line, each carrying only
+        the INCREMENTAL delta of message.content -- verified directly
+        against a live local daemon, never assumed) and calls
+        on_delta(text) for every non-empty delta the instant it actually
+        arrives -- never a client-side simulated reveal-by-character.
+
+        cancel_event (a threading.Event, optional) is checked between
+        every line read; when set, the in-flight connection to Ollama is
+        closed immediately (raising a sanitized FalgunaModelError so the
+        caller's normal cancellation handling applies) -- closing the
+        socket causes Ollama's own server to detect the client disconnect
+        and abort the underlying generation, a real cancellation of the
+        model call itself, not merely "stop reading the response".
+
+        Returns the exact same result shape generate() does, built from
+        the fully accumulated stream, so cost/usage accounting and the
+        final JSON parse behave identically to the non-streaming path.
+        """
+        schema = payload["response_format"]["json_schema"]["schema"]
+        body = {"model": model_id, "messages": payload["messages"], "stream": True, "format": schema}
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/api/chat", data=data, method="POST", headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout_seconds)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:2000] if hasattr(exc, "read") else str(exc)
+            if exc.code == 404:
+                raise FalgunaModelError(
+                    ErrorCategory.MODEL_UNSUPPORTED, f"Model '{model_id}' is not pulled in the local Ollama runtime.",
+                    technical_detail=detail, provider_id=self.provider_id,
+                ) from exc
+            if exc.code == 429:
+                raise FalgunaModelError(
+                    ErrorCategory.RATE_LIMITED, "The local Ollama runtime is busy handling another request.",
+                    technical_detail=detail, provider_id=self.provider_id,
+                ) from exc
+            raise FalgunaModelError(
+                ErrorCategory.TRANSPORT_FAILURE, "The local Ollama runtime returned an error.",
+                technical_detail=detail, provider_id=self.provider_id,
+            ) from exc
+        except (socket.timeout, TimeoutError) as exc:
+            raise FalgunaModelError(
+                ErrorCategory.TIMEOUT, "The local Ollama runtime did not respond in time.",
+                technical_detail=str(exc), provider_id=self.provider_id,
+            ) from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (socket.timeout, TimeoutError)):
+                raise FalgunaModelError(
+                    ErrorCategory.TIMEOUT, "The local Ollama runtime did not respond in time.",
+                    technical_detail=str(exc), provider_id=self.provider_id,
+                ) from exc
+            raise FalgunaModelError(
+                ErrorCategory.PROVIDER_OFFLINE, "No local Ollama runtime is reachable.",
+                technical_detail=str(exc), provider_id=self.provider_id,
+            ) from exc
+        except OSError as exc:
+            raise FalgunaModelError(
+                ErrorCategory.PROVIDER_OFFLINE, "No local Ollama runtime is reachable.",
+                technical_detail=str(exc), provider_id=self.provider_id,
+            ) from exc
+
+        accumulated = []
+        final_chunk = None
+        try:
+            try:
+                with resp:
+                    for raw_line in resp:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise _StreamCancelled()
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue  # a malformed/partial line is skipped, never crashes the stream
+                        delta = (chunk.get("message") or {}).get("content") or ""
+                        if delta:
+                            accumulated.append(delta)
+                            try:
+                                on_delta(delta)
+                            except Exception:
+                                pass  # a UI-side callback failure must never abort real generation
+                        if chunk.get("done"):
+                            final_chunk = chunk
+                            break
+            except _StreamCancelled:
+                raise FalgunaModelError(
+                    ErrorCategory.TRANSPORT_FAILURE, "Generation was stopped.", provider_id=self.provider_id,
+                )
+        except (socket.timeout, TimeoutError) as exc:
+            raise FalgunaModelError(
+                ErrorCategory.TIMEOUT, "The local Ollama runtime did not respond in time.",
+                technical_detail=str(exc), provider_id=self.provider_id,
+            ) from exc
+        except OSError as exc:
+            raise FalgunaModelError(
+                ErrorCategory.PROVIDER_OFFLINE, "The local Ollama runtime connection was interrupted.",
+                technical_detail=str(exc), provider_id=self.provider_id,
+            ) from exc
+
+        content = "".join(accumulated)
+        if not content:
+            raise FalgunaModelError(
+                ErrorCategory.TRANSPORT_FAILURE, "The local model returned an empty response.",
+                technical_detail=json.dumps(final_chunk or {})[:2000], provider_id=self.provider_id,
+            )
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise FalgunaModelError(
+                ErrorCategory.TRANSPORT_FAILURE, "The local model's response could not be parsed as the requested format.",
+                technical_detail=content[:2000], provider_id=self.provider_id,
+            ) from exc
+        final_chunk = final_chunk or {}
+        usage = {
+            "prompt_tokens": int(final_chunk.get("prompt_eval_count", 0) or 0),
+            "completion_tokens": int(final_chunk.get("eval_count", 0) or 0),
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+        return {
+            "choices": [{"message": {"content": content}}],
+            "usage": usage,
+            "_falguna_provider": "ollama-local",
+            "_falguna_cost_usd": 0.0,
+            "_falguna_metadata": {
+                "adapter": "ollama-local", "billing": "local-compute-no-cash-cost",
+                "cost_basis": "local-zero-marginal-cost", "routed_model": model_id, "streamed": True,
             },
         }
 

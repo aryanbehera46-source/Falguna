@@ -24,12 +24,13 @@ network call -- this is what the Local-Only privacy test in
 tests/test_model_router.py verifies.
 """
 import json
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .providers import (
     CodexProvider, ErrorCategory, FalgunaModelError, GenericOpenAICompatibleProvider,
     HealthState, ModelProvider, OllamaProvider, ROUTABLE_HEALTH_STATES,
 )
+from .scheduler import QueueCancelled, QueueTimeout, get_scheduler
 from .store import StateStore, utcnow
 
 
@@ -41,6 +42,12 @@ REGISTRY_SETTINGS_KEY = "model_registry"
 DEFAULT_REGISTRY_SETTINGS = {
     "privacy_mode": DEFAULT_PRIVACY_MODE,
     "preferred_local_model": None,  # e.g. "ollama/llama3.2:3b"
+    # Local AI Independence V1.1 Pass D: a conservative, configurable cap
+    # on how many heavyweight LOCAL generations (Chat/Research/Work) may
+    # run at once on this machine -- see falguna/scheduler.py. Starts at
+    # 1 (one heavyweight local generation at a time) until real benchmark
+    # evidence on the target hardware supports raising it.
+    "local_inference": {"max_concurrent": 1, "queue_timeout_seconds": 300},
     "providers": {
         "ollama": {"enabled": True, "base_url": "http://127.0.0.1:11434"},
         "codex": {"enabled": True},
@@ -69,6 +76,15 @@ def parse_selector(selector: Optional[str]):
     if selector in SUPPORTED_CODEX_MODELS:
         return "codex", selector
     return None, selector
+
+
+def _chat_capable(models: List) -> List:
+    """Generation-capable models only -- excludes an embedding-only model
+    (ModelInfo.is_embedding_only, set from a provider's real reported
+    capabilities; see OllamaProvider.list_models) from every path that
+    picks a model automatically. Memory & Knowledge V2's embedding calls
+    go straight to the provider and never pass through this filter."""
+    return [m for m in models if not getattr(m, "is_embedding_only", False)]
 
 
 class ModelRegistry:
@@ -100,6 +116,10 @@ class ModelRegistry:
         if merged["privacy_mode"] not in PRIVACY_MODES:
             merged["privacy_mode"] = DEFAULT_PRIVACY_MODE
         merged["preferred_local_model"] = saved.get("preferred_local_model", merged["preferred_local_model"])
+        saved_local_inference = saved.get("local_inference") or {}
+        for key in ("max_concurrent", "queue_timeout_seconds"):
+            if key in saved_local_inference:
+                merged["local_inference"][key] = saved_local_inference[key]
         for provider_id, defaults in merged["providers"].items():
             saved_provider = (saved.get("providers") or {}).get(provider_id) or {}
             defaults.update({k: v for k, v in saved_provider.items() if k in defaults})
@@ -133,6 +153,7 @@ class ModelRegistry:
             "privacy_mode": settings["privacy_mode"],
             "preferred_local_model": settings["preferred_local_model"],
             "providers": settings["providers"],
+            "local_inference": settings["local_inference"],
         }
 
 
@@ -183,6 +204,16 @@ class ModelRouter:
     @classmethod
     def from_registry(cls, registry: ModelRegistry, codex_use_fallback: bool = True) -> "ModelRouter":
         settings = registry.load()
+        # Local AI Independence V1.1 Pass D: every ModelRouter built from a
+        # persisted registry re-applies that registry's local_inference
+        # settings to the process-global scheduler, so a saved change to
+        # max_concurrent/queue_timeout_seconds takes effect on the very
+        # next request without a restart.
+        local_inference = settings.get("local_inference") or {}
+        get_scheduler().configure(
+            max_concurrent=local_inference.get("max_concurrent"),
+            queue_timeout_seconds=local_inference.get("queue_timeout_seconds"),
+        )
         return cls(
             providers=build_providers(settings, codex_use_fallback=codex_use_fallback),
             privacy_mode=settings["privacy_mode"],
@@ -193,6 +224,19 @@ class ModelRouter:
         if self.privacy_mode == "LOCAL_ONLY":
             return [p for p in self.providers.values() if p.is_local]
         return list(self.providers.values())
+
+    @staticmethod
+    def _embedding_only_model(provider: ModelProvider, model_id: str) -> bool:
+        """True only when the provider's own live model list positively
+        reports this exact model_id as embedding-only. A model_id the
+        provider doesn't currently list (e.g. a stale conversation history
+        selector) is never blocked here -- resolve() still tries to route
+        it and lets the provider itself report MODEL_UNSUPPORTED/offline
+        if it truly can't serve it. No evidence never means a block."""
+        for info in provider.list_models():
+            if info.model_id == model_id:
+                return bool(getattr(info, "is_embedding_only", False))
+        return False
 
     def resolve(self, requested_selector: Optional[str]):
         """Returns (provider, model_id) or raises
@@ -211,6 +255,18 @@ class ModelRouter:
                 )
             provider = self.providers.get(provider_id)
             if provider and model_id:
+                # Local AI Independence V1.1: an explicit request for an
+                # embedding-only model (a forged/stale request, or a
+                # conversation still pinned to one from before this check
+                # existed) is rejected with a clean, sanitized error here --
+                # never silently routed to a model that cannot actually
+                # answer a chat/research/work generation request.
+                if self._embedding_only_model(provider, model_id):
+                    raise FalgunaModelError(
+                        ErrorCategory.MODEL_UNSUPPORTED,
+                        f"'{model_id}' is an embedding-only model -- it powers local semantic search, not chat, research, or work generation.",
+                        provider_id=provider_id,
+                    )
                 health = provider.health_check()
                 if health.state in ROUTABLE_HEALTH_STATES:
                     return provider, model_id
@@ -221,10 +277,17 @@ class ModelRouter:
             preferred_provider_id, preferred_model_id = parse_selector(self.preferred_local_selector)
             provider = self.providers.get(preferred_provider_id)
             if provider and provider.is_local and provider.provider_id in visible_ids:
-                health = provider.health_check()
-                if health.state in ROUTABLE_HEALTH_STATES:
-                    return provider, preferred_model_id
-                errors.append(f"{preferred_provider_id} (preferred local): {health.state} -- {health.detail}")
+                if self._embedding_only_model(provider, preferred_model_id):
+                    # A misconfigured preferred-local default never hard-
+                    # fails the whole request -- fall through to the
+                    # other-local/external routing below, same as if this
+                    # provider were simply unreachable.
+                    errors.append(f"{preferred_provider_id} (preferred local): '{preferred_model_id}' is embedding-only, skipping")
+                else:
+                    health = provider.health_check()
+                    if health.state in ROUTABLE_HEALTH_STATES:
+                        return provider, preferred_model_id
+                    errors.append(f"{preferred_provider_id} (preferred local): {health.state} -- {health.detail}")
 
         for provider in visible:
             if not provider.is_local or provider.provider_id == preferred_provider_id:
@@ -233,10 +296,10 @@ class ModelRouter:
             if health.state not in ROUTABLE_HEALTH_STATES:
                 errors.append(f"{provider.provider_id}: {health.state} -- {health.detail}")
                 continue
-            models = provider.list_models()
+            models = _chat_capable(provider.list_models())
             if models:
                 return provider, models[0].model_id
-            errors.append(f"{provider.provider_id}: no local model available yet")
+            errors.append(f"{provider.provider_id}: no local chat-capable model available yet")
 
         if self.privacy_mode != "LOCAL_ONLY":
             for provider in visible:
@@ -246,10 +309,10 @@ class ModelRouter:
                 if health.state not in ROUTABLE_HEALTH_STATES:
                     errors.append(f"{provider.provider_id}: {health.state} -- {health.detail}")
                     continue
-                models = provider.list_models()
+                models = _chat_capable(provider.list_models())
                 if models:
                     return provider, models[0].model_id
-                errors.append(f"{provider.provider_id}: no allow-listed model available")
+                errors.append(f"{provider.provider_id}: no allow-listed chat-capable model available")
 
         reason = (
             "Privacy Mode is Local Only and no local model runtime is reachable."
@@ -258,10 +321,98 @@ class ModelRouter:
         )
         raise FalgunaModelError(ErrorCategory.NO_COMPATIBLE_MODEL, reason, technical_detail=" | ".join(errors))
 
-    def __call__(self, config: dict, payload: dict, timeout_seconds: int) -> dict:
+    def __call__(self, config: dict, payload: dict, timeout_seconds: int, cancel_event=None) -> dict:
         requested = config.get("model")
         provider, model_id = self.resolve(requested)
-        result = provider.generate(model_id, payload, timeout_seconds)
+        if provider.is_local:
+            # Local AI Independence V1.1 Pass D: only a LOCAL provider call
+            # shares this machine's finite CPU/RAM, so only it waits for a
+            # scheduler slot -- an external provider call is never gated
+            # here (see falguna/scheduler.py's module docstring).
+            try:
+                with get_scheduler().acquire(cancel_event=cancel_event):
+                    result = provider.generate(model_id, payload, timeout_seconds)
+            except QueueCancelled as exc:
+                raise FalgunaModelError(ErrorCategory.TRANSPORT_FAILURE, "Generation was stopped.", provider_id=provider.provider_id) from exc
+            except QueueTimeout as exc:
+                raise FalgunaModelError(ErrorCategory.RATE_LIMITED, "Too many local generations are already running on this machine; please try again in a moment.", provider_id=provider.provider_id) from exc
+        else:
+            result = provider.generate(model_id, payload, timeout_seconds)
+        result.setdefault("_falguna_metadata", {})
+        result["_falguna_metadata"].setdefault("requested_model", requested)
+        result["_falguna_metadata"]["routed_provider"] = provider.provider_id
+        result["_falguna_metadata"]["routed_model"] = model_id
+        result["_falguna_metadata"]["privacy_mode"] = self.privacy_mode
+        return result
+
+    def supports_streaming(self, requested_selector: Optional[str]) -> bool:
+        """True only when resolve() would currently route this selector to
+        a provider that can actually stream (duck-typed: has
+        generate_stream) -- never guessed, never assumed from is_local
+        alone (a future local provider without streaming support must
+        stay on the non-streaming path). A selector that would not
+        resolve at all reports False rather than raising, since this is
+        only ever used to decide which code path to take, not to route."""
+        try:
+            provider, _ = self.resolve(requested_selector)
+        except FalgunaModelError:
+            return False
+        return hasattr(provider, "generate_stream")
+
+    def stream(self, config: dict, payload: dict, timeout_seconds: int,
+               on_delta: Callable[[str], None], cancel_event=None,
+               on_queue_acquired: Optional[Callable[[], None]] = None) -> dict:
+        """Local AI Independence V1.1: streaming counterpart to __call__.
+        Resolves a model exactly as __call__ does (identical policy,
+        identical embedding-only/privacy-mode enforcement), then, when the
+        resolved provider actually supports streaming (duck-typed --
+        currently only OllamaProvider), calls its generate_stream() so
+        on_delta(text) fires for every real incremental chunk as it
+        arrives. When the resolved provider has no streaming support
+        (Codex, a generic OpenAI-compatible endpoint), this transparently
+        falls back to a single, non-streaming generate() call and -- once
+        the full reply is known -- still calls on_delta() exactly once
+        with the complete text, so a caller only ever has to implement one
+        rendering path; it is simply not incremental for that provider.
+        Never a fabricated per-character reveal on the non-streaming path
+        -- one real, complete delta, not a simulated typewriter effect.
+
+        Pass D: exactly like __call__, a LOCAL provider's turn only ever
+        runs while holding a slot from the shared scheduler -- a caller
+        stuck waiting in the queue can still be cancelled (cancel_event)
+        or time out (QueueTimeout) before ever reaching the real model
+        call. `on_queue_acquired`, if given, fires the instant the slot is
+        actually granted, so a caller (e.g. web.py's operation-state
+        tracking) can honestly show QUEUED only for as long as this
+        request is genuinely waiting on the local machine's capacity."""
+        requested = config.get("model")
+        provider, model_id = self.resolve(requested)
+
+        def _do_generate():
+            if hasattr(provider, "generate_stream"):
+                return provider.generate_stream(model_id, payload, timeout_seconds, on_delta, cancel_event)
+            # This provider has no streaming support at all -- a single,
+            # ordinary generate() call, exactly like __call__ above. This
+            # router layer deliberately does not attempt to parse the
+            # JSON-schema-constrained content and synthesize a fallback
+            # delta itself (that parsing is Chat/Research-specific, not
+            # something every caller of this generic transport shares) --
+            # falguna.chat.ChatResponder.reply_stream is what delivers a
+            # single, complete, non-incremental delta in this case.
+            return provider.generate(model_id, payload, timeout_seconds)
+
+        if provider.is_local:
+            try:
+                with get_scheduler().acquire(cancel_event=cancel_event, on_acquired=on_queue_acquired):
+                    result = _do_generate()
+            except QueueCancelled as exc:
+                raise FalgunaModelError(ErrorCategory.TRANSPORT_FAILURE, "Generation was stopped.", provider_id=provider.provider_id) from exc
+            except QueueTimeout as exc:
+                raise FalgunaModelError(ErrorCategory.RATE_LIMITED, "Too many local generations are already running on this machine; please try again in a moment.", provider_id=provider.provider_id) from exc
+        else:
+            if on_queue_acquired is not None:
+                on_queue_acquired()
+            result = _do_generate()
         result.setdefault("_falguna_metadata", {})
         result["_falguna_metadata"].setdefault("requested_model", requested)
         result["_falguna_metadata"]["routed_provider"] = provider.provider_id
@@ -284,7 +435,16 @@ def provider_status_snapshot(providers: List[ModelProvider]) -> List[Dict]:
             "is_local": provider.is_local,
             "health": health.to_dict(),
             "models": [
-                {"model_id": m.model_id, "display_name": m.display_name, "is_local": m.is_local, "notes": m.notes}
+                {
+                    "model_id": m.model_id, "display_name": m.display_name, "is_local": m.is_local, "notes": m.notes,
+                    # Local AI Independence V1.1: real capability metadata
+                    # (from the provider's own reporting, e.g. Ollama's
+                    # /api/tags "capabilities") so Settings -> Models can
+                    # honestly show which models can answer a chat/research/
+                    # work request and which are embedding-only.
+                    "is_embedding_only": bool(getattr(m, "is_embedding_only", False)),
+                    "supports_streaming": bool(getattr(m, "supports_streaming", False)),
+                }
                 for m in models
             ],
         })

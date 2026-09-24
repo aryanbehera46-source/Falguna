@@ -33,6 +33,7 @@ from falguna.chat import ChatError, ChatResponder
 from falguna.gateway import OpenAICompatibleGateway
 from falguna.model_router import (
     DEFAULT_REGISTRY_SETTINGS, ModelRegistry, ModelRouter, PRIVACY_MODES, build_providers, parse_selector,
+    provider_status_snapshot,
 )
 from falguna.providers import (
     CodexProvider, ErrorCategory, FalgunaModelError, GenericOpenAICompatibleProvider, HealthState,
@@ -126,6 +127,147 @@ class ProviderInterfaceTests(unittest.TestCase):
             model_allowlist=["some-model"],
         )
         self.assertEqual(provider.provider_id, "custom")  # constructed without raising / blocking
+
+
+# --------------------------------------------------------------------- model capability filtering (V1.1)
+
+class OllamaCapabilityParsingTests(unittest.TestCase):
+    """OllamaProvider.list_models() must derive is_embedding_only from
+    Ollama's own real, live /api/tags "capabilities" field -- never from
+    guessing at the model's name. These tests monkeypatch only the
+    provider's internal `_get` (the one seam that would otherwise make a
+    real HTTP call) so the capability-parsing logic itself is exercised
+    for real, without depending on a live Ollama daemon being present in
+    every test environment."""
+
+    def _provider_with_tags_response(self, models):
+        provider = OllamaProvider(base_url="http://127.0.0.1:1")
+        provider._get = lambda path, timeout: (200, {"models": models})
+        return provider
+
+    def test_a_completion_capable_model_is_never_marked_embedding_only(self):
+        provider = self._provider_with_tags_response([
+            {"model": "qwen2.5:1.5b-instruct", "name": "qwen2.5:1.5b-instruct", "capabilities": ["completion", "tools"]},
+        ])
+        models = provider.list_models()
+        self.assertEqual(len(models), 1)
+        self.assertFalse(models[0].is_embedding_only)
+        self.assertTrue(models[0].supports_streaming)
+
+    def test_an_embedding_only_model_is_marked_and_excluded_from_streaming(self):
+        provider = self._provider_with_tags_response([
+            {"model": "nomic-embed-text:latest", "name": "nomic-embed-text:latest", "capabilities": ["embedding"]},
+        ])
+        models = provider.list_models()
+        self.assertEqual(len(models), 1)
+        self.assertTrue(models[0].is_embedding_only)
+        self.assertFalse(models[0].supports_streaming)
+        self.assertIn("not available for Chat", models[0].notes)
+
+    def test_a_model_reporting_both_completion_and_embedding_capabilities_is_not_embedding_only(self):
+        # A model that CAN also serve generation requests must never be
+        # blocked just because it additionally reports "embedding" --
+        # is_embedding_only means embedding-ONLY (no "completion" at all).
+        provider = self._provider_with_tags_response([
+            {"model": "hypothetical-dual", "name": "hypothetical-dual", "capabilities": ["completion", "embedding"]},
+        ])
+        models = provider.list_models()
+        self.assertFalse(models[0].is_embedding_only)
+
+    def test_a_model_with_no_capabilities_array_at_all_is_conservatively_not_blocked(self):
+        # An older Ollama build (or a future response shape) that omits
+        # "capabilities" entirely must never cause a false-positive block --
+        # no evidence of embedding-only means it is treated as chat-capable.
+        provider = self._provider_with_tags_response([
+            {"model": "some-model", "name": "some-model"},
+        ])
+        models = provider.list_models()
+        self.assertFalse(models[0].is_embedding_only)
+
+    def test_a_mixed_response_reports_each_model_independently(self):
+        provider = self._provider_with_tags_response([
+            {"model": "qwen2.5:1.5b-instruct", "name": "qwen2.5:1.5b-instruct", "capabilities": ["completion", "tools"]},
+            {"model": "nomic-embed-text:latest", "name": "nomic-embed-text:latest", "capabilities": ["embedding"]},
+        ])
+        by_id = {m.model_id: m for m in provider.list_models()}
+        self.assertFalse(by_id["qwen2.5:1.5b-instruct"].is_embedding_only)
+        self.assertTrue(by_id["nomic-embed-text:latest"].is_embedding_only)
+
+
+class ModelRouterCapabilityRoutingTests(unittest.TestCase):
+    """ModelRouter must never route a Chat/Research/Work generation
+    request to an embedding-only model, whether requested explicitly or
+    picked automatically during Auto routing."""
+
+    def test_resolve_rejects_an_explicit_selector_naming_an_embedding_only_model(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "nomic-embed-text", "nomic-embed-text", True, is_embedding_only=True),
+            ModelInfo("ollama", "qwen2.5:1.5b-instruct", "qwen2.5:1.5b-instruct", True, is_embedding_only=False),
+        ])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        with self.assertRaises(FalgunaModelError) as ctx:
+            router.resolve("ollama/nomic-embed-text")
+        self.assertEqual(ctx.exception.category, ErrorCategory.MODEL_UNSUPPORTED)
+        self.assertIn("embedding-only", ctx.exception.message)
+
+    def test_resolve_still_honors_an_explicit_selector_for_a_chat_capable_model(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "nomic-embed-text", "nomic-embed-text", True, is_embedding_only=True),
+            ModelInfo("ollama", "qwen2.5:1.5b-instruct", "qwen2.5:1.5b-instruct", True, is_embedding_only=False),
+        ])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        chosen_provider, model_id = router.resolve("ollama/qwen2.5:1.5b-instruct")
+        self.assertIs(chosen_provider, provider)
+        self.assertEqual(model_id, "qwen2.5:1.5b-instruct")
+
+    def test_auto_routing_skips_an_embedding_only_model_and_picks_a_chat_capable_one(self):
+        # A provider whose ONLY locally-pulled model is embedding-only must
+        # never be auto-selected -- Auto routing should fall through to
+        # NO_COMPATIBLE_MODEL rather than silently handing a chat request
+        # to a model that cannot answer it.
+        embedding_only_provider = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "nomic-embed-text", "nomic-embed-text", True, is_embedding_only=True),
+        ])
+        router = ModelRouter([embedding_only_provider], privacy_mode="LOCAL_ONLY")
+        with self.assertRaises(FalgunaModelError) as ctx:
+            router.resolve(None)
+        self.assertEqual(ctx.exception.category, ErrorCategory.NO_COMPATIBLE_MODEL)
+
+    def test_auto_routing_picks_the_chat_capable_model_over_an_embedding_only_one_on_the_same_provider(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "nomic-embed-text", "nomic-embed-text", True, is_embedding_only=True),
+            ModelInfo("ollama", "qwen2.5:1.5b-instruct", "qwen2.5:1.5b-instruct", True, is_embedding_only=False),
+        ])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        chosen_provider, model_id = router.resolve(None)
+        self.assertIs(chosen_provider, provider)
+        self.assertEqual(model_id, "qwen2.5:1.5b-instruct")
+
+    def test_a_misconfigured_preferred_local_embedding_model_falls_through_rather_than_hard_failing(self):
+        embedding_default = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "nomic-embed-text", "nomic-embed-text", True, is_embedding_only=True),
+        ])
+        other_local = _FakeProvider("llamacpp", is_local=True, models=[
+            ModelInfo("llamacpp", "some-chat-model", "Some Chat Model", True, is_embedding_only=False),
+        ])
+        router = ModelRouter(
+            [embedding_default, other_local], privacy_mode="HYBRID",
+            preferred_local_selector="ollama/nomic-embed-text",
+        )
+        chosen_provider, model_id = router.resolve(None)
+        self.assertIs(chosen_provider, other_local)
+        self.assertEqual(model_id, "some-chat-model")
+
+    def test_provider_status_snapshot_reports_capability_flags_for_settings(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "nomic-embed-text", "nomic-embed-text", True, is_embedding_only=True, supports_streaming=False),
+            ModelInfo("ollama", "qwen2.5:1.5b-instruct", "qwen2.5:1.5b-instruct", True, is_embedding_only=False, supports_streaming=True),
+        ])
+        snapshot = provider_status_snapshot([provider])
+        by_id = {m["model_id"]: m for m in snapshot[0]["models"]}
+        self.assertTrue(by_id["nomic-embed-text"]["is_embedding_only"])
+        self.assertFalse(by_id["qwen2.5:1.5b-instruct"]["is_embedding_only"])
+        self.assertTrue(by_id["qwen2.5:1.5b-instruct"]["supports_streaming"])
 
 
 # --------------------------------------------------------------------- routing policy tests

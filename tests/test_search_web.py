@@ -388,27 +388,50 @@ class SearchHttpLayerTests(_LiveFalgunaServerCase):
         self.assertEqual(out["sources"], [])
 
     def test_research_with_sources_but_no_authenticated_codex_degrades_to_failed_not_a_crash(self):
-        # This environment has no authenticated `codex` executable and no
-        # local Ollama runtime, exactly like Chat's equivalent test. A
+        # This environment has no authenticated `codex` executable. A
         # provider that finds sources but every configured model provider
         # is unavailable must still return 201 with a FAILED record and a
         # clear, sanitized error -- never a 500, never a fabricated answer.
-        # Falguna V2.1: the message comes from falguna.model_router's honest
-        # NO_COMPATIBLE_MODEL reporting rather than a raw "MODEL_UNAVAILABLE:
-        # <exception>" string that could embed raw Codex CLI stdout/stderr.
+        # Falguna V2.1 / Local AI Independence V1: the message comes from
+        # falguna.model_router's honest reporting rather than a raw
+        # "MODEL_UNAVAILABLE: <exception>" string that could embed raw
+        # Codex CLI stdout/stderr. Whether this lands as NO_COMPATIBLE_MODEL
+        # (truly no provider to try) or a real local runtime being attempted
+        # and itself failing legitimately depends on whether this machine
+        # happens to have a local Ollama runtime running, which this test
+        # suite does not control -- so this asserts the structural,
+        # environment-independent contract (a real, sanitized error) rather
+        # than one specific message's wording.
         fake_provider = CallableSearchProvider(lambda q, n: [{"url": "https://real.example.com/page", "title": "A real page"}], name="fake")
         with unittest.mock.patch.object(web, "SEARCH_PROVIDER", fake_provider):
             status, out = self._post("/api/research", {"query": "a query with one real source"})
         self.assertEqual(status, 201)
-        self.assertEqual(out["research"]["status"], "FAILED")
-        self.assertIn("provider", out["research"]["error"].lower())
-        self.assertNotIn("Traceback", out["research"]["error"])
-        self.assertNotIn("stdout=", out["research"]["error"])
-        # save_failure never calls save_result, so no source rows are ever
-        # written on a synthesis failure -- a failed research record cites
-        # nothing, rather than half-persisting sources for an answer that
-        # was never produced.
-        self.assertEqual(out["sources"], [])
+        # Local AI Independence V1.1: this test's name predates Local AI
+        # Independence. On a machine with a real, working local Ollama
+        # runtime and a chat-capable model pulled (the common case on
+        # Aryan's own Mac, and the whole point of this phase), routing
+        # legitimately reaches it and produces a real DONE answer with no
+        # Codex involved at all -- that is success, not a degradation,
+        # and must not be asserted away. On a machine with no reachable
+        # provider at all, the honest outcome is still a sanitized FAILED
+        # record with a safe error (never raw Codex CLI stdout/stderr,
+        # never a Python traceback, never a fabricated answer). Both are
+        # real, live outcomes of the same state machine; which one occurs
+        # depends on whether *this* machine has a working local runtime,
+        # which this test suite does not control.
+        if out["research"]["status"] == "DONE":
+            self.assertTrue(out["research"]["answer"])
+            self.assertNotIn("Traceback", out["research"]["answer"])
+        else:
+            self.assertEqual(out["research"]["status"], "FAILED")
+            self.assertTrue(out["research"]["error"])
+            self.assertNotIn("Traceback", out["research"]["error"])
+            self.assertNotIn("stdout=", out["research"]["error"])
+            # save_failure never calls save_result, so no source rows are
+            # ever written on a synthesis failure -- a failed research
+            # record cites nothing, rather than half-persisting sources
+            # for an answer that was never produced.
+            self.assertEqual(out["sources"], [])
 
     def test_get_research_not_found(self):
         self.assertEqual(self._get_status("/api/research/does-not-exist"), 404)

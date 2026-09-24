@@ -401,11 +401,33 @@ class ChatHttpV2Tests(_LiveFalgunaServerCase):
     def test_model_and_work_mode_overrides_round_trip_and_validate(self):
         status, conv = self._post("/api/conversations", {"title": "Chat"})
         conversation_id = conv["id"]
+        # Local AI Independence V1: saving a conversation's model override
+        # now accepts any non-empty selector string -- a bare legacy Codex
+        # model id, OR a "provider/model" selector such as
+        # "ollama/qwen2.5:1.5b-instruct" for a local runtime. This used to
+        # 400 here for anything but a literal known Codex model id, which
+        # made it impossible to ever pin a conversation to a local model,
+        # and meant "Auto" (no override) always silently requested Codex
+        # by name instead of letting ModelRouter apply its real
+        # local-first policy. An actually-unroutable selector still fails
+        # cleanly the first time a reply is generated (ModelRouter.
+        # resolve), as a normal ChatError -- not as a 400 on save, since
+        # Falguna cannot know at save time whether "not-a-real-model"
+        # might resolve against a provider/model the caller is about to
+        # configure.
         status, out = self._post(f"/api/conversations/{conversation_id}/model", {"model": "not-a-real-model"})
-        self.assertEqual(status, 400)
+        self.assertEqual(status, 200)
+        self.assertEqual(out["model_override"], "not-a-real-model")
         status, out = self._post(f"/api/conversations/{conversation_id}/model", {"model": "gpt-5.6-terra"})
         self.assertEqual(status, 200)
         self.assertEqual(out["model_override"], "gpt-5.6-terra")
+        status, out = self._post(f"/api/conversations/{conversation_id}/model", {"model": "ollama/qwen2.5:1.5b-instruct"})
+        self.assertEqual(status, 200)
+        self.assertEqual(out["model_override"], "ollama/qwen2.5:1.5b-instruct")
+        # A non-string body is still rejected outright -- the widened
+        # acceptance above is "any string", not "anything at all".
+        status, out = self._post(f"/api/conversations/{conversation_id}/model", {"model": 12345})
+        self.assertEqual(status, 400)
         status, out = self._post(f"/api/conversations/{conversation_id}/work-mode", {"work_mode": "deep"})
         self.assertEqual(status, 200)
         self.assertEqual(out["work_mode"], "DEEP")

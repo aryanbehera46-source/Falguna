@@ -33,13 +33,11 @@ from .memory import (
     MemorySuggestionStore, assemble_chat_context, build_embedding_adapter, embedding_status,
 )
 from .model_router import (
-    DEFAULT_REGISTRY_SETTINGS, ModelRegistry, ModelRouter, PRIVACY_MODES, build_providers, parse_selector,
-    provider_status_snapshot,
+    DEFAULT_REGISTRY_SETTINGS, ModelRegistry, ModelRouter, PRIVACY_MODES, build_providers, provider_status_snapshot,
 )
 from .models import CommandSpec, RunPolicy
 from .notifications import NotificationStore
 from .providers import ALL_ERROR_CATEGORIES, ErrorCategory, FalgunaModelError
-from .scheduler import get_scheduler
 from .research import ResearchError, ResearchResponder, ResearchStore, rank_sources
 from .review import ModelSemanticReviewer
 from .runtime import open_control_plane
@@ -58,14 +56,6 @@ MODEL = DEFAULT_CODEX_MODEL
 SEARCH_PROVIDER = DuckDuckGoHTMLSearchProvider()
 _operations = {}
 _operations_lock = threading.Lock()
-# Local AI Independence V1.1: one threading.Event per in-flight assistant
-# message, so Stop generation can signal a background streaming call to
-# actually abort the underlying local-model connection (see
-# OllamaProvider.generate_stream) rather than only discarding the result
-# once it eventually finishes on its own. Keyed by message_id (not
-# operation token) because _stop_message only ever receives message_id.
-_cancel_events = {}
-_cancel_events_lock = threading.Lock()
 
 # Product Experience V2 -- Work Mode (Section 6). Falguna does not control
 # any model's internal reasoning depth and never claims to; these three
@@ -89,26 +79,8 @@ def _work_mode(value) -> str:
     return value if value in WORK_MODE_SETTINGS else DEFAULT_WORK_MODE
 
 
-def _model_choice(value):
-    """Falguna Local AI Independence V1: a model selector for Chat/Work/
-    Research. Returns None for no-override/""/"auto" so it reaches
-    ModelRouter.resolve(None) unchanged -- letting the router apply its
-    real local-first -> external policy -- and passes any other non-empty
-    string through as-is (a bare Codex model id, for full backward
-    compatibility, or an explicit 'provider/model' selector such as
-    'ollama/qwen2.5:1.5b-instruct'). Previously this substituted the
-    Codex default model (MODEL) whenever there was no explicit override,
-    which meant every 'Auto' chat silently requested Codex by name and
-    never reached the router's local-first selection at all -- a real
-    bug that made 'no override' behave like 'always Codex' instead of
-    'let the router decide'. Validity of whatever selector comes out of
-    here is still checked for real at generate time (ModelRouter.resolve
-    raises a clean, sanitized FalgunaModelError/ChatError on anything
-    unroutable) -- this function only decides what gets *asked for*."""
-    value = (value or "").strip()
-    if value in ("", "auto"):
-        return None
-    return value
+def _model_choice(value) -> str:
+    return value if value in SUPPORTED_CODEX_MODELS else MODEL
 
 
 def _build_transport(codex_path, codex_home, timeout_seconds: int, use_fallback: bool):
@@ -237,47 +209,18 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             profiles = load_profiles(self.app_root)
             control, store = open_control_plane(self.app_root)
             try:
-                registry_settings = ModelRegistry(store).load()
-                privacy_mode = registry_settings["privacy_mode"]
-                # Local AI Independence V1: a real, live, multi-provider
-                # model list for the Chat picker (previously it only ever
-                # offered `available_models` below, a hardcoded Codex-only
-                # list -- a real local model could never even be selected
-                # from Chat). Built the same way Settings -> Models does
-                # (provider_status_snapshot over build_providers), so it is
-                # never stale/invented: health_check()/list_models() run
-                # for real, right now, for every enabled provider.
-                provider_models = []
-                for p in provider_status_snapshot(build_providers(registry_settings)):
-                    for m in p["models"]:
-                        provider_models.append({
-                            "selector": f"{p['provider_id']}/{m['model_id']}",
-                            "display_name": m.get("display_name") or m["model_id"],
-                            "provider_display_name": p["display_name"],
-                            "is_local": bool(m.get("is_local")),
-                            # Local AI Independence V1.1: real capability
-                            # metadata (see ModelInfo.is_embedding_only) so
-                            # the Chat model picker can filter out a model
-                            # that cannot answer a generation request at
-                            # all (e.g. Ollama's nomic-embed-text). The
-                            # backend still independently rejects an
-                            # embedding-only selector in
-                            # _set_conversation_model/ModelRouter.resolve --
-                            # this flag is a frontend convenience, not the
-                            # only place this is enforced.
-                            "is_embedding_only": bool(m.get("is_embedding_only")),
-                            "supports_streaming": bool(m.get("supports_streaming")),
-                        })
+                privacy_mode = ModelRegistry(store).load()["privacy_mode"]
             finally:
                 store.close()
             return self._json({
                 "product": "Falguna Engineering", "stage": "internal alpha", "profiles": profiles, "model": MODEL,
                 "available_models": sorted(SUPPORTED_CODEX_MODELS), "codex_runtime_found": bool(shutil.which("codex")),
-                "provider_models": provider_models,
                 "work_modes": list(WORK_MODE_SETTINGS), "default_work_mode": DEFAULT_WORK_MODE,
-                # `available_models` is kept, unchanged, for anything old
-                # still reading it -- `provider_models` above is the real,
-                # live, local-model-aware list the Chat picker now uses.
+                # Falguna V2.1: Codex remains listed above for full backward
+                # compatibility (every conversation's model_override is still
+                # a bare Codex model id unless the person explicitly picks a
+                # provider/model pair), but it is no longer the only runtime
+                # -- see /api/models for the full, live, multi-provider view.
                 "privacy_mode": privacy_mode,
             })
         if path == "/api/settings":
@@ -302,12 +245,6 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             return self._live_summary()
         if path == "/api/usage":
             return self._usage()
-        if path == "/api/local-inference/status":
-            # Local AI Independence V1.1 Pass D: real-time running/queued
-            # counts for the shared local-inference scheduler -- read
-            # directly off the live process-global gate, never a stored
-            # or stale value (see falguna/scheduler.py).
-            return self._json(get_scheduler().snapshot())
         if path == "/api/files":
             return self._files()
         if path == "/api/notifications":
@@ -1518,19 +1455,11 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         work_mode = _work_mode(conversation.get("work_mode"))
         model = _model_choice(conversation.get("model_override"))
         token = secrets.token_urlsafe(16)
-        # Local AI Independence V1.1: a real cancellation handle for this
-        # specific message, wired all the way down to the underlying
-        # provider connection (see OllamaProvider.generate_stream) so Stop
-        # generation can actually interrupt local-model inference in
-        # progress, not just discard whatever result eventually arrives.
-        cancel_event = threading.Event()
         with _operations_lock:
             _operations[token] = {"state": "QUEUED", "conversation_id": conversation_id, "message_id": pending["id"], "started_at": utcnow()}
-        with _cancel_events_lock:
-            _cancel_events[pending["id"]] = cancel_event
         threading.Thread(
             target=_run_chat_reply,
-            args=(self.app_root, token, conversation_id, pending["id"], history, model, work_mode, conversation.get("project_id"), cancel_event),
+            args=(self.app_root, token, conversation_id, pending["id"], history, model, work_mode, conversation.get("project_id")),
             daemon=True,
         ).start()
         return token
@@ -1539,17 +1468,6 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         control, store = open_control_plane(self.app_root)
         try:
             row = ConversationStore(store).cancel_message(message_id)
-            # Local AI Independence V1.1: signal the real cancellation
-            # event for this message, if a background stream is still
-            # running one -- this is what makes Stop close the actual
-            # in-flight connection to the local model provider instead of
-            # only marking the row CANCELLED and letting inference run to
-            # completion unseen. A message that was never streaming (no
-            # entry registered, or it already finished) is unaffected.
-            with _cancel_events_lock:
-                event = _cancel_events.get(message_id)
-            if event is not None:
-                event.set()
             return self._json(row)
         finally:
             store.close()
@@ -1602,45 +1520,15 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             store.close()
 
     def _set_conversation_model(self, conversation_id, body):
-        # Local AI Independence V1: this used to reject anything that
-        # wasn't a literal Codex model id, which made it impossible to
-        # ever pin a conversation to a local ('ollama/<model>') or
-        # custom-endpoint selector even though ModelRouter has supported
-        # 'provider/model' selectors since V2.1. Any non-empty string is
-        # now accepted here; an actually-unroutable selector still fails
-        # cleanly, as a normal ChatError, the first time a reply is
-        # generated (ModelRouter.resolve), not as a 400 on save.
-        raw = body.get("model")
-        if raw is not None and not isinstance(raw, str):
+        model = body.get("model")
+        if model not in (None, "", "auto") and model not in SUPPORTED_CODEX_MODELS:
             raise ValueError("Unsupported model")
-        model = _model_choice(raw)
+        model = model if model in SUPPORTED_CODEX_MODELS else None
         control, store = open_control_plane(self.app_root)
         try:
             chat = ConversationStore(store)
             if not chat.get_conversation(conversation_id):
                 return self._json({"error": "conversation not found"}, HTTPStatus.NOT_FOUND)
-            if model:
-                # Local AI Independence V1.1: reject an embedding-only
-                # selector (e.g. a forged 'ollama/nomic-embed-text' request
-                # bypassing the Chat picker's own filtering) here too, with
-                # the same sanitized message ModelRouter.resolve() would
-                # otherwise only raise later, mid-generation. Checked
-                # against the provider's real, live capability metadata --
-                # a selector referring to an unknown/unreachable provider or
-                # model is never blocked here (no false positives); it
-                # still fails cleanly at generate time if truly unroutable.
-                provider_id, model_id = parse_selector(model)
-                if provider_id and model_id:
-                    registry_settings = ModelRegistry(store).load()
-                    for provider in build_providers(registry_settings):
-                        if provider.provider_id != provider_id:
-                            continue
-                        if ModelRouter._embedding_only_model(provider, model_id):
-                            raise ValueError(
-                                f"'{model_id}' is an embedding-only model -- it powers local semantic search, "
-                                "not chat, research, or work generation. Choose a chat-capable model instead."
-                            )
-                        break
             store.update("conversations", conversation_id, model_override=model)
             return self._json(chat.get_conversation(conversation_id))
         finally:
@@ -2095,7 +1983,7 @@ def _run_computer_session_background(app_root, session_id, resume_from_index=0, 
         store.close()
 
 
-def _run_chat_reply(app_root, token, conversation_id, message_id, history, model, work_mode, project_id=None, cancel_event=None):
+def _run_chat_reply(app_root, token, conversation_id, message_id, history, model, work_mode, project_id=None):
     """Background worker for the async Chat pipeline (Sections 3-4) --
     structurally identical to _run_mission: the HTTP handler has already
     returned, and this thread is the only thing that ever writes the
@@ -2107,32 +1995,13 @@ def _run_chat_reply(app_root, token, conversation_id, message_id, history, model
     regardless of Privacy Mode. The retrieved text only leaves this
     machine if/when the model call below does, and that call is already
     gated by ModelRouter's own Privacy Mode enforcement -- memory never
-    gets a separate, wider network permission than the reply itself has.
-
-    Local AI Independence V1.1: the reply is now generated through
-    ChatResponder.reply_stream rather than reply() -- real, incremental
-    text is persisted to the message row (ConversationStore.
-    update_streaming_content) as it actually arrives from the underlying
-    model, throttled to at most ~1 write per 80ms so a fast local model
-    can't write-storm SQLite, with the operation's own state moving to
-    STREAMING the moment the first real token lands (never before). The
-    final chat.complete_message call below is unconditionally the source
-    of truth for the persisted reply regardless of streaming -- it always
-    writes the complete, fully-parsed text, so a throttled/missed
-    intermediate write is never user-visible in the final result."""
+    gets a separate, wider network permission than the reply itself has."""
     control, store = open_control_plane(app_root)
     settings = WORK_MODE_SETTINGS.get(work_mode, WORK_MODE_SETTINGS[DEFAULT_WORK_MODE])
     chat = ConversationStore(store)
     try:
-        # Local AI Independence V1.1 Pass D: the operation is created as
-        # "QUEUED" by _spawn_chat_reply and stays QUEUED -- honestly --
-        # until ModelRouter.stream's scheduler actually grants this
-        # request a local-inference slot (_on_queue_acquired below), not
-        # merely until this background thread happened to start running.
-        # A machine with spare capacity acquires near-instantly, so this
-        # is invisible in the common case; under real contention it is
-        # the difference between an honest queue position and a "THINKING"
-        # status that silently wasn't true yet.
+        with _operations_lock:
+            _operations[token]["state"] = "THINKING"
         chat.mark_generating(message_id)
         memory_context = None
         try:
@@ -2147,34 +2016,8 @@ def _run_chat_reply(app_root, token, conversation_id, message_id, history, model
             memory_context = None  # retrieval is best-effort -- a memory-store problem must never block a reply
         gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
         transport = _build_router(store, use_fallback=settings["fallback"])
-
-        partial_chunks = []
-        last_write_at = [0.0]
-
-        def _on_queue_acquired() -> None:
-            # Fires synchronously, on this background thread, the instant
-            # a local-inference slot is actually granted (or immediately,
-            # for an external provider -- see ModelRouter.stream). Never
-            # regresses a state this operation has already moved past
-            # (e.g. if a delta somehow raced ahead onto another thread).
-            with _operations_lock:
-                if _operations.get(token, {}).get("state") == "QUEUED":
-                    _operations[token]["state"] = "THINKING"
-
-        def _on_reply_delta(text_delta: str) -> None:
-            partial_chunks.append(text_delta)
-            with _operations_lock:
-                if _operations.get(token, {}).get("state") in ("QUEUED", "THINKING"):
-                    _operations[token]["state"] = "STREAMING"
-            now = time.monotonic()
-            if now - last_write_at[0] >= 0.08:
-                chat.update_streaming_content(message_id, "".join(partial_chunks))
-                last_write_at[0] = now
-
-        outcome = ChatResponder(gateway, transport, model, timeout_seconds=settings["chat_timeout"]).reply_stream(
-            history, _on_reply_delta, cancel_event=cancel_event,
-            memory_context=memory_context["text"] if memory_context else None,
-            on_queue_acquired=_on_queue_acquired,
+        outcome = ChatResponder(gateway, transport, model, timeout_seconds=settings["chat_timeout"]).reply(
+            history, memory_context=memory_context["text"] if memory_context else None,
         )
         applied = chat.complete_message(
             message_id, outcome["reply"], outcome["model_call"], outcome["suggested_objective"],
@@ -2194,13 +2037,11 @@ def _run_chat_reply(app_root, token, conversation_id, message_id, history, model
             _operations[token] = {**_operations.get(token, {}), "state": "FAILED" if applied else "CANCELLED", "error": str(exc), "message_id": message_id}
     except Exception as exc:
         safe_message = "Falguna hit an unexpected internal error generating this reply."
-        applied = chat.fail_message(message_id, safe_message, category=ErrorCategory.UNEXPECTED_FAILURE, detail=str(exc))
+        chat.fail_message(message_id, safe_message, category=ErrorCategory.UNEXPECTED_FAILURE, detail=str(exc))
         with _operations_lock:
-            _operations[token] = {**_operations.get(token, {}), "state": "FAILED" if applied else "CANCELLED", "error": safe_message, "message_id": message_id}
+            _operations[token] = {**_operations.get(token, {}), "state": "FAILED", "error": safe_message, "message_id": message_id}
     finally:
         store.close()
-        with _cancel_events_lock:
-            _cancel_events.pop(message_id, None)
 
 
 def reconcile_browser_sessions_at_startup(app_root: Path):
@@ -3080,31 +2921,11 @@ async function renderChatToolbar(id,conversation){
   const bar=$('chatToolbar');
   if(!bar)return;
   let cfg;
-  try{cfg=await api('/api/config')}catch(err){cfg={available_models:[],provider_models:[],work_modes:['FAST','BALANCED','DEEP'],default_work_mode:'BALANCED'}}
-  // Local AI Independence V1: provider_models is the live, multi-provider
-  // list (each entry a real 'provider/model' selector, e.g.
-  // 'ollama/qwen2.5:1.5b-instruct'), grouped so Local models are never
-  // confused with an External one that leaves this machine. Falls back to
-  // the old flat Codex-only list only if provider_models is unexpectedly
-  // absent (e.g. mid-rollout against a cached /api/config response).
-  // Local AI Independence V1.1: an embedding-only model (e.g. Ollama's
-  // nomic-embed-text) can never answer a Chat generation request, so it
-  // is filtered out here even though /api/config still reports it (for
-  // Settings -> Models). The backend independently rejects an
-  // embedding-only selector too (_set_conversation_model / ModelRouter),
-  // so this filter is a UX convenience, never the only enforcement.
-  const pm=(cfg.provider_models||[]).filter(m=>!m.is_embedding_only);
-  const modelOptions=pm.length
-    ? ['local','external'].map(kind=>{
-        const rows=pm.filter(m=>(kind==='local')===!!m.is_local);
-        if(!rows.length)return'';
-        return `<optgroup label="${kind==='local'?'Local (runs on this machine)':'External (leaves this machine)'}">${rows.map(m=>`<option value="${esc(m.selector)}" ${conversation.model_override===m.selector?'selected':''}>${esc(m.display_name)} &middot; ${esc(m.provider_display_name)}</option>`).join('')}</optgroup>`;
-      }).join('')
-    : cfg.available_models.map(m=>`<option value="${esc(m)}" ${conversation.model_override===m?'selected':''}>${esc(m)}</option>`).join('');
+  try{cfg=await api('/api/config')}catch(err){cfg={available_models:[],work_modes:['FAST','BALANCED','DEEP'],default_work_mode:'BALANCED'}}
   bar.innerHTML=`
     <select class="tiny-select" id="convModel" title="Model for this chat">
-      <option value="">Auto (local-first, fallback-aware)</option>
-      ${modelOptions}
+      <option value="">Auto (fallback-aware)</option>
+      ${cfg.available_models.map(m=>`<option value="${esc(m)}" ${conversation.model_override===m?'selected':''}>${esc(m)}</option>`).join('')}
     </select>
     <select class="tiny-select" id="convWorkMode" title="Work mode for this chat">
       ${cfg.work_modes.map(w=>`<option value="${esc(w)}" ${(conversation.work_mode||cfg.default_work_mode)===w?'selected':''}>${esc(w.charAt(0)+w.slice(1).toLowerCase())}</option>`).join('')}
@@ -3203,14 +3024,7 @@ function pollConversationUntilSettled(id){
     if(currentRoute().view==='chat'&&currentRoute().id===id)renderThread(id,data);
     const last=data.messages[data.messages.length-1];
     if(last&&last.role==='assistant'&&['PENDING','GENERATING'].includes(last.status)){
-      // Local AI Independence V1.1: once real generation is under way
-      // (GENERATING), poll fast enough that real, incrementally-persisted
-      // model output (ConversationStore.update_streaming_content) reads
-      // as a smooth, live stream rather than a slow reveal -- still real
-      // network responses carrying strictly more real text each time,
-      // never a client-side simulated typewriter. While merely QUEUED
-      // (PENDING, worker not started yet) the slower interval is enough.
-      setTimeout(tick,last.status==='GENERATING'?250:900);
+      setTimeout(tick,900);
     }else if(currentRoute().view==='chat'&&currentRoute().id===id){
       renderSideChats();
     }
@@ -3235,20 +3049,6 @@ function renderMessageRow(m,attachments,isLast){
   }
   const status=m.status||'COMPLETED';
   if(status==='PENDING'||status==='GENERATING'){
-    // Local AI Independence V1.1: once real streamed text has actually
-    // arrived (m.content is non-empty while still GENERATING -- written
-    // by ConversationStore.update_streaming_content as genuine
-    // incremental model output lands), render it directly instead of the
-    // "thinking" placeholder -- a real, growing answer, not a fabricated
-    // progress indicator. Before the first token arrives (content still
-    // empty) the honest "queued"/"thinking" state is shown exactly as
-    // before this phase.
-    if(status==='GENERATING'&&m.content){
-      return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble">${nl2br(m.content)}</div>
-        <div class="status-note">Generating&hellip; <span data-since="${esc(m.created_at)}">0s</span>
-          <button type="button" class="msg-action-btn" data-stop-id="${esc(m.id)}">${icon('stop',11)}Stop</button>
-        </div></div>`;
-    }
     return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble thinking"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></div>
       <div class="status-note">${status==='PENDING'?'Queued':'Thinking'}&hellip; <span data-since="${esc(m.created_at)}">0s</span>
         <button type="button" class="msg-action-btn" data-stop-id="${esc(m.id)}">${icon('stop',11)}Stop</button>
@@ -4285,7 +4085,7 @@ async function renderSettingsView(tab){
         </div>
         <div class="provider-meta">${p.is_local?'Local &middot; inference happens on this machine, nothing leaves it':'External &middot; requests leave this machine'}</div>
         <div class="provider-detail">${esc(p.health.detail)}</div>
-        ${p.models.length?`<div class="provider-models">${p.models.slice(0,8).map(m=>esc(m.display_name||m.model_id)+(m.is_embedding_only?' <span class="muted">(embedding only)</span>':'')).join(', ')}${p.models.length>8?` +${p.models.length-8} more`:''}</div>`:'<div class="provider-models muted">No model available yet</div>'}
+        ${p.models.length?`<div class="provider-models">${p.models.slice(0,8).map(m=>esc(m.display_name||m.model_id)).join(', ')}${p.models.length>8?` +${p.models.length-8} more`:''}</div>`:'<div class="provider-models muted">No model available yet</div>'}
       </div>`;
     body.innerHTML=`<div class="settings-section">
       <div class="section-label" style="margin-top:0">Privacy Mode</div>
