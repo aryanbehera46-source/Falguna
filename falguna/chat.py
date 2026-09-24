@@ -186,11 +186,17 @@ class ConversationStore:
             self.store.update("chat_messages", message_id, status="GENERATING")
 
     def complete_message(self, message_id: str, content: str, model_call: Optional[dict],
-                          suggested_objective: Optional[str] = None) -> bool:
+                          suggested_objective: Optional[str] = None, memory_context: Optional[dict] = None) -> bool:
         """Only applies the result if the message has not already been
         cancelled (Stop generation) -- returns False when a cancel raced it,
         in which case the caller must not surface the (already-discarded)
-        reply as if it were delivered."""
+        reply as if it were delivered.
+
+        `memory_context` (Falguna Memory & Knowledge V2, Pass F), when
+        given, is {"citations": [...]​} describing exactly which
+        memory/knowledge items were actually assembled into this reply's
+        context -- NULL/omitted means memory retrieval found nothing
+        relevant, never "memory was used but not recorded"."""
         row = self.store.get("chat_messages", message_id)
         if not row or row.get("status") == "CANCELLED":
             return False
@@ -198,6 +204,7 @@ class ConversationStore:
             "chat_messages", message_id, content=content, error=None, status="COMPLETED",
             model_call_json=json.dumps(model_call, sort_keys=True) if model_call else None,
             suggested_objective=suggested_objective,
+            memory_context_json=json.dumps(memory_context, sort_keys=True) if memory_context else None,
         )
         self.store.update("conversations", row["conversation_id"], updated_at=utcnow())
         return True
@@ -356,13 +363,22 @@ class ChatResponder:
         self.model = model
         self.timeout_seconds = timeout_seconds
 
-    def reply(self, history: List[dict]) -> dict:
+    def reply(self, history: List[dict], memory_context: Optional[str] = None) -> dict:
         """history: [{"role": "user"|"assistant", "content": str}, ...] oldest first.
         Returns {"reply", "suggested_objective", "model_call"} or raises ChatError
-        with a message safe to show the person -- never a fabricated reply."""
+        with a message safe to show the person -- never a fabricated reply.
+
+        `memory_context` (Memory & Knowledge V2, Pass F), when given, is
+        plain text already labeled as untrusted retrieved DATA (see
+        falguna.memory.MEMORY_CONTEXT_PREFIX) -- inserted as its own system
+        message, after the fixed CHAT_SYSTEM_PROMPT and before conversation
+        history, so it can never be mistaken for an instruction from Aryan
+        or override this responder's fixed no-tools contract."""
         config = dict(self.gateway.configuration())
         config["model"] = self.model
         messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+        if memory_context:
+            messages.append({"role": "system", "content": memory_context})
         messages += [{"role": m["role"], "content": m["content"]} for m in history[-20:]]
         payload = {
             "model": config["model"],

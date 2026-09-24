@@ -382,3 +382,119 @@ CREATE TABLE IF NOT EXISTS browser_downloads (
     source_url TEXT, attachment_id TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_browser_downloads_session ON browser_downloads(session_id, created_at);
+
+-- Falguna Memory & Knowledge V2 (falguna/memory.py). Reuses every existing
+-- seam rather than inventing a parallel system: `scope_id` for scope_type
+-- 'project' is one of project_profiles.json's own ids (falguna/web.py's
+-- load_profiles -- the single project registry); for scope_type 'venture'
+-- it is a vs_ventures.id (Venture Studio's own registry); 'personal' and
+-- 'company' rows carry a NULL scope_id (company = TTT-wide, authorized
+-- shared knowledge; personal = Aryan, unscoped). There is no second
+-- project/tenant registry anywhere in this schema.
+--
+-- Provenance and fact-strength are never conflated: `kind` records what
+-- KIND of statement this is (an instruction, an explicitly saved
+-- preference, a confirmed fact, a source-derived observation, an
+-- assistant-written summary, or an uncertain inference) and `confidence`
+-- separately records how sure Falguna is the content is true (verified /
+-- user_provided / inferred) -- an inference is never silently upgraded to
+-- verified just because it was written down.
+--
+-- Deletion policy (Pass B/I): `state` moves ACTIVE -> SUPERSEDED (a newer
+-- record replaces this one; content is kept for authorized history, but a
+-- superseded row is removed from memory_fts so it can never surface in a
+-- keyword/semantic search or be assembled into a model's context again) or
+-- ACTIVE -> DELETED (an explicit Forget; also removed from memory_fts).
+-- `purged_at` marks a *second*, separate, user-selected step that actually
+-- overwrites `content` with a tombstone string for a DELETED row -- the
+-- genuine, non-reversible removal Pass B calls for, kept distinct from the
+-- ordinary (reversible, content-preserving) Forget so that irreversible
+-- content erasure is never a side effect of an everyday delete.
+CREATE TABLE IF NOT EXISTS memory_records (
+    id TEXT PRIMARY KEY,
+    scope_type TEXT NOT NULL,            -- personal | project | venture | company
+    scope_id TEXT,                       -- project_profiles.json id, or vs_ventures.id; NULL for personal/company
+    kind TEXT NOT NULL,                  -- instruction | preference | fact | observation | summary | inference
+    content TEXT NOT NULL,
+    source_type TEXT NOT NULL,           -- user_stated | conversation | research | document | browser | system_derived
+    source_ref TEXT,                     -- conversation_id/message_id, research_id, knowledge_document_id, browser_session_id (free-form pointer, never executed)
+    confidence TEXT NOT NULL,            -- verified | user_provided | inferred
+    sensitivity TEXT NOT NULL DEFAULT 'normal',  -- normal | sensitive
+    pinned INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'active', -- active | superseded | deleted
+    supersedes_id TEXT REFERENCES memory_records(id),
+    superseded_by_id TEXT REFERENCES memory_records(id),
+    valid_from TEXT,
+    valid_until TEXT,
+    purged_at TEXT,
+    deletion_reason TEXT,
+    project_id TEXT,                     -- denormalized convenience mirror of scope_id when scope_type='project' (kept for simple joins/filters only)
+    venture_id TEXT,                     -- denormalized convenience mirror of scope_id when scope_type='venture'
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_records_scope ON memory_records(scope_type, scope_id, state);
+CREATE INDEX IF NOT EXISTS idx_memory_records_state ON memory_records(state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_memory_records_supersedes ON memory_records(supersedes_id);
+-- Standalone (not "external content") FTS5 index: rows are inserted/removed
+-- explicitly by falguna/memory.py alongside memory_records writes, never by
+-- a SQLite trigger, so a superseded/deleted row's removal from search is a
+-- real, verifiable step this codebase performs rather than a DB feature to
+-- trust blindly.
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, ref_id UNINDEXED);
+
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+    id TEXT PRIMARY KEY,
+    scope_type TEXT NOT NULL,            -- personal | project | venture | company
+    scope_id TEXT,
+    project_id TEXT,
+    venture_id TEXT,
+    title TEXT NOT NULL,
+    source_type TEXT NOT NULL,           -- upload | conversation | research | browser_download | file_path
+    source_ref TEXT,
+    mime_type TEXT,
+    byte_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    status TEXT NOT NULL,                -- ready | unsupported_format | too_large | error | duplicate | deleted
+    error TEXT,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_documents_scope ON knowledge_documents(scope_type, scope_id, status);
+CREATE INDEX IF NOT EXISTS idx_knowledge_documents_hash ON knowledge_documents(scope_type, scope_id, sha256);
+
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES knowledge_documents(id),
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    char_start INTEGER NOT NULL,
+    char_end INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    embedding_json TEXT,        -- populated only when a local embedding adapter actually ran (never fabricated)
+    embedding_model TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document ON knowledge_chunks(document_id, chunk_index);
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(content, ref_id UNINDEXED, document_id UNINDEXED);
+
+CREATE TABLE IF NOT EXISTS memory_suggestions (
+    id TEXT PRIMARY KEY,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT,
+    conversation_id TEXT,
+    message_id TEXT,
+    suggested_kind TEXT NOT NULL,
+    suggested_content TEXT NOT NULL,
+    signal TEXT,                 -- which deterministic phrase/rule triggered this suggestion (auditable, never a black box)
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | accepted | dismissed
+    memory_record_id TEXT,       -- set once accepted
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_suggestions_status ON memory_suggestions(status, created_at);

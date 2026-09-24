@@ -144,6 +144,13 @@ class StateStore:
             # any) for an expandable "technical details" panel only -- never
             # rendered by default, never included in `error`.
             ("error_category", "TEXT"), ("error_detail", "TEXT"),
+            # Falguna Memory & Knowledge V2 (Pass F): a completed assistant
+            # message can record which memory/knowledge items materially
+            # informed it, so the UI can show "Sources" -- NULL for every
+            # message created before this column existed (and for every
+            # message where retrieval found nothing relevant), meaning
+            # "no memory was used", identical to today's behavior.
+            ("memory_context_json", "TEXT"),
         ],
         # Falguna V2.1 (Mission Control count cleanup): a run can be
         # explicitly archived off the active board -- this is a
@@ -213,7 +220,12 @@ class StateStore:
             # Falguna V2.1: UX Hardening + Provider Independence Foundation
             "model_settings",
             # Falguna Browser + Computer Use V1
-            "browser_sessions", "browser_tabs", "browser_actions", "browser_downloads"}
+            "browser_sessions", "browser_tabs", "browser_actions", "browser_downloads",
+            # Falguna Memory & Knowledge V2 (falguna/memory.py). memory_fts and
+            # knowledge_fts are standalone FTS5 virtual tables managed directly
+            # by MemoryStore/KnowledgeStore (raw SQL, not this generic helper --
+            # a virtual table has no "id" column for create() to populate).
+            "memory_records", "knowledge_documents", "knowledge_chunks", "memory_suggestions"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

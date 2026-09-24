@@ -28,6 +28,10 @@ from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL, Resilie
 from .continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
 from .discovery import ProjectDiscovery
 from .gateway import OpenAICompatibleGateway
+from .memory import (
+    KnowledgeError, KnowledgeStore, MemoryConflict, MemoryError, MemorySettingsStore, MemoryStore,
+    MemorySuggestionStore, assemble_chat_context, build_embedding_adapter, embedding_status,
+)
 from .model_router import (
     DEFAULT_REGISTRY_SETTINGS, ModelRegistry, ModelRouter, PRIVACY_MODES, build_providers, provider_status_snapshot,
 )
@@ -258,6 +262,20 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/conversations/"):
             conversation_id = path.rsplit("/", 1)[-1]
             return self._get_conversation(conversation_id)
+        if path == "/api/memory":
+            return self._list_memory(parse_qs(parsed.query))
+        if path == "/api/memory/settings":
+            return self._memory_settings_get()
+        if path == "/api/memory/suggestions":
+            return self._list_memory_suggestions(parse_qs(parsed.query))
+        if path.startswith("/api/memory/") and path.endswith("/history"):
+            return self._memory_history(path.split("/")[3])
+        if path.startswith("/api/memory/"):
+            return self._get_memory(path.rsplit("/", 1)[-1])
+        if path == "/api/knowledge/documents":
+            return self._list_knowledge_documents(parse_qs(parsed.query))
+        if path.startswith("/api/knowledge/documents/"):
+            return self._get_knowledge_document(path.rsplit("/", 1)[-1])
         if path == "/api/runs":
             control, store = open_control_plane(self.app_root)
             try:
@@ -426,6 +444,234 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 "handoffs": chat.list_handoffs(conversation_id),
                 "attachments": AttachmentStore(store, self.app_root).list_for_conversation(conversation_id),
             })
+        finally:
+            store.close()
+
+    # -------------------------------------------- Memory & Knowledge V2
+
+    def _memory_scope_registry(self, store):
+        """Every scope Aryan (the sole operator) is authorized to see:
+        personal + company (both unscoped) plus every currently-APPROVED
+        project (project_profiles.json, via the existing load_profiles --
+        never a second registry) plus every venture Venture Studio already
+        knows about (vs_ventures). Returns (all_scopes, known_project_ids)."""
+        project_ids = {p["id"] for p in load_profiles(self.app_root)}
+        venture_ids = {v["id"] for v in store.list("vs_ventures")}
+        scopes = [("personal", None), ("company", None)]
+        scopes += [("project", pid) for pid in sorted(project_ids)]
+        scopes += [("venture", vid) for vid in sorted(venture_ids)]
+        return scopes, project_ids
+
+    def _resolve_requested_scopes(self, store, params: dict):
+        """Query-param scope filter for the Memory/Knowledge UI:
+        ?scope_type=project&scope_id=falguna-engineering restricts to
+        exactly that one scope; no filter means every scope this operator
+        is authorized to see. A requested scope that is not in the
+        authorized registry is simply dropped -- never silently widened."""
+        all_scopes, project_ids = self._memory_scope_registry(store)
+        scope_type = (params.get("scope_type") or [None])[0]
+        scope_id = (params.get("scope_id") or [None])[0]
+        if not scope_type:
+            return all_scopes, project_ids
+        requested = (scope_type, scope_id or None)
+        return ([requested] if requested in all_scopes else []), project_ids
+
+    def _list_memory(self, params: dict):
+        control, store = open_control_plane(self.app_root)
+        try:
+            scopes, _ = self._resolve_requested_scopes(store, params)
+            mem = MemoryStore(store, control.audit)
+            query = (params.get("q") or [None])[0]
+            kind = (params.get("kind") or [None])[0]
+            state = (params.get("state") or ["active"])[0]
+            pinned_only = (params.get("pinned") or [""])[0] == "1"
+            if query:
+                results = mem.search(scopes, query, limit=int((params.get("limit") or [20])[0]))
+            else:
+                results = mem.list(scopes, kind=kind, state=state, pinned_only=pinned_only, limit=int((params.get("limit") or [200])[0]))
+            return self._json({"records": results, "scopes": [{"scope_type": t, "scope_id": s} for t, s in scopes]})
+        finally:
+            store.close()
+
+    def _get_memory(self, record_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            row = MemoryStore(store, control.audit).get(record_id)
+            if not row:
+                return self._json({"error": "memory record not found"}, HTTPStatus.NOT_FOUND)
+            return self._json(row)
+        finally:
+            store.close()
+
+    def _memory_history(self, record_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json({"history": MemoryStore(store, control.audit).history(record_id)})
+        finally:
+            store.close()
+
+    def _create_memory(self, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            _, project_ids = self._memory_scope_registry(store)
+            mem = MemoryStore(store, control.audit)
+            record = mem.save(
+                scope_type=body.get("scope_type", "personal"), scope_id=body.get("scope_id"),
+                kind=body.get("kind", "fact"), content=body.get("content", ""),
+                source_type=body.get("source_type", "user_stated"), source_ref=body.get("source_ref"),
+                confidence=body.get("confidence", "user_provided"), actor=body.get("actor") or "Aryan",
+                sensitivity=body.get("sensitivity", "normal"), supersedes_id=body.get("supersedes_id"),
+                allow_conflict=bool(body.get("allow_conflict", False)), known_project_ids=project_ids,
+            )
+            return self._json(record, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _supersede_memory(self, record_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            _, project_ids = self._memory_scope_registry(store)
+            mem = MemoryStore(store, control.audit)
+            existing = mem.get(record_id)
+            if not existing:
+                return self._json({"error": "memory record not found"}, HTTPStatus.NOT_FOUND)
+            record = mem.save(
+                scope_type=existing["scope_type"], scope_id=existing["scope_id"], kind=body.get("kind", existing["kind"]),
+                content=body.get("content", ""), source_type=body.get("source_type", existing["source_type"]),
+                source_ref=body.get("source_ref"), confidence=body.get("confidence", existing["confidence"]),
+                actor=body.get("actor") or "Aryan", sensitivity=body.get("sensitivity", existing["sensitivity"]),
+                supersedes_id=record_id, known_project_ids=project_ids,
+            )
+            return self._json(record, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _pin_memory(self, record_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            record = MemoryStore(store, control.audit).pin(record_id, bool(body.get("pinned", True)), body.get("actor") or "Aryan")
+            return self._json(record)
+        finally:
+            store.close()
+
+    def _edit_memory(self, record_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            record = MemoryStore(store, control.audit).edit(record_id, body.get("content", ""), body.get("actor") or "Aryan")
+            return self._json(record)
+        finally:
+            store.close()
+
+    def _forget_memory(self, record_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            record = MemoryStore(store, control.audit).forget(record_id, body.get("actor") or "Aryan", body.get("reason", ""))
+            return self._json(record)
+        finally:
+            store.close()
+
+    def _purge_memory(self, record_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            record = MemoryStore(store, control.audit).purge(record_id, "Aryan")
+            return self._json(record)
+        finally:
+            store.close()
+
+    def _memory_settings_get(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json(embedding_status(store))
+        finally:
+            store.close()
+
+    def _memory_settings_update(self, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            settings_store = MemorySettingsStore(store)
+            settings_store.save({k: v for k, v in body.items() if k in ("embedding_provider", "ollama_base_url", "ollama_embedding_model")})
+            return self._json(embedding_status(store))
+        finally:
+            store.close()
+
+    def _list_memory_suggestions(self, params: dict):
+        control, store = open_control_plane(self.app_root)
+        try:
+            scopes, _ = self._resolve_requested_scopes(store, params)
+            mem = MemoryStore(store, control.audit)
+            suggestions = MemorySuggestionStore(store, control.audit, mem)
+            return self._json({"suggestions": suggestions.list_pending(scopes)})
+        finally:
+            store.close()
+
+    def _accept_memory_suggestion(self, suggestion_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            mem = MemoryStore(store, control.audit)
+            suggestions = MemorySuggestionStore(store, control.audit, mem)
+            record = suggestions.accept(suggestion_id, body.get("actor") or "Aryan", confidence=body.get("confidence", "user_provided"))
+            return self._json(record, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _dismiss_memory_suggestion(self, suggestion_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            mem = MemoryStore(store, control.audit)
+            suggestions = MemorySuggestionStore(store, control.audit, mem)
+            return self._json(suggestions.dismiss(suggestion_id, "Aryan"))
+        finally:
+            store.close()
+
+    def _list_knowledge_documents(self, params: dict):
+        control, store = open_control_plane(self.app_root)
+        try:
+            scopes, _ = self._resolve_requested_scopes(store, params)
+            kb = KnowledgeStore(store, control.audit)
+            status = (params.get("status") or [None])[0]
+            return self._json({"documents": kb.list_documents(scopes, status=status)})
+        finally:
+            store.close()
+
+    def _get_knowledge_document(self, document_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            kb = KnowledgeStore(store, control.audit)
+            doc = kb.get_document(document_id)
+            if not doc:
+                return self._json({"error": "document not found"}, HTTPStatus.NOT_FOUND)
+            return self._json({"document": doc, "chunks": kb.get_chunks(document_id)})
+        finally:
+            store.close()
+
+    def _ingest_knowledge_document(self, body):
+        import base64
+        control, store = open_control_plane(self.app_root)
+        try:
+            _, project_ids = self._memory_scope_registry(store)
+            data_b64 = body.get("data_base64", "")
+            try:
+                data = base64.b64decode(data_b64, validate=True) if data_b64 else (body.get("content", "") or "").encode("utf-8")
+            except Exception as exc:
+                raise KnowledgeError("data_base64 must be valid base64") from exc
+            embedding_adapter = build_embedding_adapter(MemorySettingsStore(store).load())
+            kb = KnowledgeStore(store, control.audit, embedding_adapter=embedding_adapter)
+            doc = kb.ingest_bytes(
+                filename=body.get("filename", "untitled.txt"), mime_type=body.get("mime_type", "text/plain"), data=data,
+                scope_type=body.get("scope_type", "personal"), source_type=body.get("source_type", "upload"),
+                actor=body.get("actor") or "Aryan", scope_id=body.get("scope_id"), source_ref=body.get("source_ref"),
+                known_project_ids=project_ids, title=body.get("title"),
+            )
+            return self._json(doc, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _forget_knowledge_document(self, document_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            kb = KnowledgeStore(store, control.audit)
+            doc = kb.forget_document(document_id, body.get("actor") or "Aryan", body.get("reason", ""))
+            return self._json(doc)
         finally:
             store.close()
 
@@ -1052,10 +1298,34 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 return self._research_to_chat(segments[3], body)
             if path.startswith("/api/research/") and path.endswith("/handoff"):
                 return self._research_to_work(segments[3], body)
+            if path == "/api/memory":
+                return self._create_memory(body)
+            if path == "/api/memory/settings":
+                return self._memory_settings_update(body)
+            if path.startswith("/api/memory/") and path.endswith("/supersede"):
+                return self._supersede_memory(segments[3], body)
+            if path.startswith("/api/memory/") and path.endswith("/pin"):
+                return self._pin_memory(segments[3], body)
+            if path.startswith("/api/memory/") and path.endswith("/edit"):
+                return self._edit_memory(segments[3], body)
+            if path.startswith("/api/memory/") and path.endswith("/forget"):
+                return self._forget_memory(segments[3], body)
+            if path.startswith("/api/memory/") and path.endswith("/purge"):
+                return self._purge_memory(segments[3])
+            if path.startswith("/api/memory/suggestions/") and path.endswith("/accept"):
+                return self._accept_memory_suggestion(segments[4], body)
+            if path.startswith("/api/memory/suggestions/") and path.endswith("/dismiss"):
+                return self._dismiss_memory_suggestion(segments[4])
+            if path == "/api/knowledge/documents":
+                return self._ingest_knowledge_document(body)
+            if path.startswith("/api/knowledge/documents/") and path.endswith("/forget"):
+                return self._forget_knowledge_document(segments[4], body)
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except MemoryConflict as exc:
+            return self._json({"error": str(exc), "candidates": exc.candidates}, HTTPStatus.CONFLICT)
         except DiscoveryUncertain as exc:
             return self._json({"error": str(exc), "discovery": exc.evidence}, HTTPStatus.CONFLICT)
-        except (ValueError, KeyError, json.JSONDecodeError, ChatError) as exc:
+        except (ValueError, KeyError, json.JSONDecodeError, ChatError, MemoryError, KnowledgeError) as exc:
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def _start(self, body):
@@ -1155,6 +1425,17 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             user_message = chat.add_message(conversation_id, "user", content)
             if attachment_ids:
                 AttachmentStore(store, self.app_root).attach_to_message(attachment_ids, conversation_id, user_message["id"])
+            # Memory & Knowledge V2 (Pass E): a deterministic, literal-phrase
+            # check for a save-worthy statement -- never auto-saved, only
+            # ever queued as a suggestion the person must explicitly accept
+            # (see MemorySuggestionStore.accept / the Memory UI). Scoped to
+            # this conversation's own project (or personal, if none) --
+            # never company-wide from a single chat message.
+            scope_type = "project" if conversation.get("project_id") else "personal"
+            scope_id = conversation.get("project_id")
+            MemorySuggestionStore(store, control.audit, MemoryStore(store, control.audit)).create_from_message(
+                scope_type, scope_id, conversation_id, user_message["id"], content,
+            )
             pending = chat.add_pending_message(conversation_id)
             history = self._chat_history(chat, conversation_id, exclude_message_id=pending["id"])
         finally:
@@ -1178,7 +1459,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             _operations[token] = {"state": "QUEUED", "conversation_id": conversation_id, "message_id": pending["id"], "started_at": utcnow()}
         threading.Thread(
             target=_run_chat_reply,
-            args=(self.app_root, token, conversation_id, pending["id"], history, model, work_mode),
+            args=(self.app_root, token, conversation_id, pending["id"], history, model, work_mode, conversation.get("project_id")),
             daemon=True,
         ).start()
         return token
@@ -1702,12 +1983,19 @@ def _run_computer_session_background(app_root, session_id, resume_from_index=0, 
         store.close()
 
 
-def _run_chat_reply(app_root, token, conversation_id, message_id, history, model, work_mode):
+def _run_chat_reply(app_root, token, conversation_id, message_id, history, model, work_mode, project_id=None):
     """Background worker for the async Chat pipeline (Sections 3-4) --
     structurally identical to _run_mission: the HTTP handler has already
     returned, and this thread is the only thing that ever writes the
     reply. Every operation-state write below reflects a state this call
-    actually reached; there is no fabricated "typing" percentage."""
+    actually reached; there is no fabricated "typing" percentage.
+
+    Memory & Knowledge V2 (Pass F): retrieval below is 100% local SQL
+    (FTS5) -- it never makes a network call, so it runs unconditionally
+    regardless of Privacy Mode. The retrieved text only leaves this
+    machine if/when the model call below does, and that call is already
+    gated by ModelRouter's own Privacy Mode enforcement -- memory never
+    gets a separate, wider network permission than the reply itself has."""
     control, store = open_control_plane(app_root)
     settings = WORK_MODE_SETTINGS.get(work_mode, WORK_MODE_SETTINGS[DEFAULT_WORK_MODE])
     chat = ConversationStore(store)
@@ -1715,10 +2003,26 @@ def _run_chat_reply(app_root, token, conversation_id, message_id, history, model
         with _operations_lock:
             _operations[token]["state"] = "THINKING"
         chat.mark_generating(message_id)
+        memory_context = None
+        try:
+            scopes = [("personal", None), ("company", None)]
+            if project_id:
+                scopes.append(("project", project_id))
+            last_user_text = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+            memory_context = assemble_chat_context(
+                MemoryStore(store, control.audit), KnowledgeStore(store, control.audit), scopes, last_user_text,
+            )
+        except Exception:
+            memory_context = None  # retrieval is best-effort -- a memory-store problem must never block a reply
         gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
         transport = _build_router(store, use_fallback=settings["fallback"])
-        outcome = ChatResponder(gateway, transport, model, timeout_seconds=settings["chat_timeout"]).reply(history)
-        applied = chat.complete_message(message_id, outcome["reply"], outcome["model_call"], outcome["suggested_objective"])
+        outcome = ChatResponder(gateway, transport, model, timeout_seconds=settings["chat_timeout"]).reply(
+            history, memory_context=memory_context["text"] if memory_context else None,
+        )
+        applied = chat.complete_message(
+            message_id, outcome["reply"], outcome["model_call"], outcome["suggested_objective"],
+            memory_context={"citations": memory_context["citations"]} if memory_context else None,
+        )
         with _operations_lock:
             _operations[token] = {**_operations.get(token, {}), "state": "COMPLETE" if applied else "CANCELLED", "message_id": message_id}
     except ChatError as exc:
@@ -2134,6 +2438,11 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
 .bubble em{font-style:italic}
 .msg.editing textarea{width:100%;min-height:60px;background:var(--panel);border:1px solid var(--accent-dim);border-radius:10px;padding:9px 10px;resize:vertical}
 .msg.editing .edit-actions{display:flex;gap:8px;margin-top:8px}
+.memory-sources{display:block;margin:8px 0 0;font-size:11.5px;color:var(--muted)}
+.memory-sources summary{cursor:pointer;display:flex;align-items:center;gap:6px;list-style:none}
+.memory-sources summary::-webkit-details-marker{display:none}
+.memory-source-list{margin-top:6px;display:flex;flex-direction:column;gap:5px}
+.memory-source-row{border:1px solid var(--line);background:var(--soft);border-radius:8px;padding:6px 9px;display:flex;gap:8px;align-items:baseline}
 .attach-chip-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .attach-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--soft);border-radius:999px;padding:4px 10px 4px 8px;font-size:11px;text-decoration:none;color:inherit}
 .attach-chip:hover{border-color:var(--accent-dim)}
@@ -2315,6 +2624,7 @@ const ICON={
   moon:'<path d="M15.5 12.3A6.2 6.2 0 1 1 7.7 4.5a5 5 0 0 0 7.8 7.8Z" stroke="currentColor" stroke-width="1.3" fill="currentColor" fill-opacity=".12" stroke-linejoin="round"/>',
   monitor:'<rect x="3" y="4.5" width="14" height="9" rx="1.3" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M7.5 16.5h5M10 13.5v3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
   download:'<path d="M10 3.5v9M6.2 9.2 10 13l3.8-3.8" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15.5h12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
+  memory:'<path d="M10 3.4c-2.3 0-3.7 1.5-3.7 3.4 0 .9.3 1.6.9 2.2-1 .5-1.5 1.3-1.5 2.4 0 1.9 1.6 3.2 3.5 3.2h1.6c1.9 0 3.5-1.3 3.5-3.2 0-1.1-.5-1.9-1.5-2.4.6-.6.9-1.3.9-2.2 0-1.9-1.4-3.4-3.7-3.4Z" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/><path d="M8.2 8.2h3.6M7.9 10.9h4.2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>',
 };
 const icon=(name,size=16)=>`<svg width="${size}" height="${size}" viewBox="0 0 20 20" fill="none">${ICON[name]||''}</svg>`;
 
@@ -2322,7 +2632,7 @@ $('newChatBtn').innerHTML=icon('plus',15)+'New chat';
 $('menuButton').innerHTML=icon('menu',17);
 $('bellBtn').innerHTML=icon('bell',16)+'<span class="bell-dot hidden" id="bellDot"></span>';
 $('nav').innerHTML=[
-  ['chat','Chat'],['search','Search'],['work','Work'],['mission','Mission Control'],['projects','Projects'],['files','Files'],['history','History'],['settings','Settings'],
+  ['chat','Chat'],['search','Search'],['work','Work'],['mission','Mission Control'],['memory','Memory'],['projects','Projects'],['files','Files'],['history','History'],['settings','Settings'],
 ].map(([id,label])=>`<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`).join('');
 
 function closeSidebar(){$('sidebar').classList.remove('open');$('scrim').classList.remove('open');$('menuButton').setAttribute('aria-expanded','false')}
@@ -2423,7 +2733,7 @@ function currentRoute(){
   return {view:parts[0]||'chat', id:parts[1]?decodeURIComponent(parts[1]):null};
 }
 function go(hash){location.hash=hash}
-const VIEW_TITLES={chat:'Chat',search:'Search',work:'Work',mission:'Mission Control',projects:'Projects',files:'Files',history:'History',settings:'Settings'};
+const VIEW_TITLES={chat:'Chat',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings'};
 function setActiveNav(view){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   $('viewTitle').textContent=VIEW_TITLES[view]||'Falguna';
@@ -2442,6 +2752,7 @@ async function router(){
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
     if(view==='search'){await renderSideResearch();return renderSearchView(id)}
     if(view==='mission'){hideSideList();return renderMissionControlView()}
+    if(view==='memory'){hideSideList();return renderMemoryView(id)}
     if(view==='browser'){hideSideList();return renderBrowserSessionView(id)}
     if(view==='projects'){hideSideList();return renderProjectsView()}
     if(view==='files'){hideSideList();return renderFilesView(id)}
@@ -2765,7 +3076,30 @@ function renderMessageRow(m,attachments,isLast){
         </div>
       </div></div>`;
   }
-  return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble">${renderMarkdown(m.content)}</div>
+  // Memory & Knowledge V2 (Pass F/G): when retrieval actually assembled
+  // something into this reply's context, memory_context_json carries
+  // exactly which memory/knowledge items -- shown as real citations, never
+  // implied when nothing was used (memory_context_json is null/absent for
+  // every message before this feature existed and for every reply where
+  // retrieval found nothing relevant).
+  let memoryNote='';
+  if(m.memory_context_json){
+    try{
+      const mc=JSON.parse(m.memory_context_json);
+      const cites=(mc.citations||[]);
+      if(cites.length)memoryNote=`<details class="memory-sources"><summary>${icon('memory',11)}Used ${cites.length} saved ${cites.length===1?'item':'items'} from Memory</summary>
+        <div class="memory-source-list">${cites.map(c=>`<div class="memory-source-row"><span class="status-pill">${esc(c.type)}${c.kind?' &middot; '+esc(c.kind):''}</span> ${esc(c.preview||c.title||'')}</div>`).join('')}</div>
+      </details>`;
+    }catch(e){}
+  }
+  // memoryNote is rendered INSIDE the bubble (not as a flex sibling of it)
+  // so its citation card's own width can never steal flex space from the
+  // reply text -- a real, verified bug (the bubble is `flex:1;min-width:0`
+  // in a non-wrapping `.msg{display:flex}` row, so an unconstrained
+  // sibling here squeezed the reply text down to a near-zero-width,
+  // one-character-per-line column). Keeping it inside the bubble's normal
+  // block flow avoids the flex row entirely.
+  return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble">${renderMarkdown(m.content)}${memoryNote}</div>
     <div class="msg-actions">
       <button type="button" class="msg-action-btn" data-copy-text="${esc(m.content)}">${icon('copy',12)}Copy</button>
       ${isLast?`<button type="button" class="msg-action-btn" data-regen-id="${esc(m.id)}">${icon('retry',12)}Regenerate</button>`:''}
@@ -3442,9 +3776,257 @@ async function renderHistoryView(){
   renderList();
 }
 
+/* ------------------------------------------------------------ Memory view */
+
+let memoryTab='memories';
+let memoryScopeFilter='';  // '' = all authorized scopes; else 'personal'|'company'|'project:<id>'
+let editingMemoryId=null;    // id of the memory record currently shown as an inline edit form, or null
+let openHistoryId=null;      // id of the memory record whose History panel is expanded, or null
+let memoryHistoryCache={};   // id -> history array, populated lazily on first expand
+function memoryScopeParams(){
+  if(!memoryScopeFilter)return '';
+  const [t,id]=memoryScopeFilter.split(':');
+  return `scope_type=${encodeURIComponent(t)}${id?`&scope_id=${encodeURIComponent(id)}`:''}`;
+}
+function memoryScopeLabel(rec){
+  if(rec.scope_type==='project')return 'Project: '+esc((profiles[rec.scope_id]||{}).name||rec.scope_id||'?');
+  if(rec.scope_type==='venture')return 'Venture';
+  return rec.scope_type==='company'?'Company':'Personal';
+}
+async function renderMemoryView(tab){
+  memoryTab=tab||memoryTab||'memories';
+  await loadProfiles().catch(()=>{});
+  const vp=$('viewport');
+  vp.innerHTML=`<div class="page">
+    <h1>Memory</h1>
+    <p class="lede">Falguna's own local, provenance-aware memory and knowledge -- scoped to you, a project, or (when explicitly saved that way) the whole company. Offline keyword search always works here; nothing is sent anywhere by browsing this page.</p>
+    <div class="files-tabs">
+      <button type="button" data-mtab="memories" class="${memoryTab==='memories'?'active':''}">Memories</button>
+      <button type="button" data-mtab="knowledge" class="${memoryTab==='knowledge'?'active':''}">Knowledge</button>
+      <button type="button" data-mtab="suggestions" class="${memoryTab==='suggestions'?'active':''}">Suggestions</button>
+    </div>
+    <div class="settings-form" style="max-width:360px;margin:12px 0">
+      <label>Scope
+        <select id="memScope">
+          <option value="">All authorized scopes</option>
+          <option value="personal">Personal</option>
+          <option value="company">Company (TTT-wide)</option>
+          ${profileList.map(p=>`<option value="project:${esc(p.id)}">Project: ${esc(p.name)}</option>`).join('')}
+        </select>
+      </label>
+    </div>
+    <div id="memoryBody"><div class="empty-state">Loading&hellip;</div></div>
+  </div>`;
+  $('memScope').value=memoryScopeFilter;
+  document.querySelectorAll('[data-mtab]').forEach(b=>b.onclick=()=>go('#/memory/'+b.dataset.mtab));
+  $('memScope').onchange=()=>{memoryScopeFilter=$('memScope').value;renderMemoryBody()};
+  await renderMemoryBody();
+}
+async function renderMemoryBody(){
+  const body=$('memoryBody');
+  if(!body)return;
+  if(memoryTab==='memories')return renderMemoryRecordsTab(body);
+  if(memoryTab==='knowledge')return renderKnowledgeTab(body);
+  return renderMemorySuggestionsTab(body);
+}
+async function renderMemoryRecordsTab(body){
+  body.innerHTML=`<div class="settings-form" style="max-width:520px;margin-bottom:14px">
+      <label>Save a new memory to the current scope
+        <textarea id="memNewContent" rows="2" placeholder="e.g. Aryan prefers concise commit messages"></textarea>
+      </label>
+      <div class="selector-row">
+        <select id="memNewKind" class="tiny-select">
+          <option value="preference">preference</option>
+          <option value="fact" selected>fact</option>
+          <option value="instruction">instruction</option>
+          <option value="observation">observation</option>
+          <option value="summary">summary</option>
+          <option value="inference">inference</option>
+        </select>
+        <select id="memNewConfidence" class="tiny-select">
+          <option value="verified">verified</option>
+          <option value="user_provided" selected>user_provided</option>
+          <option value="inferred">inferred</option>
+        </select>
+        <button type="button" class="action" id="memNewSave">Save to Memory</button>
+      </div>
+    </div>
+    <div class="searchbar"><input id="memQuery" placeholder="Search memory (offline keyword search)&hellip;"></div>
+    <div class="result-list" id="memList"><div class="empty-state">Loading&hellip;</div></div>`;
+  const list=$('memList');
+  $('memNewSave').onclick=async()=>{
+    const content=$('memNewContent').value.trim();
+    if(!content){showToast('Write something to save first',{error:true});return}
+    const [scopeType,scopeId]=(memoryScopeFilter||'personal').split(':');
+    try{
+      await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        scope_type:scopeType||'personal', scope_id:scopeId||null, kind:$('memNewKind').value,
+        content, source_type:'user_stated', confidence:$('memNewConfidence').value,
+      })});
+      $('memNewContent').value='';showToast('Saved to memory');load();
+    }catch(err){
+      if(err.data&&err.data.candidates){
+        const ok=await confirmModal({title:'Similar memory already exists',body:`${err.message}\n\nSave anyway as a separate memory?`,confirmLabel:'Save anyway'});
+        if(ok){
+          try{
+            await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+              scope_type:scopeType||'personal', scope_id:scopeId||null, kind:$('memNewKind').value,
+              content, source_type:'user_stated', confidence:$('memNewConfidence').value, allow_conflict:true,
+            })});
+            $('memNewContent').value='';showToast('Saved to memory');load();
+          }catch(err2){showToast(err2.message,{error:true})}
+        }
+      }else showToast(err.message,{error:true});
+    }
+  };
+  async function load(){
+    const q=$('memQuery').value.trim();
+    const params=[memoryScopeParams(),q?`q=${encodeURIComponent(q)}`:''].filter(Boolean).join('&');
+    let data;
+    try{data=await api('/api/memory'+(params?`?${params}`:''))}catch(err){list.innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
+    const rows=data.records||[];
+    list.innerHTML=rows.length?rows.map(r=>{
+      if(r.id===editingMemoryId){
+        return `<div class="result-row" style="cursor:default;align-items:flex-start;flex-direction:column;gap:8px">
+          <div class="kind"><span class="status-pill">${esc(r.kind)}</span> <span class="status-pill">${esc(r.confidence)}</span> &middot; ${memoryScopeLabel(r)}</div>
+          <textarea id="memEditArea-${esc(r.id)}" rows="3" style="width:100%">${esc(r.content)}</textarea>
+          <div class="edit-actions"><button type="button" class="pill-btn" data-mem-cancel-edit="1">Cancel</button><button type="button" class="action" data-mem-save-edit="${esc(r.id)}">Save (in place)</button></div>
+        </div>`;
+      }
+      const hist=openHistoryId===r.id?memoryHistoryCache[r.id]:null;
+      const historyPanel=openHistoryId!==r.id?'':(hist===undefined?'<div class="empty-state" style="padding:8px 0">Loading history&hellip;</div>':`
+        <div class="mem-history-panel" style="width:100%;border-top:1px solid var(--line);margin-top:8px;padding-top:8px">
+          ${hist.map(h=>`<div class="mem-history-row" style="padding:4px 0"><span class="status-pill${h.state==='active'?' done':''}">${esc(h.state)}</span> <span style="white-space:normal">${esc(h.content)}</span> <span class="meta">&middot; ${esc(timeAgo(h.updated_at))}</span></div>`).join('')}
+        </div>`);
+      return `
+      <div class="result-row" style="cursor:default;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:0">
+          <div class="kind"><span class="status-pill">${esc(r.kind)}</span> <span class="status-pill">${esc(r.confidence)}</span> ${r.pinned?'<span class="status-pill done">pinned</span>':''} &middot; ${memoryScopeLabel(r)}</div>
+          <div class="title" style="white-space:normal">${esc(r.content)}</div>
+          <div class="meta">${esc(r.source_type)} &middot; ${esc(timeAgo(r.updated_at))}</div>
+        </div>
+        <div style="display:flex;gap:6px;flex:none;flex-wrap:wrap">
+          <button type="button" class="pill-btn" data-mem-pin="${esc(r.id)}" data-pinned="${r.pinned?1:0}">${r.pinned?'Unpin':'Pin'}</button>
+          <button type="button" class="pill-btn" data-mem-edit="${esc(r.id)}">Edit</button>
+          <button type="button" class="pill-btn" data-mem-history="${esc(r.id)}">${openHistoryId===r.id?'Hide history':'History'}</button>
+          <button type="button" class="pill-btn" data-mem-forget="${esc(r.id)}">Forget</button>
+        </div>
+        ${historyPanel}
+      </div>`;
+    }).join(''):'<div class="empty-state">No memory saved in this scope yet.</div>';
+    document.querySelectorAll('[data-mem-pin]').forEach(b=>b.onclick=async()=>{
+      try{await api(`/api/memory/${b.dataset.memPin}/pin`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pinned:b.dataset.pinned!=='1'})});load()}
+      catch(err){showToast(err.message,{error:true})}
+    });
+    document.querySelectorAll('[data-mem-forget]').forEach(b=>b.onclick=async()=>{
+      const ok=await confirmModal({title:'Forget this memory?',body:'It will no longer be used in search or Chat context. This can be undone by an operator via History, or made permanent later with Purge.',confirmLabel:'Forget',danger:true});
+      if(!ok)return;
+      try{await api(`/api/memory/${b.dataset.memForget}/forget`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'forgotten from Memory UI'})});load()}
+      catch(err){showToast(err.message,{error:true})}
+    });
+    document.querySelectorAll('[data-mem-edit]').forEach(b=>b.onclick=()=>{editingMemoryId=b.dataset.memEdit;load()});
+    document.querySelectorAll('[data-mem-cancel-edit]').forEach(b=>b.onclick=()=>{editingMemoryId=null;load()});
+    document.querySelectorAll('[data-mem-save-edit]').forEach(b=>b.onclick=async()=>{
+      const id=b.dataset.memSaveEdit;
+      const next=$(`memEditArea-${id}`).value;
+      const row=rows.find(x=>x.id===id);
+      if(next.trim()===row.content){editingMemoryId=null;load();return}
+      try{await api(`/api/memory/${id}/edit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:next})});editingMemoryId=null;showToast('Memory updated');load()}
+      catch(err){showToast(err.message,{error:true})}
+    });
+    document.querySelectorAll('[data-mem-history]').forEach(b=>b.onclick=async()=>{
+      const id=b.dataset.memHistory;
+      if(openHistoryId===id){openHistoryId=null;load();return}
+      openHistoryId=id;
+      load();
+      try{
+        const {history}=await api(`/api/memory/${id}/history`);
+        memoryHistoryCache[id]=history;
+        if(openHistoryId===id)load();
+      }catch(err){openHistoryId=null;showToast(err.message,{error:true});load()}
+    });
+  }
+  $('memQuery').addEventListener('input',()=>{clearTimeout(window._memDebounce);window._memDebounce=setTimeout(load,220)});
+  await load();
+}
+async function renderKnowledgeTab(body){
+  body.innerHTML=`<div class="settings-form" style="max-width:520px">
+      <label>Paste text to ingest as knowledge<textarea id="kbContent" rows="4" placeholder="Paste plain text, markdown, CSV, or JSON here"></textarea></label>
+      <label>Title<input id="kbTitle" placeholder="notes.txt"></label>
+      <div class="handoff-actions"><button type="button" class="action" id="kbIngest">Ingest into current scope</button></div>
+    </div>
+    <div class="result-list" id="kbList" style="margin-top:14px"><div class="empty-state">Loading&hellip;</div></div>`;
+  const list=$('kbList');
+  async function load(){
+    const params=memoryScopeParams();
+    let data;
+    try{data=await api('/api/knowledge/documents'+(params?`?${params}`:''))}catch(err){list.innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
+    const rows=data.documents||[];
+    list.innerHTML=rows.length?rows.map(d=>`
+      <div class="result-row" style="cursor:default">
+        <div style="flex:1;min-width:0">
+          <div class="kind"><span class="status-pill ${d.status==='ready'?'done':d.status==='deleted'?'failed':'pending'}">${esc(d.status)}</span> &middot; ${d.chunk_count} chunk(s)</div>
+          <div class="title">${esc(d.title)}</div>
+          <div class="meta">${esc(d.source_type)} &middot; ${esc(timeAgo(d.updated_at))}</div>
+        </div>
+        ${d.status!=='deleted'?`<button type="button" class="pill-btn" data-kb-forget="${esc(d.id)}">Forget</button>`:''}
+      </div>`).join(''):'<div class="empty-state">No knowledge documents in this scope yet.</div>';
+    document.querySelectorAll('[data-kb-forget]').forEach(b=>b.onclick=async()=>{
+      const ok=await confirmModal({title:'Forget this document?',body:'Its chunks are permanently removed from search and Chat context.',confirmLabel:'Forget',danger:true});
+      if(!ok)return;
+      try{await api(`/api/knowledge/documents/${b.dataset.kbForget}/forget`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'forgotten from Memory UI'})});load()}
+      catch(err){showToast(err.message,{error:true})}
+    });
+  }
+  $('kbIngest').onclick=async()=>{
+    const content=$('kbContent').value;
+    if(!content.trim()){showToast('Paste some text first',{error:true});return}
+    const [scopeType,scopeId]=(memoryScopeFilter||'personal').split(':');
+    try{
+      await api('/api/knowledge/documents',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        filename:$('kbTitle').value||'notes.txt', mime_type:'text/plain', data_base64:btoa(unescape(encodeURIComponent(content))),
+        scope_type:scopeType||'personal', scope_id:scopeId||null, source_type:'upload',
+      })});
+      $('kbContent').value='';$('kbTitle').value='';showToast('Ingested');load();
+    }catch(err){showToast(err.message,{error:true})}
+  };
+  await load();
+}
+async function renderMemorySuggestionsTab(body){
+  body.innerHTML=`<div class="result-list" id="sugList"><div class="empty-state">Loading&hellip;</div></div>`;
+  const list=$('sugList');
+  async function load(){
+    const params=memoryScopeParams();
+    let data;
+    try{data=await api('/api/memory/suggestions'+(params?`?${params}`:''))}catch(err){list.innerHTML=`<div class="empty-state error">${esc(err.message)}</div>`;return}
+    const rows=data.suggestions||[];
+    list.innerHTML=rows.length?rows.map(s=>`
+      <div class="result-row" style="cursor:default">
+        <div style="flex:1;min-width:0">
+          <div class="kind"><span class="status-pill">${esc(s.suggested_kind)}</span> &middot; matched "${esc(s.signal)}"</div>
+          <div class="title" style="white-space:normal">${esc(s.suggested_content)}</div>
+          <div class="meta">${esc(timeAgo(s.created_at))}</div>
+        </div>
+        <div style="display:flex;gap:6px;flex:none">
+          <button type="button" class="pill-btn" data-sug-accept="${esc(s.id)}">Save to memory</button>
+          <button type="button" class="pill-btn" data-sug-dismiss="${esc(s.id)}">Dismiss</button>
+        </div>
+      </div>`).join(''):'<div class="empty-state">No pending suggestions. Falguna only suggests -- it never saves a memory from a conversation automatically.</div>';
+    document.querySelectorAll('[data-sug-accept]').forEach(b=>b.onclick=async()=>{
+      try{await api(`/api/memory/suggestions/${b.dataset.sugAccept}/accept`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});showToast('Saved to memory');load()}
+      catch(err){showToast(err.message,{error:true})}
+    });
+    document.querySelectorAll('[data-sug-dismiss]').forEach(b=>b.onclick=async()=>{
+      try{await api(`/api/memory/suggestions/${b.dataset.sugDismiss}/dismiss`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});load()}
+      catch(err){showToast(err.message,{error:true})}
+    });
+  }
+  await load();
+}
+
 /* ----------------------------------------------------------- Settings view */
 
-const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['browser','Browser'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
+const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['browser','Browser'],['memory','Memory'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
 // Falguna V2.1: Privacy Mode is a routing boundary the Model Router enforces
 // structurally (see falguna/model_router.py) -- Local Only never even
 // contacts an external provider, it is not merely hidden from the result.
@@ -3601,6 +4183,40 @@ async function renderSettingsView(tab){
           max_concurrent_sessions:Math.max(1,Math.min(10,parseInt($('bsMaxConcurrent').value,10)||1)),
         })});
         showToast('Browser settings saved');renderSettingsView('browser');
+      }catch(err){showToast(err.message,{error:true})}
+    };
+  }else if(tab==='memory'){
+    const mset=await api('/api/memory/settings');
+    body.innerHTML=`<div class="settings-section">
+      <div class="section-label" style="margin-top:0">Local-first memory &amp; knowledge</div>
+      <p class="lede" style="margin:0 0 4px">Keyword search over your saved memory and ingested documents always works fully offline, with zero embedding model. Semantic (meaning-based) retrieval is an optional add-on Falguna never installs on its own.</p>
+      <div class="settings-list" style="margin:0 0 8px">
+        <div>Offline keyword search: always available (SQLite FTS5, no network, no model)</div>
+        <div>Semantic retrieval: <b>${mset.semantic_retrieval_active?'active':'not active'}</b>${mset.configured&&!mset.available?' &mdash; configured, but the runtime is not reachable right now':''}</div>
+      </div>
+      <div class="settings-form">
+        <label>Embedding provider
+          <select id="memEmbProvider">
+            <option value="none" ${mset.provider==='none'?'selected':''}>None (keyword search only)</option>
+            <option value="ollama" ${mset.provider==='ollama'?'selected':''}>Ollama (local, if installed)</option>
+          </select>
+        </label>
+        <label>Ollama base URL<input id="memOllamaUrl" value="${esc(mset.settings.ollama_base_url)}"></label>
+        <label>Ollama embedding model<input id="memOllamaModel" value="${esc(mset.settings.ollama_embedding_model)}"></label>
+        <div class="handoff-actions"><button type="button" class="action" id="memSettingsSave">Save memory settings</button></div>
+      </div>
+      <div class="section-label">Setting up local embeddings on this Mac</div>
+      <div class="settings-list">
+        <div>Falguna never downloads or installs a model runtime automatically -- see MEMORY_LOCAL_EMBEDDINGS.md in the repository root for the exact, manual install steps for a lightweight local embedding model on this machine.</div>
+        <div>Until that runtime is installed and reachable, retrieval is keyword-only -- this is expected, not an error.</div>
+      </div>
+    </div>`;
+    $('memSettingsSave').onclick=async()=>{
+      try{
+        await api('/api/memory/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+          embedding_provider:$('memEmbProvider').value, ollama_base_url:$('memOllamaUrl').value, ollama_embedding_model:$('memOllamaModel').value,
+        })});
+        showToast('Memory settings saved');renderSettingsView('memory');
       }catch(err){showToast(err.message,{error:true})}
     };
   }else if(tab==='privacy'){
