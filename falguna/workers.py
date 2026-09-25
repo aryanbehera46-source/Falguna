@@ -7,6 +7,7 @@ import urllib.request
 import hashlib
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Optional
 
 from .gateway import ModelGateway
 from .models import WorkerResult
@@ -66,7 +67,7 @@ class AiderWorker(WorkerAdapter):
 class StructuredEditWorker(WorkerAdapter):
     """Replaceable worker that applies model-produced full-file edits deterministically."""
 
-    def __init__(self, gateway: ModelGateway, editable_files, timeout_seconds: int = 180, transport=None, max_replans: int = 2, max_diff_chars: int = 120000, checkpoint=None):
+    def __init__(self, gateway: ModelGateway, editable_files, timeout_seconds: int = 180, transport=None, max_replans: int = 2, max_diff_chars: int = 120000, checkpoint=None, always_excerpt_large_files: bool = False, excerpt_max_chars: int = 12000, max_tokens: Optional[int] = None):
         self.gateway = gateway
         self.editable_files = list(editable_files)
         self.timeout_seconds = timeout_seconds
@@ -74,6 +75,41 @@ class StructuredEditWorker(WorkerAdapter):
         self.max_replans = max_replans
         self.max_diff_chars = max_diff_chars
         self.checkpoint = checkpoint
+        # Opt-in output token cap (default None preserves every existing caller's
+        # behavior unchanged -- no cap was ever sent before this option existed).
+        # Real-world evidence (Sprint V1, Milestone 1, Royal Table retrial): a
+        # CPU-only 3B local model, given a strict JSON-schema-constrained bounded-
+        # edit request with no max_tokens, was observed generating past 1850
+        # tokens without terminating its own response, consuming its entire
+        # 300s per-call budget and being cancelled by the server (500 after
+        # 5m0s) with no output at all -- a slow, silent, budget-exhausting
+        # failure mode distinct from PATCH_NOOP/PATCH_STALE/SCOPE_EXPANSION,
+        # which at least produce a decodable response the replan loop can act
+        # on. A small, well-reasoned cap sized to the expected output (a short
+        # summary plus 1-3 minimal old/new text patches) forces the request to
+        # either finish promptly or fail fast as a normal parse/URL error the
+        # existing except clause and (for replan-eligible errors) the
+        # PatchTargetError feedback loop already handle -- it never changes
+        # what is written to disk, only how long a single model call is
+        # allowed to keep generating before giving up.
+        self.max_tokens = max_tokens
+        # Opt-in only (default False preserves every existing caller's behavior
+        # unchanged). A plain chat-completions transport (no `uses_workspace_context`
+        # -- i.e. no real filesystem access for the model) currently embeds a
+        # file's FULL raw content in the request no matter how large it is.
+        # For a slow CPU-only local model this is a real reliability problem,
+        # not just a cost one: a real ~60KB production file was observed to
+        # push a single structured-edit call's prompt processing past a 280s+
+        # timeout with zero output, and past a 300s budget with an empty
+        # PATCH_NOOP response. Setting this excerpts each oversized file around
+        # the requirement's own terms (the same `_context_excerpt` helper this
+        # class already uses for workspace-context replans), so the model sees
+        # a real, contiguous, relevant slice instead of the whole file -- the
+        # excerpt only shrinks what the model *reads*; `_apply_patches` still
+        # matches and writes against the full on-disk file, so this cannot by
+        # itself cause a wrong-location edit.
+        self.always_excerpt_large_files = always_excerpt_large_files
+        self.excerpt_max_chars = excerpt_max_chars
 
     def execute(self, worktree: Path, requirement: str, run_id: str) -> WorkerResult:
         config = dict(self.gateway.configuration())
@@ -90,11 +126,19 @@ class StructuredEditWorker(WorkerAdapter):
                     raise ValueError(f"editable path escapes worktree: {relative}")
                 files[relative] = target.read_text(encoding="utf-8")
             workspace_context = getattr(self.transport, "uses_workspace_context", False)
-            model_files = list(files) if workspace_context else files
             if workspace_context:
+                model_files = list(files)
                 config["_falguna_context_files"] = {
                     path: self._context_excerpt(content, requirement) for path, content in files.items()
                 }
+            elif self.always_excerpt_large_files:
+                model_files = {
+                    path: (self._context_excerpt(content, requirement, max_chars=self.excerpt_max_chars)
+                           if len(content) > self.excerpt_max_chars else content)
+                    for path, content in files.items()
+                }
+            else:
+                model_files = files
             payload = {
                 "model": config["model"],
                 "messages": [
@@ -103,6 +147,12 @@ class StructuredEditWorker(WorkerAdapter):
                         "content": (
                             "You are a bounded repository editor. Return minimal exact old-to-new text patches. Each old "
                             "snippet must occur exactly once in its file. Preserve all unrelated text byte-for-byte. "
+                            "The 'old' field of every patch MUST be copied character-for-character from the file content "
+                            "shown to you -- same characters, same line breaks, same indentation, same quote characters. "
+                            "Do not retype, reformat, or reindent it from memory: locate the exact snippet in the given "
+                            "file content and copy that literal span verbatim. If you are not fully certain of the exact "
+                            "surrounding characters, choose a shorter contiguous snippet you can copy with total certainty "
+                            "instead of a longer one you would have to reconstruct. "
                             "For a milestone, label each patch with task 1, 2, or 3 and order related tasks sequentially. "
                             "The working directory contains read-only copies of only the approved editable files. You may "
                             "inspect them with read-only shell commands, but do not attempt to edit them with tools. Large "
@@ -158,6 +208,8 @@ class StructuredEditWorker(WorkerAdapter):
                     },
                 },
             }
+            if self.max_tokens:
+                payload["max_tokens"] = self.max_tokens
             responses = []
             last_error = None
             for replan in range(self.max_replans + 1):
@@ -212,7 +264,18 @@ class StructuredEditWorker(WorkerAdapter):
         for patch in patches:
             relative = patch["path"]
             if relative not in allowed:
-                raise ValueError(f"SCOPE_EXPANSION_REQUIRED: unapproved edit path: {relative}")
+                # A wrong-but-plausible path (the model inventing a path instead of using one
+                # of the literal approved editable_files) is a recoverable mistake, not a
+                # security boundary violation -- route it through the same replan/feedback
+                # loop as PATCH_STALE/PATCH_AMBIGUOUS so the model sees exactly which path it
+                # got wrong and the real approved list on its very next attempt, instead of
+                # failing the whole run closed and restarting from scratch with no memory of
+                # the mistake (this was observed hallucinating a different wrong path on every
+                # independent run attempt).
+                raise PatchTargetError(
+                    f"SCOPE_EXPANSION_REQUIRED: unapproved edit path: {relative}; "
+                    f"the only approved editable file path(s) are: {sorted(allowed)}"
+                )
             target = (root / relative).resolve()
             if target == root or root not in target.parents:
                 raise ValueError(f"path escapes worktree: {relative}")

@@ -40,6 +40,8 @@ guessed into a false COMPLETED.
 """
 import json
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -60,6 +62,40 @@ from .store import utcnow
 
 def _inputs(task: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(task["inputs_json"]) if task.get("inputs_json") else {}
+
+
+_CODING_MODEL_MARKERS = ("coder", "codellama", "starcoder", "deepseek-coder")
+
+
+def _select_engineering_model(default: str, base_url: str = "http://127.0.0.1:11434") -> str:
+    """Capability-aware local model selection for coding tasks (Sprint V1 Milestone 1).
+
+    Deliberately narrow: this only ever looks at the local Ollama endpoint
+    already used by EngineeringAgentWorker's LocalGateway. It never touches
+    privacy_mode, never considers an external/paid provider, and never fails
+    the caller -- any error (Ollama unreachable, malformed response, timeout)
+    silently falls back to `default`. Among installed local models it prefers
+    the largest one whose name looks coding-specialized (e.g. a pulled
+    `qwen2.5-coder` model) over the generic instruct default, so a stronger
+    local model is used automatically the moment one is installed -- no
+    per-call configuration required, and nothing breaks if none ever is.
+    """
+    try:
+        with urllib.request.urlopen(f"{base_url}/api/tags", timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return default
+    candidates = []
+    for entry in payload.get("models", []) or []:
+        name = entry.get("name") or entry.get("model") or ""
+        if not name or "embed" in name.lower():
+            continue
+        if any(marker in name.lower() for marker in _CODING_MODEL_MARKERS):
+            candidates.append((int(entry.get("size") or 0), name))
+    if not candidates:
+        return default
+    candidates.sort(reverse=True)  # prefer the largest coding-specialized model installed
+    return candidates[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -295,14 +331,33 @@ class EngineeringAgentWorker(WorkforceWorker):
         except ValueError as exc:
             return WorkerResult(status="FAILED", next_action=str(exc), execution_method="API")
 
-        model = inputs.get("model", self.DEFAULT_MODEL)
+        model = inputs.get("model") or _select_engineering_model(self.DEFAULT_MODEL)
         # The default (180s) is tuned for a hosted/GPU-backed gateway. A local
         # CPU-only Ollama model editing a non-trivial file can genuinely take
         # longer per call; let the caller raise it explicitly rather than
         # silently failing every real attempt with "timed out".
         edit_timeout = int(inputs.get("model_timeout_seconds", 300))
         gateway = LocalGateway(model=model)
-        worker = StructuredEditWorker(gateway=gateway, editable_files=editable_files, timeout_seconds=edit_timeout)
+        worker = StructuredEditWorker(
+            gateway=gateway, editable_files=editable_files, timeout_seconds=edit_timeout,
+            # CPU-only local inference plus strict JSON-schema-constrained decoding makes
+            # embedding a whole large real file directly unworkable (observed: a real
+            # ~60KB production file pushed prompt processing past 280-300s with no usable
+            # output). Excerpt any oversized editable file down to the requirement-relevant
+            # slice before it goes to the model; the on-disk patch match/write still
+            # operates on the full real file (falguna/workers.py's own contract).
+            always_excerpt_large_files=True,
+            excerpt_max_chars=int(inputs.get("excerpt_max_chars", 12000)),
+            # A slow CPU-only local model given no output cap was observed generating
+            # past 1850 tokens without terminating, silently burning the entire
+            # model_timeout_seconds budget and being cancelled with zero usable output
+            # (Sprint V1, Milestone 1, Royal Table retrial evidence). The expected
+            # output here is a short summary plus 1-3 minimal old/new text patches;
+            # 1536 tokens is a generous bound for that and forces a fast, decodable
+            # failure (handled by the existing except clause / replan loop) instead of
+            # a slow, silent timeout when the model rambles.
+            max_tokens=int(inputs.get("max_tokens", 1536)),
+        )
         # ControlPlane.__init__ defaults self.reviewer to SemanticIndependentReviewer(),
         # an intentional fail-closed stub whose "unresolved_uncertainty" always rejects
         # every candidate -- it never approves anything, by design, until a real
