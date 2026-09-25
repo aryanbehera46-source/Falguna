@@ -50,6 +50,19 @@ CONFIDENCE_LEVELS = ("verified", "user_provided", "inferred")
 MEMORY_STATES = ("active", "superseded", "deleted")
 SENSITIVITY_LEVELS = ("normal", "sensitive")
 
+
+def _redact_if_sensitive(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Mask a sensitive record's content wherever it could surface as a
+    casual preview (list/search results) -- never used on get()-by-id,
+    where the caller already knows exactly which record they're opening."""
+    if record.get("sensitivity") != "sensitive":
+        return record
+    masked = dict(record)
+    masked["content"] = "\U0001F512 Sensitive memory \u2014 open this record to view its content"
+    if "snippet" in masked:
+        masked["snippet"] = "\U0001F512 Sensitive \u2014 content hidden in previews"
+    return masked
+
 MAX_DOCUMENT_BYTES = 5 * 1024 * 1024  # 5MB -- ingested text is chunked and tokenized in pure Python
 
 # Deliberately narrow: only formats this module can safely read as inert
@@ -473,7 +486,7 @@ class MemoryStore:
                 clauses.append("pinned=1")
             out.extend(self.store.list("memory_records", " AND ".join(clauses), params))
         out.sort(key=lambda r: r["updated_at"], reverse=True)
-        return out[:limit]
+        return [_redact_if_sensitive(r) for r in out[:limit]]
 
     def history(self, record_id: str) -> List[Dict[str, Any]]:
         """The full supersession chain for a record (oldest first),
@@ -520,7 +533,7 @@ class MemoryStore:
                 continue
             if (record["scope_type"], record["scope_id"] or None) not in allowed:
                 continue
-            out.append({**record, "rank": row["rank"], "snippet": row["snip"]})
+            out.append(_redact_if_sensitive({**record, "rank": row["rank"], "snippet": row["snip"]}))
             if len(out) >= limit:
                 break
         return out

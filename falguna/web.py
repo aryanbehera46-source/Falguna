@@ -2392,7 +2392,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .nav-item.active{background:var(--accent-soft);color:var(--accent-hi);font-weight:650}
 .nav-icon{width:16px;height:16px;display:grid;place-items:center;color:var(--muted-dim);flex:none}
 .nav-item:hover .nav-icon{color:var(--muted)}
-.nav-item.active .nav-icon{color:var(--accent)}
+.nav-item.active .nav-icon{color:var(--accent)}.nav-adv{border:0;margin:2px 0}.nav-adv-summary{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;padding:9px 9px 5px;color:var(--muted);font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.07em}.nav-adv-summary::-webkit-details-marker{display:none}.nav-adv-summary:hover{color:var(--text)}.nav-adv-chev{display:inline-block;font-size:9px;transition:transform .15s ease}.nav-adv[open] .nav-adv-chev{transform:rotate(90deg)}.nav-adv-chev::before{content:'\25B8'}.nav-adv .nav-item{padding-left:9px}
 .side-title{flex:none;padding:20px 9px 6px;color:var(--muted-dim);font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.09em}
 .side-list{flex:1;min-height:60px;overflow-x:hidden;overflow-y:auto;display:flex;flex-direction:column;gap:1px;padding-right:2px;scrollbar-width:thin;scrollbar-color:#4a3d28 transparent}
 .side-group-label{padding:10px 9px 3px;color:var(--muted-dim);font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.07em}
@@ -2411,7 +2411,7 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .topbar-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650;font-size:14px;color:var(--text)}
 .menu-button{display:none;border:0;background:transparent;color:var(--text);padding:6px;border-radius:7px;cursor:pointer}
 .model-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:5px 11px 5px 9px;font-size:11.5px;white-space:nowrap}.privacy-pill{cursor:default}.privacy-pill .dot{background:var(--muted)}.privacy-pill.mode-local .dot{background:var(--good)}.privacy-pill.mode-external .dot{background:var(--warn)}
-.model-pill .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.model-pill .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}.model-pill.unavailable{cursor:pointer;border-color:var(--bad-dim,var(--bad))}.model-pill.unavailable .dot{background:var(--bad)}
 .viewport{min-height:0;overflow:auto;display:flex;flex-direction:column}
 .scrim{display:none}
 .hidden{display:none!important}
@@ -2724,7 +2724,7 @@ button.action:disabled{opacity:.5;cursor:not-allowed}
 .attach-chip:hover{border-color:var(--accent-dim)}
 .attach-chip .x{cursor:pointer;color:var(--muted-dim)}
 .composer-attach-row{display:flex;gap:6px;flex-wrap:wrap;padding:0 8px 6px}
-.selector-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:0 2px 6px}
+.selector-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:0 2px 6px}.mem-sensitive-toggle{display:flex;align-items:center;gap:7px;padding:2px 2px 0;font-size:11.5px;color:var(--muted);cursor:pointer}.mem-sensitive-toggle input{margin:0}
 .tiny-select{border:1px solid var(--line);background:var(--soft);color:var(--muted);border-radius:999px;padding:5px 9px;font-size:11px}
 
 /* ---------- Settings V2 ---------- */
@@ -2931,9 +2931,13 @@ const icon=(name,size=16)=>`<svg width="${size}" height="${size}" viewBox="0 0 2
 $('newChatBtn').innerHTML=icon('plus',15)+'New chat';
 $('menuButton').innerHTML=icon('menu',17);
 $('bellBtn').innerHTML=icon('bell',16)+'<span class="bell-dot hidden" id="bellDot"></span>';
-$('nav').innerHTML=[
-  ['home','Home'],['chat','Chat'],['search','Search'],['work','Work'],['mission','Mission Control'],['memory','Memory'],['projects','Projects'],['files','Files'],['history','History'],['settings','Settings'],
-].map(([id,label])=>`<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`).join('');
+function navBtn([id,label]){return `<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`}
+$('nav').innerHTML=[['home','Home'],['chat','Chat'],['search','Search'],['projects','Projects']].map(navBtn).join('')
+  +`<details class="nav-adv" id="navAdvanced"><summary class="nav-adv-summary">Workspace<span class="nav-adv-chev" aria-hidden="true"></span></summary>`
+  +[['work','Work'],['mission','Mission Control'],['memory','Memory'],['files','Files'],['history','History']].map(navBtn).join('')
+  +`</details>`
+  +navBtn(['settings','Settings']);
+const ADVANCED_VIEWS=new Set(['work','mission','memory','files','history']);
 
 function closeSidebar(){$('sidebar').classList.remove('open');$('scrim').classList.remove('open');$('menuButton').setAttribute('aria-expanded','false')}
 function toggleSidebar(){const open=!$('sidebar').classList.contains('open');$('sidebar').classList.toggle('open',open);$('scrim').classList.toggle('open',open);$('menuButton').setAttribute('aria-expanded',String(open))}
@@ -3036,6 +3040,8 @@ const VIEW_TITLES={home:'Home',chat:'Chat',search:'Search',work:'Work',mission:'
 function setActiveNav(view){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   $('viewTitle').textContent=VIEW_TITLES[view]||'Falguna';
+  const adv=$('navAdvanced');
+  if(adv&&ADVANCED_VIEWS.has(view))adv.open=true;
 }
 document.querySelectorAll('.nav-item').forEach(b=>b.onclick=()=>{go('#/'+b.dataset.view);closeSidebar()});
 
@@ -3236,13 +3242,41 @@ async function renderHomeView(){
   wireMcControls();
 }
 
+async function refreshModelPill(){
+  // Local AI Independence / Phase A: the pill must reflect what will
+  // ACTUALLY be used, from the same live health-check /api/models already
+  // powers Settings -> Models -- never a static config string -- so it
+  // never contradicts what Chat does when the person actually sends.
+  let providers=[];
+  try{providers=(await api('/api/models')).providers||[]}catch(err){}
+  const ROUTABLE=new Set(['HEALTHY','DEGRADED']);
+  let resolved=null;
+  for(const p of providers){
+    if(!ROUTABLE.has(p.health&&p.health.state))continue;
+    const usable=(p.models||[]).find(m=>!m.is_embedding_only);
+    if(usable){resolved={provider:p,model:usable};break}
+  }
+  const pill=$('modelPill');
+  if(!pill)return;
+  if(resolved){
+    pill.classList.remove('unavailable');
+    pill.title=`${resolved.model.display_name} via ${resolved.provider.display_name} -- reachable now`;
+    pill.innerHTML=`<span class="dot"></span><span class="label">${esc(resolved.model.display_name)}</span>`;
+  }else{
+    pill.classList.add('unavailable');
+    const reasons=providers.map(p=>`${p.display_name}: ${(p.health&&p.health.detail)||(p.health&&p.health.state)||'unavailable'}`).join('; ');
+    pill.title=reasons?`No reachable model. ${reasons}. Click to open Settings.`:'No model provider configured. Click to open Settings.';
+    pill.innerHTML=`<span class="dot"></span><span class="label">No model available</span>`;
+    pill.onclick=()=>go('#/settings');
+  }
+}
 async function loadProfiles(){
   if(profileList.length)return;
   const c=await api('/api/config');
   profileList=c.profiles;
   settingsModel=c.model;
   c.profiles.forEach(p=>profiles[p.id]=p);
-  $('modelPill').innerHTML=`<span class="dot"></span><span class="label">${esc(settingsModel||'Falguna')}</span>`;
+  refreshModelPill().catch(()=>{});
   const pMode=c.privacy_mode;
   const pInfo=PRIVACY_MODE_INFO.find(([id])=>id===pMode);
   const pPill=$('privacyPill');
@@ -3255,6 +3289,12 @@ async function loadProfiles(){
   }
 }
 loadProfiles().catch(()=>{});
+// Model-readiness fix: a provider can drop mid-session (Ollama stops,
+// Codex logs out) -- loadProfiles() itself only ever runs once
+// (see its `if(profileList.length)return;` guard), so the pill needs
+// its own periodic re-check to never go stale/contradictory.
+setInterval(()=>{if(document.visibilityState==='visible')refreshModelPill().catch(()=>{})},20000);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refreshModelPill().catch(()=>{})});
 
 /* ------------------------------------------------------------ sidebar lists */
 
@@ -4425,6 +4465,9 @@ async function renderMemoryRecordsTab(body){
         </select>
         <button type="button" class="action" id="memNewSave">Save to Memory</button>
       </div>
+      <label class="mem-sensitive-toggle" title="Hides the content in lists, search and Home previews; still viewable by opening this record directly.">
+        <input type="checkbox" id="memNewSensitive"> Mark as sensitive (password, key, or other secret -- content stays hidden in previews)
+      </label>
     </div>
     <div class="searchbar"><input id="memQuery" placeholder="Search memory (offline keyword search)&hellip;"></div>
     <div class="result-list" id="memList"><div class="empty-state">Loading&hellip;</div></div>`;
@@ -4437,8 +4480,9 @@ async function renderMemoryRecordsTab(body){
       await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
         scope_type:scopeType||'personal', scope_id:scopeId||null, kind:$('memNewKind').value,
         content, source_type:'user_stated', confidence:$('memNewConfidence').value,
+        sensitivity:$('memNewSensitive').checked?'sensitive':'normal',
       })});
-      $('memNewContent').value='';showToast('Saved to memory');load();
+      $('memNewContent').value='';$('memNewSensitive').checked=false;showToast('Saved to memory');load();
     }catch(err){
       if(err.data&&err.data.candidates){
         const ok=await confirmModal({title:'Similar memory already exists',body:`${err.message}\n\nSave anyway as a separate memory?`,confirmLabel:'Save anyway'});
@@ -4447,8 +4491,9 @@ async function renderMemoryRecordsTab(body){
             await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
               scope_type:scopeType||'personal', scope_id:scopeId||null, kind:$('memNewKind').value,
               content, source_type:'user_stated', confidence:$('memNewConfidence').value, allow_conflict:true,
+              sensitivity:$('memNewSensitive').checked?'sensitive':'normal',
             })});
-            $('memNewContent').value='';showToast('Saved to memory');load();
+            $('memNewContent').value='';$('memNewSensitive').checked=false;showToast('Saved to memory');load();
           }catch(err2){showToast(err2.message,{error:true})}
         }
       }else showToast(err.message,{error:true});

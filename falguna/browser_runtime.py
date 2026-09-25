@@ -370,9 +370,22 @@ class BrowserSessionStore:
     def record_action(self, session_id: str, seq: int, action_type: str, target: Optional[str], value: Optional[str],
                        result: str, detail: str = "", tab_id: Optional[str] = None,
                        screenshot_attachment_id: Optional[str] = None) -> str:
+        # Security fix (Phase A survey finding): classify_sensitive_action()
+        # gates the ACT of typing into a credential-shaped field (password,
+        # card number, CVV, SSN, ...) before it runs, but the actual typed
+        # VALUE was still being persisted verbatim into browser_actions on
+        # every call site (queued-for-approval, completed, everywhere) --
+        # so a real password ended up in durable session history regardless
+        # of the gate. computer_use.py's type_text() already gets this
+        # right, only ever recording a length; this brings record_action()
+        # to the same standard, at the single choke point every TYPE action
+        # passes through, so no call site can regress it again.
+        stored_value = (value or "")[:500] if value else None
+        if action_type == BrowserActionType.TYPE and value and _CREDENTIAL_FIELD_PATTERN.search(target or ""):
+            stored_value = f"[REDACTED credential value -- {len(value)} chars typed]"
         return self.store.create("browser_actions", {
             "session_id": session_id, "tab_id": tab_id, "seq": seq, "action_type": action_type,
-            "target": (target or "")[:500], "value": (value or "")[:500] if value else None,
+            "target": (target or "")[:500], "value": stored_value,
             "result": result, "detail": (detail or "")[:2000],
             "screenshot_attachment_id": screenshot_attachment_id, "created_at": utcnow(),
         })
