@@ -498,3 +498,143 @@ CREATE TABLE IF NOT EXISTS memory_suggestions (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_memory_suggestions_status ON memory_suggestions(status, created_at);
+
+-- ============================================================
+-- Public corporate website (falguna/site_web.py, port 8767)
+-- Added: TTT Flagship Website V1. Additive only, site_ prefixed.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS site_services (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    division TEXT NOT NULL,          -- e.g. "Custom Software Engineering"
+    tagline TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    deliverables_json TEXT NOT NULL, -- JSON array of strings
+    process_json TEXT NOT NULL,      -- JSON array of {step, detail}
+    proof_slugs_json TEXT,           -- JSON array of site_case_studies.slug
+    status TEXT NOT NULL DEFAULT 'current', -- current | partner_qualified | in_development
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_case_studies (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    client_label TEXT NOT NULL,      -- e.g. "Royal Table (TTT demonstration project)"
+    is_own_project INTEGER NOT NULL DEFAULT 0,
+    summary TEXT NOT NULL,
+    problem TEXT NOT NULL,
+    approach TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    stack_json TEXT NOT NULL,
+    division_slugs_json TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    published INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_products (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    tagline TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    status TEXT NOT NULL,            -- research | in_development | beta | available
+    is_internal INTEGER NOT NULL DEFAULT 0, -- Falguna/TTT HQ = internal tooling, publicly described but not sold
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_posts (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    dek TEXT,
+    body_md TEXT NOT NULL,
+    author TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'engineering', -- engineering | company | marketing
+    published INTEGER NOT NULL DEFAULT 0,
+    published_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_jobs (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    department TEXT NOT NULL,
+    employment_type TEXT NOT NULL,   -- full_time | contract | internship
+    location_policy TEXT NOT NULL,   -- e.g. "Remote (India, +/-3h IST)"
+    summary TEXT NOT NULL,
+    responsibilities_json TEXT NOT NULL,
+    requirements_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open', -- open | closed
+    posted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_applications (
+    id TEXT PRIMARY KEY,
+    job_id TEXT REFERENCES site_jobs(id),
+    job_title_snapshot TEXT NOT NULL, -- "General Application" if job_id is NULL
+    applicant_name TEXT NOT NULL,
+    applicant_email TEXT NOT NULL,
+    applicant_phone TEXT,
+    links_json TEXT,                  -- portfolio/LinkedIn/GitHub URLs
+    cover_note TEXT,
+    resume_filename TEXT,
+    resume_storage_rel_path TEXT,
+    resume_sha256 TEXT,
+    resume_size_bytes INTEGER,
+    status TEXT NOT NULL DEFAULT 'new', -- new | reviewed | rejected | shortlisted
+    source_ip_hash TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_site_applications_status ON site_applications(status, created_at);
+
+CREATE TABLE IF NOT EXISTS site_enquiries (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,               -- general | project
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    company TEXT,
+    message TEXT NOT NULL,
+    opportunity_id TEXT,              -- set when kind=project and OpportunityStore.create() succeeded
+    source_ip_hash TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_staff_users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,      -- PBKDF2-HMAC-SHA256, salted (see site_auth.py)
+    role TEXT NOT NULL DEFAULT 'staff', -- staff | admin
+    is_active INTEGER NOT NULL DEFAULT 1,
+    mfa_enabled INTEGER NOT NULL DEFAULT 0, -- reserved; real TOTP not wired in V1, see spec
+    failed_login_count INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    last_login_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_staff_sessions (
+    id TEXT PRIMARY KEY,              -- opaque random token (the session id / cookie value)
+    user_id TEXT NOT NULL REFERENCES site_staff_users(id),
+    csrf_token TEXT NOT NULL,
+    ip_hash TEXT,
+    user_agent TEXT,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_site_staff_sessions_user ON site_staff_sessions(user_id);

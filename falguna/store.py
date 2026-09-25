@@ -236,7 +236,10 @@ class StateStore:
             # knowledge_fts are standalone FTS5 virtual tables managed directly
             # by MemoryStore/KnowledgeStore (raw SQL, not this generic helper --
             # a virtual table has no "id" column for create() to populate).
-            "memory_records", "knowledge_documents", "knowledge_chunks", "memory_suggestions"}
+            "memory_records", "knowledge_documents", "knowledge_chunks", "memory_suggestions",
+            # Twenty Two Technologies flagship public website (falguna/site_web.py)
+            "site_services", "site_case_studies", "site_products", "site_posts", "site_jobs",
+            "site_applications", "site_enquiries", "site_staff_users", "site_staff_sessions"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())
