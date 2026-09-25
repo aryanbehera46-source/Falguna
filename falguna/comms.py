@@ -225,6 +225,28 @@ class CommsStore:
         })
         return self.store.get("comm_messages", msg_id)
 
+    def mark_message_sent(self, message_id: str, actor: str) -> Dict[str, Any]:
+        """The one, explicit, owner-performed action that turns a drafted
+        OUTBOUND message into one that was actually sent -- same shape as
+        `EmailStore.mark_sent` / `FollowupStore` elsewhere in this
+        codebase. Nothing in this module ever calls this itself; it exists
+        only for a human (via the TTT HQ UI) to call after reviewing a
+        DRAFT and sending it through whatever real channel applies."""
+        message = self.store.get("comm_messages", message_id)
+        if not message:
+            raise CommsError("message not found")
+        if message["direction"] != "OUTBOUND":
+            raise CommsError("only an outbound (drafted) message can be marked sent")
+        if message["status"] != "DRAFT":
+            raise CommsError(f"message is already {message['status']}, not DRAFT")
+        now = utcnow()
+        self.store.update("comm_messages", message_id, status="SENT", updated_at=now)
+        conv = self.store.get("comm_conversations", message["conversation_id"])
+        if conv and not conv.get("first_response_at"):
+            self.store.update("comm_conversations", message["conversation_id"], first_response_at=now, updated_at=now)
+        self.audit.append("COMM_MESSAGE_SENT", {"message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor})
+        return self.store.get("comm_messages", message_id)
+
     # -- status / priority / assignment --------------------------------
 
     def set_status(self, conversation_id: str, status: str, actor: str, reason: Optional[str] = None) -> Dict[str, Any]:

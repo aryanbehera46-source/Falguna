@@ -64,6 +64,7 @@ from .capital_and_risk import (
     allowed_experimental_capital, budget_status, recommend_allocation,
 )
 from .comms import CommsError, CommsStore
+from .comms_workforce import run_agent_for_conversation, run_workforce_pass
 from .conversations import ConversationError, ConversationStore
 from .documents import DocumentError, DocumentStore
 from .email_admin import EmailError, EmailStore
@@ -533,6 +534,21 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 needs_aryan = NeedsAryanQueue(store, control.audit, control)
                 conv = CommsStore(store, control.audit, needs_aryan).get_conversation(conv_id)
                 return self._json(conv or {"error": "conversation not found"}, HTTPStatus.OK if conv else HTTPStatus.NOT_FOUND)
+            if path == "/api/comms/workforce/activity":
+                agent_messages = [
+                    m for m in store.list("comm_messages") if m.get("sender_agent")
+                ]
+                agent_messages.sort(key=lambda m: m["created_at"], reverse=True)
+                needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                escalations = [
+                    item for item in needs_aryan.list_pending()
+                    if item.get("ref_type") in ("comm_conversation", "rh_proposal", "rh_opportunity")
+                ]
+                return self._json({
+                    "recent_agent_messages": agent_messages[:25],
+                    "pending_escalations": escalations[:25],
+                    "email_provider": EmailStore(store, control.audit).provider_status(),
+                })
             if path == "/api/cc/snapshot":
                 return self._json(command_center_snapshot(store))
             if path == "/api/cc/ceo-brief/latest":
@@ -1202,6 +1218,41 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     risk_id = path.split("/")[4]
                     risk = RiskRegisterStore(store, control.audit).update_status(risk_id, body.get("status", ""), body.get("actor", "Aryan"), note=body.get("note"))
                     return self._json(risk)
+                if path == "/api/comms/workforce/run":
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    result = run_workforce_pass(store, control.audit, actor=body.get("actor", "ai_workforce"), needs_aryan=needs_aryan)
+                    return self._json(result)
+                if path.startswith("/api/comms/conversations/") and path.endswith("/run-agent"):
+                    conv_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    try:
+                        result = run_agent_for_conversation(store, control.audit, conv_id, actor=body.get("actor", "ai_workforce"), needs_aryan=needs_aryan)
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+                    return self._json(result)
+                if path.startswith("/api/comms/conversations/") and path.endswith("/messages"):
+                    conv_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    comms = CommsStore(store, control.audit, needs_aryan)
+                    message = comms.add_message(
+                        conv_id, "OUTBOUND", body.get("body", ""), kind=body.get("kind", "message"),
+                        sender_agent=body.get("sender_agent") or "Aryan",
+                        status=body.get("status", "SENT"), is_internal_note=bool(body.get("is_internal_note", False)),
+                        actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json(message, HTTPStatus.CREATED)
+                if path.startswith("/api/comms/conversations/") and path.endswith("/status"):
+                    conv_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    conv = CommsStore(store, control.audit, needs_aryan).set_status(
+                        conv_id, body.get("status", ""), body.get("actor", "Aryan"), reason=body.get("reason"),
+                    )
+                    return self._json(conv)
+                if path.startswith("/api/comms/messages/") and path.endswith("/mark-sent"):
+                    message_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    message = CommsStore(store, control.audit, needs_aryan).mark_message_sent(message_id, body.get("actor", "Aryan"))
+                    return self._json(message)
                 if path == "/api/needs-aryan":
                     item_id = NeedsAryanQueue(store, control.audit, control).create_item(
                         body.get("kind", ""), body.get("title", ""), body.get("what_is_needed", ""),
@@ -1217,6 +1268,18 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     result = queue.decide(item_id, body.get("action", ""), body.get("actor", "Aryan"), note=body.get("note"))
                     if before is not None and result.get("action"):
                         apply_decision_side_effect(store, control.audit, dict(before), result["action"], body.get("actor", "Aryan"), orchestrator=orchestrator)
+                        if before.get("ref_type") == "comm_conversation":
+                            # A conversation escalation (communications_approval /
+                            # negotiation_response_approval / client_response_decision)
+                            # parks the conversation in pending_approval -- any
+                            # decision here (approve, reject, defer, request-changes)
+                            # hands it back to "open" so a human or the next agent
+                            # pass can actually act on it, instead of leaving it
+                            # stuck forever.
+                            CommsStore(store, control.audit, queue).set_status(
+                                before["ref_id"], "open", body.get("actor", "Aryan"),
+                                reason=f"needs_aryan {result['action']}",
+                            )
                         if before.get("ref_type") == "rh_closing_package" and result["action"] == "APPROVED":
                             # Commercial safety default: an unconfigured Sales
                             # Policy prepared this as a package instead of
@@ -2621,7 +2684,7 @@ Ask Falguna
 </div>
 <div class="view" id="view-communications">
 <h1>Communications</h1>
-<div class="pageintro">Every real inbound/outbound conversation -- website enquiries, careers applications, and future channels -- in one place. Escalations here are the same Needs Aryan queue, not a second approval system.</div>
+<div class="pageintro">Every real inbound/outbound conversation -- website enquiries, careers applications, and future channels -- in one place. Escalations here are the same Needs Aryan queue, not a second approval system. The AI Receptionist / Sales Rep / Support Rep / Account Manager only ever draft; every send below is a deliberate, permission-controlled action.</div>
 <div class="row">
 <div class="section" style="flex:1"><h2 id="commsOpenTotal">0</h2><div class="sub">Open conversations</div></div>
 <div class="section" style="flex:1"><h2 id="commsNeedsAttention">0</h2><div class="sub">Needs attention (high/urgent/escalated)</div></div>
@@ -2629,6 +2692,13 @@ Ask Falguna
 <div class="section" style="flex:1"><h2 id="commsAwaitingApproval">0</h2><div class="sub">Awaiting approval</div></div>
 </div>
 <div class="section"><h2>By department</h2><div class="list" id="commsByDepartment"></div></div>
+<div class="section">
+<h2>AI Workforce</h2>
+<div class="sub" id="commsEmailProviderStatus">Email send provider: checking...</div>
+<div class="actions"><button id="commsRunWorkforce">Run AI Workforce now</button></div>
+<div class="list" id="commsWorkforceRunStatus"></div>
+<div class="list" id="commsWorkforceActivity"></div>
+</div>
 <div class="section"><h2>Needs attention</h2><div class="list" id="commsNeedsAttentionList"></div></div>
 <div class="section"><h2>All open conversations</h2><div class="list" id="commsConversationsList"></div></div>
 </div>
@@ -3457,8 +3527,8 @@ ${i.source==='falguna_engineering'?`<a class="secondary" style="border:0;border-
 </div>
 </div>`).join(''):'<div class="empty">Nothing needs Aryan right now.</div>';
 document.querySelectorAll('.na').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadNeedsAryan()}catch(e){alert(e.message)}})}
-async function loadCommunications(){const [ov,list]=await Promise.all([api('/api/comms/overview'),api('/api/comms/conversations')]);renderCommunications(ov,list.items||[])}
-function renderCommunications(ov,items){
+async function loadCommunications(){const [ov,list,activity]=await Promise.all([api('/api/comms/overview'),api('/api/comms/conversations'),api('/api/comms/workforce/activity')]);renderCommunications(ov,list.items||[],activity)}
+function renderCommunications(ov,items,activity){
 $('commsOpenTotal').textContent=ov.open_total||0;
 $('commsNeedsAttention').textContent=(ov.needs_attention||[]).length;
 $('commsNewLeads').textContent=(ov.new_leads||[]).length;
@@ -3469,10 +3539,27 @@ const convItem=c=>`<div class="item">
 <h3>${esc(c.subject||'(no subject)')}</h3>
 <div class="meta"><span>${esc(c.channel)}</span><span>${esc(c.department)}</span><span class="${c.priority==='urgent'||c.priority==='high'?'badge-actionable':'badge-inspect'}">${esc(c.priority)}</span><span>${esc(c.status)}</span>${c.assigned_agent?`<span>assigned: ${esc(c.assigned_agent)}</span>`:''}</div>
 <div class="contrib">Opened ${hqTimeAgo(c.created_at)} ago${c.first_response_due_at?` -- first response due ${esc(c.first_response_due_at)}`:''}</div>
+<div class="actions">
+<button class="secondary commsRunAgent" data-id="${esc(c.id)}">Run AI agent</button>
+<button class="secondary commsExpand" data-id="${esc(c.id)}">View messages</button>
+${c.status!=='resolved'&&c.status!=='closed'?`<button class="secondary commsResolve" data-id="${esc(c.id)}">Mark resolved</button>`:''}
+</div>
+<div class="hqcontribs" id="commsmsgs-${esc(c.id)}"></div>
 </div>`;
+if(activity&&activity.email_provider){const ep=activity.email_provider;$('commsEmailProviderStatus').textContent=`Email send provider: ${ep.provider}${ep.configured?' (configured -- live send possible)':' (not configured -- drafts only, nothing can be sent automatically)'}`}
+if(activity){
+const msgs=activity.recent_agent_messages||[];
+const escs=activity.pending_escalations||[];
+$('commsWorkforceActivity').innerHTML=`<div class="item"><h3>Recent agent drafts</h3>${msgs.length?msgs.slice(0,10).map(m=>`<div class="contrib"><b>${esc(m.sender_agent||'agent')}</b> (${esc(m.status)}, ${hqTimeAgo(m.created_at)} ago): ${esc((m.body||'').slice(0,140))}</div>`).join(''):'<div class="empty">No agent activity yet.</div>'}</div>
+<div class="item"><h3>Pending communications escalations</h3>${escs.length?escs.map(i=>`<div class="contrib"><b>${esc(i.kind)}:</b> ${esc(i.title)}</div>`).join(''):'<div class="empty">Nothing pending.</div>'}</div>`;
+}
 $('commsNeedsAttentionList').innerHTML=(ov.needs_attention||[]).length?(ov.needs_attention||[]).map(convItem).join(''):'<div class="empty">Nothing needs attention right now.</div>';
 $('commsConversationsList').innerHTML=items.length?items.map(convItem).join(''):'<div class="empty">No open conversations yet.</div>';
+document.querySelectorAll('.commsRunAgent').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const r=await api(`/api/comms/conversations/${b.dataset.id}/run-agent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});alert(r.actions&&r.actions.length?'Agent actions:\n'+r.actions.join('\n'):(r.note||'No action taken.'));await loadCommunications()}catch(e){alert(e.message)}finally{b.disabled=false}});
+document.querySelectorAll('.commsResolve').forEach(b=>b.onclick=async()=>{await api(`/api/comms/conversations/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'resolved',actor:'Aryan'})});await loadCommunications()});
+document.querySelectorAll('.commsExpand').forEach(b=>b.onclick=async()=>{const el=$('commsmsgs-'+b.dataset.id);if(el.dataset.loaded==='1'){el.innerHTML='';el.dataset.loaded='0';return}const conv=await api('/api/comms/conversations/'+b.dataset.id);el.dataset.loaded='1';el.innerHTML=(conv.messages||[]).map(m=>`<div class="contrib"><b>${esc(m.direction)}${m.is_internal_note?' note':''} (${esc(m.status)})${m.sender_agent?' -- '+esc(m.sender_agent):''}:</b> ${esc(m.body)}${m.direction==='OUTBOUND'&&m.status==='DRAFT'?` <button class="secondary commsMarkSent" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}">Approve & mark sent</button>`:''}</div>`).join('')||'<div class="empty">No messages yet.</div>';el.querySelectorAll('.commsMarkSent').forEach(mb=>mb.onclick=async()=>{if(!confirm('Confirm you have actually sent this message through the real channel, and mark it sent?'))return;await api(`/api/comms/messages/${mb.dataset.mid}/mark-sent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCommunications()})});
 }
+$('commsRunWorkforce').onclick=async()=>{$('commsRunWorkforce').disabled=true;$('commsWorkforceRunStatus').innerHTML='<div class="empty">Running AI Workforce across open conversations...</div>';try{const r=await api('/api/comms/workforce/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});$('commsWorkforceRunStatus').innerHTML=`<div class="item"><div class="meta"><span>checked ${r.conversations_checked}</span><span>acted on ${r.conversations_acted_on}</span></div></div>`;await loadCommunications()}catch(e){$('commsWorkforceRunStatus').innerHTML=`<div class="empty">Run failed: ${esc(e.message)}</div>`}finally{$('commsRunWorkforce').disabled=false}};
 
 // ---------- Revenue Hunter ----------
 const RH_STAGES=["New","Qualified","Proposal Ready","Applied/Sent","Replied","Meeting","Negotiating","Won","Lost"];

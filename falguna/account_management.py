@@ -24,6 +24,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .audit import AuditLog
+from .conversations import classify_intent
 from .store import StateStore
 
 BLOCKED_RUN_STATES = {"FAILED", "QUARANTINED"}
@@ -131,6 +132,27 @@ class AccountManagerService:
             m for m in messages
             if m["intent"] in _SCOPE_SIGNAL_INTENTS and (closed_at is None or m["created_at"] > closed_at)
         ]
+
+    def comms_signals(self, opportunity_id: str) -> List[Dict[str, Any]]:
+        """Same purpose as `scope_signals`, additive rather than a
+        replacement: reads the newer Unified Communications Center
+        (falguna.comms) tables instead of the older
+        rh_conversation_messages ones, so a scope/requirement signal that
+        came in through the real Communications Center (Milestone 1) is
+        just as visible to Account Management as one that came in through
+        Revenue Hunter's own conversation inbox. `scope_signals` above is
+        left untouched, so any existing caller or test keeps working."""
+        closing_records = self.store.list("rh_closing_records", "opportunity_id=?", (opportunity_id,))
+        closed_at = closing_records[-1]["created_at"] if closing_records else None
+        conversations = self.store.list("comm_conversations", "linked_opportunity_id=?", (opportunity_id,))
+        signals: List[Dict[str, Any]] = []
+        for conv in conversations:
+            messages = self.store.list("comm_messages", "conversation_id=? AND direction=?", (conv["id"], "INBOUND"))
+            for message in messages:
+                intent = classify_intent(message["body"])
+                if intent in _SCOPE_SIGNAL_INTENTS and (closed_at is None or message["created_at"] > closed_at):
+                    signals.append({**message, "conversation_id": conv["id"], "intent": intent})
+        return signals
 
     def portfolio_overview(self) -> List[Dict[str, Any]]:
         """One truthful status row per Active Job -- what the Sales

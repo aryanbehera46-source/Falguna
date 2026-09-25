@@ -23,6 +23,54 @@ class EmailError(ValueError):
     pass
 
 
+class EmailProvider:
+    """Provider-independent send boundary for future official
+    @twentytwotechnologies.com mailboxes (Communications workforce v1,
+    requirement 7). Wiring in a real provider later (SMTP, SES, Postmark,
+    the Gmail API, ...) means writing one small adapter class here that
+    implements these two methods -- nothing else in this codebase changes,
+    and no credentials for any provider are ever stored in code."""
+
+    def is_configured(self) -> bool:
+        raise NotImplementedError
+
+    def send(self, to_address: str, subject: str, body: str, from_address: Optional[str] = None) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class NullEmailProvider(EmailProvider):
+    """The only provider wired in today. Deliberately incapable of sending
+    anything: `is_configured()` is always False and `send()` always
+    raises. This is what keeps `mark_sent` a manual, owner-performed action
+    -- this code can never send email on its own -- and it never assumes an
+    unprovisioned @twentytwotechnologies.com mailbox is actually live."""
+
+    def is_configured(self) -> bool:
+        return False
+
+    def send(self, to_address: str, subject: str, body: str, from_address: Optional[str] = None) -> Dict[str, Any]:
+        raise EmailError(
+            "no email provider is configured -- this system cannot send email on its own. "
+            "Send this message yourself, then call mark_sent()."
+        )
+
+
+# Planned departmental mailboxes -- addresses only, never asserted as live,
+# provisioned inboxes. A department shows here once it has a planned
+# identity in the rest of the app (see falguna.comms.DEPARTMENTS); treat as
+# operational only once a human confirms it and wires a real EmailProvider
+# to it below.
+DEPARTMENT_MAILBOXES: Dict[str, str] = {
+    "general": "hello@twentytwotechnologies.com",
+    "sales": "sales@twentytwotechnologies.com",
+    "projects": "projects@twentytwotechnologies.com",
+    "support": "support@twentytwotechnologies.com",
+    "billing": "billing@twentytwotechnologies.com",
+    "careers": "careers@twentytwotechnologies.com",
+    "media": "media@twentytwotechnologies.com",
+}
+
+
 def _first_sentence(text: Optional[str]) -> str:
     text = (text or "").strip()
     if not text:
@@ -34,10 +82,23 @@ def _first_sentence(text: Optional[str]) -> str:
 
 
 class EmailStore:
-    def __init__(self, store: StateStore, audit: AuditLog, needs_aryan=None):
+    def __init__(self, store: StateStore, audit: AuditLog, needs_aryan=None, provider: Optional[EmailProvider] = None):
         self.store = store
         self.audit = audit
         self.needs_aryan = needs_aryan
+        # Defaults to a provider that structurally cannot send anything --
+        # see NullEmailProvider above. Passing a real provider here is the
+        # only way this class's send-readiness ever changes.
+        self.provider = provider or NullEmailProvider()
+
+    def provider_status(self) -> Dict[str, Any]:
+        """What TTT HQ shows for email-send readiness -- never claims a
+        department mailbox is live just because it's in DEPARTMENT_MAILBOXES."""
+        return {
+            "provider": type(self.provider).__name__,
+            "configured": self.provider.is_configured(),
+            "planned_mailboxes": dict(DEPARTMENT_MAILBOXES),
+        }
 
     def draft(
         self, to_address: str, subject: str, body: str, department: Optional[str] = None,
