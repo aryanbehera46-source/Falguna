@@ -41,6 +41,7 @@ from .conversations import _detect_sensitive_content as detect_sensitive_content
 from .revenue_hunter import (
     FollowupStore, OpportunityStore, ProposalStore, QualificationStore,
 )
+from .risk_engine import RiskClassificationStore
 from .sales_ops import NegotiationGuardrails
 from .store import StateStore
 from .ttt_hq import NeedsAryanQueue
@@ -408,6 +409,37 @@ _SPECIALIST_AGENT_CLASSES = {
 }
 
 
+def _classify_unrisked_outbound_drafts(
+    store: StateStore, audit: AuditLog, comms: CommsStore, needs_aryan: NeedsAryanQueue,
+    conversation_id: str, actor: str,
+) -> List[str]:
+    """Milestone 2 integration point: every OUTBOUND DRAFT message an agent
+    just drafted (or left unclassified from an earlier, interrupted pass)
+    gets a deterministic risk classification -- HIGH risk escalates through
+    the same single NeedsAryanQueue used everywhere else in this module.
+    Idempotent: a message that already has a comm_risk_events row is left
+    alone, so re-running the workforce never reclassifies or double-escalates
+    the same draft. This never changes a message's status -- classification
+    is visibility, not a second send gate (see risk_engine.py's own note)."""
+    risk = RiskClassificationStore(store, audit, needs_aryan)
+    conversation = comms.get_conversation(conversation_id)
+    notes: List[str] = []
+    for message in conversation.get("messages", []):
+        if message["direction"] != "OUTBOUND" or message["status"] != "DRAFT" or message["is_internal_note"]:
+            continue
+        if risk.list_for_subject("comm_message", message["id"]):
+            continue
+        result = risk.classify(
+            "comm_message", message["id"], message["body"], actor=actor,
+            title=f"High-risk draft reply needs review (conversation {conversation_id})",
+        )
+        if result["risk"] == "HIGH":
+            notes.append(f"Risk classified HIGH for draft message {message['id']} -- escalated to Needs Aryan")
+        else:
+            notes.append(f"Risk classified {result['risk']} for draft message {message['id']}")
+    return notes
+
+
 def run_agent_for_conversation(
     store: StateStore, audit: AuditLog, conversation_id: str, actor: str = "ai_workforce",
     needs_aryan: Optional[NeedsAryanQueue] = None,
@@ -436,6 +468,8 @@ def run_agent_for_conversation(
     if specialist_cls is not None:
         specialist = specialist_cls(store, audit, comms, needs_aryan)
         actions += specialist.run(conversation, actor=actor)
+
+    actions += _classify_unrisked_outbound_drafts(store, audit, comms, needs_aryan, conversation_id, actor)
 
     return {"conversation_id": conversation_id, "department": department, "actions": actions}
 

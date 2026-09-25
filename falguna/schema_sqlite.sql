@@ -758,3 +758,22 @@ CREATE TABLE IF NOT EXISTS comm_status_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_comm_status_events_conversation ON comm_status_events(conversation_id, created_at);
+
+-- TTT Communications V2 (falguna/risk_engine.py): deterministic outbound
+-- risk classification, persisted per event so TTT HQ and any later audit
+-- can see exactly what was classified and why -- not just the final state.
+CREATE TABLE IF NOT EXISTS comm_risk_events (
+    id TEXT PRIMARY KEY,
+    subject_type TEXT NOT NULL,        -- e.g. comm_message | wf_email_message | rh_proposal
+    subject_id TEXT NOT NULL,
+    risk TEXT NOT NULL,                -- LOW | MEDIUM | HIGH
+    reasons_json TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    needs_aryan_id TEXT,               -- set when risk=HIGH
+    final_action TEXT,                 -- set once a human decides/acts
+    decided_by TEXT,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_risk_events_subject ON comm_risk_events(subject_type, subject_id);

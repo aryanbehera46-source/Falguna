@@ -18,6 +18,7 @@ from falguna.comms_workforce import (
     run_agent_for_conversation, run_workforce_pass,
 )
 from falguna.revenue_hunter import ActiveJobStore, OpportunityStore, ProposalStore, apply_decision_side_effect
+from falguna.risk_engine import RiskClassificationStore
 from falguna.runtime import open_control_plane
 from falguna.site_content import EnquiryStore
 from falguna.store import StateStore
@@ -310,6 +311,55 @@ class DispatcherTests(_CommsWorkforceCase):
         run_workforce_pass(self.store, self.audit, needs_aryan=self.needs_aryan)
         second = run_workforce_pass(self.store, self.audit, needs_aryan=self.needs_aryan)
         self.assertEqual(second["conversations_acted_on"], 0)
+
+
+class RiskIntegrationTests(_CommsWorkforceCase):
+    """Milestone 2 wired into the dispatcher: every OUTBOUND DRAFT message
+    the workforce produces gets a deterministic risk classification, and a
+    second pass never reclassifies or double-escalates the same draft."""
+
+    def test_dispatcher_classifies_every_new_outbound_draft(self):
+        _, conv_id = self._sales_conversation()  # Receptionist drafts an acknowledgement
+        result = run_agent_for_conversation(self.store, self.audit, conv_id, actor="ai_workforce", needs_aryan=self.needs_aryan)
+        self.assertTrue(any("Risk classified" in a for a in result["actions"]))
+        conv = self.comms.get_conversation(conv_id)
+        draft = [m for m in conv["messages"] if m["direction"] == "OUTBOUND"][0]
+        risk = RiskClassificationStore(self.store, self.audit, self.needs_aryan)
+        rows = risk.list_for_subject("comm_message", draft["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertIn(rows[0]["risk"], ("LOW", "MEDIUM", "HIGH"))
+
+    def test_second_pass_does_not_reclassify_the_same_draft(self):
+        _, conv_id = self._sales_conversation()
+        run_agent_for_conversation(self.store, self.audit, conv_id, actor="ai_workforce", needs_aryan=self.needs_aryan)
+        conv = self.comms.get_conversation(conv_id)
+        draft = [m for m in conv["messages"] if m["direction"] == "OUTBOUND"][0]
+        risk = RiskClassificationStore(self.store, self.audit, self.needs_aryan)
+        first_rows = risk.list_for_subject("comm_message", draft["id"])
+        second = run_agent_for_conversation(self.store, self.audit, conv_id, actor="ai_workforce", needs_aryan=self.needs_aryan)
+        self.assertFalse(any("Risk classified" in a for a in second["actions"]))
+        second_rows = risk.list_for_subject("comm_message", draft["id"])
+        self.assertEqual(len(second_rows), len(first_rows))
+
+    def test_high_risk_draft_reply_escalates_through_workforce_pass(self):
+        """A support reply that happens to read as a commitment (e.g. a
+        template that got a refund-related intent) must be classified HIGH
+        and show up in Needs Aryan -- proven here by drafting a message
+        directly with commitment language and confirming the dispatcher's
+        risk pass (not the agent itself) is what catches and escalates it."""
+        conv = self.comms.open_conversation("SUPPORT", "support", priority="normal", actor="website")
+        self.comms.add_message(conv["id"], "INBOUND", "Can I get help with my account?", actor="website")
+        # Simulate an already-drafted outbound reply containing high-risk language
+        # (defensive coverage: even a draft not produced by today's templates
+        # must still be caught by the dispatcher's risk pass before anyone acts on it).
+        self.comms.add_message(
+            conv["id"], "OUTBOUND", "We agree to issue a full refund for this.",
+            sender_agent="AI Support Rep", actor="ai_workforce",
+        )
+        result = run_agent_for_conversation(self.store, self.audit, conv["id"], actor="ai_workforce", needs_aryan=self.needs_aryan)
+        self.assertTrue(any("Risk classified HIGH" in a for a in result["actions"]))
+        pending = self.needs_aryan.list_pending()
+        self.assertTrue(any(i["kind"] == "communications_approval" for i in pending))
 
 
 class EndToEndTrialTests(_CommsWorkforceCase):
