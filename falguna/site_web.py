@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
+from .comms import CommsStore
 from .revenue_hunter import OpportunityStore
 from .runtime import open_control_plane
 from .site_auth import StaffAuthService, AuthError
@@ -38,7 +39,10 @@ from .site_content import (
 
 SITE_NAME = "Twenty Two Technologies"
 SITE_DOMAIN = "twentytwotechnologies.com"
-SITE_EMAIL = "aryan@twentytwotechnologies.com"
+SITE_EMAIL = "hello@twentytwotechnologies.com"
+SALES_EMAIL = "sales@twentytwotechnologies.com"
+CAREERS_EMAIL = "careers@twentytwotechnologies.com"
+MEDIA_EMAIL = "media@twentytwotechnologies.com"
 FOUNDED_YEAR = 2020
 MAX_RESUME_BYTES = 8 * 1024 * 1024  # 8MB
 ALLOWED_RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
@@ -62,94 +66,133 @@ def esc(value: Optional[str]) -> str:
     """HTML-escape for safe interpolation into templates -- the single
     chokepoint every piece of user- or DB-sourced text must pass through
     before landing in a page, which is what keeps this XSS-safe."""
-    return html.escape(value or "", quote=True)
+    # Keep imported content presentation-ready when older seed rows use
+    # manuscript-style double hyphens instead of sentence punctuation.
+    clean = (value or "").replace(" -- ", ". ").replace(" & ", " and ")
+    return html.escape(clean, quote=True)
 
 
 # ============================================================
-# Design system -- deep charcoal / warm white / one restrained accent.
+# Design system -- approved logo palette: black, graphite, red and amber.
 # System font stack only: zero external font/script requests, which is
 # also why Lighthouse/CWV budgets in Block H are realistic to hit.
 # ============================================================
 SITE_CSS = r"""
 :root{
-  --ink:#0d0d0e; --ink-2:#17171a; --ink-3:#232327; --line:#2c2c31;
-  --paper:#faf8f3; --paper-dim:#eeece5; --ink-soft:#c9c8c4;
-  --accent:#c0392b; --accent-2:#e0644f; --focus:#7fb0ff;
-  --maxw:1180px; --gutter:24px;
-  --radius:14px;
+  --ink:#080809; --ink-2:#111113; --ink-3:#19191c; --line:#2a2a2f;
+  --paper:#f7f5ef; --paper-dim:#e8e4da; --ink-soft:#aaa9a6;
+  --accent:#ed1c24; --accent-hover:#ff3b30; --accent-2:#ff695f; --amber:#f29a16; --focus:#ffb13b;
+  --maxw:1200px; --gutter:28px;
+  --radius:18px;
   --ease:cubic-bezier(.2,.7,.2,1);
   --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
 }
 *{box-sizing:border-box}
 html{background:var(--ink)}
 body{
-  margin:0;background:var(--ink);color:var(--paper);
+  margin:0;background:var(--ink);color:var(--paper);overflow-x:hidden;
   font-family:var(--font);
   font-size:17px;line-height:1.6;-webkit-font-smoothing:antialiased;
 }
 img,svg{max-width:100%;display:block}
 a{color:inherit}
-.container{max-width:var(--maxw);margin:0 auto;padding:0 var(--gutter)}
+.container{width:100%;max-width:var(--maxw);margin:0 auto;padding:0 var(--gutter)}
 .visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.visually-hidden:focus{position:fixed;z-index:100;top:12px;left:12px;width:auto;height:auto;overflow:visible;clip:auto;padding:10px 14px;background:var(--paper);color:var(--ink);border-radius:8px}
 :focus-visible{outline:3px solid var(--focus);outline-offset:3px}
 @media (prefers-reduced-motion: reduce){*{animation-duration:.001ms !important;transition-duration:.001ms !important}}
 
 h1,h2,h3,h4{font-weight:600;letter-spacing:-0.02em;margin:0 0 .5em}
-h1{font-size:clamp(2.4rem,5vw,4.6rem);line-height:1.04;font-weight:650}
+h1{font-size:clamp(2.8rem,6vw,5.7rem);line-height:1.01;font-weight:650;max-width:16ch}
 h2{font-size:clamp(1.7rem,3.1vw,2.6rem);line-height:1.12}
 h3{font-size:clamp(1.2rem,1.7vw,1.5rem);line-height:1.25}
 p{margin:0 0 1em;color:var(--ink-soft)}
-.lede{font-size:clamp(1.05rem,1.6vw,1.35rem);color:var(--paper)}
-.eyebrow{font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent-2);font-weight:600}
+.lede{font-size:clamp(1.05rem,1.55vw,1.28rem);color:var(--paper-dim)}
+.eyebrow{font-size:.74rem;letter-spacing:.18em;text-transform:uppercase;color:#ff695f;font-weight:700}
 
 /* header / nav */
-.site-header{position:sticky;top:0;z-index:40;background:rgba(13,13,14,.86);backdrop-filter:saturate(140%) blur(10px);border-bottom:1px solid var(--line)}
-.site-header .bar{display:flex;align-items:center;justify-content:space-between;padding:18px var(--gutter);max-width:var(--maxw);margin:0 auto}
+.site-header{position:sticky;top:0;z-index:40;background:rgba(8,8,9,.9);backdrop-filter:saturate(130%) blur(16px);border-bottom:1px solid rgba(255,255,255,.08)}
+.site-header .bar{display:flex;align-items:center;justify-content:space-between;min-height:76px;padding:14px var(--gutter);max-width:var(--maxw);margin:0 auto}
 .wordmark{font-weight:700;font-size:1.05rem;letter-spacing:-.01em;text-decoration:none;color:var(--paper);display:flex;align-items:center;gap:.5em}
-.wordmark .dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}
-.nav{display:flex;gap:28px;align-items:center}
-.nav a{text-decoration:none;color:var(--ink-soft);font-size:.94rem;transition:color .15s var(--ease)}
+.brand-mark{display:block;width:42px;height:42px;overflow:hidden;position:relative;flex:0 0 42px;border-radius:8px;background:var(--ink)}
+.brand-mark img{position:absolute;max-width:none;width:42px;height:42px;left:0;top:0;mix-blend-mode:screen}
+.nav{display:flex;gap:24px;align-items:center}
+.nav a{text-decoration:none;color:var(--ink-soft);font-size:.9rem;transition:color .15s var(--ease)}
 .nav a:hover,.nav a[aria-current="page"]{color:var(--paper)}
-.nav-toggle{display:none;background:none;border:1px solid var(--line);color:var(--paper);border-radius:8px;padding:8px 10px}
-@media (max-width:860px){
+.nav-toggle{display:none;background:none;border:1px solid var(--line);color:var(--paper);border-radius:10px;padding:9px 12px;font-size:1rem}
+@media (max-width:1040px){
   .nav{display:none}
   .nav-toggle{display:inline-flex}
-  .site-header.open .nav{display:flex;position:absolute;left:0;right:0;top:100%;flex-direction:column;background:var(--ink-2);padding:18px var(--gutter);border-bottom:1px solid var(--line);gap:16px}
+  .site-header.open .nav{display:flex;position:absolute;left:0;right:0;top:100%;align-items:stretch;flex-direction:column;background:#0d0d0f;padding:20px var(--gutter) 24px;border-bottom:1px solid var(--line);gap:6px;box-shadow:0 18px 38px rgba(0,0,0,.35)}
+  .site-header.open .nav a{padding:10px 0}
 }
 
 /* buttons */
-.btn{display:inline-flex;align-items:center;gap:.5em;padding:13px 22px;border-radius:999px;font-weight:600;font-size:.95rem;text-decoration:none;transition:transform .15s var(--ease),background .15s var(--ease);border:1px solid transparent;cursor:pointer}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:var(--accent-2);transform:translateY(-1px)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.5em;padding:13px 22px;border-radius:999px;font-weight:650;font-size:.93rem;text-decoration:none;transition:transform .15s var(--ease),background .15s var(--ease),border-color .15s var(--ease);border:1px solid transparent;cursor:pointer}
+.btn-primary{background:linear-gradient(110deg,#d9161e,var(--accent));color:#fff;box-shadow:0 10px 28px rgba(237,28,36,.16)}
+.btn-primary:hover{background:var(--accent-hover);transform:translateY(-1px)}
 .btn-ghost{border-color:var(--line);color:var(--paper);background:transparent}
 .btn-ghost:hover{border-color:var(--paper)}
 .btn-row{display:flex;gap:14px;flex-wrap:wrap;margin-top:1.8em}
 
 /* hero */
-.hero{padding:min(14vw,140px) 0 90px;border-bottom:1px solid var(--line)}
+.hero{padding:clamp(74px,9vw,116px) 0 clamp(70px,8vw,100px);border-bottom:1px solid var(--line)}
 .hero .eyebrow{margin-bottom:18px;display:block}
-.hero-sub{max-width:640px;margin-top:22px}
+.hero-sub{max-width:650px;margin-top:24px}
+.home-hero{position:relative;isolation:isolate;min-height:760px;display:flex;align-items:center;overflow:hidden}
+.home-hero:before{content:"";position:absolute;z-index:-1;width:560px;height:560px;right:max(-160px,calc((100vw - var(--maxw))/2 - 190px));top:34px;border-radius:50%;background:radial-gradient(circle,rgba(237,28,36,.12) 0,rgba(242,154,22,.045) 38%,transparent 69%);filter:blur(3px)}
+.home-hero h1 em{font-style:normal;color:var(--paper);position:relative}
+.home-hero h1 em:after{content:"";position:absolute;left:0;right:6%;height:3px;bottom:-8px;background:linear-gradient(90deg,var(--accent),var(--amber));border-radius:99px}
+.hero-proof{display:flex;gap:26px;flex-wrap:wrap;margin-top:42px;padding-top:25px;border-top:1px solid var(--line);max-width:720px;color:var(--ink-soft);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}
+.hero-proof span{display:flex;align-items:center;gap:9px}
+.hero-proof span:before{content:"";width:5px;height:5px;border-radius:50%;background:var(--amber)}
 
 /* sections / grid */
-section{padding:88px 0}
+section{padding:96px 0}
 section.tight{padding:56px 0}
-.section-head{max-width:640px;margin-bottom:52px}
-.grid{display:grid;gap:28px}
+.section-head{max-width:680px;margin-bottom:46px}
+.grid{display:grid;gap:28px;min-width:0}
 .grid-3{grid-template-columns:repeat(3,1fr)}
 .grid-2{grid-template-columns:repeat(2,1fr)}
 @media (max-width:900px){.grid-3,.grid-2{grid-template-columns:1fr}}
 
-.card{background:var(--ink-2);border:1px solid var(--line);border-radius:var(--radius);padding:30px}
+.card{background:linear-gradient(145deg,#151517,#101012);border:1px solid var(--line);border-radius:var(--radius);padding:30px;min-width:0;overflow-wrap:anywhere}
 .card-link{text-decoration:none;display:block;transition:border-color .15s var(--ease),transform .15s var(--ease)}
 .card-link:hover{border-color:#3a3a40;transform:translateY(-2px)}
-.index{color:var(--accent-2);font-weight:700;font-size:.82rem;margin-bottom:14px;display:block}
+.index{color:#ff695f;font-weight:700;font-size:.78rem;margin-bottom:14px;display:block}
 .divider{border:0;border-top:1px solid var(--line);margin:0}
+.service-rail{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.service-rail a{padding:40px 30px 42px;text-decoration:none;border-right:1px solid var(--line);min-height:190px}
+.service-rail a:last-child{border-right:0}
+.service-rail a:hover h3{color:#ff695f}
+.service-rail h3{transition:color .15s var(--ease)}
+.service-rail p{font-size:.98rem;margin:0;max-width:30ch}
+.work-feature{display:grid;grid-template-columns:1fr 1fr;gap:80px;align-items:start;min-width:0}
+.work-feature>*{min-width:0}
+.work-feature .card{min-height:0;display:block;padding:0 0 26px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent}
+.work-feature .card + .card{padding-top:26px}
+.showcase-section{border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.showcase-list{display:flex;flex-direction:column}
+.showcase-item{display:block;padding:0 0 30px;margin-bottom:30px;border-bottom:1px solid var(--line);text-decoration:none}
+.showcase-item:last-child{margin-bottom:0}
+.showcase-item h3{margin-top:12px;transition:color .15s var(--ease)}
+.showcase-item:hover h3{color:#ff695f}
+.showcase-item p{max-width:48ch;margin:0}
+.service-catalog{display:grid;grid-template-columns:repeat(2,1fr);column-gap:70px}
+.service-catalog .service-item{display:block;padding:30px 0;border-top:1px solid var(--line);text-decoration:none}
+.service-catalog .service-item:hover h3{color:#ff695f}
+.service-catalog h3{transition:color .15s var(--ease)}
+.service-catalog p{margin:0;max-width:42ch}
+@media (max-width:760px){.service-catalog{grid-template-columns:1fr;column-gap:0}}
+.cta-band{padding:96px 0;background:var(--ink);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.cta-band .container{display:flex;align-items:end;justify-content:space-between;gap:36px}
+.cta-band h2{max-width:16ch;margin-bottom:0}
 
 /* alt panel (warm white band, used sparingly) */
-.panel-paper{background:var(--paper);color:var(--ink)}
-.panel-paper p,.panel-paper .lede{color:#4a4842}
-.panel-paper .card{background:#fff;border-color:#e6e3da}
-.panel-paper h2,.panel-paper h3{color:var(--ink)}
+.panel-paper{background:var(--ink-2);color:var(--paper);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.panel-paper p,.panel-paper .lede{color:var(--ink-soft)}
+.panel-paper .card{background:linear-gradient(145deg,#19191c,#111113);border-color:var(--line)}
+.panel-paper h2,.panel-paper h3{color:var(--paper)}
 
 /* footer */
 .site-footer{border-top:1px solid var(--line);padding:64px 0 40px;color:var(--ink-soft);font-size:.92rem}
@@ -159,6 +202,26 @@ section.tight{padding:56px 0}
 .footer-grid a{display:block;text-decoration:none;color:var(--ink-soft);margin-bottom:10px}
 .footer-grid a:hover{color:var(--paper)}
 .footer-bottom{margin-top:44px;padding-top:24px;border-top:1px solid var(--line);display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
+
+@media (max-width:760px){
+  :root{--gutter:20px}
+  body{font-size:16px}
+  .wordmark{font-size:.95rem}
+  .brand-mark{width:38px;height:38px;flex-basis:38px}
+  .brand-mark img{width:38px;height:38px}
+  .home-hero{min-height:auto;padding:92px 0 82px}
+  .home-hero:before{width:380px;height:380px;right:-220px}
+  .hero-proof{gap:14px;margin-top:32px}
+  section{padding:68px 0}
+  .service-rail{grid-template-columns:1fr}
+  .service-rail a{padding:28px 0;border-right:0;border-bottom:1px solid var(--line);min-height:0}
+  .service-rail a:last-child{border-bottom:0}
+  .work-feature{grid-template-columns:1fr;gap:28px}
+  .cta-band .container{align-items:flex-start;flex-direction:column}
+  .btn-row .btn{width:100%}
+  .footer-grid{grid-template-columns:1fr 1fr;gap:28px 22px}
+  .footer-grid>div:first-child{grid-column:1/-1}
+}
 
 /* forms */
 form.stack{display:flex;flex-direction:column;gap:18px;max-width:640px}
@@ -191,9 +254,9 @@ th{color:var(--ink-soft);font-weight:600;font-size:.78rem;text-transform:upperca
 # ============================================================
 
 NAV_ITEMS = [
-    ("/", "Home"), ("/about", "About"), ("/services", "Services"),
-    ("/work", "Work"), ("/products", "Products"), ("/careers", "Careers"),
-    ("/insights", "Insights"), ("/contact", "Contact"),
+    ("/services", "Services"), ("/work", "Work"),
+    ("/products", "Products"), ("/about", "Company"),
+    ("/contact", "Contact"),
 ]
 
 FOOTER_SERVICES = [
@@ -215,14 +278,14 @@ FOOTER_LEGAL = [
 def _logo_img(cls: str = "") -> str:
     """The real, approved Twenty Two Technologies mark. Replaces the
     temporary typographic wordmark once Aryan supplied the actual asset."""
-    return (f'<img class="brand-logo {cls}" src="{HEADER_LOGO_PATH}" '
-             f'alt="Twenty Two Technologies" width="36" height="36">')
+    return (f'<span class="brand-mark {cls}" aria-hidden="true"><img src="{HEADER_LOGO_PATH}" '
+             f'alt="" width="86" height="86"></span>')
 
 
 def render_header(active_path: str) -> str:
     links = []
     for href, label in NAV_ITEMS:
-        current = ' aria-current="page"' if href == active_path else ""
+        current = ' aria-current="page"' if active_path == href or active_path.startswith(href + "/") else ""
         links.append(f'<a href="{href}"{current}>{esc(label)}</a>')
     return f"""
 <header class="site-header" id="site-header">
@@ -257,8 +320,8 @@ def render_footer() -> str:
     <div class="footer-grid">
       <div>
         <a class="wordmark" href="/">{_logo_img()}<span>Twenty Two Technologies</span></a>
-        <p style="margin-top:16px;max-width:32ch">Established {FOUNDED_YEAR}. Custom software, AI systems, and
-        digital experience engineering for clients who need real, working products -- not decks.</p>
+        <p style="margin-top:16px;max-width:34ch">Established {FOUNDED_YEAR}. We design and build dependable
+        software, AI systems, and digital products.</p>
         <p><a href="mailto:{SITE_EMAIL}" style="color:var(--paper);text-decoration:underline">{SITE_EMAIL}</a></p>
       </div>
       {col("Services", FOOTER_SERVICES)}
@@ -266,7 +329,7 @@ def render_footer() -> str:
       {col("Legal", FOOTER_LEGAL)}
     </div>
     <div class="footer-bottom">
-      <span>&copy; {year} Twenty Two Technologies Pvt. Ltd. All rights reserved.</span>
+      <span>&copy; {FOUNDED_YEAR} Twenty Two Technologies Pvt. Ltd. All rights reserved.</span>
       <span>Built and operated on our own engineering stack.</span>
     </div>
   </div>
@@ -331,101 +394,67 @@ def page(title: str, description: str, path: str, body_html: str,
 
 def render_home(services: List[Dict[str, Any]], case_studies: List[Dict[str, Any]],
                   products: List[Dict[str, Any]]) -> str:
-    top_services = services[:6]
+    top_services = services[:3]
     service_cards = "".join(f"""
-    <a class="card card-link" href="/services/{esc(s['slug'])}">
+    <a href="/services/{esc(s['slug'])}">
       <span class="index">{i+1:02d}</span>
       <h3>{esc(s['division'])}</h3>
       <p>{esc(s['tagline'])}</p>
     </a>""" for i, s in enumerate(top_services))
 
-    proof = case_studies[:3]
+    proof = case_studies[:2]
     proof_cards = "".join(f"""
-    <a class="card card-link" href="/work/{esc(c['slug'])}">
-      <span class="badge">{esc(c['client_label'])}</span>
-      <h3 style="margin-top:14px">{esc(c['title'])}</h3>
+    <a class="showcase-item" href="/work/{esc(c['slug'])}">
+      <span class="eyebrow">{esc(c['client_label'])}</span>
+      <h3>{esc(c['title'])}</h3>
       <p>{esc(c['summary'])}</p>
     </a>""" for c in proof)
 
-    venture_cards = "".join(f"""
-    <div class="card">
-      <span class="badge badge-{'live' if p['status']=='available' else ('dev' if p['status']=='in_development' else 'research')}">{esc(p['status'].replace('_',' ').title())}</span>
-      <h3 style="margin-top:14px">{esc(p['name'])}</h3>
-      <p>{esc(p['tagline'])}</p>
-    </div>""" for p in products)
-
     return f"""
-<section class="hero">
+<section class="hero home-hero">
   <div class="container">
     <span class="eyebrow">Twenty Two Technologies &middot; Est. {FOUNDED_YEAR}</span>
-    <h1>Software engineering for companies who need it to actually work.</h1>
-    <p class="lede hero-sub">We design and build custom software, AI systems, and digital products --
-    end to end, from a scoped first milestone to a full platform. Small projects and complex
-    engagements, held to the same engineering bar.</p>
+    <h1>We build software that is ready for the <em>real world.</em></h1>
+    <p class="lede hero-sub">Custom platforms, AI systems, and digital products, designed with
+    restraint, engineered for reliability, and delivered in clear milestones.</p>
     <div class="btn-row">
-      <a class="btn btn-primary" href="/contact/start-a-project">Start a project</a>
-      <a class="btn btn-ghost" href="/work">See our work</a>
+      <a class="btn btn-primary" href="/contact/start-a-project">Discuss your project</a>
+      <a class="btn btn-ghost" href="/work">Explore selected work</a>
     </div>
-  </div>
-</section>
-
-<section class="tight">
-  <div class="container">
-    <div class="section-head">
-      <span class="eyebrow">What we do</span>
-      <h2>Capabilities that scale with the engagement.</h2>
-      <p>A cross-disciplinary studio built around real delivery, not a single narrow specialty.</p>
-    </div>
-    <div class="grid grid-3">{service_cards}</div>
-    <div class="btn-row"><a class="btn btn-ghost" href="/services">View all services</a></div>
-  </div>
-</section>
-
-<section class="panel-paper">
-  <div class="container">
-    <div class="section-head">
-      <span class="eyebrow">Proof of work</span>
-      <h2>Real projects, not mockups.</h2>
-      <p>We show working software and named engagements -- including our own products, built and
-      operated the same way we build for clients.</p>
-    </div>
-    <div class="grid grid-3">{proof_cards}</div>
-    <div class="btn-row"><a class="btn btn-ghost" href="/work">View all work</a></div>
   </div>
 </section>
 
 <section>
   <div class="container">
     <div class="section-head">
-      <span class="eyebrow">Products & ventures</span>
-      <h2>What we're building ourselves.</h2>
-      <p>Independent products developed in-house, at the stage they're honestly at.</p>
+      <span class="eyebrow">Core capabilities</span>
+      <h2>From the first useful release to the platform behind it.</h2>
+      <p>Digital products, platforms, and experiences designed to put your business in motion.</p>
     </div>
-    <div class="grid grid-3">{venture_cards}</div>
-    <div class="btn-row"><a class="btn btn-ghost" href="/products">Products & ventures</a></div>
+    <div class="service-rail">{service_cards}</div>
+    <div class="btn-row"><a class="btn btn-ghost" href="/services">View all services</a></div>
   </div>
 </section>
 
-<section class="tight">
-  <div class="container grid grid-2" style="align-items:center">
+<section class="showcase-section">
+  <div class="container work-feature">
     <div>
-      <span class="eyebrow">How we engage</span>
-      <h2>Start small. Scale if it's working.</h2>
-      <p>Most engagements begin with a scoped first milestone -- one feature, one integration, one
-      discovery phase -- priced and delivered on its own, so you can evaluate us before committing to
-      more. No inflated minimums, no artificial ceilings on scope.</p>
-      <div class="btn-row"><a class="btn btn-primary" href="/contact/start-a-project">Tell us about your project</a></div>
+      <span class="eyebrow">Proof of work</span>
+      <h2>Selected work that speaks for itself.</h2>
+      <p>Explore a selection of products and platforms from the Twenty Two Technologies studio.</p>
+      <div class="btn-row"><a class="btn btn-primary" href="/work">See all work</a></div>
     </div>
-    <div class="card">
-      <h3>A typical first engagement</h3>
-      <table>
-        <tr><th>Step</th><th>What happens</th></tr>
-        <tr><td>Scope exchange</td><td>Must-haves, deadline, existing assets, decision process</td></tr>
-        <tr><td>Proposal</td><td>Named proof of work, phased milestones, explicit assumptions</td></tr>
-        <tr><td>First milestone</td><td>Small, fixed, delivered before any larger commitment</td></tr>
-        <tr><td>Delivery & QA</td><td>Isolated build, independent review, agreed verification</td></tr>
-      </table>
+    <div class="showcase-list">{proof_cards}</div>
+  </div>
+</section>
+
+<section class="cta-band">
+  <div class="container">
+    <div>
+      <span class="eyebrow">Let’s build what’s next</span>
+      <h2>Bring your next digital product to life.</h2>
     </div>
+    <a class="btn btn-primary" href="/contact/start-a-project">Start a conversation</a>
   </div>
 </section>
 """
@@ -447,36 +476,18 @@ def render_about() -> str:
   </div>
 </section>
 
-<section class="tight">
-  <div class="container grid grid-2">
-    <div>
-      <h2>How we work</h2>
-      <p>Every engagement starts with a real scope exchange, not a template proposal. We name the
-      proof of work that's actually comparable, price a first milestone on its own, and keep delivery
-      isolated and independently verified before anything is called done.</p>
-    </div>
-    <div>
-      <h2>What we won't do</h2>
-      <p>We don't claim capabilities we haven't proven, publish invented client logos or testimonials,
-      or promise turnaround times we can't back with evidence. Where a capability depends on a
-      qualified specialist or partner rather than an in-house team, we say so.</p>
-    </div>
-  </div>
-</section>
-
-<section class="panel-paper">
+<section>
   <div class="container">
     <div class="section-head">
-      <span class="eyebrow">Engineering principles</span>
-      <h2>What "done" means here.</h2>
+      <span class="eyebrow">The studio</span>
+      <h2>Technology with ambition, clarity, and craft.</h2>
+      <p>Twenty Two Technologies brings strategy, design, engineering, and growth together under one roof.
+      We partner with organizations that want to move faster and build for what comes next.</p>
     </div>
     <div class="grid grid-3">
-      <div class="card"><h3>Isolated delivery</h3><p>Work happens on isolated branches/worktrees with
-      sandboxed execution, so a build in progress can never destabilize a live system.</p></div>
-      <div class="card"><h3>Independent verification</h3><p>A second, independent review checks
-      requirement fit, scope, and regression risk before anything is presented as finished.</p></div>
-      <div class="card"><h3>Honest status</h3><p>Research, in development, beta, and available are
-      real distinctions we hold ourselves to across our own products, not just client work.</p></div>
+      <div><h3>Strategy</h3><p>Clear direction for complex digital opportunities.</p></div>
+      <div><h3>Design</h3><p>Distinctive experiences that make technology easy to use.</p></div>
+      <div><h3>Engineering</h3><p>Scalable systems built for the demands of modern business.</p></div>
     </div>
   </div>
 </section>
@@ -487,7 +498,7 @@ def render_about() -> str:
       <span class="eyebrow">Where we're headed</span>
       <h2>A studio built to take on more, deliberately.</h2>
       <p>We're built to support a growing base of clients and an expanding portfolio of our own
-      products -- adding capacity and capability as real engagements justify it, not ahead of it.</p>
+      products, adding capacity and capability as real engagements justify it, not ahead of it.</p>
     </div>
     <div class="btn-row"><a class="btn btn-primary" href="/contact/start-a-project">Work with us</a>
       <a class="btn btn-ghost" href="/careers">See open roles</a></div>
@@ -509,9 +520,8 @@ STATUS_LABEL = {
 
 def render_services_index(services: List[Dict[str, Any]]) -> str:
     cards = "".join(f"""
-    <a class="card card-link" href="/services/{esc(s['slug'])}">
-      <span class="badge {STATUS_LABEL.get(s['status'], STATUS_LABEL['current'])[0]}">{esc(STATUS_LABEL.get(s['status'], STATUS_LABEL['current'])[1])}</span>
-      <h3 style="margin-top:14px">{esc(s['division'])}</h3>
+    <a class="service-item" href="/services/{esc(s['slug'])}">
+      <h3>{esc(s['division'])}</h3>
       <p>{esc(s['tagline'])}</p>
     </a>""" for s in services)
     return f"""
@@ -519,12 +529,11 @@ def render_services_index(services: List[Dict[str, Any]]) -> str:
   <div class="container">
     <span class="eyebrow">Services</span>
     <h1>What we build, and how we deliver it.</h1>
-    <p class="lede hero-sub">Current, in-house capability; capability we deliver through a named,
-    qualified partner; and services in active development are marked distinctly below -- we don't
-    blur the line.</p>
+    <p class="lede hero-sub">A full spectrum of technology, digital experience, and business services
+    for ambitious companies.</p>
   </div>
 </section>
-<section class="tight"><div class="container"><div class="grid grid-3">{cards}</div></div></section>
+<section class="tight"><div class="container"><div class="service-catalog">{cards}</div></div></section>
 """
 
 
@@ -539,7 +548,6 @@ def render_service_detail(s: Dict[str, Any], proof: List[Dict[str, Any]]) -> str
       <span class="badge">{esc(c['client_label'])}</span>
       <h3 style="margin-top:14px">{esc(c['title'])}</h3>
     </a>""" for c in proof) or '<p>No published case study for this division yet.</p>'
-    badge_cls, badge_label = STATUS_LABEL.get(s["status"], STATUS_LABEL["current"])
     jsonld = [{
         "@context": "https://schema.org", "@type": "Service",
         "serviceType": s["division"], "provider": {"@type": "Organization", "name": SITE_NAME},
@@ -549,7 +557,6 @@ def render_service_detail(s: Dict[str, Any], proof: List[Dict[str, Any]]) -> str
 <section class="hero" style="padding-bottom:50px">
   <div class="container">
     <span class="eyebrow">Services</span>
-    <span class="badge {badge_cls}" style="margin-bottom:14px;display:inline-block">{esc(badge_label)}</span>
     <h1>{esc(s['division'])}</h1>
     <p class="lede hero-sub">{esc(s['summary'])}</p>
   </div>
@@ -600,7 +607,7 @@ def render_work_index(case_studies: List[Dict[str, Any]]) -> str:
 def render_case_study_detail(c: Dict[str, Any]) -> tuple:
     stack = "".join(f'<span class="badge" style="margin:0 8px 8px 0">{esc(t)}</span>' for t in c["stack"])
     own_note = ('<p class="form-note">This is a Twenty Two Technologies product/demonstration project, '
-                 "shown as proof of engineering capability -- not a paid third-party client engagement.</p>"
+                 "shown as proof of engineering capability, not a paid third-party client engagement.</p>"
                  if c["is_own_project"] else "")
     jsonld = [{
         "@context": "https://schema.org", "@type": "CreativeWork",
@@ -639,14 +646,9 @@ def render_case_study_detail(c: Dict[str, Any]) -> tuple:
 # ============================================================
 
 def render_products(products: List[Dict[str, Any]]) -> str:
-    status_meta = {
-        "research": ("badge-research", "Research"), "in_development": ("badge-dev", "In development"),
-        "beta": ("badge-dev", "Beta"), "available": ("badge-live", "Available"),
-    }
     cards = "".join(f"""
-    <div class="card">
-      <span class="badge {status_meta.get(p['status'], status_meta['research'])[0]}">{esc(status_meta.get(p['status'], status_meta['research'])[1])}</span>
-      <h3 style="margin-top:14px">{f'<img src="{FALGUNA_MARK_PATH}" alt="" width="24" height="24" style="vertical-align:-5px;margin-right:8px;border-radius:6px">' if p['name'].strip().lower() == 'falguna' else ''}{esc(p['name'])}</h3>
+    <div class="showcase-item">
+      <h3>{f'<img src="{FALGUNA_MARK_PATH}" alt="" width="24" height="24" style="vertical-align:-5px;margin-right:8px;border-radius:6px">' if p['name'].strip().lower() == 'falguna' else ''}{esc(p['name'])}</h3>
       <p>{esc(p['tagline'])}</p>
       <p>{esc(p['summary'])}</p>
     </div>""" for p in products)
@@ -655,11 +657,10 @@ def render_products(products: List[Dict[str, Any]]) -> str:
   <div class="container">
     <span class="eyebrow">Products & Ventures</span>
     <h1>What we're building ourselves.</h1>
-    <p class="lede hero-sub">Status badges reflect where each product genuinely is today -- research,
-    in development, beta, or available -- not aspiration.</p>
+    <p class="lede hero-sub">Ideas, platforms, and products created by the Twenty Two Technologies studio.</p>
   </div>
 </section>
-<section class="tight"><div class="container"><div class="grid grid-3">{cards}</div></div></section>
+<section class="tight"><div class="container"><div class="showcase-list">{cards}</div></div></section>
 """
 
 
@@ -668,28 +669,17 @@ def render_products(products: List[Dict[str, Any]]) -> str:
 # ============================================================
 
 def render_careers_index(jobs: List[Dict[str, Any]]) -> str:
-    if jobs:
-        cards = "".join(f"""
-        <a class="card card-link" href="/careers/{esc(j['slug'])}">
-          <span class="badge">{esc(j['department'])} &middot; {esc(j['employment_type'].replace('_',' ').title())}</span>
-          <h3 style="margin-top:14px">{esc(j['title'])}</h3>
-          <p>{esc(j['location_policy'])}</p>
-        </a>""" for j in jobs)
-        listing = f'<div class="grid grid-3">{cards}</div>'
-    else:
-        listing = ('<div class="card"><p>No open roles right now. We post here the moment a real '
-                    "position opens -- we don't list placeholder vacancies. Strong candidates are "
-                    "welcome to send a general application below.</p></div>")
+    listing = "".join(f'<a class="showcase-item" href="/careers/{esc(j["slug"])}"><h3>{esc(j["title"])}</h3><p>{esc(j["department"])}</p></a>' for j in jobs)
+    listing += '<p class="form-note">Send your resume and we will be in touch when a suitable opportunity opens.</p>'
     return f"""
 <section class="hero" style="padding-bottom:50px">
   <div class="container">
     <span class="eyebrow">Careers</span>
     <h1>Build real software with us.</h1>
-    <p class="lede hero-sub">Every listing here is a genuinely open role. We add openings as we need
-    them, not on a schedule.</p>
+    <p class="lede hero-sub">We are always interested in people who build, think, and move with purpose.</p>
   </div>
 </section>
-<section class="tight"><div class="container">{listing}
+<section class="tight"><div class="container"><div class="showcase-list">{listing}</div>
   <div class="btn-row"><a class="btn btn-ghost" href="/careers/apply">Send a general application</a></div>
 </div></section>
 """
@@ -733,7 +723,7 @@ def render_apply_form(job: Optional[Dict[str, Any]], error: Optional[str] = None
     job_field = f'<input type="hidden" name="job_slug" value="{esc(job["slug"])}">' if job else ""
     alert = ""
     if success:
-        alert = '<div class="alert alert-success">Application received. We review every submission -- thank you.</div>'
+        alert = '<div class="alert alert-success">Application received. We review every submission. Thank you.</div>'
     elif error:
         alert = f'<div class="alert alert-error">{esc(error)}</div>'
     form = "" if success else f"""
@@ -742,11 +732,7 @@ def render_apply_form(job: Optional[Dict[str, Any]], error: Optional[str] = None
       {job_field}
       <div class="field"><label for="name">Full name</label><input id="name" name="name" required></div>
       <div class="field"><label for="email">Email</label><input id="email" name="email" type="email" required></div>
-      <div class="field"><label for="phone">Phone (optional)</label><input id="phone" name="phone"></div>
-      <div class="field"><label for="links">Portfolio / LinkedIn / GitHub (one per line, optional)</label><textarea id="links" name="links" style="min-height:70px"></textarea></div>
-      <div class="field"><label for="cover_note">Note to us</label><textarea id="cover_note" name="cover_note"></textarea></div>
       <div class="field"><label for="resume">Resume (PDF or Word, max 8MB)</label><input id="resume" name="resume" type="file" accept=".pdf,.doc,.docx" required></div>
-      <p class="form-note">Honeypot field below must stay empty (bots only).</p>
       <input type="text" name="website" id="website" style="position:absolute;left:-9999px" tabindex="-1" autocomplete="off">
       <button class="btn btn-primary" type="submit">Submit application</button>
     </form>"""
@@ -754,7 +740,7 @@ def render_apply_form(job: Optional[Dict[str, Any]], error: Optional[str] = None
 <section class="hero" style="padding-bottom:40px">
   <div class="container">
     <span class="eyebrow">Careers</span>
-    <h1>Apply &mdash; {esc(job_title)}</h1>
+  <h1>Apply: {esc(job_title)}</h1>
   </div>
 </section>
 <section class="tight"><div class="container">{alert}{form}</div></section>
@@ -782,7 +768,10 @@ def render_contact_hub() -> str:
     <p>Questions, partnerships, press, or anything else.</p></a>
 </div></section>
 <section class="tight"><div class="container">
-  <p>Direct: <a href="mailto:{SITE_EMAIL}" style="color:var(--paper);text-decoration:underline">{SITE_EMAIL}</a></p>
+  <p>General: <a href="mailto:{SITE_EMAIL}" style="color:var(--paper);text-decoration:underline">{SITE_EMAIL}</a><br>
+  Projects: <a href="mailto:{SALES_EMAIL}" style="color:var(--paper);text-decoration:underline">{SALES_EMAIL}</a><br>
+  Careers: <a href="mailto:{CAREERS_EMAIL}" style="color:var(--paper);text-decoration:underline">{CAREERS_EMAIL}</a><br>
+  Media: <a href="mailto:{MEDIA_EMAIL}" style="color:var(--paper);text-decoration:underline">{MEDIA_EMAIL}</a></p>
 </div></section>
 """
 
@@ -807,9 +796,9 @@ def render_contact_form(kind: str, error: Optional[str] = None, success: bool = 
     title = "Start a project" if kind == "project" else "General enquiry"
     alert = ""
     if success:
-        alert = ('<div class="alert alert-success">Thank you -- this has been logged in our pipeline '
+        alert = ('<div class="alert alert-success">Thank you. This has been logged in our pipeline '
                   "and we'll follow up by email.</div>" if kind == "project" else
-                  '<div class="alert alert-success">Thank you -- we\'ll get back to you by email.</div>')
+                  '<div class="alert alert-success">Thank you. We will get back to you by email.</div>')
     elif error:
         alert = f'<div class="alert alert-error">{esc(error)}</div>'
     form = "" if success else f"""
@@ -901,7 +890,7 @@ def render_post_detail(p: Dict[str, Any]) -> tuple:
 # Legal / trust
 # ============================================================
 
-LEGAL_REVIEW_NOTE = ('<div class="alert alert-error">Draft for internal review -- this page has not yet '
+LEGAL_REVIEW_NOTE = ('<div class="alert alert-error">Draft for internal review. This page has not yet '
                        "been reviewed by qualified legal counsel and must not be relied on as final "
                        "before that review.</div>")
 
@@ -915,7 +904,7 @@ def render_legal_privacy() -> str:
   <h2>What we collect</h2>
   <p>Contact and project-enquiry forms collect the name, email, and message you provide. Career
   applications additionally collect a resume file and any links you provide. We log a salted,
-  non-reversible hash of the submitting IP address for abuse prevention -- never the raw address.</p>
+  non-reversible hash of the submitting IP address for abuse prevention. The raw address is never stored.</p>
   <h2>How we use it</h2>
   <p>Project and general enquiries are used solely to evaluate and respond to your request.
   Applications are used solely for recruitment. We do not sell personal data.</p>
@@ -974,7 +963,7 @@ def render_login(error: Optional[str] = None, csrf_token: str = "") -> str:
     <button class="btn btn-primary" type="submit">Sign in</button>
   </form>
   <p class="form-note" style="margin-top:20px">This account model is independent of, and does not
-  itself expose, the internal TTT HQ operating system. Staff MFA is not yet wired into this login --
+  itself expose, the internal TTT HQ operating system. Staff MFA is not yet wired into this login.
   see the deployment notes before treating this as sufficient for a highly privileged account.</p>
 </div></section>
 """
@@ -1233,7 +1222,7 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return self._html(200, page(svc["division"], svc["tagline"], path, body, jsonld), set_cookies)
 
             if path == "/work":
-                return self._html(200, page("Work", "Real, named projects -- client engagements and our own products.", "/work", render_work_index(case_studies)), set_cookies)
+                return self._html(200, page("Work", "Real, named projects from client engagements and our own products.", "/work", render_work_index(case_studies)), set_cookies)
             if path.startswith("/work/"):
                 slug = path.split("/", 2)[2]
                 cs = CaseStudyStore(store).get_by_slug(slug)
@@ -1358,18 +1347,19 @@ class SiteHandler(BaseHTTPRequestHandler):
         csrf_token = jar.get("csrf").value if jar.get("csrf") else ""
         if not csrf_cookie_val or fields.get("csrf_token") != csrf_cookie_val:
             body = page("Error", "Security check failed.", f"/contact/{kind}",
-                         render_contact_form(kind, error="Security check failed -- please reload the page and try again.", csrf_token=csrf_token))
+                         render_contact_form(kind, error="Security check failed. Please reload the page and try again.", csrf_token=csrf_token))
             return self._html(400, body)
         if fields.get("website"):  # honeypot
             return self._redirect(f"/contact/{kind}")
         if rate_limited(ip_hash):
             body = page("Error", "Too many submissions.", f"/contact/{kind}",
-                         render_contact_form(kind, error="Too many submissions from this connection recently -- please try again later, or email us directly.", csrf_token=csrf_token))
+                         render_contact_form(kind, error="Too many submissions from this connection recently. Please try again later, or email us directly.", csrf_token=csrf_token))
             return self._html(429, body)
         try:
             control, _ = open_control_plane(self.app_root)
             opp_store = OpportunityStore(store, control.audit)
-            enquiry_store = EnquiryStore(store, opp_store)
+            comms_store = CommsStore(store, control.audit)
+            enquiry_store = EnquiryStore(store, opp_store, comms_store)
             enquiry_store.submit(
                 kind=kind, name=fields.get("name", ""), email=fields.get("email", ""),
                 company=fields.get("company"), message=fields.get("message", ""),
@@ -1403,12 +1393,12 @@ class SiteHandler(BaseHTTPRequestHandler):
 
         if not csrf_cookie_val or val("csrf_token") != csrf_cookie_val:
             return self._html(400, page("Error", "Security check failed.", "/careers/apply",
-                                          render_apply_form(job, error="Security check failed -- please reload and try again.", csrf_token=csrf_token)))
+                                          render_apply_form(job, error="Security check failed. Please reload and try again.", csrf_token=csrf_token)))
         if val("website"):
             return self._redirect("/careers/apply")
         if rate_limited(ip_hash):
             return self._html(429, page("Error", "Too many submissions.", "/careers/apply",
-                                          render_apply_form(job, error="Too many submissions recently -- please try again later.", csrf_token=csrf_token)))
+                                          render_apply_form(job, error="Too many submissions recently. Please try again later.", csrf_token=csrf_token)))
 
         resume_field = form["resume"] if "resume" in form else None
         resume_meta: Dict[str, Any] = {}
@@ -1434,7 +1424,9 @@ class SiteHandler(BaseHTTPRequestHandler):
                                           render_apply_form(job, error="A resume file is required.", csrf_token=csrf_token)))
 
         try:
-            ApplicationStore(store).create({
+            control, _ = open_control_plane(self.app_root)
+            comms_store = CommsStore(store, control.audit)
+            ApplicationStore(store, comms_store).create({
                 "job_id": job["id"] if job else None,
                 "job_title_snapshot": job["title"] if job else "General Application",
                 "applicant_name": val("name"), "applicant_email": val("email"),
@@ -1456,10 +1448,10 @@ class SiteHandler(BaseHTTPRequestHandler):
         csrf_token = jar.get("csrf").value if jar.get("csrf") else ""
         if not csrf_cookie_val or fields.get("csrf_token") != csrf_cookie_val:
             return self._html(400, page("Sign in", "Staff sign in.", "/login",
-                                          render_login(error="Security check failed -- please reload and try again.", csrf_token=csrf_token)))
+                                          render_login(error="Security check failed. Please reload and try again.", csrf_token=csrf_token)))
         if rate_limited(f"login:{ip_hash}"):
             return self._html(429, page("Sign in", "Staff sign in.", "/login",
-                                          render_login(error="Too many attempts -- please wait before trying again.", csrf_token=csrf_token)))
+                                          render_login(error="Too many attempts. Please wait before trying again.", csrf_token=csrf_token)))
         auth = StaffAuthService(store)
         try:
             result = auth.login(fields.get("email", ""), fields.get("password", ""),
@@ -1488,7 +1480,7 @@ def serve_site(root, host: str = "127.0.0.1", port: int = 8767) -> None:
     # ensure schema (incl. new site_ tables) is migrated before first request
     control, store = open_control_plane(server.app_root)
     store.close()
-    print(f"Twenty Two Technologies -- public website: http://{host}:{server.server_port}")
+    print(f"Twenty Two Technologies website: http://{host}:{server.server_port}")
     server.serve_forever()
 
 

@@ -63,6 +63,7 @@ from .capital_and_risk import (
     BudgetStore, CapitalRiskError, ReservePolicyStore, RiskRegisterStore,
     allowed_experimental_capital, budget_status, recommend_allocation,
 )
+from .comms import CommsError, CommsStore
 from .conversations import ConversationError, ConversationStore
 from .documents import DocumentError, DocumentStore
 from .email_admin import EmailError, EmailStore
@@ -516,6 +517,22 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 return self._json({"items": BacklogStore(store, control.audit).list_items()})
             if path == "/api/needs-aryan":
                 return self._json({"items": NeedsAryanQueue(store, control.audit, control).list_pending()})
+            if path == "/api/comms/overview":
+                needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                return self._json(CommsStore(store, control.audit, needs_aryan).overview())
+            if path == "/api/comms/conversations":
+                query = parse_qs(urlparse(self.path).query)
+                needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                items = CommsStore(store, control.audit, needs_aryan).list_conversations(
+                    status=(query.get("status") or [None])[0], department=(query.get("department") or [None])[0],
+                    priority=(query.get("priority") or [None])[0], limit=50,
+                )
+                return self._json({"items": items})
+            if path.startswith("/api/comms/conversations/"):
+                conv_id = path.rsplit("/", 1)[-1]
+                needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                conv = CommsStore(store, control.audit, needs_aryan).get_conversation(conv_id)
+                return self._json(conv or {"error": "conversation not found"}, HTTPStatus.OK if conv else HTTPStatus.NOT_FOUND)
             if path == "/api/cc/snapshot":
                 return self._json(command_center_snapshot(store))
             if path == "/api/cc/ceo-brief/latest":
@@ -2259,6 +2276,7 @@ Ask Falguna
 <div class="navsec home-navsec">Home</div>
 <button class="navitem active" data-view="commandCenter">Command Center</button>
 <button class="navitem" data-view="needsAryan">Needs Aryan</button>
+<button class="navitem" data-view="communications">Communications</button>
 <button class="navitem" data-view="boardroom">Boardroom</button>
 <details class="navexec" data-exec="briefing" open>
 <summary class="navsec navsec-exec">Briefing<span class="chev" aria-hidden="true"></span></summary>
@@ -2600,6 +2618,19 @@ Ask Falguna
 <h1>Needs Aryan</h1>
 <div class="pageintro">Every pending decision in one place -- business approvals and Falguna Engineering missions awaiting a merge decision.</div>
 <div class="list" id="needsAryanList"></div>
+</div>
+<div class="view" id="view-communications">
+<h1>Communications</h1>
+<div class="pageintro">Every real inbound/outbound conversation -- website enquiries, careers applications, and future channels -- in one place. Escalations here are the same Needs Aryan queue, not a second approval system.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="commsOpenTotal">0</h2><div class="sub">Open conversations</div></div>
+<div class="section" style="flex:1"><h2 id="commsNeedsAttention">0</h2><div class="sub">Needs attention (high/urgent/escalated)</div></div>
+<div class="section" style="flex:1"><h2 id="commsNewLeads">0</h2><div class="sub">New, unopened</div></div>
+<div class="section" style="flex:1"><h2 id="commsAwaitingApproval">0</h2><div class="sub">Awaiting approval</div></div>
+</div>
+<div class="section"><h2>By department</h2><div class="list" id="commsByDepartment"></div></div>
+<div class="section"><h2>Needs attention</h2><div class="list" id="commsNeedsAttentionList"></div></div>
+<div class="section"><h2>All open conversations</h2><div class="list" id="commsConversationsList"></div></div>
 </div>
 <div class="view" id="view-rhToday">
 <h1>Today</h1>
@@ -3066,7 +3097,7 @@ $('themeToggleBtn').onclick=()=>{
 };
 applyHqTheme(currentHqThemeMode());
 
-async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadCommandCenter(),loadBoardroom(),loadBacklog(),loadNeedsAryan()])}
+async function loadAll(){const c=await api('/api/config');FALGUNA_URL=c.falguna_url||FALGUNA_URL;await Promise.all([loadCommandCenter(),loadBoardroom(),loadBacklog(),loadNeedsAryan(),loadCommunications()])}
 function hqSetGreeting(){
 const h=new Date().getHours();
 const part=h<12?'Good morning':h<18?'Good afternoon':'Good evening';
@@ -3426,6 +3457,22 @@ ${i.source==='falguna_engineering'?`<a class="secondary" style="border:0;border-
 </div>
 </div>`).join(''):'<div class="empty">Nothing needs Aryan right now.</div>';
 document.querySelectorAll('.na').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadNeedsAryan()}catch(e){alert(e.message)}})}
+async function loadCommunications(){const [ov,list]=await Promise.all([api('/api/comms/overview'),api('/api/comms/conversations')]);renderCommunications(ov,list.items||[])}
+function renderCommunications(ov,items){
+$('commsOpenTotal').textContent=ov.open_total||0;
+$('commsNeedsAttention').textContent=(ov.needs_attention||[]).length;
+$('commsNewLeads').textContent=(ov.new_leads||[]).length;
+$('commsAwaitingApproval').textContent=(ov.awaiting_approval||[]).length;
+const depts=Object.entries(ov.by_department||{});
+$('commsByDepartment').innerHTML=depts.length?depts.map(([d,n])=>`<div class="item"><div class="meta"><span>${esc(d)}</span><span class="badge">${n}</span></div></div>`).join(''):'<div class="empty">No open conversations.</div>';
+const convItem=c=>`<div class="item">
+<h3>${esc(c.subject||'(no subject)')}</h3>
+<div class="meta"><span>${esc(c.channel)}</span><span>${esc(c.department)}</span><span class="${c.priority==='urgent'||c.priority==='high'?'badge-actionable':'badge-inspect'}">${esc(c.priority)}</span><span>${esc(c.status)}</span>${c.assigned_agent?`<span>assigned: ${esc(c.assigned_agent)}</span>`:''}</div>
+<div class="contrib">Opened ${hqTimeAgo(c.created_at)} ago${c.first_response_due_at?` -- first response due ${esc(c.first_response_due_at)}`:''}</div>
+</div>`;
+$('commsNeedsAttentionList').innerHTML=(ov.needs_attention||[]).length?(ov.needs_attention||[]).map(convItem).join(''):'<div class="empty">Nothing needs attention right now.</div>';
+$('commsConversationsList').innerHTML=items.length?items.map(convItem).join(''):'<div class="empty">No open conversations yet.</div>';
+}
 
 // ---------- Revenue Hunter ----------
 const RH_STAGES=["New","Qualified","Proposal Ready","Applied/Sent","Replied","Meeting","Negotiating","Won","Lost"];

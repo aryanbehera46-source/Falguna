@@ -239,7 +239,10 @@ class StateStore:
             "memory_records", "knowledge_documents", "knowledge_chunks", "memory_suggestions",
             # Twenty Two Technologies flagship public website (falguna/site_web.py)
             "site_services", "site_case_studies", "site_products", "site_posts", "site_jobs",
-            "site_applications", "site_enquiries", "site_staff_users", "site_staff_sessions"}
+            "site_applications", "site_enquiries", "site_staff_users", "site_staff_sessions",
+            # TTT Communications + AI Customer Service V1 (falguna/comms.py)
+            "comm_organizations", "comm_contacts", "comm_conversations", "comm_messages",
+            "comm_participants", "comm_status_events"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

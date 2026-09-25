@@ -638,3 +638,123 @@ CREATE TABLE IF NOT EXISTS site_staff_sessions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_site_staff_sessions_user ON site_staff_sessions(user_id);
+
+
+-- ============================================================
+-- TTT Communications + AI Customer Service V1 (falguna/comms.py)
+-- Milestone 1: Unified Communications Center.
+--
+-- One durable, channel-agnostic model for every inbound/outbound customer
+-- interaction (general enquiries, sales, support, projects, billing,
+-- careers, media, and future channels), additive and separate from the
+-- existing sales-opportunity-scoped `rh_conversation_messages` (which
+-- keeps working exactly as-is). A comm_conversation optionally LINKS to a
+-- real rh_opportunities row, a real clients row, or a real site_applications
+-- row rather than duplicating them -- there is no second, competing CRM
+-- here. Attachments reuse the existing generic `attachments` table
+-- (conversation_id/message_id columns already support this). Escalations
+-- and approvals reuse the existing needs_aryan_items queue via
+-- NeedsAryanQueue, never a parallel approval system. The audit trail reuses
+-- the existing AuditLog hash chain, the same as every other subsystem.
+--
+-- Channel and Department are validated Python-level enums (falguna/
+-- comms.py: CHANNELS, DEPARTMENTS), not separate reference tables -- the
+-- same convention this codebase already uses for rh_opportunities.stage,
+-- ConversationStore's INTENTS, etc.: a small, closed, code-reviewed set of
+-- values doesn't need its own table and foreign key.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS comm_organizations (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    domain TEXT,                       -- lowercased email domain, used for dedup/lookup
+    linked_client_id TEXT,             -- REFERENCES clients(id) once/if a deal closes; nullable
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_organizations_domain ON comm_organizations(domain);
+
+CREATE TABLE IF NOT EXISTS comm_contacts (
+    id TEXT PRIMARY KEY,
+    organization_id TEXT REFERENCES comm_organizations(id),
+    name TEXT,
+    email TEXT,
+    phone TEXT,
+    role_title TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_contacts_email ON comm_contacts(email);
+CREATE INDEX IF NOT EXISTS idx_comm_contacts_org ON comm_contacts(organization_id);
+
+CREATE TABLE IF NOT EXISTS comm_conversations (
+    id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,             -- EMAIL | WEBSITE | SUPPORT | CAREERS | PROJECT | INTERNAL
+    department TEXT NOT NULL,          -- general | sales | support | projects | billing | careers | media
+    subject TEXT,
+    status TEXT NOT NULL,              -- new | open | pending_customer | pending_approval | escalated | resolved | closed
+    priority TEXT NOT NULL,            -- low | normal | high | urgent
+    tags_json TEXT,                    -- JSON array of short string tags
+    organization_id TEXT REFERENCES comm_organizations(id),
+    primary_contact_id TEXT REFERENCES comm_contacts(id),
+    assigned_agent TEXT,               -- an AI role name (falguna/comms.py AGENT_ROLES) or 'Aryan'
+    linked_opportunity_id TEXT,        -- REFERENCES rh_opportunities(id), nullable
+    linked_project_id TEXT,            -- reserved: REFERENCES a future delivery/project record, nullable
+    linked_client_id TEXT,             -- REFERENCES clients(id), nullable
+    linked_application_id TEXT,        -- REFERENCES site_applications(id), nullable (careers)
+    source_ref_type TEXT,              -- e.g. 'site_enquiry', 'site_application' -- what created this
+    source_ref_id TEXT,
+    first_response_due_at TEXT,        -- SLA target, set deterministically from priority at open time
+    first_response_at TEXT,
+    resolution_due_at TEXT,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_conversations_status ON comm_conversations(status, department);
+CREATE INDEX IF NOT EXISTS idx_comm_conversations_org ON comm_conversations(organization_id);
+CREATE INDEX IF NOT EXISTS idx_comm_conversations_opportunity ON comm_conversations(linked_opportunity_id);
+CREATE INDEX IF NOT EXISTS idx_comm_conversations_application ON comm_conversations(linked_application_id);
+CREATE INDEX IF NOT EXISTS idx_comm_conversations_created ON comm_conversations(created_at);
+
+CREATE TABLE IF NOT EXISTS comm_messages (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES comm_conversations(id),
+    direction TEXT NOT NULL,           -- INBOUND | OUTBOUND
+    kind TEXT NOT NULL,                -- message | note | system
+    sender_contact_id TEXT REFERENCES comm_contacts(id),
+    sender_agent TEXT,                 -- AI role name or 'Aryan' when direction=OUTBOUND
+    body TEXT NOT NULL,
+    status TEXT NOT NULL,              -- RECEIVED | DRAFT | APPROVED | SENT
+    is_internal_note INTEGER NOT NULL DEFAULT 0,
+    source_ref_type TEXT,
+    source_ref_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_messages_conversation ON comm_messages(conversation_id, created_at);
+
+CREATE TABLE IF NOT EXISTS comm_participants (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES comm_conversations(id),
+    participant_type TEXT NOT NULL,    -- customer | agent | watcher
+    contact_id TEXT REFERENCES comm_contacts(id),
+    agent_role TEXT,
+    created_at TEXT NOT NULL           -- StateStore.list() always orders by created_at
+);
+CREATE INDEX IF NOT EXISTS idx_comm_participants_conversation ON comm_participants(conversation_id);
+
+CREATE TABLE IF NOT EXISTS comm_status_events (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES comm_conversations(id),
+    field TEXT NOT NULL,               -- status | priority | assigned_agent | escalation
+    old_value TEXT,
+    new_value TEXT,
+    actor TEXT NOT NULL,
+    reason TEXT,
+    needs_aryan_id TEXT,               -- set when field='escalation'
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_status_events_conversation ON comm_status_events(conversation_id, created_at);

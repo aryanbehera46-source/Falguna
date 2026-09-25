@@ -205,14 +205,20 @@ class ApplicationStore:
     """Careers application intake. Resume bytes are written to disk under
     the app root's .falguna/site_uploads/ (never served back publicly);
     only the DB row (metadata + path) is queryable from the internal
-    applicant-management view."""
+    applicant-management view.
 
-    def __init__(self, store: StateStore):
+    When a `comms_store` is supplied, every real application also opens a
+    Communications Center conversation under the careers department
+    (Milestone 9 groundwork), linked back to the application row rather
+    than duplicating its data."""
+
+    def __init__(self, store: StateStore, comms_store=None):
         self.store = store
+        self.comms_store = comms_store
 
     def create(self, fields: Dict[str, Any]) -> str:
         now = utcnow()
-        return self.store.create("site_applications", {
+        application_id = self.store.create("site_applications", {
             "job_id": fields.get("job_id"),
             "job_title_snapshot": fields["job_title_snapshot"],
             "applicant_name": fields["applicant_name"],
@@ -228,6 +234,23 @@ class ApplicationStore:
             "source_ip_hash": fields.get("source_ip_hash"),
             "created_at": now, "updated_at": now,
         })
+
+        if self.comms_store is not None:
+            email = fields["applicant_email"]
+            contact_id = self.comms_store.find_or_create_contact(email, fields["applicant_name"], None)
+            conv = self.comms_store.open_conversation(
+                "CAREERS", "careers", subject=f"Application: {fields['job_title_snapshot']}",
+                contact_id=contact_id, priority="normal", tags=["careers"], actor="website",
+                linked_application_id=application_id,
+                source_ref_type="site_application", source_ref_id=application_id,
+            )
+            note = fields.get("cover_note") or f"Applied for {fields['job_title_snapshot']} -- resume attached ({fields.get('resume_filename', 'no filename on file')})."
+            self.comms_store.add_message(
+                conv["id"], "INBOUND", note, sender_contact_id=contact_id,
+                source_ref_type="site_application", source_ref_id=application_id, actor="website",
+            )
+
+        return application_id
 
     def list_all(self) -> List[Dict[str, Any]]:
         rows = self.store.list("site_applications")
@@ -246,11 +269,19 @@ class EnquiryStore:
     """Contact / Start-a-Project intake. Every real submission is logged
     here for a full record AND, for project enquiries, handed to the
     existing OpportunityStore so it enters the real sales pipeline instead
-    of a disconnected marketing-site inbox."""
+    of a disconnected marketing-site inbox.
 
-    def __init__(self, store: StateStore, opportunity_store=None):
+    When a `comms_store` (falguna.comms.CommsStore) is supplied, every
+    submission -- general and project alike -- also opens a real Unified
+    Communications Center conversation (Milestone 1/3 of the Communications
+    + AI Customer Service sprint), linked to the same opportunity rather
+    than duplicating it, so the website's front door and the Communications
+    Center never disagree about what came in."""
+
+    def __init__(self, store: StateStore, opportunity_store=None, comms_store=None):
         self.store = store
         self.opportunity_store = opportunity_store
+        self.comms_store = comms_store
 
     def submit(self, kind: str, name: str, email: str, company: Optional[str], message: str,
                 extra: Optional[Dict[str, Any]] = None, source_ip: Optional[str] = None) -> Dict[str, Any]:
@@ -279,4 +310,26 @@ class EnquiryStore:
             "source_ip_hash": hash_ip(source_ip),
             "created_at": utcnow(),
         })
-        return {"enquiry_id": row_id, "opportunity_id": opportunity_id}
+
+        conversation_id = None
+        if self.comms_store is not None:
+            domain = email.strip().split("@")[-1].lower() if "@" in email else None
+            org_id = self.comms_store.find_or_create_organization(company or None, domain)
+            contact_id = self.comms_store.find_or_create_contact(email, name, org_id)
+            department = "sales" if kind == "project" else "general"
+            subject = (extra or {}).get("project_title") if extra else None
+            subject = subject or f"{'Project enquiry' if kind == 'project' else 'General enquiry'} from {name.strip()}"
+            conv = self.comms_store.open_conversation(
+                "WEBSITE", department, subject=subject, contact_id=contact_id, organization_id=org_id,
+                priority="high" if kind == "project" else "normal",
+                tags=["website", kind], actor="website",
+                linked_opportunity_id=opportunity_id,
+                source_ref_type="site_enquiry", source_ref_id=row_id,
+            )
+            conversation_id = conv["id"]
+            self.comms_store.add_message(
+                conversation_id, "INBOUND", message.strip(), sender_contact_id=contact_id,
+                source_ref_type="site_enquiry", source_ref_id=row_id, actor="website",
+            )
+
+        return {"enquiry_id": row_id, "opportunity_id": opportunity_id, "conversation_id": conversation_id}

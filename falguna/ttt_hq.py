@@ -72,6 +72,18 @@ NEEDS_ARYAN_KINDS = {
     # own instruction, rather than duplicated under a new name.
     "strategic_decision", "resource_reallocation_approval", "major_client_risk",
     "policy_exception", "major_reprioritization",
+    # Added for TTT Communications + AI Customer Service V1 (falguna/
+    # comms.py): a communications-department decision that must be an
+    # owner call per that sprint's own Milestone 6 -- final commercial
+    # pricing outside the established catalog, a contract, a refund above
+    # policy limits, a financial commitment, a legal statement, a security
+    # incident, a major scope change, a large discount, a regulated
+    # financial claim, an employment offer, or accepting a project beyond
+    # verified delivery capacity. A routine sensitive-content escalation
+    # keeps reusing client_response_decision, exactly as ConversationStore
+    # already does -- this kind is for the broader approval surface above
+    # and beyond that one narrow case.
+    "communications_approval",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 # A run in one of these statuses cannot become actionable again through

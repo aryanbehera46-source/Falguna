@@ -138,6 +138,22 @@ class RoutingTests(_SiteLiveServerCase):
             resp, _ = self._get(path)
             self.assertEqual(resp.status, 200, f"{path} returned {resp.status}")
 
+    def test_homepage_is_a_focused_sales_path(self):
+        resp, body = self._get("/")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("We build software that is ready for the", body)
+        self.assertIn("Discuss your project", body)
+        # This scratch database seeds one service; the home renderer must not
+        # add unrelated catalogue sections around whatever is available.
+        self.assertEqual(body.count('<div class="service-rail">'), 1)
+        self.assertNotIn("A typical first engagement", body)
+        self.assertNotIn("What we&#x27;re building ourselves", body)
+
+    def test_detail_page_marks_parent_navigation_current(self):
+        resp, body = self._get("/services/custom-software-engineering")
+        self.assertEqual(resp.status, 200)
+        self.assertIn('<a href="/services" aria-current="page">Services</a>', body)
+
     def test_unknown_service_and_case_study_slugs_404(self):
         resp, _ = self._get("/services/does-not-exist")
         self.assertEqual(resp.status, 404)
@@ -201,6 +217,37 @@ class ContactIntakeTests(_SiteLiveServerCase):
         self.assertEqual(opps[0]["stage"], "New")
         self.assertEqual(opps[0]["client_name"], "Prospect Co")
 
+    def test_general_enquiry_opens_a_linked_comms_conversation(self):
+        csrf = self._csrf_cookie("/contact/general")
+        self._post_form("/contact/general", {
+            "csrf_token": csrf, "name": "Jamie", "email": "jamie2@example.com", "message": "hello there",
+        }, cookie_header=f"csrf={csrf}")
+        enquiry = self.store.list("site_enquiries", "email = 'jamie2@example.com'")[0]
+        convs = self.store.list(
+            "comm_conversations", "source_ref_type = 'site_enquiry' AND source_ref_id = ?", (enquiry["id"],),
+        )
+        self.assertEqual(len(convs), 1)
+        self.assertEqual(convs[0]["channel"], "WEBSITE")
+        self.assertEqual(convs[0]["department"], "general")
+        self.assertIsNone(convs[0]["linked_opportunity_id"])
+        messages = self.store.list("comm_messages", "conversation_id = ?", (convs[0]["id"],))
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["direction"], "INBOUND")
+        self.assertIn("hello there", messages[0]["body"])
+
+    def test_project_enquiry_comms_conversation_links_the_real_opportunity(self):
+        csrf = self._csrf_cookie("/contact/start-a-project")
+        self._post_form("/contact/start-a-project", {
+            "csrf_token": csrf, "name": "Prospect2", "email": "prospect2@example.com",
+            "project_title": "New Portal", "company": "Prospect2 Co", "message": "We need a portal.",
+        }, cookie_header=f"csrf={csrf}")
+        opp = self.store.list("rh_opportunities", "client_name = 'Prospect2 Co'")[0]
+        convs = self.store.list("comm_conversations", "linked_opportunity_id = ?", (opp["id"],))
+        self.assertEqual(len(convs), 1)
+        self.assertEqual(convs[0]["department"], "sales")
+        self.assertEqual(convs[0]["priority"], "high")
+        self.assertEqual(convs[0]["status"], "open")  # 'new' -> 'open' once the inbound message lands
+
     def test_honeypot_field_silently_drops_bot_submissions(self):
         csrf = self._csrf_cookie("/contact/general")
         resp, _ = self._post_form("/contact/general", {
@@ -239,6 +286,10 @@ class CareersApplicationTests(_SiteLiveServerCase):
         self.assertEqual(apps[0]["resume_size_bytes"], len(b"%PDF-1.4 fake pdf content"))
         stored_path = Path(self.repo) / ".falguna" / apps[0]["resume_storage_rel_path"]
         self.assertTrue(stored_path.exists())
+        convs = self.store.list("comm_conversations", "linked_application_id = ?", (apps[0]["id"],))
+        self.assertEqual(len(convs), 1)
+        self.assertEqual(convs[0]["channel"], "CAREERS")
+        self.assertEqual(convs[0]["department"], "careers")
 
     def test_disallowed_file_extension_is_rejected(self):
         csrf = self._csrf_cookie("/careers/apply")

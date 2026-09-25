@@ -167,7 +167,27 @@ def seed_services(svc: ServiceStore):
         "SEO, content, and conversion fundamentals -- applied first to our own site, offered as a standalone division.",
         "SEO, paid media, social, content, analytics, and conversion optimization. This division is in development as a dedicated client offering; this website itself was built to our own SEO/performance standard as the first demonstration of it.",
         ["Technical SEO", "Content strategy", "Analytics & conversion instrumentation", "Paid media (via qualified partner)"],
-        status="in_development", sort=10)
+        sort=10)
+
+    add("trading-and-financial-technology", "Trading & Financial Technology",
+        "Technology, analytics, and operating systems for trading and financial businesses.",
+        "Data platforms, workflow systems, dashboards, and digital infrastructure for modern financial operations.",
+        ["Financial data platforms", "Trading workflow systems", "Analytics and reporting", "Operations automation"], sort=12)
+
+    add("media-and-entertainment", "Media & Entertainment",
+        "Digital platforms and audience experiences for media businesses.",
+        "Content platforms, audience products, commerce, and workflow systems for media and entertainment brands.",
+        ["Content platforms", "Audience experiences", "Commerce and subscriptions", "Workflow automation"], sort=13)
+
+    add("banking-and-financial-services", "Banking & Financial Services",
+        "Secure digital experiences and operational platforms for financial services.",
+        "Customer journeys, internal platforms, data experiences, and integrations for banking and financial services.",
+        ["Customer portals", "Internal operations platforms", "Data and reporting", "Systems integration"], sort=14)
+
+    add("business-and-strategy-consulting", "Business & Strategy Consulting",
+        "Digital strategy and technology direction for companies ready to move.",
+        "Practical technology roadmaps, product direction, and operating-model support connected to execution.",
+        ["Technology roadmaps", "Product strategy", "Operating-model design", "Transformation planning"], sort=15)
 
     add("maintenance-support-and-consulting", "Maintenance, Support & Technical Consulting",
         "Ongoing support and technical consulting for what we (or you) have already shipped.",

@@ -276,6 +276,55 @@ class TTTHQServerTests(_LiveServerCase):
         self.assertEqual(code, 404)
 
 
+class CommunicationsHQServerTests(TTTHQServerTests):
+    """TTT Communications + AI Customer Service V1, Milestone 7: the
+    Communications view's real data layer, exercised through the actual
+    HTTP layer the SPA calls (falguna/comms.py itself is covered
+    exhaustively in tests/test_comms.py)."""
+
+    def test_overview_is_empty_on_a_fresh_install(self):
+        status, body = self._get(self.hq_port, "/api/comms/overview")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["open_total"], 0)
+        self.assertEqual(body["needs_attention"], [])
+        self.assertEqual(body["awaiting_approval"], [])
+
+    def test_a_real_conversation_shows_up_in_overview_and_list_over_http(self):
+        from falguna.comms import CommsStore
+        comms = CommsStore(self.store, self.control.audit)
+        conv = comms.open_conversation("SUPPORT", "support", subject="Login broken", priority="urgent")
+        comms.add_message(conv["id"], "INBOUND", "I can't log in to my account.")
+
+        status, ov = self._get(self.hq_port, "/api/comms/overview")
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["open_total"], 1)
+        self.assertEqual(ov["by_department"], {"support": 1})
+        self.assertEqual(len(ov["needs_attention"]), 1)
+
+        status, listing = self._get(self.hq_port, "/api/comms/conversations")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["items"]), 1)
+        self.assertEqual(listing["items"][0]["subject"], "Login broken")
+
+        status, detail = self._get(self.hq_port, f"/api/comms/conversations/{conv['id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(detail["messages"]), 1)
+
+    def test_conversation_filters_and_missing_id_over_http(self):
+        from falguna.comms import CommsStore
+        comms = CommsStore(self.store, self.control.audit)
+        comms.open_conversation("WEBSITE", "sales", priority="normal")
+        comms.open_conversation("CAREERS", "careers", priority="normal")
+
+        status, listing = self._get(self.hq_port, "/api/comms/conversations?department=careers")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["items"]), 1)
+        self.assertEqual(listing["items"][0]["department"], "careers")
+
+        code = self._get_raises(self.hq_port, "/api/comms/conversations/does-not-exist")
+        self.assertEqual(code, 404)
+
+
 class WorkforceMediaHQServerTests(TTTHQServerTests):
     """Digital Workforce + Media/Growth Engine v1 routes (Section 20),
     exercised through the real HTTP layer this server actually serves --
