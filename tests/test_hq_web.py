@@ -9,9 +9,10 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from falguna.hq_web import HQ_INDEX_HTML, PRODUCT_NAME, TTTHQHandler
+from falguna.hq_web import HQ_INDEX_HTML, PRODUCT_NAME, TTTHQHandler, reconcile_workforce_tasks_at_startup
 from falguna.runtime import open_control_plane
 from falguna.web import FalgunaHandler, INDEX_HTML
+from falguna.workforce import WorkforceTaskStore
 
 
 def git(repo: Path, *args):
@@ -137,6 +138,57 @@ class _LiveServerCase(unittest.TestCase):
         req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method="POST", headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=2) as resp:
             return resp.status, json.loads(resp.read())
+
+
+class WorkforceRestartReconciliationTests(_LiveServerCase):
+    """Exercises falguna.hq_web.reconcile_workforce_tasks_at_startup -- the
+    exact function serve_hq() calls before accepting any request. Found via
+    a real, live restart test (Revenue Operations V2, Milestone 3): a real
+    wf_task created via POST /api/wf/tasks, with its execute() call fired in
+    the background, was caught genuinely EXECUTING and the hq_web process
+    was killed (kill -9) at that exact moment; after restarting the process
+    the task was still EXECUTING with no automatic detection. This mirrors
+    that same fix at the same layer serve_hq() actually calls it from (the
+    underlying WorkforceOrchestrator.reconcile_after_restart() behavior
+    itself is already covered in tests/test_workforce.py)."""
+
+    def test_reconciles_a_task_orphaned_by_a_simulated_crash(self):
+        tasks = WorkforceTaskStore(self.store, self.control.audit)
+        task_id = tasks.create("engineering", "Fix something", "engineering_fix", actor="Aryan")
+        tasks.transition(task_id, "PLANNING", "system")
+        tasks.transition(task_id, "READY", "system", assigned_worker="engineering_agent")
+        tasks.transition(task_id, "EXECUTING", "system")
+        self.store.close()  # simulates the process exiting mid-execute()
+
+        reconciled = reconcile_workforce_tasks_at_startup(self.repo)
+        self.assertEqual(reconciled, [task_id])
+
+        control2, store2 = open_control_plane(self.repo)
+        try:
+            task = WorkforceTaskStore(store2, control2.audit).get(task_id)
+            self.assertEqual(task["status"], "BLOCKED")
+            self.assertIsNotNone(task["needs_aryan_id"])
+            item = store2.get("needs_aryan_items", task["needs_aryan_id"])
+            self.assertEqual(item["status"], "PENDING")
+        finally:
+            store2.close()
+
+    def test_is_a_harmless_noop_with_no_stuck_tasks(self):
+        self.store.close()
+        self.assertEqual(reconcile_workforce_tasks_at_startup(self.repo), [])
+
+    def test_running_it_twice_in_a_row_is_idempotent(self):
+        tasks = WorkforceTaskStore(self.store, self.control.audit)
+        task_id = tasks.create("engineering", "Fix something", "engineering_fix", actor="Aryan")
+        tasks.transition(task_id, "PLANNING", "system")
+        tasks.transition(task_id, "READY", "system", assigned_worker="engineering_agent")
+        tasks.transition(task_id, "EXECUTING", "system")
+        self.store.close()
+
+        first = reconcile_workforce_tasks_at_startup(self.repo)
+        second = reconcile_workforce_tasks_at_startup(self.repo)
+        self.assertEqual(first, [task_id])
+        self.assertEqual(second, [])  # already BLOCKED (terminal for this purpose) -- not re-touched
 
 
 class TTTHQServerTests(_LiveServerCase):

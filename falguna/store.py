@@ -76,6 +76,17 @@ class StateStore:
             # belongs to one venture -- NULL means company-wide, exactly as
             # before this column existed.
             ("venture_id", "TEXT"),
+            # Revenue Operations V2, Milestone 4: an obsolete/duplicated
+            # trial or test record (e.g. a repeated "(simulated)" dry-run
+            # prospect created while exercising the Sales->Proposal path)
+            # needs to stop inflating the real pipeline's counts without
+            # ever being destroyed -- the same `mc_archived`-style additive
+            # flag `runs`/`browser_sessions` already use for exactly this
+            # reason (see store.py's own _ADDITIVE_COLUMNS comment above).
+            # 0/NULL means visible in the normal pipeline, exactly as
+            # before this column existed; OpportunityStore.list() filters
+            # archived=1 out by default but never deletes the row.
+            ("archived", "INTEGER"),
         ],
         "needs_aryan_items": [
             # A generic structured-payload slot (Passes B-E): a "closing

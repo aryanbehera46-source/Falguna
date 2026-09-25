@@ -301,6 +301,108 @@ class OrchestratorTests(WorkforceTestBase):
         self.assertEqual(result["assigned_worker"], "echo_worker")
 
 
+class RestartReconciliationTests(WorkforceTestBase):
+    """reconcile_after_restart() -- added after a live restart test (see
+    Revenue Operations V2, Milestone 3) found that a real hq_web process
+    killed mid-execute() left its wf_task stuck at EXECUTING forever,
+    across a real restart, with no automatic detection. These tests
+    simulate that same crash point (transition straight to EXECUTING/
+    PLANNING the way execute()/plan() do, then never call the worker --
+    exactly what "the process died before worker.execute() returned"
+    looks like from the task row's point of view) and then reconcile."""
+
+    def _orch(self, *workers):
+        o = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        for w in workers:
+            o.register_worker(w)
+        return o
+
+    def test_reconciles_a_task_stuck_executing(self):
+        orch = self._orch(EchoWorker())
+        task_id = self.tasks.create("media", "Say hi", "echo", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        self.tasks.transition(task_id, "READY", "system", assigned_worker="echo_worker")
+        self.tasks.transition(task_id, "EXECUTING", "system", started_at="2026-01-01T00:00:00+00:00")
+        # No worker.execute() call happens -- this is the crash: the row
+        # is left exactly where a real interrupted process would leave it.
+
+        reconciled = orch.reconcile_after_restart(actor="system")
+
+        self.assertEqual(reconciled, [task_id])
+        task = self.tasks.get(task_id)
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertIsNotNone(task["needs_aryan_id"])
+        item = self.store.get("needs_aryan_items", task["needs_aryan_id"])
+        self.assertEqual(item["kind"], "workforce_action_approval")
+        self.assertEqual(item["status"], "PENDING")
+        self.assertEqual(item["ref_type"], "wf_task")
+        self.assertEqual(item["ref_id"], task_id)
+        reason_events = [e for e in self.tasks.history(task_id) if e["to_status"] == "BLOCKED"]
+        self.assertTrue(reason_events)
+        self.assertIn("restarted", reason_events[-1]["reason"])
+
+    def test_reconciles_a_task_stuck_planning(self):
+        orch = self._orch(EchoWorker())
+        task_id = self.tasks.create("media", "Say hi", "echo", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        # Crash lands mid-plan(), before a worker was even assigned.
+
+        reconciled = orch.reconcile_after_restart(actor="system")
+
+        self.assertEqual(reconciled, [task_id])
+        self.assertEqual(self.tasks.get(task_id)["status"], "BLOCKED")
+
+    def test_never_touches_tasks_in_terminal_or_waiting_states(self):
+        orch = self._orch(EchoWorker())
+        completed_id = self.tasks.create("media", "Say hi", "echo", actor="Aryan")
+        orch.execute(completed_id)  # -> COMPLETED, genuinely finished
+        created_id = self.tasks.create("media", "Not started yet", "echo", actor="Aryan")
+
+        reconciled = orch.reconcile_after_restart(actor="system")
+
+        self.assertEqual(reconciled, [])
+        self.assertEqual(self.tasks.get(completed_id)["status"], "COMPLETED")
+        self.assertEqual(self.tasks.get(created_id)["status"], "CREATED")
+
+    def test_never_silently_retries_or_duplicates_the_interrupted_work(self):
+        # The whole point: reconciliation must never call a worker's
+        # execute() itself (that would risk re-running a half-applied
+        # engineering patch) and must never fabricate a COMPLETED result.
+        class BoomIfCalledWorker(WorkforceWorker):
+            name = "boom_worker"
+
+            def supports(self, task_type):
+                return task_type == "echo"
+
+            def execute(self, task):  # pragma: no cover -- must never run
+                raise AssertionError("reconcile_after_restart must never invoke a worker")
+
+        orch = self._orch(BoomIfCalledWorker())
+        task_id = self.tasks.create("media", "Say hi", "echo", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        self.tasks.transition(task_id, "READY", "system", assigned_worker="boom_worker")
+        self.tasks.transition(task_id, "EXECUTING", "system")
+
+        orch.reconcile_after_restart(actor="system")  # must not raise
+
+        task = self.tasks.get(task_id)
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertIsNone(task["outputs_json"])
+
+    def test_idempotent_second_call_finds_nothing_left_to_reconcile(self):
+        orch = self._orch(EchoWorker())
+        task_id = self.tasks.create("media", "Say hi", "echo", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        self.tasks.transition(task_id, "READY", "system", assigned_worker="echo_worker")
+        self.tasks.transition(task_id, "EXECUTING", "system")
+
+        first = orch.reconcile_after_restart(actor="system")
+        second = orch.reconcile_after_restart(actor="system")
+
+        self.assertEqual(first, [task_id])
+        self.assertEqual(second, [])  # already BLOCKED -- nothing left in EXECUTING/PLANNING
+
+
 class PersistenceTests(WorkforceTestBase):
     def test_task_state_survives_a_fresh_store_reconnect(self):
         orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)

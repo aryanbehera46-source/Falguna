@@ -813,6 +813,59 @@ class OpportunityLifecycleTests(_RepoCase):
         self.store = StateStore(self.state_dir / "state.db")  # tearDown needs a live handle
 
 
+class OpportunityArchiveTests(_RepoCase):
+    """archive()/unarchive() -- Milestone 4, Revenue Operations V2. Found
+    live: a "(simulated)" workforce-trial prospect got created three times
+    while exercising the Sales->Proposal path, inflating the real pipeline's
+    counts. This must hide a row from the default pipeline view/counts
+    without ever deleting it -- the genuine historical record (who created
+    it, when, its full stage history) stays intact and one query away."""
+
+    def test_archived_opportunity_is_hidden_from_default_list_but_not_deleted(self):
+        opportunities = OpportunityStore(self.store, self.audit)
+        keep_id = opportunities.create({"title": "Real prospect"}, source="manual")
+        dupe_id = opportunities.create({"title": "Real prospect (simulated) dupe"}, source="manual")
+
+        opportunities.archive(dupe_id, "Aryan", reason="duplicate trial record")
+
+        visible_ids = {o["id"] for o in opportunities.list()}
+        self.assertIn(keep_id, visible_ids)
+        self.assertNotIn(dupe_id, visible_ids)
+
+        # Never deleted -- get() and include_archived=True still find it.
+        self.assertIsNotNone(opportunities.get(dupe_id))
+        all_ids = {o["id"] for o in opportunities.list(include_archived=True)}
+        self.assertIn(dupe_id, all_ids)
+
+    def test_archiving_an_unknown_opportunity_raises(self):
+        opportunities = OpportunityStore(self.store, self.audit)
+        with self.assertRaises(OpportunityError):
+            opportunities.archive("does-not-exist", "Aryan")
+
+    def test_unarchive_restores_visibility(self):
+        opportunities = OpportunityStore(self.store, self.audit)
+        opp_id = opportunities.create({"title": "Reconsidered prospect"}, source="manual")
+        opportunities.archive(opp_id, "Aryan")
+        self.assertNotIn(opp_id, {o["id"] for o in opportunities.list()})
+
+        opportunities.unarchive(opp_id, "Aryan")
+        self.assertIn(opp_id, {o["id"] for o in opportunities.list()})
+
+    def test_archived_opportunities_are_excluded_from_dashboard_and_analytics(self):
+        opportunities = OpportunityStore(self.store, self.audit)
+        real_id = opportunities.create({"title": "Real prospect"}, source="manual")
+        dupe_id = opportunities.create({"title": "Duplicate trial record"}, source="manual")
+        opportunities.archive(dupe_id, "Aryan", reason="duplicate trial record")
+
+        dashboard = DashboardService(self.store).today()
+        needing_qual_ids = {o["id"] for o in dashboard["opportunities_needing_qualification"]}
+        self.assertIn(real_id, needing_qual_ids)
+        self.assertNotIn(dupe_id, needing_qual_ids)
+
+        summary = AnalyticsService(self.store).summary()
+        self.assertEqual(summary["opportunities_added"], 1)  # only the real one counted
+
+
 # ---------- Dashboard + analytics ----------
 
 class DashboardAnalyticsTests(_RepoCase):

@@ -274,13 +274,21 @@ class OpportunityStore:
         rows = self.store.list("rh_qualifications", "opportunity_id=?", (opportunity_id,))
         return rows[-1] if rows else None
 
-    def list(self, stage: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(self, stage: Optional[str] = None, include_archived: bool = False) -> List[Dict[str, Any]]:
         if stage:
             if stage not in PIPELINE_STAGES:
                 raise OpportunityError(f"stage must be one of {PIPELINE_STAGES}")
             rows = self.store.list("rh_opportunities", "stage=?", (stage,))
         else:
             rows = self.store.list("rh_opportunities")
+        # Milestone 4 (Revenue Operations V2): an archived row (an obsolete
+        # duplicated trial/test record -- see the `archived` column's own
+        # comment in store.py) stays out of the default pipeline view and
+        # its counts, exactly like runs/browser_sessions' own mc_archived
+        # already does, but is never deleted and is still one query away
+        # (include_archived=True) for anyone who needs the real history.
+        if not include_archived:
+            rows = [r for r in rows if not r.get("archived")]
         rows = list(reversed(rows))
         # Attach each opportunity's latest qualification -- lightweight
         # (unlike get(), this never pulls proposals/followups/stage_history)
@@ -293,6 +301,22 @@ class OpportunityStore:
             row["qualification"] = self.latest_qualification(row["id"])
             out.append(row)
         return out
+
+    def archive(self, opportunity_id: str, actor: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        current = self.store.get("rh_opportunities", opportunity_id)
+        if not current:
+            raise OpportunityError("opportunity not found")
+        self.store.update("rh_opportunities", opportunity_id, archived=1)
+        self.audit.append("RH_OPPORTUNITY_ARCHIVED", {"opportunity_id": opportunity_id, "actor": actor, "reason": reason})
+        return self.store.get("rh_opportunities", opportunity_id)
+
+    def unarchive(self, opportunity_id: str, actor: str) -> Dict[str, Any]:
+        current = self.store.get("rh_opportunities", opportunity_id)
+        if not current:
+            raise OpportunityError("opportunity not found")
+        self.store.update("rh_opportunities", opportunity_id, archived=0)
+        self.audit.append("RH_OPPORTUNITY_UNARCHIVED", {"opportunity_id": opportunity_id, "actor": actor})
+        return self.store.get("rh_opportunities", opportunity_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1246,7 +1270,11 @@ class DashboardService:
 
     def today(self, needs_aryan_pending: Optional[List[Dict[str, Any]]] = None,
               discovery_runs: Optional[List[Dict[str, Any]]] = None, aging_days: int = 14) -> Dict[str, Any]:
-        opportunities = self.store.list("rh_opportunities")
+        # Archived rows (obsolete/duplicated trial records -- Milestone 4,
+        # Revenue Operations V2; see the `archived` column's comment in
+        # store.py) never inflate the real pipeline's numbers here, exactly
+        # like OpportunityStore.list()'s own default already excludes them.
+        opportunities = [o for o in self.store.list("rh_opportunities") if not o.get("archived")]
         by_id = {o["id"]: o for o in opportunities}
         active = [o for o in opportunities if o["stage"] not in TERMINAL_STAGES]
         won = [o for o in opportunities if o["stage"] == "Won"]
@@ -1326,7 +1354,9 @@ class AnalyticsService:
         self.store = store
 
     def summary(self) -> Dict[str, Any]:
-        opportunities = self.store.list("rh_opportunities")
+        # See DashboardService.today()'s identical comment -- archived
+        # (obsolete/duplicated trial) rows stay out of analytics too.
+        opportunities = [o for o in self.store.list("rh_opportunities") if not o.get("archived")]
         qualified_ids = {q["opportunity_id"] for q in self.store.list("rh_qualifications")}
         proposals = self.store.list("rh_proposals")
         sent_stage_events = self.store.list("rh_stage_history", "to_stage=?", ("Applied/Sent",))

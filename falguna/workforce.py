@@ -326,3 +326,67 @@ class WorkforceOrchestrator:
         if not exhausted:
             self.tasks.transition(task_id, "READY", actor, reason="retrying after failure", retries=retries + 1)
         return self.tasks.get(task_id)
+
+    def reconcile_after_restart(self, actor: str = "system") -> List[str]:
+        """Call once, before a process starts accepting requests (mirrors
+        `reconcile_browser_sessions_at_startup` / `BrowserSessionStore.
+        reconcile_after_restart` in `falguna/browser_runtime.py` -- same
+        problem, same fix, kept consistent rather than reinvented).
+
+        `execute()` above runs a worker synchronously inside one HTTP
+        request: it flips a task to EXECUTING, calls `worker.execute()`
+        (which, for EngineeringAgentWorker, can mean a real multi-minute
+        local-model call), and only writes the terminal status once that
+        call returns. If the process is killed or crashes anywhere in that
+        window -- and PLANNING is a second, much shorter, but real window
+        with the same property -- nothing ever runs the rest of `execute()`
+        or `plan()`. Left alone, the task row sits at EXECUTING/PLANNING
+        forever: Workforce would show it as perpetually "in progress" with
+        no worker actually running it -- confirmed live on 2026-09-25 by
+        killing the hq_web process mid-`execute()` and restarting it: the
+        task stayed EXECUTING across the restart with no automatic
+        detection until this method was added.
+
+        This never guesses that the interrupted work actually finished, and
+        never silently retries it either -- an engineering task's worktree
+        may hold a real, half-applied patch, and re-running it blind risks
+        exactly the duplicate/conflicting execution the durable-autonomy
+        requirement rules out. Instead it moves every PLANNING/EXECUTING
+        task to BLOCKED with an honest, specific reason and escalates to
+        Needs Aryan through the same `workforce_action_approval` path
+        `execute()`'s own BLOCKED branch already uses -- a person decides
+        whether to retry, reassign, or cancel, with the task's own
+        evidence/outputs (if any -- e.g. an engineering task's underlying
+        `run_id`/worktree, still on disk and independently resumable via
+        the Engineering Runs UI) intact rather than lost.
+
+        Returns the ids it reconciled (empty if none)."""
+        reconciled: List[str] = []
+        for old_status in ("EXECUTING", "PLANNING"):
+            for task in self.tasks.list(status=old_status):
+                task_id = task["id"]
+                reason = (
+                    f"Falguna restarted while this task was {old_status.lower()} "
+                    f"(assigned to {task.get('assigned_worker') or 'an unassigned worker'}). "
+                    "No in-process worker state survives a restart, so this task was stopped "
+                    "rather than left showing as running forever. If this is an engineering "
+                    "task, its run/worktree (if any) is untouched on disk -- check the "
+                    "Engineering Runs view before deciding whether to resume, retry, or cancel."
+                )
+                needs_aryan_id = None
+                if self.needs_aryan is not None:
+                    needs_aryan_id = self.needs_aryan.create_item(
+                        "workforce_action_approval",
+                        f"Workforce task interrupted by restart: {task['objective']}",
+                        reason, actor=actor, rationale="restart-interrupted, not a worker-reported failure",
+                        risk="task was mid-execution when the process restarted; true state is unknown",
+                        ref_type="wf_task", ref_id=task_id,
+                    )
+                self.tasks.transition(
+                    task_id, "BLOCKED", actor, reason=reason, needs_aryan_id=needs_aryan_id,
+                )
+                self.audit.append("WF_TASK_RESTART_RECONCILED", {
+                    "task_id": task_id, "from_status": old_status, "actor": actor, "needs_aryan_id": needs_aryan_id,
+                })
+                reconciled.append(task_id)
+        return reconciled

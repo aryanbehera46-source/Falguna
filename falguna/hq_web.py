@@ -1248,6 +1248,16 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     opportunity = OpportunityStore(store, control.audit).move_stage(opportunity_id, body.get("to_stage", ""), body.get("actor", "Aryan"), note=body.get("note"))
                     return self._json(opportunity)
 
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/archive"):
+                    opportunity_id = path.split("/")[4]
+                    opportunity = OpportunityStore(store, control.audit).archive(opportunity_id, body.get("actor", "Aryan"), reason=body.get("reason"))
+                    return self._json(opportunity)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/unarchive"):
+                    opportunity_id = path.split("/")[4]
+                    opportunity = OpportunityStore(store, control.audit).unarchive(opportunity_id, body.get("actor", "Aryan"))
+                    return self._json(opportunity)
+
                 if path.startswith("/api/rh/opportunities/") and path.endswith("/proposals"):
                     opportunity_id = path.split("/")[4]
                     needs_aryan = NeedsAryanQueue(store, control.audit, control)
@@ -2165,6 +2175,35 @@ class TTTHQHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+def reconcile_workforce_tasks_at_startup(app_root: Path):
+    """Call once, before TTT HQ starts accepting requests.
+
+    `WorkforceOrchestrator.execute()` (falguna/workforce.py) runs a worker
+    synchronously inside one HTTP request -- flip to EXECUTING, call the
+    worker (an engineering task's worker can be a real multi-minute local
+    model call), write the terminal status once it returns. If this process
+    is killed or crashes in that window, nothing ever writes the terminal
+    status: the task sits at EXECUTING/PLANNING forever and Workforce would
+    show it as perpetually "in progress." This is the same class of gap
+    `reconcile_browser_sessions_at_startup` already closes for browser
+    sessions in falguna/web.py, applied to workforce tasks via
+    `WorkforceOrchestrator.reconcile_after_restart()`. Never raises, so a
+    database/reconciliation problem can't block the server from starting.
+    Returns the ids it reconciled (empty if none, or if reconciliation
+    itself failed)."""
+    try:
+        control, store = open_control_plane(app_root)
+        try:
+            needs_aryan_q = NeedsAryanQueue(store, control.audit, control)
+            orch = _build_workforce_orchestrator(app_root, store, control.audit, needs_aryan_q, control=control)
+            return orch.reconcile_after_restart(actor="system")
+        finally:
+            store.close()
+    except Exception as exc:
+        print(f"TTT HQ: workforce task restart-reconciliation skipped ({exc})")
+        return []
+
+
 def serve_hq(root, host: str = "127.0.0.1", port: int = 8766, falguna_url: str = "http://127.0.0.1:8765") -> None:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("TTT HQ is local-only")
@@ -2172,6 +2211,10 @@ def serve_hq(root, host: str = "127.0.0.1", port: int = 8766, falguna_url: str =
     server = ThreadingHTTPServer((host, port), TTTHQHandler)
     server.app_root = Path(root).resolve()
     server.falguna_url = falguna_url
+    reconciled = reconcile_workforce_tasks_at_startup(server.app_root)
+    if reconciled:
+        print(f"TTT HQ: {len(reconciled)} workforce task(s) were interrupted by restart "
+              f"and marked BLOCKED (escalated to Needs Aryan): {', '.join(reconciled)}")
     print(f"Twenty Two Technologies HQ internal alpha: http://{host}:{server.server_port}")
     server.serve_forever()
 
