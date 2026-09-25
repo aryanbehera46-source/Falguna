@@ -8,6 +8,10 @@ python3 scripts/seed_site_content.py        # idempotent; safe to re-run
 python3 -m falguna.site_web .               # serves http://127.0.0.1:8767
 ```
 
+For normal local use, open `launcher/TTT Website.app`; it safely reuses a healthy
+website listener or starts exactly one on port 8767. `launcher/Stop TTT Website.app`
+stops only the matching launcher-managed website process.
+
 Create a real staff account before testing `/login` (there is no public signup route, by design):
 
 ```bash
@@ -29,7 +33,7 @@ The service itself (`falguna.site_web.serve_site`) intentionally binds to `127.0
 
 1. **A host.** Either the same Mac (if it will stay on and reachable) behind a reverse proxy, or a small cloud VM. Given TTT HQ and Falguna already run as local macOS `.app` launchers, the lowest-risk V1 is: keep running `site_web.py` on `127.0.0.1:8767` on the Mac, and put a reverse proxy (Caddy or nginx) in front of it that terminates TLS and forwards to `127.0.0.1:8767`. Caddy is recommended specifically because it gets automatic Let's Encrypt TLS with a two-line config.
 2. **DNS.** At the registrar for `twentytwotechnologies.com`: an `A`/`AAAA` (or `CNAME` if hosted behind a provider) record for the apex/`www` pointing at wherever the reverse proxy lives. `hq.twentytwotechnologies.com` and `mail.twentytwotechnologies.com` are reserved subdomains for later -- do not create them yet; TTT HQ (port 8766) must **not** be exposed publicly until it has its own hardened auth (it currently has none -- see below).
-3. **Process supervision.** Add a fourth macOS launcher app (mirroring the existing `Falguna.app` / `Twenty Two Technologies.app` / `Stop *.app` pattern in `launcher/`) so the site survives a reboot the same way the other two services do. Not built this sprint -- flagged as a follow-up, not faked.
+3. **Process supervision.** Local start/stop launchers now exist in `launcher/`, matching the safe PID/port ownership pattern of the other services. A production host still needs an OS-level supervisor so the public website restarts automatically after a reboot.
 4. ~~**A real logo asset.**~~ **RESOLVED.** Aryan supplied the real, approved Twenty Two Technologies mark and the real Falguna brand mark/wordmark (4 original files). They live in `falguna/site_static/brand/` (originals + `sips`-derived web sizes: `header-logo.png` 240px, `favicon-64.png` 64px, `og-image.png` 630px, `falguna-mark-small.png` 120px -- no new dependency needed, macOS's built-in `sips` did the resizing). `_wordmark_svg()` was removed and replaced with `_logo_img()`, which is now used in the header, footer, and favicon/`og:image` tags; a new path-traversal-safe, extension-allowlisted `/static/*` route serves the files. The Falguna product card on `/products` also now shows the real Falguna mark. Verified live: all four asset URLs return `200 image/png` with correct `Content-Type` and security headers, traversal attempts (`../`, `%2e%2e/`) correctly 404, and the full `tests/test_site_web.py` suite (19 tests) still passes.
 5. **Legal review.** `/legal/privacy`, `/legal/terms` carry a visible "not yet reviewed by counsel" banner (`LEGAL_REVIEW_NOTE` in `site_web.py`) -- get real review, then remove the banner in a follow-up edit.
 6. **MFA for privileged staff accounts.** Deliberately not built this sprint (see `docs/website/WEBSITE_V1_SPEC.md`). Password auth + sessions + CSRF + lockout is real and tested, but is not sufficient on its own for a highly privileged account. Add TOTP (e.g. `pyotp`) or WebAuthn before treating any staff account here as high-privilege.
