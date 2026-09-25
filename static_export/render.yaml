@@ -1,0 +1,26 @@
+# Render Blueprint for the twentytwotechnologies.com static export.
+# Not applied -- provided for review only, per instruction not to deploy.
+# To use: place at the repo root (or point a Render Blueprint at this
+# path) and connect the repo in the Render dashboard.
+services:
+  - type: web
+    runtime: static
+    name: twentytwotechnologies-com
+    buildCommand: "echo 'pre-built static export -- no build step needed'"
+    staticPublishPath: static_export/twentytwotechnologies-com
+    pullRequestPreviewsEnabled: false
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+    # Render auto-serves a root 404.html (present in this export) for any
+    # path that doesn't match a real file -- no rewrite rule needed for
+    # that. Verify after the first deploy; if it doesn't 404 correctly,
+    # add this explicit fallback in the Render dashboard (Redirects/Rewrites):
+    #   Source: /*   Destination: /404.html   Action: Rewrite
