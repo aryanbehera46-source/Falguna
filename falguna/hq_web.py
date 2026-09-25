@@ -113,6 +113,9 @@ from .workforce_workers import (
     BrowserWorker, ContentWorker, DataWorker, DocumentWorker, EmailAdminWorker, ResearchWorker,
     SpreadsheetWorker,
 )
+from .agent_roles import (
+    ChiefOfStaffWorker, EngineeringAgentWorker, ProposalSpecialistWorker, QAAgentWorker, SalesResearcherWorker,
+)
 
 PRODUCT_NAME = "Twenty Two Technologies HQ"
 
@@ -417,14 +420,23 @@ def _ask_falguna_context(store, control) -> str:
     return ASK_FALGUNA_CONTEXT_PREFIX + "\n".join(lines)
 
 
-def _build_workforce_orchestrator(app_root, store, audit, needs_aryan) -> WorkforceOrchestrator:
+def _build_workforce_orchestrator(app_root, store, audit, needs_aryan, control=None) -> WorkforceOrchestrator:
     """Wires one WorkforceOrchestrator with every registered worker --
-    Digital Workforce (Pass A/B) and every Media agent (Pass C/D) -- all
-    sharing the same task model, per Section 10's "do not make separate
+    Digital Workforce (Pass A/B), every Media agent (Pass C/D), and the
+    Phase B AI Workforce V1 named roles (Sales Researcher, Proposal
+    Specialist, Engineering Agent, QA Agent, Executive Chief of Staff) --
+    all sharing the same task model, per Section 10's "do not make separate
     incompatible execution frameworks." Every honest default applies here
     exactly as it does in isolation: no browser/publish adapter, no
     research provider, so those task types BLOCK and escalate rather than
     fabricate a result -- this route wires nothing that pretends otherwise.
+    Engineering Agent and QA Agent are only registered when a ControlPlane
+    (`control`) is supplied, since they drive real, isolated missions
+    through it -- callers that don't pass one simply don't get those two
+    roles wired in (their task_types then BLOCK with "no capable worker",
+    same as any other unwired role), rather than this function reaching
+    into `open_control_plane` itself and risking a second, inconsistent
+    ControlPlane instance.
     """
     media_output_root = Path(app_root) / ".falguna" / "media_output"
     documents = DocumentStore(store, audit)
@@ -438,14 +450,21 @@ def _build_workforce_orchestrator(app_root, store, audit, needs_aryan) -> Workfo
     growth = GrowthAgent(analytics)
 
     orch = WorkforceOrchestrator(store, audit, needs_aryan=needs_aryan)
-    for worker in [
+    workers = [
         BrowserWorker(), ResearchWorker(), DataWorker(), DocumentWorker(documents), SpreadsheetWorker(documents),
         EmailAdminWorker(emails), ContentWorker(documents),
         ContentStrategistAgent(content), ScriptWriterAgent(content, scripts), CreativeDirectorAgent(content, scripts),
         VisualAssetAgent(content, assets), VoiceAgent(content, assets), VideoEditAgent(content, assets, pipeline),
         ThumbnailAgent(content, assets), PublishingAgent(content, publications),
         AnalyticsIngestionAgent(content, publications, analytics), GrowthRecommendationAgent(content, publications, growth),
-    ]:
+        # Phase B: AI Workforce V1 named roles (Sales, Engineering, QA, Executive).
+        SalesResearcherWorker(store, audit), ProposalSpecialistWorker(store, audit, documents, needs_aryan=needs_aryan),
+        ChiefOfStaffWorker(store, audit, documents, needs_aryan=needs_aryan),
+    ]
+    if control is not None:
+        workers.append(EngineeringAgentWorker(control))
+        workers.append(QAAgentWorker(control))
+    for worker in workers:
         orch.register_worker(worker)
     return orch
 
@@ -1496,7 +1515,7 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     return self._json({"task_id": task_id}, HTTPStatus.CREATED)
                 if path.startswith("/api/wf/tasks/") and path.endswith("/execute"):
                     task_id = path.split("/")[4]
-                    orch = _build_workforce_orchestrator(self.app_root, store, control.audit, needs_aryan_q)
+                    orch = _build_workforce_orchestrator(self.app_root, store, control.audit, needs_aryan_q, control=control)
                     result = orch.execute(task_id, actor=body.get("actor", "system"))
                     return self._json(result)
                 if path == "/api/wf/recurring-workflows":

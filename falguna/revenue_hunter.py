@@ -608,7 +608,15 @@ class QualificationEngine:
     def _budget_quality(self, budget_rate: Optional[str]) -> (str, Optional[float]):
         if not budget_rate:
             return "UNKNOWN", None
-        numbers = [float(n.replace(",", "")) for n in re.findall(r"[\d,]+(?:\.\d+)?", budget_rate)]
+        numbers: List[float] = []
+        for raw in re.findall(r"[\d,]+(?:\.\d+)?", budget_rate):
+            cleaned = raw.replace(",", "")
+            if not cleaned or not any(ch.isdigit() for ch in cleaned):
+                continue  # e.g. a bare "," picked up from prose like "fixed project, budget-conscious"
+            try:
+                numbers.append(float(cleaned))
+            except ValueError:
+                continue
         if not numbers:
             return "UNKNOWN", None
         amount = max(numbers)
