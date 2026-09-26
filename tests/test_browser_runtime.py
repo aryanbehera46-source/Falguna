@@ -262,6 +262,29 @@ class BrowserSessionStoreTests(_FixtureServerCase):
         ids = [r["id"] for r in rows]
         self.assertLess(ids.index(sid2), ids.index(sid1))
 
+    def test_list_with_no_conversation_id_filter_returns_every_session_unaffected(self):
+        # Phase 2 Milestone 3: the new optional filter must be purely
+        # additive -- Mission Control's existing unfiltered call must see
+        # exactly what it always saw.
+        self.sessions.create("unlinked one", "browser_research", None, "Aryan", True, "standard")
+        self.sessions.create("unlinked two", "browser_research", None, "Aryan", True, "standard",
+                              conversation_id="conv-a")
+        self.assertEqual(len(self.sessions.list()), 2)
+        self.assertEqual(len(self.sessions.list(conversation_id=None)), 2)
+
+    def test_list_filtered_by_conversation_id_returns_only_linked_sessions(self):
+        linked = self.sessions.create("chat-started task", "browser_research", None, "Aryan", True, "standard",
+                                       conversation_id="conv-a")
+        self.sessions.create("a different chat's task", "browser_research", None, "Aryan", True, "standard",
+                              conversation_id="conv-b")
+        self.sessions.create("never linked to any chat", "browser_research", None, "Aryan", True, "standard")
+        rows = self.sessions.list(conversation_id="conv-a")
+        self.assertEqual([r["id"] for r in rows], [linked])
+
+    def test_list_filtered_by_an_unused_conversation_id_returns_empty_not_an_error(self):
+        self.sessions.create("some task", "browser_research", None, "Aryan", True, "standard", conversation_id="conv-a")
+        self.assertEqual(self.sessions.list(conversation_id="conv-does-not-exist"), [])
+
     def test_reconcile_after_restart_fails_every_actively_running_status(self):
         # Found via real Mac QA: SIGKILL-ing the Falguna process mid-session
         # left the row permanently RUNNING with no way for the UI to know it

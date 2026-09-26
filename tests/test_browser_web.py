@@ -304,6 +304,35 @@ class BrowserSessionRouteTests(_LiveFalgunaServerCase):
         self.assertEqual(status, 200)
         self.assertIn(sid, [s["session_id"] for s in out["sessions"]])
 
+    def test_list_sessions_filtered_by_conversation_id_over_http(self):
+        # Phase 2 Milestone 3: a chat conversation must be able to fetch
+        # only ITS OWN linked browser session(s) for inline progress
+        # display, without Mission Control's unfiltered board call being
+        # affected at all.
+        linked = self._create_explicit_session("chat-linked task", [
+            {"action": "open", "target": f"{self.fixture_base}/browser_fixture.html", "value": None, "description": "open"},
+        ], conversation_id="conv-phase2-m3")
+        self._create_explicit_session("unrelated task", [
+            {"action": "open", "target": f"{self.fixture_base}/browser_fixture.html", "value": None, "description": "open"},
+        ])
+        status, out = self._get("/api/browser/sessions?conversation_id=conv-phase2-m3")
+        self.assertEqual(status, 200)
+        session_ids = [s["session_id"] for s in out["sessions"]]
+        self.assertEqual(session_ids, [linked])
+        self.assertEqual(out["sessions"][0]["conversation_id"], "conv-phase2-m3")
+        # The unfiltered call must still see both.
+        status, out_all = self._get("/api/browser/sessions")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(len(out_all["sessions"]), 2)
+
+    def test_list_sessions_filtered_by_an_unlinked_conversation_id_is_empty(self):
+        self._create_explicit_session("some task", [
+            {"action": "open", "target": f"{self.fixture_base}/browser_fixture.html", "value": None, "description": "open"},
+        ])
+        status, out = self._get("/api/browser/sessions?conversation_id=conv-never-used")
+        self.assertEqual(status, 200)
+        self.assertEqual(out["sessions"], [])
+
 
 class MissionControlBoardMergeTests(_LiveFalgunaServerCase):
     def test_needs_aryan_browser_session_appears_in_the_needs_you_bucket(self):

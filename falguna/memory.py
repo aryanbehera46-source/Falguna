@@ -138,6 +138,20 @@ def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (na * nb)
 
 
+# Phase 2 Milestone 2 (gap closure): a hard safety bound on how many
+# embedded, ready-status chunks KnowledgeStore.search()'s independent
+# semantic pass will pull out of SQLite before ranking them by cosine
+# similarity. This is a scan-size safety bound, not a relevance filter --
+# there is no ANN/vector index in this local, single-tenant store, so
+# finding the single best-matching embedded chunk genuinely requires
+# comparing the query embedding against every candidate; this cap exists
+# only to keep that comparison bounded (most-recently-ingested chunks
+# first) rather than literally unbounded on a pathologically large corpus.
+# At Falguna's actual current scale (a personal/small-team knowledge base)
+# this cap is never reached in practice.
+_SEMANTIC_SCAN_CAP = 500
+
+
 def _fts_escape(query: str) -> str:
     """FTS5 has its own tiny query syntax (AND/OR/NOT, quoting, prefix `*`).
     A free-text search box must never let a stray `"`/`-`/`(` turn into a
@@ -758,34 +772,181 @@ class KnowledgeStore:
         self.audit.append("KNOWLEDGE_DOCUMENT_FORGOTTEN", {"id": document_id, "actor": actor, "reason": reason})
         return self.get_document(document_id)
 
-    def search(self, scopes: Sequence[Tuple[str, Optional[str]]], query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        fts_query = _fts_escape(query)
-        if not fts_query:
-            return []
+    def search(self, scopes: Sequence[Tuple[str, Optional[str]]], query: str, limit: int = 10,
+               use_semantic: bool = True) -> List[Dict[str, Any]]:
+        """FTS5 keyword search remains the mandatory, always-on baseline --
+        it runs first, unconditionally, and is exactly what a zero-embedding
+        install still gets. `use_semantic` exists so a caller (or a test)
+        can force pure-keyword behavior even when an adapter is configured,
+        to prove the baseline still works standalone.
+
+        Gap closure (independent re-audit, post-Milestone-2): the original
+        version of this method only ever RERANKED the keyword-matched pool
+        by cosine similarity -- a chunk with zero keyword overlap with the
+        query could never surface, however close its embedding was to the
+        query's, because it was never a candidate in the first place. This
+        version adds a genuinely independent semantic retrieval pass: when
+        a real embedding adapter is available, it separately scans
+        authorized, embedded, ready-status chunks (bounded by
+        `_SEMANTIC_SCAN_CAP`, a scan-size safety bound -- see that
+        constant), ranks them by cosine similarity to the live query
+        embedding, and merges the top matches into the SAME candidate pool
+        the keyword pass built -- so a chunk can now be found via keyword
+        overlap, via semantic similarity, or both, and either path alone is
+        sufficient for the chunk to be retrievable. The semantic pass is
+        subject to the exact same scope-authorization and
+        status='ready' checks as the keyword pass, applied via the same
+        `allowed` set, so isolation is enforced identically on both paths.
+
+        A candidate found only via keyword match and never scored for
+        similarity (no stored embedding, or embeddings unavailable this
+        call) is treated as similarity 0.0 for sorting purposes ONLY -- it
+        is never fabricated as a real score in the reported
+        `cosine_similarity` field (which stays None for it), and ties are
+        broken by keyword rank so behavior degrades gracefully rather than
+        randomly. Every result carries an honest `cosine_similarity` (None
+        when not computed), `semantic_boosted` (True when this result's
+        similarity score actually informed its rank), and `retrieved_via`
+        ("keyword", "semantic", or "both") so a caller/UI or test can see,
+        without guessing, exactly how each result was actually found."""
         allowed = {(t, s or None) for t, s in scopes}
-        rows = self.store.db.execute(
-            "SELECT ref_id, document_id, bm25(knowledge_fts) AS rank, snippet(knowledge_fts, 0, '[', ']', '…', 16) AS snip "
-            "FROM knowledge_fts WHERE knowledge_fts MATCH ? ORDER BY rank LIMIT ?",
-            (fts_query, limit * 4),
-        ).fetchall()
+        pool_limit = max(limit * 4, limit + 20)
+        fts_query = _fts_escape(query)
+        candidates: Dict[str, Dict[str, Any]] = {}
+
+        if fts_query:
+            rows = self.store.db.execute(
+                "SELECT ref_id, document_id, bm25(knowledge_fts) AS rank, snippet(knowledge_fts, 0, '[', ']', '…', 16) AS snip "
+                "FROM knowledge_fts WHERE knowledge_fts MATCH ? ORDER BY rank LIMIT ?",
+                (fts_query, pool_limit),
+            ).fetchall()
+            for fts_position, row in enumerate(rows):
+                document = self.get_document(row["document_id"])
+                if not document or document["status"] != "ready":
+                    continue
+                if (document["scope_type"], document["scope_id"] or None) not in allowed:
+                    continue
+                chunk = self.store.get("knowledge_chunks", row["ref_id"])
+                if not chunk:
+                    continue
+                candidates[chunk["id"]] = {
+                    "chunk_id": chunk["id"], "document_id": document["id"], "document_title": document["title"],
+                    "source_type": document["source_type"], "source_ref": document["source_ref"],
+                    "chunk_index": chunk["chunk_index"], "char_start": chunk["char_start"], "char_end": chunk["char_end"],
+                    "content": chunk["content"], "snippet": row["snip"], "rank": row["rank"],
+                    "_fts_position": fts_position, "_embedding_json": chunk["embedding_json"],
+                    "cosine_similarity": None, "_retrieved_via": {"keyword"},
+                }
+
+        semantic_used = False
+        if use_semantic:
+            try:
+                adapter_available = self.embedding_adapter.is_available()
+            except Exception:
+                adapter_available = False
+            query_vector = None
+            if adapter_available:
+                try:
+                    query_vector = self.embedding_adapter.embed([query])[0]
+                except Exception:
+                    query_vector = None  # a real embedding call failing never breaks keyword search
+            if query_vector:
+                semantic_used = True
+                # Pass 1: score every already-found keyword candidate that
+                # has a stored embedding (the original rerank behavior).
+                for candidate in candidates.values():
+                    if not candidate["_embedding_json"]:
+                        continue
+                    try:
+                        stored = json.loads(candidate["_embedding_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        stored = None
+                    if stored:
+                        candidate["cosine_similarity"] = cosine_similarity(query_vector, stored)
+
+                # Pass 2: independent semantic retrieval. Every scored
+                # candidate -- keyword-matched ones from pass 1 AND
+                # authorized, embedded, ready chunks the keyword pass never
+                # even considered (because they share no terms with the
+                # query) -- competes on cosine similarity alone for the top
+                # `pool_limit` semantic slots. Scope/status filtering for the
+                # NEW chunks happens here in Python against the same
+                # `allowed` set (identical enforcement point to the keyword
+                # pass above), not at the SQL level, so a chunk from an
+                # out-of-scope or non-ready document is never scored or
+                # returned regardless of how similar its embedding is. A
+                # chunk that lands in the top semantic slots AND was already
+                # a keyword candidate is genuinely retrievable via either
+                # path independently, so it is honestly labeled "both"
+                # rather than just "keyword" -- see the `_retrieved_via`
+                # union below.
+                scored_all = [
+                    (c["cosine_similarity"], chunk_id, None)
+                    for chunk_id, c in candidates.items()
+                    if c.get("cosine_similarity") is not None
+                ]
+                semantic_rows = self.store.db.execute(
+                    "SELECT kc.id AS chunk_id, kc.document_id, kc.chunk_index, kc.char_start, kc.char_end, "
+                    "kc.content, kc.embedding_json, kd.title, kd.source_type, kd.source_ref, "
+                    "kd.scope_type, kd.scope_id, kd.status "
+                    "FROM knowledge_chunks kc JOIN knowledge_documents kd ON kd.id = kc.document_id "
+                    "WHERE kc.embedding_json IS NOT NULL ORDER BY kc.created_at DESC LIMIT ?",
+                    (_SEMANTIC_SCAN_CAP,),
+                ).fetchall()
+                for row in semantic_rows:
+                    if row["chunk_id"] in candidates:
+                        continue  # already scored in pass 1 above (scored_all already has it)
+                    if row["status"] != "ready":
+                        continue
+                    if (row["scope_type"], row["scope_id"] or None) not in allowed:
+                        continue
+                    try:
+                        stored = json.loads(row["embedding_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        stored = None
+                    if not stored:
+                        continue
+                    scored_all.append((cosine_similarity(query_vector, stored), row["chunk_id"], row))
+
+                scored_all.sort(key=lambda triple: triple[0], reverse=True)
+                for similarity, chunk_id, row in scored_all[:pool_limit]:
+                    if row is None:
+                        # Already a keyword candidate -- it independently
+                        # clears the semantic bar too, not merely "scored".
+                        candidates[chunk_id]["_retrieved_via"].add("semantic")
+                        continue
+                    snippet = row["content"][:240] + ('…' if len(row["content"]) > 240 else '')
+                    candidates[chunk_id] = {
+                        "chunk_id": row["chunk_id"], "document_id": row["document_id"], "document_title": row["title"],
+                        "source_type": row["source_type"], "source_ref": row["source_ref"],
+                        "chunk_index": row["chunk_index"], "char_start": row["char_start"], "char_end": row["char_end"],
+                        "content": row["content"], "snippet": snippet, "rank": None,
+                        "_fts_position": None, "_embedding_json": row["embedding_json"],
+                        "cosine_similarity": similarity, "_retrieved_via": {"semantic"},
+                    }
+
+        ordered = list(candidates.values())
+        if semantic_used:
+            # Stable sort: a candidate with no similarity score sorts as if
+            # it were 0.0 (never promoted above a genuine positive match)
+            # but keeps its relative keyword-rank order versus other
+            # unscored candidates, since Python's sort is guaranteed stable
+            # even with reverse=True.
+            ordered.sort(key=lambda c: c.get("cosine_similarity") or 0.0, reverse=True)
+        else:
+            ordered.sort(key=lambda c: c["_fts_position"] if c["_fts_position"] is not None else pool_limit)
+            for candidate in ordered:
+                candidate.setdefault("cosine_similarity", None)
+
         out = []
-        for row in rows:
-            document = self.get_document(row["document_id"])
-            if not document or document["status"] != "ready":
-                continue
-            if (document["scope_type"], document["scope_id"] or None) not in allowed:
-                continue
-            chunk = self.store.get("knowledge_chunks", row["ref_id"])
-            if not chunk:
-                continue
-            out.append({
-                "chunk_id": chunk["id"], "document_id": document["id"], "document_title": document["title"],
-                "source_type": document["source_type"], "source_ref": document["source_ref"],
-                "chunk_index": chunk["chunk_index"], "char_start": chunk["char_start"], "char_end": chunk["char_end"],
-                "content": chunk["content"], "snippet": row["snip"], "rank": row["rank"],
-            })
-            if len(out) >= limit:
-                break
+        for candidate in ordered[:limit]:
+            result = dict(candidate)
+            via = result.pop("_retrieved_via", set())
+            result["retrieved_via"] = "both" if len(via) > 1 else (next(iter(via)) if via else "keyword")
+            result["semantic_boosted"] = semantic_used and result.get("cosine_similarity") is not None
+            for internal_key in ("_fts_position", "_embedding_json", "_combined_score"):
+                result.pop(internal_key, None)
+            out.append(result)
         return out
 
 

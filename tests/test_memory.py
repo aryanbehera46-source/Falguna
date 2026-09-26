@@ -11,11 +11,12 @@ from pathlib import Path
 
 from falguna.audit import AuditLog
 from falguna.memory import (
-    KnowledgeError, KnowledgeStore, MemoryConflict, MemoryError, MemorySettingsStore, MemoryStore,
-    MemorySuggestionStore, NullEmbeddingAdapter, OllamaEmbeddingAdapter, assemble_chat_context,
-    build_embedding_adapter, chunk_text, detect_memory_suggestion, embedding_status, jaccard_similarity,
+    EmbeddingAdapter, KnowledgeError, KnowledgeStore, MemoryConflict, MemoryError, MemorySettingsStore,
+    MemoryStore, MemorySuggestionStore, NullEmbeddingAdapter, OllamaEmbeddingAdapter, assemble_chat_context,
+    build_embedding_adapter, chunk_text, cosine_similarity, detect_memory_suggestion, embedding_status,
+    jaccard_similarity,
 )
-from falguna.store import StateStore
+from falguna.store import StateStore, utcnow
 
 
 class _TempStoreCase(unittest.TestCase):
@@ -438,6 +439,327 @@ class AuditTrailTests(_TempStoreCase):
         events = [json.loads(line)["event"] for line in Path(self.audit.path).read_text().splitlines()]
         for expected in ("MEMORY_RECORD_SAVED", "MEMORY_RECORD_PINNED", "MEMORY_RECORD_EDITED", "MEMORY_RECORD_FORGOTTEN"):
             self.assertIn(expected, events)
+
+
+class _FakeEmbeddingAdapter(EmbeddingAdapter):
+    """A fully deterministic, no-network embedding adapter for testing
+    semantic re-ranking without any real Ollama dependency -- `vectors`
+    maps an exact input string (a chunk's content, or a query string) to
+    its fixed vector, so a test can construct an exact, reproducible
+    keyword-vs-semantic disagreement."""
+
+    name = "fake-test-adapter"
+
+    def __init__(self, vectors: dict, available: bool = True):
+        self._vectors = vectors
+        self._available = available
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def embed(self, texts):
+        return [self._vectors[t] for t in texts]
+
+
+class KnowledgeSemanticRerankingTests(_TempStoreCase):
+    """Phase 2 Milestone 2: cosine_similarity() -- previously defined in
+    this module but never called anywhere -- is now genuinely exercised by
+    KnowledgeStore.search(). These prove semantic re-ranking actually
+    changes result ORDER (not merely that a number gets computed
+    somewhere), using the fully deterministic fake adapter above so this
+    suite never depends on a real local Ollama daemon being reachable."""
+
+    def setUp(self):
+        super().setUp()
+        # Chunk B repeats every query term several times (bm25 must rank it
+        # first on keywords alone); its fake embedding is deliberately far
+        # from the query's, while chunk A's is deliberately close -- so a
+        # working semantic re-rank must promote A above B.
+        self.chunk_a_text = "There is an urgent deployment freeze policy in effect for the holidays."
+        self.chunk_b_text = ("Urgent deployment freeze policy: urgent deployment freeze policy applies to "
+                              "urgent deployment freeze policy changes across every team.")
+        self.query = "urgent deployment freeze policy"
+        vectors = {
+            self.chunk_a_text: [1.0, 0.0],
+            self.chunk_b_text: [0.0, 1.0],
+            self.query: [0.95, 0.05],
+        }
+        self.adapter = _FakeEmbeddingAdapter(vectors)
+        self.kb_semantic = KnowledgeStore(self.store, self.audit, embedding_adapter=self.adapter)
+        self.doc_a = self.kb_semantic.ingest_bytes("a.txt", "text/plain", self.chunk_a_text.encode(), "personal", "upload", "aryan")
+        self.doc_b = self.kb_semantic.ingest_bytes("b.txt", "text/plain", self.chunk_b_text.encode(), "personal", "upload", "aryan")
+
+    def test_fixture_sanity_pure_keyword_search_ranks_the_keyword_dense_chunk_first(self):
+        hits = self.kb_semantic.search([("personal", None)], self.query, use_semantic=False)
+        self.assertEqual(hits[0]["document_id"], self.doc_b["id"])
+        self.assertIsNone(hits[0]["cosine_similarity"])
+        self.assertFalse(hits[0]["semantic_boosted"])
+
+    def test_semantic_reranking_promotes_the_embedding_closer_chunk_to_first_place(self):
+        hits = self.kb_semantic.search([("personal", None)], self.query, use_semantic=True)
+        self.assertEqual(hits[0]["document_id"], self.doc_a["id"])
+        self.assertTrue(hits[0]["semantic_boosted"])
+        self.assertIsNotNone(hits[0]["cosine_similarity"])
+        self.assertGreater(hits[0]["cosine_similarity"], hits[1]["cosine_similarity"])
+        # A sanity check that this is really cosine_similarity() being used,
+        # not an arbitrary number.
+        expected = cosine_similarity([0.95, 0.05], [1.0, 0.0])
+        self.assertAlmostEqual(hits[0]["cosine_similarity"], expected, places=6)
+
+    def test_reranking_is_skipped_when_the_embedding_adapter_reports_unavailable(self):
+        self.adapter._available = False
+        hits = self.kb_semantic.search([("personal", None)], self.query, use_semantic=True)
+        self.assertEqual(hits[0]["document_id"], self.doc_b["id"])  # falls back to pure keyword order
+        self.assertFalse(hits[0]["semantic_boosted"])
+
+    def test_a_failing_query_embedding_call_falls_back_to_keyword_order_without_crashing(self):
+        # The query string is deliberately absent from the adapter's
+        # vectors dict, so embed([query]) raises KeyError inside the
+        # adapter -- this must be caught, never propagated, and must never
+        # break the keyword baseline.
+        broken_adapter = _FakeEmbeddingAdapter({self.chunk_a_text: [1.0, 0.0], self.chunk_b_text: [0.0, 1.0]})
+        kb = KnowledgeStore(self.store, self.audit, embedding_adapter=broken_adapter)
+        hits = kb.search([("personal", None)], self.query, use_semantic=True)
+        self.assertEqual(hits[0]["document_id"], self.doc_b["id"])
+        self.assertFalse(hits[0]["semantic_boosted"])
+
+    def test_semantic_reranking_never_surfaces_a_chunk_outside_the_authorized_scope(self):
+        # The new semantic path only re-ORDERS the pool that scope
+        # authorization already filtered -- it must never let a
+        # differently-scoped chunk back in just because its embedding is
+        # a close match.
+        other_project_doc = self.kb_semantic.ingest_bytes(
+            "c.txt", "text/plain", self.chunk_a_text.encode(), "project", "upload", "aryan",
+            scope_id="falguna-engineering", known_project_ids={"falguna-engineering"},
+        )
+        hits = self.kb_semantic.search([("personal", None)], self.query, use_semantic=True)
+        self.assertNotIn(other_project_doc["id"], {h["document_id"] for h in hits})
+
+    def test_a_candidate_with_no_stored_embedding_is_never_penalized_out_of_a_pure_keyword_pool(self):
+        # Ingested via the Null-adapter store (self.kb), so this chunk has
+        # no stored embedding at all -- it must still be found by a
+        # keyword-only KnowledgeStore exactly as before this milestone.
+        doc = self.kb.ingest_bytes("d.txt", "text/plain", b"A plain document with no embedding ever computed.", "personal", "upload", "aryan")
+        hits = self.kb.search([("personal", None)], "plain document embedding")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["document_id"], doc["id"])
+        self.assertIsNone(hits[0]["cosine_similarity"])
+        self.assertFalse(hits[0]["semantic_boosted"])
+
+
+class KnowledgeIndependentSemanticRetrievalTests(_TempStoreCase):
+    """Gap closure (independent re-audit, post-Milestone-2): the original
+    hybrid search only ever reranked chunks that FTS5 keyword search had
+    already found, so a chunk with zero keyword overlap with the query
+    could never surface no matter how close its embedding was -- the
+    independent verification report's finding that "a semantic-only match
+    cannot be retrieved." These tests prove the new independent semantic
+    retrieval pass actually closes that gap, not merely that a similarity
+    number gets computed somewhere, while keeping the keyword baseline,
+    missing-embedding handling, scope isolation, and ranking determinism
+    all intact."""
+
+    def _semantic_store(self, vectors, available=True):
+        adapter = _FakeEmbeddingAdapter(vectors, available=available)
+        return KnowledgeStore(self.store, self.audit, embedding_adapter=adapter), adapter
+
+    def test_semantic_only_match_with_zero_keyword_overlap_is_retrieved(self):
+        # Deliberately disjoint vocabularies: the chunk and the query share
+        # not one single word, so FTS5 keyword search is GUARANTEED to
+        # return zero rows for this query -- only a genuinely independent
+        # semantic scan can ever find this chunk.
+        content_text = "Xylophone marmalade quantum lighthouse zebra unicycle."
+        query = "banana trombone glacier submarine"
+        kb, _ = self._semantic_store({content_text: [1.0, 0.0], query: [0.99, 0.01]})
+        doc = kb.ingest_bytes("disjoint.txt", "text/plain", content_text.encode(), "personal", "upload", "aryan")
+
+        # Prove the gap actually existed: pure keyword search finds nothing.
+        self.assertEqual(kb.search([("personal", None)], query, use_semantic=False), [])
+
+        # The hybrid search closes it: independent semantic retrieval finds
+        # the chunk even though it was never an FTS candidate.
+        hits = kb.search([("personal", None)], query, use_semantic=True)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["document_id"], doc["id"])
+        self.assertIsNone(hits[0]["rank"])  # never had an FTS rank -- proof it wasn't a keyword hit
+        self.assertEqual(hits[0]["retrieved_via"], "semantic")
+        self.assertTrue(hits[0]["semantic_boosted"])
+        self.assertIsNotNone(hits[0]["cosine_similarity"])
+        self.assertGreater(hits[0]["cosine_similarity"], 0.9)
+
+    def test_keyword_fallback_when_embedding_adapter_unavailable(self):
+        # Same fixture as above, but the adapter reports itself unavailable
+        # this call -- the semantic-only chunk must honestly NOT appear (no
+        # embedding call is even attempted), rather than crashing or
+        # fabricating a result. This is the "keyword fallback" acceptance
+        # case: the pre-existing baseline behavior is unaffected.
+        content_text = "Xylophone marmalade quantum lighthouse zebra unicycle."
+        query = "banana trombone glacier submarine"
+        kb, _ = self._semantic_store({content_text: [1.0, 0.0], query: [0.99, 0.01]}, available=False)
+        kb.ingest_bytes("disjoint.txt", "text/plain", content_text.encode(), "personal", "upload", "aryan")
+        self.assertEqual(kb.search([("personal", None)], query, use_semantic=True), [])
+
+    def test_keyword_match_with_no_stored_embedding_still_surfaces_alongside_a_semantic_only_match(self):
+        # A mixed corpus: one chunk matches by KEYWORD ONLY and has no
+        # embedding at all (its content is absent from the adapter's
+        # vectors dict, so ingest's best-effort embed() call fails and it
+        # is stored with embedding_json=None -- exactly modeling "ingested
+        # before an embedding adapter ever covered this content" without a
+        # separate Null-adapter store); another matches by SEMANTIC
+        # SIMILARITY ONLY and shares no keywords with the query at all.
+        # Neither must break the other, and neither score is ever faked.
+        keyword_only_text = "The quarterly roadmap review covers Q3 deliverables."
+        semantic_only_text = "Xylophone marmalade quantum lighthouse zebra unicycle."
+        query = "roadmap review banana trombone glacier submarine"
+        adapter = _FakeEmbeddingAdapter({semantic_only_text: [1.0, 0.0], query: [0.99, 0.01]})
+        kb = KnowledgeStore(self.store, self.audit, embedding_adapter=adapter)
+        doc_keyword = kb.ingest_bytes("kw.txt", "text/plain", keyword_only_text.encode(), "personal", "upload", "aryan")
+        doc_semantic = kb.ingest_bytes("sem.txt", "text/plain", semantic_only_text.encode(), "personal", "upload", "aryan")
+        self.assertIsNone(self.store.list("knowledge_chunks", "document_id=?", (doc_keyword["id"],))[0]["embedding_json"])
+
+        hits = kb.search([("personal", None)], query, use_semantic=True)
+        by_doc = {h["document_id"]: h for h in hits}
+        self.assertIn(doc_keyword["id"], by_doc)
+        self.assertIn(doc_semantic["id"], by_doc)
+        self.assertIsNone(by_doc[doc_keyword["id"]]["cosine_similarity"])
+        self.assertEqual(by_doc[doc_keyword["id"]]["retrieved_via"], "keyword")
+        self.assertIsNotNone(by_doc[doc_semantic["id"]]["cosine_similarity"])
+        self.assertEqual(by_doc[doc_semantic["id"]]["retrieved_via"], "semantic")
+        # The genuine positive semantic match outranks the unscored
+        # keyword-only candidate (never held back purely for lacking an
+        # embedding, exactly as the pre-existing rerank tests already
+        # require of the keyword-vs-keyword case).
+        self.assertEqual(hits[0]["document_id"], doc_semantic["id"])
+
+    def test_independent_semantic_retrieval_never_crosses_scope_boundary(self):
+        # A near-perfect embedding match with ZERO keyword overlap, sitting
+        # in a DIFFERENT scope than the one being searched. The new scan
+        # query has no scope filter at the SQL level (it authorizes in
+        # Python afterward, the exact same enforcement point the keyword
+        # path already uses) -- this proves that authorization check
+        # actually runs and actually excludes it, not merely that it's
+        # inconvenient to reach by keyword.
+        content_text = "Xylophone marmalade quantum lighthouse zebra unicycle."
+        query = "banana trombone glacier submarine"
+        adapter = _FakeEmbeddingAdapter({content_text: [1.0, 0.0], query: [1.0, 0.0]})  # identical vectors: perfect match
+        kb = KnowledgeStore(self.store, self.audit, embedding_adapter=adapter)
+        other_scope_doc = kb.ingest_bytes(
+            "other.txt", "text/plain", content_text.encode(), "project", "upload", "aryan",
+            scope_id="falguna-engineering", known_project_ids=self.project_ids,
+        )
+        hits = kb.search([("personal", None)], query, use_semantic=True)
+        self.assertEqual(hits, [])
+        # Sanity: the SAME chunk IS retrievable once actually authorized
+        # for that scope -- proving the emptiness above is real isolation,
+        # not a fixture mistake that would have returned nothing anyway.
+        authorized_hits = kb.search([("project", "falguna-engineering")], query, use_semantic=True)
+        self.assertEqual([h["document_id"] for h in authorized_hits], [other_scope_doc["id"]])
+
+    def test_ranking_is_stable_and_deterministic_across_repeated_identical_calls(self):
+        # Several chunks at different similarity distances -- run the exact
+        # same search twice against unchanged state and require identical
+        # ordering both times (no dependence on dict/set iteration
+        # nondeterminism introduced by the keyword+semantic merge).
+        texts_and_vectors = {
+            "Alpha content about rockets and orbital mechanics.": [1.0, 0.0, 0.0],
+            "Beta content about rockets and orbital mechanics too.": [0.9, 0.1, 0.0],
+            "Gamma content about rockets and orbital mechanics as well.": [0.8, 0.2, 0.0],
+        }
+        query = "rockets orbital mechanics"
+        vectors = dict(texts_and_vectors)
+        vectors[query] = [0.95, 0.05, 0.0]
+        adapter = _FakeEmbeddingAdapter(vectors)
+        kb = KnowledgeStore(self.store, self.audit, embedding_adapter=adapter)
+        doc_ids = [kb.ingest_bytes(f"{i}.txt", "text/plain", text.encode(), "personal", "upload", "aryan")["id"]
+                   for i, text in enumerate(texts_and_vectors)]
+        first = [h["document_id"] for h in kb.search([("personal", None)], query, use_semantic=True)]
+        second = [h["document_id"] for h in kb.search([("personal", None)], query, use_semantic=True)]
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), set(doc_ids))
+
+    def test_semantic_pool_is_bounded_not_unbounded(self):
+        # Many independent semantic-only candidates at varying similarity;
+        # a small `limit` must still return only the genuinely best
+        # matches, proving the merge is bounded rather than dumping every
+        # authorized embedded chunk into the result.
+        query = "banana trombone glacier submarine"
+        vectors = {query: [1.0, 0.0]}
+        texts = []
+        for i in range(8):
+            text = f"Disjoint filler content number {i} xylophone marmalade quantum lighthouse."
+            vectors[text] = [1.0 - (i * 0.1), i * 0.02]
+            texts.append(text)
+        adapter = _FakeEmbeddingAdapter(vectors)
+        kb = KnowledgeStore(self.store, self.audit, embedding_adapter=adapter)
+        docs = [kb.ingest_bytes(f"f{i}.txt", "text/plain", t.encode(), "personal", "upload", "aryan") for i, t in enumerate(texts)]
+        hits = kb.search([("personal", None)], query, use_semantic=True, limit=3)
+        self.assertEqual(len(hits), 3)
+        # The three closest vectors (i=0,1,2) must win over the far ones.
+        self.assertEqual({h["document_id"] for h in hits}, {docs[0]["id"], docs[1]["id"], docs[2]["id"]})
+
+
+class AdversarialCrossBoundaryIsolationTests(_TempStoreCase):
+    """Phase 2 Milestone 2: isolation tests that specifically try to break
+    the scope boundary through a plausible implementation mistake, rather
+    than just confirming the happy path stays isolated."""
+
+    def test_sensitive_memory_content_is_redacted_in_search_results_even_when_the_caller_is_authorized(self):
+        # Authorization (being allowed to see this scope at all) and
+        # sensitivity masking (whether raw content shows in a search
+        # preview) are two different gates -- a caller correctly
+        # authorized for 'personal' must still get the masked preview,
+        # never the raw content, from search() specifically (list()'s
+        # masking is already covered elsewhere; search() must not have its
+        # own, separate, unmasked path).
+        self.mem.save(
+            "personal", "fact", "Aryan's home wifi password rotation schedule is quarterly", "user_stated",
+            "user_provided", "aryan", sensitivity="sensitive",
+        )
+        hits = self.mem.search([("personal", None)], "wifi password rotation schedule")
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("quarterly", hits[0]["content"])
+        self.assertIn("Sensitive", hits[0]["content"])
+
+    def test_project_and_venture_scopes_sharing_the_identical_id_string_never_cross_leak(self):
+        # A plausible implementation bug: filtering by scope_id alone
+        # (ignoring scope_type) would let a venture-authorized caller see
+        # a project's record purely because the id strings collide. Scope
+        # IDENTITY is the (scope_type, scope_id) PAIR, never scope_id alone.
+        self.store.create("vs_ventures", {
+            "name": "Shared ID Venture", "slug": "shared-id-venture", "venture_type": "product", "status": "active",
+            "parent_company": "TTT", "actor": "aryan", "created_at": utcnow(), "updated_at": utcnow(),
+        }, record_id="falguna-engineering")
+        project_record = self.mem.save(
+            "project", "fact", "Project-scoped: the deploy key rotates monthly", "user_stated", "user_provided",
+            "aryan", scope_id="falguna-engineering", known_project_ids=self.project_ids,
+        )
+        venture_record = self.mem.save(
+            "venture", "fact", "Venture-scoped: the deploy key rotates monthly too", "user_stated",
+            "user_provided", "aryan", scope_id="falguna-engineering",
+        )
+        venture_hits = self.mem.search([("venture", "falguna-engineering")], "deploy key rotates")
+        self.assertEqual([h["id"] for h in venture_hits], [venture_record["id"]])
+        project_hits = self.mem.search([("project", "falguna-engineering")], "deploy key rotates")
+        self.assertEqual([h["id"] for h in project_hits], [project_record["id"]])
+        # Authorized for BOTH: both are visible, but each only once, never
+        # duplicated or conflated into a single merged row.
+        both_hits = self.mem.search([("venture", "falguna-engineering"), ("project", "falguna-engineering")], "deploy key rotates")
+        self.assertEqual({h["id"] for h in both_hits}, {venture_record["id"], project_record["id"]})
+
+    def test_a_forgotten_records_scope_still_correctly_excludes_it_from_a_reauthorized_search(self):
+        # Forgetting must not accidentally leave a record reachable through
+        # some other scope-search code path -- re-run the same authorized
+        # search after forget() and confirm it is gone from every read
+        # surface, not merely the one already covered in
+        # MemorySupersessionAndDeletionTests.
+        record = self.mem.save(
+            "project", "fact", "Project A's internal staging credential rotates weekly", "user_stated",
+            "user_provided", "aryan", scope_id="falguna-engineering", known_project_ids=self.project_ids,
+        )
+        self.assertEqual(len(self.mem.search([("project", "falguna-engineering")], "staging credential rotates")), 1)
+        self.mem.forget(record["id"], "aryan", reason="rotated")
+        self.assertEqual(self.mem.search([("project", "falguna-engineering")], "staging credential rotates"), [])
+        self.assertEqual(self.mem.list([("project", "falguna-engineering")]), [])
 
 
 if __name__ == "__main__":

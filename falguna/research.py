@@ -69,9 +69,21 @@ class ProviderResult:
     sources plus the provider's own name (recorded for audit/debugging).
     Synthesis into a cited answer happens in ResearchResponder, not here,
     so providers stay simple, swappable, and impossible to trick into
-    writing the "answer" themselves."""
+    writing the "answer" themselves.
+
+    Phase 2 Milestone 4: `degraded` and `providers_tried` are additive,
+    default-valued fields -- every existing `ProviderResult(sources=...,
+    provider_name=...)` call site keeps working unchanged. They exist so a
+    zero-source result can honestly distinguish two very different
+    situations that used to look identical: a query that genuinely has no
+    matches (degraded=False) versus a search backend that is unreachable or
+    whose HTML a provider could no longer parse (degraded=True) --
+    `falguna.search_providers.FallbackSearchProvider` is what actually sets
+    these; a single provider used directly still defaults both fields."""
     sources: List[SourceResult]
     provider_name: str
+    degraded: bool = False
+    providers_tried: Optional[List[str]] = None
 
 
 class SearchProvider(Protocol):
@@ -303,6 +315,21 @@ NO_SOURCES_ANSWER = (
     "configured."
 )
 
+# Phase 2 Milestone 4: shown instead of NO_SOURCES_ANSWER whenever
+# ProviderResult.degraded is True -- i.e. FallbackSearchProvider tried every
+# configured search backend and at least one of them failed outright
+# (network error, timeout, or a page it could no longer parse), rather than
+# every backend cleanly returning a normal empty result set. This is the
+# honest-degradation message the mission's Section 6 gap called for: a
+# scraper silently breaking must never look identical to a query that
+# genuinely has no results.
+NO_SOURCES_DEGRADED_ANSWER = (
+    "Falguna couldn't retrieve sources for this query because its search "
+    "backend(s) failed or were unreachable, not because the query has no "
+    "results. Try again in a moment, or check Falguna's search provider "
+    "configuration."
+)
+
 
 def _source_payload(sources: List[SourceResult]) -> str:
     """Serializes sources as plainly-labeled, quoted DATA for the model --
@@ -326,15 +353,23 @@ class ResearchResponder:
         self.model = model
         self.timeout_seconds = timeout_seconds
 
-    def reply(self, query: str, sources: List[SourceResult]) -> dict:
+    def reply(self, query: str, sources: List[SourceResult], provider_result: Optional[ProviderResult] = None) -> dict:
         """Returns {"answer", "citations", "suggested_objective", "model_call"}
         or raises ResearchError with a message safe to show the person.
         If there are zero sources, skips the model call entirely and
         returns a deterministic, honest "no sources" answer -- Falguna
         never lets an empty search result set turn into a hallucinated
-        answer with fabricated citations."""
+        answer with fabricated citations.
+
+        Phase 2 Milestone 4: the optional `provider_result` is purely
+        additive -- every existing caller passing only (query, sources)
+        behaves exactly as before. When given and its `degraded` flag is
+        set, the zero-sources answer honestly says the search backend(s)
+        failed rather than implying the query itself had no results."""
         if not sources:
-            return {"answer": NO_SOURCES_ANSWER, "citations": [], "suggested_objective": None, "model_call": None}
+            degraded = bool(provider_result and provider_result.degraded)
+            answer = NO_SOURCES_DEGRADED_ANSWER if degraded else NO_SOURCES_ANSWER
+            return {"answer": answer, "citations": [], "suggested_objective": None, "model_call": None}
         config = dict(self.gateway.configuration())
         config["model"] = self.model
         user_content = (

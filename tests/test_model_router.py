@@ -351,6 +351,85 @@ class ModelRouterPolicyTests(unittest.TestCase):
         self.assertEqual(parse_selector("ollama/llama3.2:3b"), ("ollama", "llama3.2:3b"))
 
 
+# --------------------------------------------------------------------- capability metadata / compatibility (Phase 2 M1)
+
+class ModelRouterCapabilityMetadataTests(unittest.TestCase):
+    """ModelRouter.describe_model()/check_compatible(): real, on-demand
+    capability metadata for whatever a selector would actually resolve to
+    right now, and a compatibility-check primitive built on top of it."""
+
+    def test_describe_model_reports_static_capability_flags_from_list_models(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "m1", "M1", True, supports_streaming=True, supports_tools=True,
+                      supports_vision=False, context_window=4096),
+        ])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        info = router.describe_model("ollama/m1")
+        self.assertEqual(info["provider_id"], "ollama")
+        self.assertEqual(info["model_id"], "m1")
+        self.assertTrue(info["supports_tools"])
+        self.assertEqual(info["context_window"], 4096)
+        self.assertFalse(info["is_embedding_only"])
+
+    def test_describe_model_raises_when_nothing_is_routable(self):
+        provider = _FakeProvider("ollama", is_local=True, health_state=HealthState.OFFLINE)
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        with self.assertRaises(FalgunaModelError) as ctx:
+            router.describe_model(None)
+        self.assertEqual(ctx.exception.category, ErrorCategory.NO_COMPATIBLE_MODEL)
+
+    def test_describe_model_prefers_a_real_provider_probe_over_a_stale_static_context_window(self):
+        # A provider that offers a real describe_model()/context_window_from_show()
+        # probe (duck-typed, e.g. OllamaProvider) must have that live-probed
+        # value win over whatever list_models() statically reported.
+        class _ProbeProvider(_FakeProvider):
+            def describe_model(self, model_id):
+                return {"model_info": {"family.context_length": 32768}}
+
+            @staticmethod
+            def context_window_from_show(show_body):
+                return OllamaProvider.context_window_from_show(show_body)
+
+        provider = _ProbeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "m1", "M1", True, context_window=None),
+        ])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        info = router.describe_model("ollama/m1")
+        self.assertEqual(info["context_window"], 32768)
+
+    def test_check_compatible_passes_when_requirements_are_met(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[
+            ModelInfo("ollama", "m1", "M1", True, supports_vision=True, context_window=8192),
+        ])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        ok, reason = router.check_compatible("ollama/m1", requires_vision=True, min_context=4096)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_check_compatible_fails_with_a_plain_language_reason_when_vision_unsupported(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[ModelInfo("ollama", "m1", "M1", True, supports_vision=False)])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        ok, reason = router.check_compatible("ollama/m1", requires_vision=True)
+        self.assertFalse(ok)
+        self.assertIn("vision", reason)
+
+    def test_check_compatible_fails_when_context_window_too_small(self):
+        provider = _FakeProvider("ollama", is_local=True, models=[ModelInfo("ollama", "m1", "M1", True, context_window=2048)])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        ok, reason = router.check_compatible("ollama/m1", min_context=8192)
+        self.assertFalse(ok)
+        self.assertIn("2048", reason)
+
+    def test_check_compatible_never_fails_min_context_when_context_window_is_unknown(self):
+        # An unknown context window must never be treated as a failure --
+        # that would incorrectly penalize a provider/model that simply
+        # doesn't report the metric.
+        provider = _FakeProvider("ollama", is_local=True, models=[ModelInfo("ollama", "m1", "M1", True, context_window=None)])
+        router = ModelRouter([provider], privacy_mode="HYBRID")
+        ok, reason = router.check_compatible("ollama/m1", min_context=999999)
+        self.assertTrue(ok)
+
+
 # --------------------------------------------------------------------- provider-failure / quota simulation
 
 class ProviderFailureSimulationTests(unittest.TestCase):

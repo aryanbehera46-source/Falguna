@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import socket
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -373,6 +374,49 @@ class OllamaProvider(ModelProvider):
             return ProviderHealth(HealthState.DEGRADED, "Ollama is running but no model has been pulled yet.")
         return ProviderHealth(HealthState.DEGRADED, f"Unexpected response ({status}) from the local Ollama runtime.")
 
+    def describe_model(self, model_id: str, timeout: Optional[float] = None) -> Optional[Dict]:
+        """Phase 2 Milestone 1: on-demand, real capability metadata for one
+        specific model, via Ollama's own `/api/show` endpoint -- never
+        guessed, never cached at import time. Deliberately NOT called from
+        list_models()/health_check() (those must stay cheap and O(1)
+        regardless of how many models are pulled); a caller that actually
+        needs context-window/capability detail for one model (e.g. a
+        compatibility check before routing an attachment-heavy request)
+        asks for it explicitly here. Returns None on any failure -- same
+        "never raise from a read-only inspection call" contract as
+        list_models()/health_check() -- so a caller can treat "unknown" and
+        "unreachable" identically rather than handling a new exception
+        type.
+        """
+        try:
+            _, body = self._post("/api/show", {"model": model_id}, timeout if timeout is not None else self.connect_timeout)
+        except Exception:
+            return None
+        return body if isinstance(body, dict) else None
+
+    @staticmethod
+    def context_window_from_show(show_body: Optional[Dict]) -> Optional[int]:
+        """Extracts a context-length integer from a real `/api/show`
+        response, if one is present. Ollama reports this under
+        `model_info` as a family-prefixed key such as
+        "qwen2.context_length" or "llama.context_length" -- the exact key
+        name varies by model family, so this scans for any key ending in
+        ".context_length" rather than hardcoding one family. Returns None
+        (never 0, never a guess) when the field genuinely isn't present,
+        which is an honest "unknown", not "no context window"."""
+        if not show_body:
+            return None
+        model_info = show_body.get("model_info")
+        if not isinstance(model_info, dict):
+            return None
+        for key, value in model_info.items():
+            if key.endswith(".context_length"):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     def generate(self, model_id: str, payload: dict, timeout_seconds: int) -> dict:
         schema = payload["response_format"]["json_schema"]["schema"]
         body = {"model": model_id, "messages": payload["messages"], "stream": False, "format": schema}
@@ -583,6 +627,22 @@ class OllamaProvider(ModelProvider):
 
 # --------------------------------------------------------------------- generic OpenAI-compatible
 
+def _attempt_suffix(attempt: int) -> str:
+    """Phase 2 Milestone 4: chat's failure-explanation UI (web.py's
+    renderMessageRow error bubble) shows this FalgunaModelError.message
+    directly to the person -- before this, a retry-exhausted failure and a
+    first-try failure produced the exact same sentence, so there was no way
+    to tell "Falguna already tried this 3 times" from "Falguna gave up
+    immediately" without opening Technical details. `attempt` is the
+    0-based retry counter from generate()'s loop, so `attempt + 1` is the
+    real number of HTTP attempts made. Returns "" for a first-try failure
+    (attempt==0) -- no retries happened, so nothing new to say."""
+    if attempt <= 0:
+        return ""
+    total = attempt + 1
+    return f" after {total} attempts"
+
+
 class GenericOpenAICompatibleProvider(ModelProvider):
     """Any HTTP endpoint speaking the OpenAI chat-completions shape --
     a real external vendor, or a self-hosted server the person runs
@@ -599,7 +659,8 @@ class GenericOpenAICompatibleProvider(ModelProvider):
     """
 
     def __init__(self, provider_id: str, display_name: str, base_url: str = "", is_local: bool = False,
-                 api_key_env: str = "", model_allowlist: Optional[List[str]] = None, connect_timeout: float = 3.0):
+                 api_key_env: str = "", model_allowlist: Optional[List[str]] = None, connect_timeout: float = 3.0,
+                 max_retries: int = 2, retry_backoff_base: float = 0.5, sleep_fn=None):
         self.provider_id = provider_id
         self.display_name = display_name
         self.base_url = (base_url or "").rstrip("/")
@@ -607,6 +668,19 @@ class GenericOpenAICompatibleProvider(ModelProvider):
         self.api_key_env = api_key_env or ""
         self.model_allowlist = list(model_allowlist or [])
         self.connect_timeout = connect_timeout
+        # Phase 2 Milestone 1: bounded retry for genuinely transient
+        # failures only (a request timeout, or the vendor's own 429/5xx
+        # response) -- never for a non-transient failure (401/403 auth,
+        # 404 unknown model, an unexpected response shape), which fail
+        # immediately exactly as before this change. max_retries=2 means
+        # at most 3 total attempts; retry_backoff_base doubles each
+        # attempt (0.5s, 1s by default) so a real outage still fails in a
+        # bounded, sub-second-to-low-seconds amount of extra time rather
+        # than hanging. sleep_fn is injectable so tests can assert retry
+        # behavior without actually sleeping.
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_base = float(retry_backoff_base)
+        self._sleep = sleep_fn or time.sleep
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -643,51 +717,79 @@ class GenericOpenAICompatibleProvider(ModelProvider):
             )
         body = {"model": model_id, "messages": payload["messages"], "response_format": payload.get("response_format")}
         data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(f"{self.base_url}/chat/completions", data=data, method="POST", headers=self._headers())
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-                decoded = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:2000] if hasattr(exc, "read") else str(exc)
-            if exc.code in (401, 403):
+        decoded = None
+        attempt = 0
+        while True:
+            req = urllib.request.Request(f"{self.base_url}/chat/completions", data=data, method="POST", headers=self._headers())
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                    decoded = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:2000] if hasattr(exc, "read") else str(exc)
+                if exc.code in (401, 403):
+                    raise FalgunaModelError(
+                        ErrorCategory.AUTH_REQUIRED, f"{self.display_name} rejected the request as unauthenticated.",
+                        technical_detail=detail, provider_id=self.provider_id,
+                    ) from exc
+                if exc.code == 429:
+                    if attempt < self.max_retries:
+                        self._sleep(self.retry_backoff_base * (2 ** attempt))
+                        attempt += 1
+                        continue
+                    raise FalgunaModelError(
+                        ErrorCategory.RATE_LIMITED,
+                        f"{self.display_name} reported it is rate-limited or over quota{_attempt_suffix(attempt)}.",
+                        technical_detail=detail, provider_id=self.provider_id,
+                    ) from exc
+                if exc.code == 404:
+                    raise FalgunaModelError(
+                        ErrorCategory.MODEL_UNSUPPORTED, f"{self.display_name} does not recognize model '{model_id}'.",
+                        technical_detail=detail, provider_id=self.provider_id,
+                    ) from exc
+                # A 5xx is the vendor's own server failing -- genuinely
+                # transient, unlike a 4xx (which is this request's fault
+                # and will fail identically on retry).
+                if 500 <= exc.code < 600 and attempt < self.max_retries:
+                    self._sleep(self.retry_backoff_base * (2 ** attempt))
+                    attempt += 1
+                    continue
                 raise FalgunaModelError(
-                    ErrorCategory.AUTH_REQUIRED, f"{self.display_name} rejected the request as unauthenticated.",
+                    ErrorCategory.TRANSPORT_FAILURE, f"{self.display_name} returned an error{_attempt_suffix(attempt)}.",
                     technical_detail=detail, provider_id=self.provider_id,
                 ) from exc
-            if exc.code == 429:
+            except (socket.timeout, TimeoutError) as exc:
+                if attempt < self.max_retries:
+                    self._sleep(self.retry_backoff_base * (2 ** attempt))
+                    attempt += 1
+                    continue
                 raise FalgunaModelError(
-                    ErrorCategory.RATE_LIMITED, f"{self.display_name} reported it is rate-limited or over quota.",
-                    technical_detail=detail, provider_id=self.provider_id,
-                ) from exc
-            if exc.code == 404:
-                raise FalgunaModelError(
-                    ErrorCategory.MODEL_UNSUPPORTED, f"{self.display_name} does not recognize model '{model_id}'.",
-                    technical_detail=detail, provider_id=self.provider_id,
-                ) from exc
-            raise FalgunaModelError(
-                ErrorCategory.TRANSPORT_FAILURE, f"{self.display_name} returned an error.",
-                technical_detail=detail, provider_id=self.provider_id,
-            ) from exc
-        except (socket.timeout, TimeoutError) as exc:
-            raise FalgunaModelError(
-                ErrorCategory.TIMEOUT, f"{self.display_name} did not respond in time.",
-                technical_detail=str(exc), provider_id=self.provider_id,
-            ) from exc
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, (socket.timeout, TimeoutError)):
-                raise FalgunaModelError(
-                    ErrorCategory.TIMEOUT, f"{self.display_name} did not respond in time.",
+                    ErrorCategory.TIMEOUT, f"{self.display_name} did not respond in time{_attempt_suffix(attempt)}.",
                     technical_detail=str(exc), provider_id=self.provider_id,
                 ) from exc
-            raise FalgunaModelError(
-                ErrorCategory.PROVIDER_OFFLINE, f"{self.display_name} is not reachable.",
-                technical_detail=str(exc), provider_id=self.provider_id,
-            ) from exc
-        except OSError as exc:
-            raise FalgunaModelError(
-                ErrorCategory.PROVIDER_OFFLINE, f"{self.display_name} is not reachable.",
-                technical_detail=str(exc), provider_id=self.provider_id,
-            ) from exc
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, (socket.timeout, TimeoutError)):
+                    if attempt < self.max_retries:
+                        self._sleep(self.retry_backoff_base * (2 ** attempt))
+                        attempt += 1
+                        continue
+                    raise FalgunaModelError(
+                        ErrorCategory.TIMEOUT, f"{self.display_name} did not respond in time{_attempt_suffix(attempt)}.",
+                        technical_detail=str(exc), provider_id=self.provider_id,
+                    ) from exc
+                # A connection actually refused/unreachable is treated as
+                # persistent (the server isn't up at all), not retried --
+                # retrying a genuinely offline endpoint only adds latency
+                # without a realistic chance of success within this call.
+                raise FalgunaModelError(
+                    ErrorCategory.PROVIDER_OFFLINE, f"{self.display_name} is not reachable.",
+                    technical_detail=str(exc), provider_id=self.provider_id,
+                ) from exc
+            except OSError as exc:
+                raise FalgunaModelError(
+                    ErrorCategory.PROVIDER_OFFLINE, f"{self.display_name} is not reachable.",
+                    technical_detail=str(exc), provider_id=self.provider_id,
+                ) from exc
         try:
             content = decoded["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -703,6 +805,11 @@ class GenericOpenAICompatibleProvider(ModelProvider):
                 "adapter": self.provider_id, "billing": "local-self-hosted-no-cash-cost" if self.is_local else "external-api-estimated",
                 "cost_basis": "local-zero-marginal-cost" if self.is_local else "estimated-token-based",
                 "routed_model": model_id,
+                # Phase 2 Milestone 1: honest evidence of how many retries
+                # this specific call actually needed (0 = succeeded on the
+                # first attempt) -- never fabricated, read straight off the
+                # loop above.
+                "retry_attempts": attempt,
             },
         }
         if self.is_local:

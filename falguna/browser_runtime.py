@@ -284,8 +284,21 @@ class BrowserSessionStore:
     def get(self, session_id: str) -> Optional[dict]:
         return self.store.get("browser_sessions", session_id)
 
-    def list(self, limit: int = 200) -> List[dict]:
-        rows = self.store.list("browser_sessions")
+    def list(self, limit: int = 200, conversation_id: Optional[str] = None) -> List[dict]:
+        """Phase 2 Milestone 3: `conversation_id` is an optional, additive
+        filter -- every existing caller (Mission Control's unfiltered board)
+        is unaffected, since the default (None) preserves the exact prior
+        behavior of returning every session. Passing a conversation_id
+        narrows this to sessions actually linked to that conversation (the
+        conversation_id column, and BrowserSessionStore.create()'s
+        conversation_id parameter, already existed before this milestone --
+        only the read-side filter was missing), which is what lets Chat
+        show only the browser task(s) it itself started, not every browser
+        task running anywhere in Falguna."""
+        if conversation_id:
+            rows = self.store.list("browser_sessions", "conversation_id=?", (conversation_id,))
+        else:
+            rows = self.store.list("browser_sessions")
         rows.sort(key=lambda r: r["created_at"], reverse=True)
         return rows[:limit]
 

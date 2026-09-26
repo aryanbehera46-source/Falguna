@@ -321,6 +321,73 @@ class ModelRouter:
         )
         raise FalgunaModelError(ErrorCategory.NO_COMPATIBLE_MODEL, reason, technical_detail=" | ".join(errors))
 
+    def describe_model(self, requested_selector: Optional[str]) -> Dict:
+        """Phase 2 Milestone 1: real, on-demand capability metadata for
+        whatever model `requested_selector` would actually resolve to
+        right now -- resolves via the exact same policy as __call__/stream
+        (so this never describes a model the request would not actually
+        be routed to), then merges the provider's own list_models() flags
+        for that model with a real describe_model() probe when the
+        provider offers one (currently only OllamaProvider, via
+        `/api/show`). Never fabricates a field: any capability the
+        provider doesn't positively report comes back as None/False, not
+        a guess. Raises FalgunaModelError exactly as resolve() would if
+        nothing is currently routable."""
+        provider, model_id = self.resolve(requested_selector)
+        info = None
+        for candidate in provider.list_models():
+            if candidate.model_id == model_id:
+                info = candidate
+                break
+        context_window = info.context_window if info else None
+        if hasattr(provider, "describe_model"):
+            show_body = provider.describe_model(model_id)
+            if hasattr(provider, "context_window_from_show"):
+                probed = provider.context_window_from_show(show_body)
+                if probed is not None:
+                    context_window = probed
+        return {
+            "provider_id": provider.provider_id,
+            "model_id": model_id,
+            "display_name": info.display_name if info else model_id,
+            "is_local": provider.is_local,
+            "supports_streaming": bool(getattr(info, "supports_streaming", False)) or hasattr(provider, "generate_stream"),
+            "supports_tools": bool(getattr(info, "supports_tools", False)),
+            "supports_vision": bool(getattr(info, "supports_vision", False)),
+            "supports_json_schema": bool(getattr(info, "supports_json_schema", True)),
+            "is_embedding_only": bool(getattr(info, "is_embedding_only", False)),
+            "context_window": context_window,
+        }
+
+    def check_compatible(self, requested_selector: Optional[str], *, requires_streaming: bool = False,
+                          requires_vision: bool = False, requires_tools: bool = False,
+                          min_context: Optional[int] = None) -> "tuple[bool, str]":
+        """Phase 2 Milestone 1: a real compatibility check a caller can run
+        BEFORE committing to a request that needs a specific capability
+        (e.g. an image attachment needing vision, or a long document
+        needing a minimum context window) -- returns (True, "") when the
+        model this selector would actually route to satisfies every
+        requirement given, or (False, a plain-language reason) otherwise.
+        Never raises for an incompatibility (that is the normal, expected
+        answer this method exists to give); it still raises
+        FalgunaModelError if the selector would not resolve to any model
+        at all, since that is a routing failure, not a compatibility
+        answer, and callers already handle that exception from resolve().
+        `min_context` is only enforced when the provider positively
+        reports a context window for this model -- an unknown context
+        window is never treated as a failure, since that would penalize
+        providers/models that simply don't expose the metric."""
+        info = self.describe_model(requested_selector)
+        if requires_streaming and not info["supports_streaming"]:
+            return False, f"'{info['model_id']}' does not support streaming responses."
+        if requires_vision and not info["supports_vision"]:
+            return False, f"'{info['model_id']}' does not support image/vision input."
+        if requires_tools and not info["supports_tools"]:
+            return False, f"'{info['model_id']}' does not support tool calling."
+        if min_context is not None and info["context_window"] is not None and info["context_window"] < min_context:
+            return False, f"'{info['model_id']}' has a {info['context_window']}-token context window, below the required {min_context}."
+        return True, ""
+
     def __call__(self, config: dict, payload: dict, timeout_seconds: int, cancel_event=None) -> dict:
         requested = config.get("model")
         provider, model_id = self.resolve(requested)

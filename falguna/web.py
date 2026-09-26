@@ -43,19 +43,24 @@ from .scheduler import get_scheduler
 from .research import ResearchError, ResearchResponder, ResearchStore, rank_sources
 from .review import ModelSemanticReviewer
 from .runtime import open_control_plane
-from .search_providers import DuckDuckGoHTMLSearchProvider
+from .search_providers import DuckDuckGoHTMLSearchProvider, DuckDuckGoLiteHTMLSearchProvider, FallbackSearchProvider
 from .store import utcnow
 from .usability import MILESTONES, evidence_summary, mission_view
 from .workers import StructuredEditWorker
 
 
 MODEL = DEFAULT_CODEX_MODEL
-# Falguna Search's default provider. Swappable in one line -- research.py's
-# abstraction (SearchProvider/ProviderResult/SourceResult) never imports or
-# knows about this concrete class, so replacing DuckDuckGoHTMLSearchProvider
-# with a paid web-search API, browser-based retrieval, a provider-native
-# search tool, or a self-hosted index touches only this one assignment.
-SEARCH_PROVIDER = DuckDuckGoHTMLSearchProvider()
+# Falguna Search's default provider. Phase 2 Milestone 4: this is now a
+# FallbackSearchProvider chaining two independent, keyless DuckDuckGo HTML
+# surfaces (html.duckduckgo.com then lite.duckduckgo.com) rather than a
+# single scraper with no fallback -- if one endpoint's markup changes or is
+# unreachable, the other is tried before Falguna ever reports "no sources".
+# Still swappable in one line -- research.py's abstraction
+# (SearchProvider/ProviderResult/SourceResult) never imports or knows about
+# any of these concrete classes, so replacing the whole chain with a paid
+# web-search API, browser-based retrieval, a provider-native search tool,
+# or a self-hosted index touches only this one assignment.
+SEARCH_PROVIDER = FallbackSearchProvider([DuckDuckGoHTMLSearchProvider(), DuckDuckGoLiteHTMLSearchProvider()])
 _operations = {}
 _operations_lock = threading.Lock()
 # Local AI Independence V1.1: one threading.Event per in-flight assistant
@@ -361,7 +366,8 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         if path == "/api/missions/board":
             return self._missions_board()
         if path == "/api/browser/sessions":
-            return self._list_browser_sessions()
+            conversation_id = parse_qs(parsed.query).get("conversation_id", [""])[0] or None
+            return self._list_browser_sessions(conversation_id)
         if path == "/api/browser/settings":
             return self._browser_settings_get()
         if path.startswith("/api/browser/sessions/"):
@@ -986,12 +992,18 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             "archived": bool(row.get("mc_archived")),
         }
 
-    def _list_browser_sessions(self):
+    def _list_browser_sessions(self, conversation_id=None):
+        """Phase 2 Milestone 3: an optional `conversation_id` narrows this
+        to the browser/computer-use sessions Chat itself started for that
+        conversation -- Mission Control's own board call (no
+        conversation_id) is completely unaffected and keeps seeing every
+        session, exactly as before."""
         control, store = open_control_plane(self.app_root)
         try:
             sessions = BrowserSessionStore(store)
             profiles_by_id = {p["id"]: p for p in load_profiles(self.app_root)}
-            return self._json({"sessions": [self._browser_session_summary(row, profiles_by_id) for row in sessions.list()]})
+            rows = sessions.list(conversation_id=conversation_id)
+            return self._json({"sessions": [self._browser_session_summary(row, profiles_by_id) for row in rows]})
         finally:
             store.close()
 
@@ -1828,7 +1840,9 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 # installed" the way it used to.
                 gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
                 transport = _build_router(store, use_fallback=settings["fallback"])
-                outcome = ResearchResponder(gateway, transport, model, timeout_seconds=settings["research_timeout"]).reply(query_text, sources)
+                outcome = ResearchResponder(gateway, transport, model, timeout_seconds=settings["research_timeout"]).reply(
+                    query_text, sources, provider_result=provider_result,
+                )
                 rs.save_result(research_id, outcome["answer"], sources, outcome["citations"], outcome["suggested_objective"], model_call=outcome["model_call"])
                 NotificationStore(store).notify_once("RESEARCH_COMPLETE", f"Research ready: {query_text[:70]}", "", "research", research_id)
             except ResearchError as exc:
@@ -2571,6 +2585,19 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .handoff-trigger svg{color:var(--accent)}
 .handoff-prior{color:var(--muted-dim);font-size:11.5px}
 .handoff-prior a{color:var(--muted)}
+/* Phase 2 Milestone 3: inline browser/computer-use progress in chat --
+   same trigger-row pattern as the handoff panel above, plus a compact
+   status pill reusing the Mission Control bucket vocabulary
+   (running/needs_you/completed/failed/cancelled) so it reads as the same
+   system, not a second one. */
+.handoff-prior-list{display:flex;flex-direction:column;gap:4px}
+.browser-session-row{display:flex;align-items:center;gap:8px;text-decoration:none}
+.browser-session-status{padding:2px 8px;font-size:10.5px;cursor:default}
+.browser-session-status.status-running{color:var(--accent-hi);border-color:var(--accent)}
+.browser-session-status.status-needs_you{color:#c07a1a;border-color:#c07a1a}
+.browser-session-status.status-failed{color:#c0392b;border-color:#c0392b}
+.browser-session-status.status-cancelled{color:var(--muted-dim)}
+.browser-session-status.status-completed{color:var(--muted)}
 .modal.handoff-modal{max-width:480px;text-align:left}
 .modal.handoff-modal label{display:block;color:var(--muted);font-size:11.5px;margin:10px 0 5px;font-weight:600}
 .modal.handoff-modal select,.modal.handoff-modal textarea{width:100%;color:var(--text);background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:9px 10px}
@@ -3364,6 +3391,11 @@ const STARTERS=[
 let pendingAttachments=[];
 let currentConversationData=null,currentConversationId=null,editingMessageId=null;
 let chatPollGen=0;
+// Phase 2 Milestone 3: a separate generation counter for the inline
+// browser-sessions panel, so it can poll independently of chat's own
+// pollConversationUntilSettled (a browser task can still be RUNNING after
+// the assistant message that started it has already settled).
+let browserPanelPollGen=0;
 
 async function renderChatView(id){
   await loadProfiles();
@@ -3396,7 +3428,7 @@ async function renderChatView(id){
     });
     return;
   }
-  vp.innerHTML=`<div class="chat-view"><div class="chat-scroll"><div class="selector-row" id="chatToolbar"></div><div class="thread" id="thread"><div class="empty-state">Loading conversation&hellip;</div></div></div><div id="handoffMount"></div>${composerHtml('Send',true)}</div>`;
+  vp.innerHTML=`<div class="chat-view"><div class="chat-scroll"><div class="selector-row" id="chatToolbar"></div><div class="thread" id="thread"><div class="empty-state">Loading conversation&hellip;</div></div></div><div id="browserSessionsMount"></div><div id="handoffMount"></div>${composerHtml('Send',true)}</div>`;
   wireComposerChrome(true);
   wireAttachUpload(id);
   renderPendingAttachRow();
@@ -3737,6 +3769,7 @@ function renderThread(id,data){
   const last=messages[messages.length-1];
   const suggestion=last&&last.role==='assistant'&&last.status==='COMPLETED'&&last.suggested_objective;
   renderHandoffPanel(conversation,suggestion||'',handoffs);
+  renderBrowserSessionsPanel(id);
   $('thread').closest('.chat-scroll').scrollTop=9e6;
 }
 function renderHandoffPanel(conversation,suggested,handoffs){
@@ -3750,6 +3783,63 @@ function renderHandoffPanel(conversation,suggested,handoffs){
     ${priorRuns?`<span class="handoff-prior">Already started: ${priorRuns}</span>`:''}
   </div>`;
   $('handoffTriggerBtn').onclick=()=>openHandoffModal(conversation,suggested);
+}
+
+// Phase 2 Milestone 3: browser/computer-use <-> chat integration. This is
+// deliberately read-only progress visibility plus a start trigger -- it
+// reuses BrowserSessionStore/_browser_session_summary and the existing
+// GET /api/browser/sessions?conversation_id=... filter (Milestone 3
+// backend work) exactly as-is, the same NEEDS_ARYAN approval gate Mission
+// Control already enforces (approve/reject happens on the existing
+// #/browser/<id> detail view -- this panel never adds a second approval
+// path), and the same running/needs_you/completed/failed/cancelled bucket
+// vocabulary as _browser_session_bucket -- never a second task system.
+const BROWSER_PANEL_ACTIVE_STATUSES=new Set(['CREATED','RUNNING','WAITING']);
+function _browserPanelBucket(status){
+  if(BROWSER_PANEL_ACTIVE_STATUSES.has(status))return 'running';
+  if(status==='NEEDS_ARYAN'||status==='PAUSED')return 'needs_you';
+  if(status==='FAILED')return 'failed';
+  if(status==='CANCELLED')return 'cancelled';
+  return 'completed';
+}
+const BROWSER_PANEL_BUCKET_LABEL={running:'Running',needs_you:'Needs you',failed:'Failed',cancelled:'Cancelled',completed:'Completed'};
+async function renderBrowserSessionsPanel(conversationId){
+  const mount=$('browserSessionsMount');
+  if(!mount)return;
+  let sessions=[];
+  try{
+    const out=await api('/api/browser/sessions?conversation_id='+encodeURIComponent(conversationId));
+    sessions=out.sessions||[];
+  }catch(err){
+    // Honest degradation, matching the mission's PROVIDER_OFFLINE display
+    // convention -- never a silent empty panel pretending nothing was
+    // ever started.
+    mount.innerHTML=`<div class="handoff-trigger-row"><span class="handoff-prior error">Browser tasks unavailable: ${esc(err.message)}</span></div>`;
+    return;
+  }
+  const rows=sessions.map(s=>{
+    const bucket=_browserPanelBucket(s.status);
+    const label=(s.objective||'Browser task').trim();
+    return `<a class="handoff-prior browser-session-row" href="#/browser/${esc(s.session_id)}" data-bucket="${bucket}">
+      <span class="pill-btn browser-session-status status-${bucket}">${BROWSER_PANEL_BUCKET_LABEL[bucket]}</span>
+      ${esc(label.length>60?label.slice(0,60)+'…':label)}
+    </a>`;
+  }).join('');
+  mount.innerHTML=`<div class="handoff-trigger-row">
+    <button type="button" class="pill-btn handoff-trigger" id="browserTaskTriggerBtn">${icon('handoff',13)}New browser task</button>
+    ${rows?`<span class="handoff-prior-list">${rows}</span>`:''}
+  </div>`;
+  $('browserTaskTriggerBtn').onclick=()=>openNewBrowserTaskModal(conversationId);
+  const anyActive=sessions.some(s=>BROWSER_PANEL_ACTIVE_STATUSES.has(s.status));
+  if(anyActive)pollBrowserSessionsPanel(conversationId);
+}
+function pollBrowserSessionsPanel(conversationId){
+  const gen=++browserPanelPollGen;
+  setTimeout(async()=>{
+    if(gen!==browserPanelPollGen)return;
+    if(!(currentRoute().view==='chat'&&currentRoute().id===conversationId))return;
+    await renderBrowserSessionsPanel(conversationId);
+  },2000);
 }
 
 function openHandoffModal(conversation,suggested){
@@ -3789,7 +3879,7 @@ function openHandoffModal(conversation,suggested){
   };
 }
 
-function openNewBrowserTaskModal(){
+function openNewBrowserTaskModal(conversationId){
   // Falguna Browser + Computer Use V1: project scoping for browser tasks
   // mirrors openHandoffModal's project picker exactly (same profileList,
   // same approved-project registry -- falguna/project_profiles.json via
@@ -3797,6 +3887,15 @@ function openNewBrowserTaskModal(){
   // modal, an unscoped task is allowed here (existing policy: web.py's
   // _start_browser_session only validates project_id when one is given),
   // so the picker always offers "No project" as a real, selectable option.
+  //
+  // Phase 2 Milestone 3: an optional `conversationId` is the ONLY thing
+  // that changes when this modal is opened from renderBrowserSessionsPanel
+  // (chat) instead of the command palette / Mission Control (both of
+  // which call this with no argument, so their behavior is byte-for-byte
+  // unchanged): the new session is linked to the conversation via the
+  // backend's existing `conversation_id` field, and on success chat stays
+  // on the conversation and refreshes the inline panel instead of
+  // navigating away to the Mission-Control-only #/browser/<id> view.
   loadProfiles().catch(()=>{}).then(()=>{
     const openOptions=profileList.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
     const scrim=document.createElement('div');
@@ -3823,9 +3922,20 @@ function openNewBrowserTaskModal(){
       const btn=scrim.querySelector('#nbtStart');
       btn.disabled=true;btn.textContent='Starting…';
       try{
-        const out=await api('/api/browser/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({objective,project_id})});
+        const body={objective,project_id};
+        if(conversationId)body.conversation_id=conversationId;
+        const out=await api('/api/browser/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
         close();
-        go('#/browser/'+out.session_id);
+        if(conversationId){
+          // Stay in chat -- progress is now visible inline via
+          // renderBrowserSessionsPanel, which is exactly the "safe
+          // integration with chat and progress visibility" Milestone 3
+          // scope calls for, not a navigation away from the conversation.
+          showToast('Browser task started.');
+          renderBrowserSessionsPanel(conversationId);
+        }else{
+          go('#/browser/'+out.session_id);
+        }
       }catch(err){
         btn.disabled=false;btn.textContent='Start browser task';
         showToast(err.message,{error:true});
