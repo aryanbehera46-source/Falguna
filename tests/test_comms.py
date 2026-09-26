@@ -161,5 +161,106 @@ class OverviewTests(_CommsTestCase):
         self.assertEqual(ov["awaiting_approval"][0]["ref_id"], conv["id"])
 
 
+class Milestone8OverviewViewsTests(_CommsTestCase):
+    """TTT Communications V2, Milestone 8: the five overview() buckets
+    added for TTT HQ's Communications UX, on top of the four
+    OverviewTests above already covers."""
+
+    def test_support_issues_covers_support_and_billing_only(self):
+        self.comms.open_conversation("EMAIL", "support", priority="normal")
+        self.comms.open_conversation("EMAIL", "billing", priority="normal")
+        self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        ov = self.comms.overview()
+        self.assertEqual(len(ov["support_issues"]), 2)
+        self.assertTrue(all(c["department"] in ("support", "billing") for c in ov["support_issues"]))
+
+    def test_awaiting_client_reflects_pending_customer_status(self):
+        conv = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        self.assertEqual(self.comms.overview()["awaiting_client"], [])
+        self.comms.set_status(conv["id"], "pending_customer", actor="Aryan")
+        ov = self.comms.overview()
+        self.assertEqual(len(ov["awaiting_client"]), 1)
+        self.assertEqual(ov["awaiting_client"][0]["id"], conv["id"])
+
+    def test_follow_ups_due_lists_draft_followups(self):
+        from falguna.revenue_hunter import FollowupStore, OpportunityStore
+        opportunities = OpportunityStore(self.store, self.audit)
+        opp_id = opportunities.create({"title": "A project"}, actor="website")
+        followup_id = FollowupStore(self.store, self.audit).generate(opp_id, "response_followup")
+        ov = self.comms.overview()
+        self.assertTrue(any(f["id"] == followup_id for f in ov["follow_ups_due"]))
+
+    def test_failed_delivery_is_empty_until_a_message_is_actually_marked_failed(self):
+        conv = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg = self.comms.add_message(conv["id"], "OUTBOUND", "Draft reply", actor="ai_workforce")
+        self.assertEqual(self.comms.overview()["failed_delivery"], [])
+        self.comms.mark_message_failed(msg["id"], "system", reason="provider rejected the send")
+        ov = self.comms.overview()
+        self.assertEqual(len(ov["failed_delivery"]), 1)
+        self.assertEqual(ov["failed_delivery"][0]["id"], msg["id"])
+        self.assertEqual(self.store.get("comm_messages", msg["id"])["status"], "FAILED")
+
+    def test_recently_resolved_lists_resolved_and_closed(self):
+        c1 = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        c2 = self.comms.open_conversation("EMAIL", "support", priority="normal")
+        self.comms.set_status(c1["id"], "resolved", actor="Aryan")
+        self.comms.set_status(c2["id"], "closed", actor="Aryan")
+        ov = self.comms.overview()
+        ids = {c["id"] for c in ov["recently_resolved"]}
+        self.assertEqual(ids, {c1["id"], c2["id"]})
+
+    def test_active_conversations_excludes_resolved_and_closed(self):
+        c1 = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        c2 = self.comms.open_conversation("EMAIL", "support", priority="normal")
+        self.comms.set_status(c2["id"], "resolved", actor="Aryan")
+        ids = {c["id"] for c in self.comms.overview()["active_conversations"]}
+        self.assertEqual(ids, {c1["id"]})
+
+
+class MarkMessageFailedTests(_CommsTestCase):
+    def test_requires_a_reason(self):
+        conv = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg = self.comms.add_message(conv["id"], "OUTBOUND", "Draft", actor="ai_workforce")
+        with self.assertRaises(CommsError):
+            self.comms.mark_message_failed(msg["id"], "system", reason="")
+
+    def test_only_a_draft_outbound_message_can_be_marked_failed(self):
+        conv = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg = self.comms.add_message(conv["id"], "INBOUND", "Customer message", actor="website")
+        with self.assertRaises(CommsError):
+            self.comms.mark_message_failed(msg["id"], "system", reason="n/a")
+
+    def test_a_failed_message_cannot_also_be_marked_sent(self):
+        conv = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg = self.comms.add_message(conv["id"], "OUTBOUND", "Draft", actor="ai_workforce")
+        self.comms.mark_message_failed(msg["id"], "system", reason="provider timeout")
+        with self.assertRaises(CommsError):
+            self.comms.mark_message_sent(msg["id"], "Aryan")
+
+
+class ConversationDrillDownTests(_CommsTestCase):
+    def test_get_conversation_embeds_risk_events_for_its_own_messages(self):
+        from falguna.risk_engine import RiskClassificationStore
+        conv = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg = self.comms.add_message(conv["id"], "OUTBOUND", "We agree to those contract terms.", actor="ai_workforce")
+        RiskClassificationStore(self.store, self.audit, self.needs_aryan).classify(
+            "comm_message", msg["id"], msg["body"], actor="ai_workforce", title="review",
+        )
+        full = self.comms.get_conversation(conv["id"])
+        self.assertEqual(len(full["risk_events"]), 1)
+        self.assertEqual(full["risk_events"][0]["subject_id"], msg["id"])
+
+    def test_get_conversation_never_shows_another_conversations_risk_events(self):
+        from falguna.risk_engine import RiskClassificationStore
+        conv_a = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        conv_b = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg_b = self.comms.add_message(conv_b["id"], "OUTBOUND", "Confirmed price, ready to sign.", actor="ai_workforce")
+        RiskClassificationStore(self.store, self.audit, self.needs_aryan).classify(
+            "comm_message", msg_b["id"], msg_b["body"], actor="ai_workforce", title="review",
+        )
+        full_a = self.comms.get_conversation(conv_a["id"])
+        self.assertEqual(full_a["risk_events"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

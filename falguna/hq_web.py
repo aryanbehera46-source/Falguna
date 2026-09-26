@@ -2688,8 +2688,14 @@ Ask Falguna
 <div class="row">
 <div class="section" style="flex:1"><h2 id="commsOpenTotal">0</h2><div class="sub">Open conversations</div></div>
 <div class="section" style="flex:1"><h2 id="commsNeedsAttention">0</h2><div class="sub">Needs attention (high/urgent/escalated)</div></div>
-<div class="section" style="flex:1"><h2 id="commsNewLeads">0</h2><div class="sub">New, unopened</div></div>
+<div class="section" style="flex:1"><h2 id="commsNewLeads">0</h2><div class="sub">New leads</div></div>
 <div class="section" style="flex:1"><h2 id="commsAwaitingApproval">0</h2><div class="sub">Awaiting approval</div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="commsSupportIssues">0</h2><div class="sub">Support issues</div></div>
+<div class="section" style="flex:1"><h2 id="commsAwaitingClient">0</h2><div class="sub">Awaiting client</div></div>
+<div class="section" style="flex:1"><h2 id="commsFollowUpsDue">0</h2><div class="sub">Follow-ups due</div></div>
+<div class="section" style="flex:1"><h2 id="commsFailedDelivery">0</h2><div class="sub">Failed delivery</div></div>
 </div>
 <div class="section"><h2>By department</h2><div class="list" id="commsByDepartment"></div></div>
 <div class="section">
@@ -2700,7 +2706,20 @@ Ask Falguna
 <div class="list" id="commsWorkforceActivity"></div>
 </div>
 <div class="section"><h2>Needs attention</h2><div class="list" id="commsNeedsAttentionList"></div></div>
-<div class="section"><h2>All open conversations</h2><div class="list" id="commsConversationsList"></div></div>
+<div class="row">
+<div class="section" style="flex:1"><h2>New leads</h2><div class="list" id="commsNewLeadsList"></div></div>
+<div class="section" style="flex:1"><h2>Support issues</h2><div class="list" id="commsSupportIssuesList"></div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2>Awaiting approval</h2><div class="list" id="commsAwaitingApprovalList"></div></div>
+<div class="section" style="flex:1"><h2>Awaiting client</h2><div class="list" id="commsAwaitingClientList"></div></div>
+</div>
+<div class="row">
+<div class="section" style="flex:1"><h2>Follow-ups due</h2><div class="list" id="commsFollowUpsDueList"></div></div>
+<div class="section" style="flex:1"><h2>Failed delivery</h2><div class="list" id="commsFailedDeliveryList"></div></div>
+</div>
+<div class="section"><h2>Active conversations</h2><div class="list" id="commsConversationsList"></div></div>
+<div class="section"><h2>Recently resolved</h2><div class="list" id="commsRecentlyResolvedList"></div></div>
 </div>
 <div class="view" id="view-rhToday">
 <h1>Today</h1>
@@ -3555,9 +3574,32 @@ $('commsWorkforceActivity').innerHTML=`<div class="item"><h3>Recent agent drafts
 }
 $('commsNeedsAttentionList').innerHTML=(ov.needs_attention||[]).length?(ov.needs_attention||[]).map(convItem).join(''):'<div class="empty">Nothing needs attention right now.</div>';
 $('commsConversationsList').innerHTML=items.length?items.map(convItem).join(''):'<div class="empty">No open conversations yet.</div>';
+
+// Milestone 8: the remaining eight executive views, all the same
+// convItem card so drill-down/run-agent/resolve/mark-sent work
+// identically everywhere -- no separate dense form per view.
+$('commsSupportIssues').textContent=(ov.support_issues||[]).length;
+$('commsAwaitingClient').textContent=(ov.awaiting_client||[]).length;
+$('commsFollowUpsDue').textContent=(ov.follow_ups_due||[]).length;
+$('commsFailedDelivery').textContent=(ov.failed_delivery||[]).length;
+$('commsNewLeadsList').innerHTML=(ov.new_leads||[]).length?(ov.new_leads||[]).map(convItem).join(''):'<div class="empty">No new leads.</div>';
+$('commsSupportIssuesList').innerHTML=(ov.support_issues||[]).length?(ov.support_issues||[]).map(convItem).join(''):'<div class="empty">No open support issues.</div>';
+$('commsAwaitingApprovalList').innerHTML=(ov.awaiting_approval||[]).length?(ov.awaiting_approval||[]).map(i=>`<div class="item"><h3>${esc(i.title)}</h3><div class="meta"><span>${esc(i.kind)}</span></div><div class="contrib">${esc(i.what_is_needed||'')}</div></div>`).join(''):'<div class="empty">Nothing awaiting approval.</div>';
+$('commsAwaitingClientList').innerHTML=(ov.awaiting_client||[]).length?(ov.awaiting_client||[]).map(convItem).join(''):'<div class="empty">Nothing awaiting a client reply.</div>';
+$('commsFollowUpsDueList').innerHTML=(ov.follow_ups_due||[]).length?(ov.follow_ups_due||[]).map(f=>`<div class="item"><h3>${esc(f.kind)}</h3><div class="meta"><span>opportunity ${esc(f.opportunity_id)}</span><span>${esc(f.status)}</span></div><div class="contrib">${esc((f.draft_content||'').slice(0,160))}</div></div>`).join(''):'<div class="empty">No follow-ups due.</div>';
+$('commsFailedDeliveryList').innerHTML=(ov.failed_delivery||[]).length?(ov.failed_delivery||[]).map(m=>`<div class="item"><h3>Failed delivery</h3><div class="meta"><span>conversation ${esc(m.conversation_id)}</span></div><div class="contrib">${esc((m.body||'').slice(0,160))}</div></div>`).join(''):'<div class="empty">No failed deliveries -- no live mailbox connected yet, so nothing has attempted to send.</div>';
+$('commsRecentlyResolvedList').innerHTML=(ov.recently_resolved||[]).length?(ov.recently_resolved||[]).map(convItem).join(''):'<div class="empty">Nothing resolved recently.</div>';
+
 document.querySelectorAll('.commsRunAgent').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const r=await api(`/api/comms/conversations/${b.dataset.id}/run-agent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});alert(r.actions&&r.actions.length?'Agent actions:\n'+r.actions.join('\n'):(r.note||'No action taken.'));await loadCommunications()}catch(e){alert(e.message)}finally{b.disabled=false}});
 document.querySelectorAll('.commsResolve').forEach(b=>b.onclick=async()=>{await api(`/api/comms/conversations/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'resolved',actor:'Aryan'})});await loadCommunications()});
-document.querySelectorAll('.commsExpand').forEach(b=>b.onclick=async()=>{const el=$('commsmsgs-'+b.dataset.id);if(el.dataset.loaded==='1'){el.innerHTML='';el.dataset.loaded='0';return}const conv=await api('/api/comms/conversations/'+b.dataset.id);el.dataset.loaded='1';el.innerHTML=(conv.messages||[]).map(m=>`<div class="contrib"><b>${esc(m.direction)}${m.is_internal_note?' note':''} (${esc(m.status)})${m.sender_agent?' -- '+esc(m.sender_agent):''}:</b> ${esc(m.body)}${m.direction==='OUTBOUND'&&m.status==='DRAFT'?` <button class="secondary commsMarkSent" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}">Approve & mark sent</button>`:''}</div>`).join('')||'<div class="empty">No messages yet.</div>';el.querySelectorAll('.commsMarkSent').forEach(mb=>mb.onclick=async()=>{if(!confirm('Confirm you have actually sent this message through the real channel, and mark it sent?'))return;await api(`/api/comms/messages/${mb.dataset.mid}/mark-sent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCommunications()})});
+document.querySelectorAll('.commsExpand').forEach(b=>b.onclick=async()=>{const el=$('commsmsgs-'+b.dataset.id);if(el.dataset.loaded==='1'){el.innerHTML='';el.dataset.loaded='0';return}const conv=await api('/api/comms/conversations/'+b.dataset.id);el.dataset.loaded='1';
+const msgsHtml=(conv.messages||[]).map(m=>`<div class="contrib"><b>${esc(m.direction)}${m.is_internal_note?' note':''} (${esc(m.status)})${m.sender_agent?' -- '+esc(m.sender_agent):''}:</b> ${esc(m.body)}${m.direction==='OUTBOUND'&&m.status==='DRAFT'?` <button class="secondary commsMarkSent" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}">Approve & mark sent</button>`:''}</div>`).join('')||'<div class="empty">No messages yet.</div>';
+// Milestone 8 drill-down: risk classification + approval/audit history
+// alongside the thread, so a full review never requires leaving this card.
+const riskHtml=(conv.risk_events||[]).length?`<div class="contrib"><b>Risk classification:</b> ${(conv.risk_events||[]).map(r=>`${esc(r.risk)}`).join(', ')}</div>`:'';
+const historyHtml=(conv.history||[]).length?`<div class="contrib"><b>Audit history:</b> ${(conv.history||[]).map(h=>`${esc(h.field)}: ${esc(h.old_value||'--')} -> ${esc(h.new_value)} (${esc(h.actor)})`).join('; ')}</div>`:'';
+el.innerHTML=msgsHtml+riskHtml+historyHtml;
+el.querySelectorAll('.commsMarkSent').forEach(mb=>mb.onclick=async()=>{if(!confirm('Confirm you have actually sent this message through the real channel, and mark it sent?'))return;await api(`/api/comms/messages/${mb.dataset.mid}/mark-sent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCommunications()})});
 }
 $('commsRunWorkforce').onclick=async()=>{$('commsRunWorkforce').disabled=true;$('commsWorkforceRunStatus').innerHTML='<div class="empty">Running AI Workforce across open conversations...</div>';try{const r=await api('/api/comms/workforce/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});$('commsWorkforceRunStatus').innerHTML=`<div class="item"><div class="meta"><span>checked ${r.conversations_checked}</span><span>acted on ${r.conversations_acted_on}</span></div></div>`;await loadCommunications()}catch(e){$('commsWorkforceRunStatus').innerHTML=`<div class="empty">Run failed: ${esc(e.message)}</div>`}finally{$('commsRunWorkforce').disabled=false}};
 

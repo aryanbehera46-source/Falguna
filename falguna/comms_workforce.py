@@ -38,6 +38,7 @@ from .audit import AuditLog
 from .comms import CommsStore
 from .conversations import classify_intent
 from .conversations import _detect_sensitive_content as detect_sensitive_content
+from .lifecycle import LifecycleOrchestrator
 from .revenue_hunter import (
     FollowupStore, OpportunityStore, ProposalStore, QualificationStore,
 )
@@ -94,9 +95,49 @@ def _has_note_prefix(conversation: Dict[str, Any], prefix: str) -> bool:
     )
 
 
+def _receptionist_has_already_greeted(conversation: Dict[str, Any]) -> bool:
+    """True once the AI Receptionist has drafted at least one
+    acknowledgement on this conversation, ever -- distinct from
+    `_already_responded`, which only reflects whether the *most recent*
+    visible message happens to be ours. Without this, a customer's
+    follow-up message on an existing thread would make `_already_responded`
+    False again and cause the Receptionist to draft a second "thanks for
+    reaching out" greeting before the department specialist (Support/Sales)
+    ever gets a turn on that pass -- silently blocking real multi-turn
+    conversations from ever progressing past the first exchange."""
+    return any(
+        m["direction"] == "OUTBOUND" and not m.get("is_internal_note")
+        and m.get("sender_agent") == "AI Receptionist"
+        for m in (conversation.get("messages") or [])
+    )
+
+
 def _contains_commitment_signal(body: Optional[str]) -> Optional[str]:
     text = (body or "").lower()
     for phrase in _COMMITMENT_SIGNALS:
+        if phrase in text:
+            return phrase
+    return None
+
+
+# TTT Communications V2, Milestone 6: real buyer language asking whether
+# something can technically be done at all -- distinct from a pricing/
+# contract commitment signal above. This is grounded in the buyer's own
+# words, never a guess at technical difficulty the AI itself would have to
+# invent (Milestone 6 explicitly forbids fabricating requirements/budget/
+# commitment, and inventing a feasibility opinion would be the same kind
+# of fabrication).
+_FEASIBILITY_SIGNALS = [
+    "is this feasible", "is this possible", "is it feasible", "is it possible",
+    "can you build", "can you integrate", "technically possible",
+    "not sure if this is possible", "legacy system integration", "custom integration",
+    "can this be done", "is that achievable",
+]
+
+
+def _contains_feasibility_signal(body: Optional[str]) -> Optional[str]:
+    text = (body or "").lower()
+    for phrase in _FEASIBILITY_SIGNALS:
         if phrase in text:
             return phrase
     return None
@@ -155,6 +196,12 @@ class ReceptionistAgent:
             return actions
         if not conversation.get("messages"):
             return actions
+        if _receptionist_has_already_greeted(conversation):
+            # First-touch triage is a one-time job -- once this conversation
+            # has been acknowledged, every later inbound message is the
+            # department specialist's (Support/Sales/etc.) to handle, not a
+            # fresh "thanks for reaching out" from the Receptionist again.
+            return actions
 
         department = conversation["department"]
         contact = conversation.get("primary_contact") or {}
@@ -190,17 +237,31 @@ class SalesRepAgent:
     reads as a pricing or contractual commitment. Never negotiates and
     never drafts a number of its own; `NegotiationGuardrails` is the one
     place a proposed term is ever checked, exactly as it already is for the
-    rest of Revenue Hunter."""
+    rest of Revenue Hunter.
+
+    TTT Communications V2, Milestone 6: this is now wired to the same
+    `LifecycleOrchestrator` (falguna/lifecycle.py) that opportunity_agent.py
+    and every hq_web.py Revenue Hunter route already inject into
+    OpportunityStore/QualificationStore/ProposalStore -- it was simply the
+    one caller of those three classes that never passed `orchestrator=`.
+    That single omission meant a real sales *conversation* never left a
+    trace in the one real, already-built, already-tested company-wide
+    state machine (DISCOVERED -> ... -> WON/LOST); everything below reuses
+    that machine's own `try_initialize`/`try_transition` (best-effort, never
+    raises, exactly the pattern already used everywhere else it's wired
+    in) rather than inventing a second, comms-only stage enum -- which is
+    exactly the "second CRM" this milestone was told not to build."""
 
     def __init__(self, store: StateStore, audit: AuditLog, comms: CommsStore, needs_aryan: NeedsAryanQueue):
         self.store = store
         self.comms = comms
         self.needs_aryan = needs_aryan
-        self.opportunities = OpportunityStore(store, audit)
-        self.proposals = ProposalStore(store, audit, needs_aryan=needs_aryan)
+        self.lifecycle = LifecycleOrchestrator(store, audit)
+        self.opportunities = OpportunityStore(store, audit, orchestrator=self.lifecycle)
+        self.proposals = ProposalStore(store, audit, needs_aryan=needs_aryan, orchestrator=self.lifecycle)
         self.followups = FollowupStore(store, audit)
         self.guardrails = NegotiationGuardrails(store, audit, needs_aryan=needs_aryan)
-        self.qualifications = QualificationStore(store, audit)
+        self.qualifications = QualificationStore(store, audit, orchestrator=self.lifecycle)
 
     def _qualify(self, opportunity: Dict[str, Any], actor: str) -> Dict[str, Any]:
         """Uses the real, persisting qualification step (same one the TTT
@@ -214,6 +275,22 @@ class SalesRepAgent:
         self.qualifications.qualify(opportunity["id"], actor=actor)
         return self.opportunities.get(opportunity["id"])["qualification"]
 
+    @staticmethod
+    def _discovery_gaps(opportunity: Dict[str, Any]) -> List[str]:
+        """The same real, structured-field gaps the Receptionist already
+        checks for sales (falguna/comms_workforce.py's
+        ReceptionistAgent._missing_for_sales) -- grounded only in fields
+        actually on the opportunity record, never a guess at what the
+        free-text conversation did or didn't cover."""
+        missing = []
+        if not opportunity.get("budget_rate"):
+            missing.append("a rough budget range")
+        if not opportunity.get("deadline") and not opportunity.get("urgency"):
+            missing.append("your target timeline")
+        if not opportunity.get("contract_type"):
+            missing.append("whether this is a fixed-scope project or ongoing work")
+        return missing
+
     def run(self, conversation: Dict[str, Any], actor: str = "ai_workforce") -> List[str]:
         actions: List[str] = []
         opp_id = conversation.get("linked_opportunity_id")
@@ -222,13 +299,78 @@ class SalesRepAgent:
         opportunity = self.opportunities.get(opp_id)
         if not opportunity:
             return actions
+
+        # Milestone 9 durability finding: same real handoff-from-
+        # Receptionist gap as SupportAgent's own fix above -- without this,
+        # a sales conversation's assigned_agent stayed "AI Receptionist"
+        # forever, since SalesRepAgent never claimed it. One-time and
+        # idempotent: a later pass sees "AI Sales Rep" already set and
+        # no-ops.
+        if conversation.get("assigned_agent") != "AI Sales Rep":
+            self.comms.assign(conversation["id"], "AI Sales Rep", actor)
+            actions.append("assigned to AI Sales Rep")
+
+        if not opportunity.get("lifecycle_state"):
+            self.lifecycle.try_initialize(opp_id, actor, reason="sales conversation opened")
+            actions.append("lifecycle -> DISCOVERED")
+            opportunity = self.opportunities.get(opp_id)
+
+        # Proposal approval is a human decision made through a separate
+        # path (TTT HQ's own Approve action -> NeedsAryanQueue.decide ->
+        # apply_decision_side_effect), not this dispatcher pass -- so the
+        # next time the workforce touches this conversation, catch the
+        # lifecycle up to what HQ already approved rather than leaving it
+        # stuck at AWAITING_APPROVAL.
+        approved_proposal = next(
+            (p for p in (opportunity.get("proposals") or []) if p.get("status") == "APPROVED"), None,
+        )
+        if approved_proposal and opportunity.get("lifecycle_state") == "AWAITING_APPROVAL":
+            self.lifecycle.try_transition(
+                opp_id, "APPROVED", actor, reason=f"proposal {approved_proposal['id']} approved",
+                approval_status="APPROVED",
+            )
+            actions.append(f"lifecycle -> APPROVED (proposal {approved_proposal['id']} approved)")
+            opportunity = self.opportunities.get(opp_id)
+
+        last_inbound = _last_inbound_body(conversation)
+
+        # Milestone 6: a real "is this even possible" question from the
+        # buyer is routed to Engineering, not answered by the AI -- the
+        # same "escalate rather than invent" rule as commitment language
+        # below, just for technical feasibility instead of commercial
+        # terms. Deduped via the same internal-note-prefix convention
+        # SupportAgent already uses for its own known-contact note.
+        feasibility = _contains_feasibility_signal(last_inbound)
+        if (
+            feasibility and conversation["status"] != "pending_approval"
+            and not _has_note_prefix(conversation, "Engineering feasibility requested:")
+        ):
+            esc = self.comms.escalate(
+                conversation["id"], f"[Engineering feasibility] Buyer asked whether this is possible: {opportunity['title']}",
+                f"The client's latest message asks about technical feasibility (matched: {feasibility!r}). "
+                "This needs a real Engineering read before we commit to scope or a proposal.",
+                actor=actor, kind="communications_approval",
+                rationale=f"inbound message matched {feasibility!r}", risk="unverified technical feasibility",
+            )
+            self.comms.add_message(
+                conversation["id"], "OUTBOUND", f"Engineering feasibility requested: {feasibility!r} (needs_aryan={esc['needs_aryan_id']})",
+                kind="note", is_internal_note=True, sender_agent="AI Sales Rep", actor=actor,
+            )
+            actions.append(f"requested Engineering feasibility review (needs_aryan={esc['needs_aryan_id']})")
+            return actions
+
         qualification = self._qualify(opportunity, actor)
         opportunity = self.opportunities.get(opp_id)  # re-fetch: stage/qualification may have just changed
 
-        last_inbound = _last_inbound_body(conversation)
         commitment = _contains_commitment_signal(last_inbound)
         if commitment and conversation["status"] != "pending_approval":
             self.guardrails.evaluate(opp_id, actor, price=qualification.get("suggested_price"))
+            # Best-effort: NEGOTIATING is only a legal transition from
+            # REPLIED/DISCOVERY_CONVERSATION in the real state graph, so on
+            # an opportunity that hasn't reached either yet this is
+            # correctly a safe no-op rather than a fabricated jump --
+            # try_transition never raises, matching every other caller.
+            self.lifecycle.try_transition(opp_id, "NEGOTIATING", actor, reason=f"commitment language: {commitment!r}")
             esc = self.comms.escalate(
                 conversation["id"], f"Pricing/contract commitment requested: {opportunity['title']}",
                 "The client's latest message uses pricing or contractual commitment language "
@@ -240,6 +382,28 @@ class SalesRepAgent:
             actions.append(f"escalated pricing/contract commitment (needs_aryan={esc['needs_aryan_id']})")
             return actions
 
+        # Milestone 6: real discovery questions for a lead that isn't
+        # PURSUE-ready yet because structured fields are still missing --
+        # never fired on the very first exchange (the Receptionist's own
+        # acknowledgement already asks once there), and never fired again
+        # once this pass has already answered so it can't double-draft on
+        # a re-run. Left as a side channel from the PURSUE path below: a
+        # PURSUE recommendation always proceeds straight to a proposal
+        # exactly as before, gaps or not, since a real fit-score can
+        # already justify pursuing before every field is filled in.
+        gaps = self._discovery_gaps(opportunity)
+        if (
+            gaps and qualification.get("recommendation") != "PURSUE"
+            and not _already_responded(conversation) and _receptionist_has_already_greeted(conversation)
+        ):
+            self.lifecycle.try_transition(opp_id, "RESEARCHING", actor, reason="buyer requirements still incomplete")
+            body = (
+                "Thanks for the details so far -- to help us scope this accurately, could you also share "
+                + ", ".join(gaps) + "?"
+            )
+            self.comms.add_message(conversation["id"], "OUTBOUND", body, sender_agent="AI Sales Rep", actor=actor)
+            actions.append("drafted discovery question(s) for missing buyer requirements")
+            return actions
 
         if qualification.get("recommendation") == "PURSUE" and not opportunity.get("proposals"):
             result = self.proposals.generate(opp_id, kind="detailed", actor=actor)
@@ -309,9 +473,21 @@ class SupportAgent:
         actions: List[str] = []
         if conversation["department"] not in ("support", "billing"):
             return actions
-        if not conversation.get("assigned_agent"):
+        # Milestone 9 durability finding: Receptionist assigns itself to
+        # every conversation "pending specialist handoff" (see its own
+        # docstring) -- guarding on "not yet assigned at all" here meant
+        # that placeholder assignment was never actually replaced, so
+        # assigned_agent stayed stuck at "AI Receptionist" forever. Guard
+        # on "not yet assigned to *me*" instead: still a one-time,
+        # idempotent handoff (a second pass sees assigned_agent =="AI
+        # Support Rep" and no-ops), just one that actually completes.
+        if conversation.get("assigned_agent") != "AI Support Rep":
             self.comms.assign(conversation["id"], "AI Support Rep", actor)
             actions.append("assigned to AI Support Rep")
+        if not conversation.get("ticket_status"):
+            self.comms.set_ticket_status(conversation["id"], "NEW", actor, reason="opened as a support/billing conversation")
+            conversation = self.comms.get_conversation(conversation["id"])
+            actions.append("ticket status set to NEW")
 
         context_note = self._customer_context_note(conversation)
         if context_note and not _has_note_prefix(conversation, "Known contact:"):
@@ -327,6 +503,10 @@ class SupportAgent:
         if not last_inbound:
             return actions
 
+        if conversation.get("ticket_status") == "NEW":
+            self.comms.set_ticket_status(conversation["id"], "TRIAGED", actor, reason="classified and ready for a response")
+            actions.append("ticket status set to TRIAGED")
+
         sensitive = detect_sensitive_content(last_inbound)
         intent = classify_intent(last_inbound)
         template = _SUPPORT_REPLY_TEMPLATES.get(intent)
@@ -334,17 +514,26 @@ class SupportAgent:
         if sensitive or template is None:
             reason = f"message matched sensitive/legal content ({sensitive!r})" if sensitive else \
                 f"no safe automatic reply template for intent {intent!r} -- needs a human read"
+            # Milestone 5: tag the escalation with the team that should
+            # actually look at it -- a plain, explainable default (never a
+            # guess dressed up as certainty): sensitive/legal content always
+            # goes to Executive; billing-department tickets go to Billing;
+            # everything else without a safe template is most often a
+            # technical issue, so it defaults to Engineering.
+            category = "Executive" if sensitive else ("Billing" if conversation["department"] == "billing" else "Engineering")
             esc = self.comms.escalate(
-                conversation["id"], f"Support enquiry needs review: {conversation.get('subject') or conversation['id']}",
+                conversation["id"], f"[{category} escalation] Support enquiry needs review: {conversation.get('subject') or conversation['id']}",
                 reason, actor=actor, kind="communications_approval", risk=reason,
             )
-            actions.append(f"escalated unresolved enquiry (needs_aryan={esc['needs_aryan_id']})")
+            actions.append(f"escalated to {category} (needs_aryan={esc['needs_aryan_id']})")
+            self.comms.set_ticket_status(conversation["id"], "WAITING_INTERNAL", actor, reason=f"escalated to {category}")
             return actions
 
         self.comms.add_message(
             conversation["id"], "OUTBOUND", template, sender_agent="AI Support Rep", actor=actor,
         )
         actions.append(f"drafted routine reply (intent={intent})")
+        self.comms.set_ticket_status(conversation["id"], "WAITING_INTERNAL", actor, reason="reply drafted, awaiting approval/send")
         return actions
 
 
@@ -373,6 +562,12 @@ class AccountManagerAgent:
         job = self._active_job_for(opp_id)
         if not job:
             return actions
+
+        # Milestone 9 durability finding: same real handoff-from-
+        # Receptionist fix as SupportAgent/SalesRepAgent above.
+        if conversation.get("assigned_agent") != "AI Account Manager":
+            self.comms.assign(conversation["id"], "AI Account Manager", actor)
+            actions.append("assigned to AI Account Manager")
 
         status = self.account_manager.status_for_active_job(job["id"])
 

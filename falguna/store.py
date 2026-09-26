@@ -183,6 +183,29 @@ class StateStore:
         # every ordinary Chat upload -- identical to how conversation_id was
         # already optional.
         "attachments": [("browser_session_id", "TEXT")],
+        # TTT Communications V2, Milestone 3 (real email ingestion): a
+        # conversation opened/matched from a real inbound email can carry
+        # the provider's own thread id, and a message can carry the
+        # provider's own message id -- the two identifiers
+        # falguna/email_ingestion.py needs for thread matching and
+        # duplicate/retry detection. NULL for every conversation/message
+        # created before this column existed, and for every non-email
+        # channel -- identical to how source_ref_type/id were already
+        # optional.
+        # TTT Communications V2, Milestone 5 (support ticket workflow): a
+        # finer-grained support/billing lifecycle layered ON TOP OF the
+        # existing coarse `status` field, exactly the way `lifecycle_state`
+        # was layered onto rh_opportunities.stage above rather than
+        # replacing it. NULL for every conversation created before this
+        # column existed, and for every non-support/billing conversation --
+        # `status` alone continues to drive every existing view/test.
+        "comm_conversations": [("external_thread_id", "TEXT"), ("ticket_status", "TEXT")],
+        "comm_messages": [("provider_message_id", "TEXT")],
+        # TTT Communications V2, Milestone 11 (Digital Marketing Operations
+        # Foundation): a real campaign owner -- NULL for every campaign
+        # created before this column existed, exactly the same additive
+        # convention as every other column in this table.
+        "media_campaigns": [("owner", "TEXT")],
     }
 
     def migrate(self) -> None:
@@ -211,7 +234,7 @@ class StateStore:
         allowed = {"missions", "requirements", "tasks", "task_steps", "runs", "checkpoints", "approvals", "model_calls", "cost_events", "artifacts", "run_controls", "project_cache", "mission_timings", "supervisor_states", "boardroom_topics", "boardroom_contributions", "boardroom_decisions", "backlog_items", "backlog_history", "needs_aryan_items", "conversations", "chat_messages", "conversation_handoffs", "research_queries", "research_sources", "research_citations", "research_handoffs", "rh_opportunities", "rh_stage_history", "rh_qualifications", "rh_proposals", "rh_followups", "rh_active_jobs", "rh_discovery_runs", "rh_discovered_sources", "rh_opportunity_research", "rh_settings", "rh_lifecycle_events", "rh_application_attempts", "clients", "rh_closing_records", "rh_negotiation_terms", "rh_conversation_messages", "rh_onboarding_items", "rh_invoices", "rh_completion_records", "rh_retention_items", "rh_outbound_leads", "rh_outreach_drafts",
             "wf_tasks", "wf_task_events", "wf_recurring_workflows", "wf_recurring_runs", "wf_documents", "wf_email_messages",
             "media_brands", "media_campaigns", "media_content_items", "media_content_events", "media_scripts",
-            "media_assets", "media_publications", "media_analytics", "media_experiments",
+            "media_assets", "media_publications", "media_analytics", "media_experiments", "media_lead_attributions",
             "cc_ceo_briefs", "cc_goals", "cc_goal_progress_events", "cc_ledger_entries", "cc_budgets", "cc_risks",
             "tl_markets", "tl_instruments", "tl_data_sources", "tl_datasets", "tl_ohlcv_bars", "tl_data_quality_reports",
             "tl_strategies", "tl_strategy_versions", "tl_strategy_status_events", "tl_backtests", "tl_stress_tests",

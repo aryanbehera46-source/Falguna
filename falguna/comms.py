@@ -41,8 +41,19 @@ STATUSES = {"new", "open", "pending_customer", "pending_approval", "escalated", 
 PRIORITIES = {"low", "normal", "high", "urgent"}
 MESSAGE_DIRECTIONS = {"INBOUND", "OUTBOUND"}
 MESSAGE_KINDS = {"message", "note", "system"}
-MESSAGE_STATUSES = {"RECEIVED", "DRAFT", "APPROVED", "SENT"}
+MESSAGE_STATUSES = {"RECEIVED", "DRAFT", "APPROVED", "SENT", "FAILED"}
+# FAILED is added for Milestone 8/9 forward-compatibility: no live
+# mailbox is connected this sprint (NullEmailProvider only), so nothing
+# in this codebase sets it today -- it exists so a real provider
+# integration later has somewhere real to record a failed send
+# without a schema/status-enum change at that point.
 PARTICIPANT_TYPES = {"customer", "agent", "watcher"}
+# TTT Communications V2, Milestone 5: a finer-grained lifecycle for support
+# and billing conversations, layered on top of the coarse `status` field
+# above rather than replacing it (every existing view/test keeps working
+# off `status` unchanged). Only meaningful for department in
+# {"support", "billing"} -- NULL/unset for every other conversation.
+TICKET_STATUSES = {"NEW", "TRIAGED", "IN_PROGRESS", "WAITING_CUSTOMER", "WAITING_INTERNAL", "RESOLVED", "CLOSED"}
 
 # Deterministic, disclosed first-response SLA targets by priority (hours).
 # Not a machine-learned or guessed number -- a plain, explainable default
@@ -120,6 +131,7 @@ class CommsStore:
         linked_opportunity_id: Optional[str] = None, linked_client_id: Optional[str] = None,
         linked_application_id: Optional[str] = None, linked_project_id: Optional[str] = None,
         source_ref_type: Optional[str] = None, source_ref_id: Optional[str] = None,
+        external_thread_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if channel not in CHANNELS:
             raise CommsError(f"channel must be one of {sorted(CHANNELS)}")
@@ -137,6 +149,7 @@ class CommsStore:
             "linked_opportunity_id": linked_opportunity_id, "linked_project_id": linked_project_id,
             "linked_client_id": linked_client_id, "linked_application_id": linked_application_id,
             "source_ref_type": source_ref_type, "source_ref_id": source_ref_id,
+            "external_thread_id": external_thread_id,
             "first_response_due_at": _add_hours(now, _SLA_HOURS_BY_PRIORITY[priority]),
             "first_response_at": None, "resolution_due_at": None, "resolved_at": None,
             "created_at": now, "updated_at": now,
@@ -161,6 +174,15 @@ class CommsStore:
         conv["participants"] = self.store.list("comm_participants", "conversation_id=?", (conversation_id,))
         conv["attachments"] = self.store.list("attachments", "conversation_id=?", (conversation_id,))
         conv["history"] = self.store.list("comm_status_events", "conversation_id=?", (conversation_id,))
+        # Milestone 8: real risk classification evidence for this
+        # conversation's own messages, for the HQ drill-down view --
+        # reuses risk_engine.py's own comm_risk_events rows rather than
+        # duplicating or re-deriving a classification here.
+        message_ids = [m["id"] for m in conv["messages"]]
+        conv["risk_events"] = (
+            [e for e in self.store.list("comm_risk_events", "subject_type=?", ("comm_message",)) if e["subject_id"] in message_ids]
+            if message_ids else []
+        )
         if conv.get("organization_id"):
             conv["organization"] = self.store.get("comm_organizations", conv["organization_id"])
         if conv.get("primary_contact_id"):
@@ -189,7 +211,7 @@ class CommsStore:
         sender_contact_id: Optional[str] = None, sender_agent: Optional[str] = None,
         status: Optional[str] = None, is_internal_note: bool = False,
         source_ref_type: Optional[str] = None, source_ref_id: Optional[str] = None,
-        actor: str = "system",
+        actor: str = "system", provider_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         conv = self.store.get("comm_conversations", conversation_id)
         if not conv:
@@ -209,6 +231,7 @@ class CommsStore:
             "sender_contact_id": sender_contact_id, "sender_agent": sender_agent,
             "body": body.strip(), "status": status, "is_internal_note": 1 if is_internal_note else 0,
             "source_ref_type": source_ref_type, "source_ref_id": source_ref_id,
+            "provider_message_id": provider_message_id,
             "created_at": now, "updated_at": now,
         })
         updates: Dict[str, Any] = {"updated_at": now}
@@ -244,8 +267,80 @@ class CommsStore:
         conv = self.store.get("comm_conversations", message["conversation_id"])
         if conv and not conv.get("first_response_at"):
             self.store.update("comm_conversations", message["conversation_id"], first_response_at=now, updated_at=now)
+        # Milestone 5: once TTT has actually sent a reply on an open
+        # support/billing ticket, the ball is in the customer's court --
+        # flips WAITING_CUSTOMER automatically only from a non-terminal
+        # ticket_status, never overriding an explicit RESOLVED/CLOSED.
+        if conv and conv["department"] in ("support", "billing") and conv.get("ticket_status") not in (None, "RESOLVED", "CLOSED"):
+            self.set_ticket_status(message["conversation_id"], "WAITING_CUSTOMER", actor="system",
+                                    reason="an outbound reply was sent on this ticket")
         self.audit.append("COMM_MESSAGE_SENT", {"message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor})
         return self.store.get("comm_messages", message_id)
+
+    def mark_message_failed(self, message_id: str, actor: str, reason: str) -> Dict[str, Any]:
+        """The FAILED counterpart to mark_message_sent -- for a real
+        provider integration (later, once a mailbox is connected) to
+        record a genuine delivery failure rather than silently leaving a
+        message stuck at DRAFT or falsely marked SENT. Nothing in this
+        codebase calls this yet (see MESSAGE_STATUSES' own note); it's
+        forward-compatible plumbing so TTT HQ's Failed Delivery view
+        (Milestone 8) has a real, structurally-correct place to read from
+        the moment a provider is actually wired in, with no later
+        redesign."""
+        if not reason or not reason.strip():
+            raise CommsError("reason is required to mark a message failed")
+        message = self.store.get("comm_messages", message_id)
+        if not message:
+            raise CommsError("message not found")
+        if message["direction"] != "OUTBOUND":
+            raise CommsError("only an outbound (drafted) message can be marked failed")
+        if message["status"] != "DRAFT":
+            raise CommsError(f"message is already {message['status']}, not DRAFT")
+        now = utcnow()
+        self.store.update("comm_messages", message_id, status="FAILED", updated_at=now)
+        self.audit.append("COMM_MESSAGE_FAILED", {
+            "message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor, "reason": reason,
+        })
+        return self.store.get("comm_messages", message_id)
+
+    def set_ticket_status(self, conversation_id: str, ticket_status: str, actor: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        """Milestone 5's finer-grained support/billing lifecycle -- layered
+        on top of `status`, never a replacement for it. Setting RESOLVED
+        here does NOT by itself resolve the conversation's coarse `status`;
+        use `resolve_ticket()` for that, which requires an explicit
+        resolution note (this codebase's "never invent a resolution"
+        invariant -- see comms_workforce.SupportAgent)."""
+        if ticket_status not in TICKET_STATUSES:
+            raise CommsError(f"ticket_status must be one of {sorted(TICKET_STATUSES)}")
+        conv = self.store.get("comm_conversations", conversation_id)
+        if not conv:
+            raise CommsError("conversation not found")
+        now = utcnow()
+        self.store.update("comm_conversations", conversation_id, ticket_status=ticket_status, updated_at=now)
+        self.store.create("comm_status_events", {
+            "conversation_id": conversation_id, "field": "ticket_status", "old_value": conv.get("ticket_status"),
+            "new_value": ticket_status, "actor": actor, "reason": reason, "needs_aryan_id": None, "created_at": now,
+        })
+        self.audit.append("COMM_TICKET_STATUS_CHANGED", {
+            "conversation_id": conversation_id, "from": conv.get("ticket_status"), "to": ticket_status, "actor": actor,
+        })
+        return self.store.get("comm_conversations", conversation_id)
+
+    def resolve_ticket(self, conversation_id: str, actor: str, resolution_note: str) -> Dict[str, Any]:
+        """The one, explicit, evidence-requiring way a support/billing
+        ticket becomes RESOLVED -- never called automatically by an AI
+        agent. `resolution_note` must be a real, non-empty statement of
+        what was actually done/found; this never accepts a blank or
+        placeholder close."""
+        if not resolution_note or not resolution_note.strip():
+            raise CommsError("resolve_ticket requires a real, non-empty resolution_note (evidence of what was resolved)")
+        conv = self.store.get("comm_conversations", conversation_id)
+        if not conv:
+            raise CommsError("conversation not found")
+        self.add_message(conversation_id, "OUTBOUND", resolution_note.strip(), kind="note",
+                          is_internal_note=True, actor=actor)
+        self.set_ticket_status(conversation_id, "RESOLVED", actor, reason=resolution_note.strip())
+        return self.set_status(conversation_id, "resolved", actor, reason=resolution_note.strip())
 
     # -- status / priority / assignment --------------------------------
 
@@ -328,7 +423,13 @@ class CommsStore:
 
     def overview(self) -> Dict[str, Any]:
         """Real, live aggregate counts -- computed from these tables on every
-        call, never cached/stored, so it can never drift from reality."""
+        call, never cached/stored, so it can never drift from reality.
+
+        TTT Communications V2, Milestone 8: five more views added here on
+        top of the four this method already had (needs_attention/
+        new_leads/awaiting_approval/by_department), all the same way --
+        a real filter over comm_conversations/comm_messages/rh_followups,
+        nothing cached, nothing estimated."""
         all_open = self.store.list("comm_conversations", "status NOT IN ('resolved','closed')")
         by_status: Dict[str, int] = {}
         by_department: Dict[str, int] = {}
@@ -343,6 +444,23 @@ class CommsStore:
         new_recent = [r for r in all_open if r["status"] == "new"]
         recent_messages = self.store.list("comm_messages", "1=1")
         recent_messages = list(reversed(recent_messages))[:20]
+
+        support_issues = [r for r in all_open if r["department"] in ("support", "billing")]
+        awaiting_client = [r for r in all_open if r["status"] == "pending_customer"]
+        # "Active" is the general working set every other bucket above is a
+        # slice of -- everything genuinely open, most-recent first, same
+        # rows `list_conversations()` already returns unfiltered.
+        active_conversations = all_open
+        follow_ups_due = self.store.list("rh_followups", "status=?", ("DRAFT",))
+        follow_ups_due = list(reversed(follow_ups_due))[:20]
+        # See MESSAGE_STATUSES' own note: nothing in this codebase can set
+        # FAILED yet (no live provider is connected this sprint), so this
+        # is honestly empty today -- structurally real, not simulated.
+        failed_delivery = self.store.list("comm_messages", "status=?", ("FAILED",))
+        failed_delivery = list(reversed(failed_delivery))[:20]
+        recently_resolved = self.store.list("comm_conversations", "status IN ('resolved','closed')")
+        recently_resolved = list(reversed(recently_resolved))[:20]
+
         return {
             "open_total": len(all_open),
             "by_status": by_status,
@@ -351,4 +469,10 @@ class CommsStore:
             "new_leads": new_recent[:20],
             "awaiting_approval": awaiting_approval,
             "recent_messages": recent_messages,
+            "support_issues": support_issues[:20],
+            "awaiting_client": awaiting_client[:20],
+            "active_conversations": active_conversations[:20],
+            "follow_ups_due": follow_ups_due,
+            "failed_delivery": failed_delivery,
+            "recently_resolved": recently_resolved,
         }

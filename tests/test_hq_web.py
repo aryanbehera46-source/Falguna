@@ -324,6 +324,33 @@ class CommunicationsHQServerTests(TTTHQServerTests):
         code = self._get_raises(self.hq_port, "/api/comms/conversations/does-not-exist")
         self.assertEqual(code, 404)
 
+    def test_milestone_8_overview_views_are_present_over_http(self):
+        # Structural check that TTT HQ's Communications view (Milestone 8)
+        # has real data behind all nine executive views, over the actual
+        # HTTP layer the SPA calls -- falguna/comms.py's own overview()
+        # logic is covered exhaustively in tests/test_comms.py.
+        from falguna.comms import CommsStore
+        comms = CommsStore(self.store, self.control.audit)
+        support_conv = comms.open_conversation("EMAIL", "support", priority="normal")
+        comms.add_message(support_conv["id"], "INBOUND", "My dashboard is broken.", actor="website")
+        pending_conv = comms.open_conversation("EMAIL", "sales", priority="normal")
+        comms.set_status(pending_conv["id"], "pending_customer", actor="Aryan")
+
+        status, ov = self._get(self.hq_port, "/api/comms/overview")
+        self.assertEqual(status, 200)
+        for key in (
+            "support_issues", "awaiting_client", "active_conversations",
+            "follow_ups_due", "failed_delivery", "recently_resolved",
+        ):
+            self.assertIn(key, ov)
+        self.assertEqual(len(ov["support_issues"]), 1)
+        self.assertEqual(len(ov["awaiting_client"]), 1)
+
+        status, detail = self._get(self.hq_port, f"/api/comms/conversations/{support_conv['id']}")
+        self.assertEqual(status, 200)
+        self.assertIn("risk_events", detail)
+        self.assertIn("history", detail)
+
 
 class WorkforceMediaHQServerTests(TTTHQServerTests):
     """Digital Workforce + Media/Growth Engine v1 routes (Section 20),

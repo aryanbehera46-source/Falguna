@@ -173,7 +173,7 @@ class SupportAgentTests(_CommsWorkforceCase):
     def test_escalates_sensitive_content_instead_of_replying(self):
         conv_id = self._support_conversation("I need to verify my identity, please send my social security number confirmation.")
         actions = self._agent().run(self.comms.get_conversation(conv_id))
-        self.assertTrue(any("escalated unresolved enquiry" in a for a in actions))
+        self.assertTrue(any("escalated to" in a for a in actions))
         conv = self.comms.get_conversation(conv_id)
         self.assertEqual(conv["status"], "pending_approval")
         self.assertFalse(any(m["direction"] == "OUTBOUND" and not m.get("is_internal_note") for m in conv["messages"]))
@@ -181,7 +181,7 @@ class SupportAgentTests(_CommsWorkforceCase):
     def test_escalates_when_no_safe_reply_template(self):
         conv_id = self._support_conversation("unsubscribe, this is an automated message, no-reply.")
         actions = self._agent().run(self.comms.get_conversation(conv_id))
-        self.assertTrue(any("escalated unresolved enquiry" in a for a in actions))
+        self.assertTrue(any("escalated to" in a for a in actions))
 
     def test_records_customer_context_exactly_once(self):
         conv_id = self._support_conversation("What exactly is included in the support plan?")

@@ -24,8 +24,17 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .audit import AuditLog
+from .comms import CommsStore
 from .conversations import classify_intent
+from .customer_context import CustomerContextService
 from .store import StateStore
+from .ttt_hq import NeedsAryanQueue
+
+# TTT Communications V2, Milestone 7: an opportunity whose engagement is
+# genuinely finished -- delivered, invoiced, and paid -- is real evidence
+# an account manager should look at renewal, never a guess about what the
+# client might want next.
+_RENEWAL_CANDIDATE_STATES = {"PAID", "RETAIN"}
 
 BLOCKED_RUN_STATES = {"FAILED", "QUARANTINED"}
 
@@ -44,9 +53,16 @@ class AccountManagementError(ValueError):
 
 
 class AccountManagerService:
-    def __init__(self, store: StateStore, audit: AuditLog):
+    def __init__(self, store: StateStore, audit: AuditLog, needs_aryan: Optional[NeedsAryanQueue] = None):
         self.store = store
         self.audit = audit
+        # Optional: only constructed when account_summary() actually needs
+        # a CommsStore/CustomerContextService. Every existing caller
+        # (comms_workforce.AccountManagerAgent, hq_web.py's routes,
+        # sales_manager.py) already constructs this with just
+        # (store, audit), so this stays backward compatible rather than
+        # forcing every call site to also thread a queue through.
+        self._needs_aryan = needs_aryan
 
     def status_for_active_job(self, active_job_id: str) -> Dict[str, Any]:
         job = self.store.get("rh_active_jobs", active_job_id)
@@ -158,3 +174,107 @@ class AccountManagerService:
         """One truthful status row per Active Job -- what the Sales
         Manager (Pass E) and TTT HQ UI build their delivery view on."""
         return [self.status_for_active_job(job["id"]) for job in self.store.list("rh_active_jobs")]
+
+    # -- TTT Communications V2, Milestone 7: Account Management expansion --
+
+    @staticmethod
+    def _unanswered_conversations(conversations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """A conversation whose last customer-visible message is still
+        INBOUND -- the same "have we actually replied" signal
+        comms_workforce._already_responded uses, duplicated here in one
+        small static method rather than imported, since comms_workforce
+        already imports AccountManagerService and importing back would be
+        circular."""
+        out = []
+        for conv in conversations:
+            if conv["status"] not in ("new", "open", "escalated", "pending_customer"):
+                continue
+            visible = [m for m in (conv.get("messages") or []) if not m.get("is_internal_note")]
+            if visible and visible[-1]["direction"] == "INBOUND":
+                out.append(conv)
+        return out
+
+    def account_summary(
+        self, organization_id: str, actor: str = "system", requested_by_organization_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One factual, evidence-linked account summary. Reuses
+        `CustomerContextService` (Milestone 4) for the scoped org/contacts/
+        conversations/opportunities/proposals/followups/active_jobs bundle
+        -- the exact same isolation guarantees apply here, since this
+        calls the same scoped method rather than re-querying -- then
+        layers the account-management-specific signals Milestone 7 asks
+        for on top: unanswered customer messages, follow-ups still
+        outstanding, per-active-job delivery risk (real evidence from
+        `status_for_active_job`, never a guessed percentage), recent
+        escalations, billing issues, and a conservative, evidence-only
+        renewal/expansion flag. Nothing here infers sentiment or predicts
+        an outcome that isn't already a real row on file; every entry in
+        `next_actions` carries the evidence it was derived from."""
+        needs_aryan = self._needs_aryan or NeedsAryanQueue(self.store, self.audit)
+        comms = CommsStore(self.store, self.audit, needs_aryan)
+        ctx = CustomerContextService(self.store, comms).internal_context(
+            organization_id, actor=actor, requested_by_organization_id=requested_by_organization_id,
+        )
+
+        unanswered = self._unanswered_conversations(ctx["conversations"])
+        followups_outstanding = [f for f in ctx["followups"] if f["status"] == "DRAFT"]
+        delivery = [self.status_for_active_job(j["id"]) for j in ctx["active_jobs"]]
+        delivery_risks = [d for d in delivery if d["blocked"]]
+        billing_issues = [c for c in ctx["open_support_issues"] if c["department"] == "billing"]
+
+        opportunity_ids = {o["id"] for o in ctx["opportunities"]}
+        proposal_ids = {p["id"] for p in ctx["proposals"]}
+        conversation_ids = {c["id"] for c in ctx["conversations"]}
+        recent_escalations = [
+            item for item in self.store.list("needs_aryan_items")
+            if (item["ref_type"] == "comm_conversation" and item["ref_id"] in conversation_ids)
+            or (item["ref_type"] == "rh_proposal" and item["ref_id"] in proposal_ids)
+            or (item["ref_type"] == "rh_opportunity" and item["ref_id"] in opportunity_ids)
+        ]
+        recent_escalations.sort(key=lambda i: i["created_at"], reverse=True)
+
+        renewal_candidates = [
+            {"active_job_id": j["id"], "opportunity_id": j["opportunity_id"],
+             "lifecycle_state": next((o["lifecycle_state"] for o in ctx["opportunities"] if o["id"] == j["opportunity_id"]), None)}
+            for j in ctx["active_jobs"]
+            if next((o["lifecycle_state"] for o in ctx["opportunities"] if o["id"] == j["opportunity_id"]), None) in _RENEWAL_CANDIDATE_STATES
+        ]
+        # Expansion is simply "this organization has more than one real
+        # opportunity on file" -- a factual repeat-engagement count, never
+        # a prediction of future spend.
+        expansion_opportunities = sorted(ctx["opportunities"], key=lambda o: o["created_at"])[1:]
+
+        next_actions: List[Dict[str, Any]] = []
+        for conv in unanswered:
+            next_actions.append({
+                "action": f"Reply to {conv.get('subject') or conv['id']}",
+                "evidence": [f"conversation {conv['id']} last message is INBOUND, status={conv['status']}"],
+            })
+        for f in followups_outstanding:
+            next_actions.append({
+                "action": f"Send follow-up ({f['kind']}) for opportunity {f['opportunity_id']}",
+                "evidence": [f"rh_followup {f['id']} status=DRAFT"],
+            })
+        for d in delivery_risks:
+            next_actions.append({
+                "action": f"Resolve delivery blocker on {d.get('title') or d['active_job_id']}",
+                "evidence": [f"active_job {d['active_job_id']}: {d['blocker_reason']}"] + d["evidence"],
+            })
+        for r in renewal_candidates:
+            next_actions.append({
+                "action": f"Consider renewal outreach for opportunity {r['opportunity_id']}",
+                "evidence": [f"active_job {r['active_job_id']} opportunity lifecycle_state={r['lifecycle_state']}"],
+            })
+
+        return {
+            "organization": ctx["organization"], "contacts": ctx["contacts"],
+            "active_projects": ctx["active_jobs"], "unanswered_conversations": unanswered,
+            "followups_outstanding": followups_outstanding, "delivery_risks": delivery_risks,
+            "support_history": ctx["support_history"], "open_support_issues": ctx["open_support_issues"],
+            "billing_issues": billing_issues, "billing_status": ctx["billing_status"],
+            "proposal_contract_state": {
+                "proposals": ctx["proposals"], "approved_agreements": ctx["approved_agreements"],
+            },
+            "recent_escalations": recent_escalations, "renewal_candidates": renewal_candidates,
+            "expansion_opportunities": expansion_opportunities, "next_actions": next_actions,
+        }

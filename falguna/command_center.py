@@ -457,11 +457,17 @@ def kpi_snapshot(store: StateStore, period_days: int = 30) -> Dict[str, Any]:
     media_content = store.list("media_content_items")
     content_in_window = [c for c in media_content if c["created_at"] >= window_start]
     published_in_window = [p for p in store.list("media_publications") if p["status"] == "PUBLISHED" and (p.get("published_at") or "") >= window_start]
+    # Milestone 11 (falguna/marketing_ops.py): a real, evidence-required
+    # media-to-lead attribution model now exists -- this is a real count
+    # of real media_lead_attributions rows, never a guess, and correctly
+    # reports 0 (not None) when the mechanism exists but nothing has been
+    # attributed yet in this window.
+    leads_in_window = [a for a in store.list("media_lead_attributions") if a["created_at"] >= window_start]
     media = {
         "content_produced": {"value": len(content_in_window), "source": "media_content_items.created_at in window"},
         "content_published": {"value": len(published_in_window), "source": "media_publications.status=PUBLISHED, published_at in window"},
         "reach_engagement": {"value": None, "source": "not summarized here -- see media_analytics for raw, human-sourced metric entries per publication"},
-        "leads_generated": {"value": None, "source": "not yet tracked -- no media-to-lead attribution model exists yet"},
+        "leads_generated": {"value": len(leads_in_window), "source": "media_lead_attributions.created_at in window"},
     }
 
     snapshot = command_center_snapshot(store)

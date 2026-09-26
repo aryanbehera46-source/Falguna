@@ -134,13 +134,15 @@ class CampaignStore:
     def create(
         self, brand_id: str, name: str, objective: Optional[str] = None,
         start_date: Optional[str] = None, end_date: Optional[str] = None, actor: str = "Aryan",
+        owner: Optional[str] = None,
     ) -> str:
         if not name or not name.strip():
             raise MediaError("name is required")
         now = utcnow()
         campaign_id = self.store.create("media_campaigns", {
             "brand_id": brand_id, "name": name.strip(), "objective": objective, "status": "ACTIVE",
-            "start_date": start_date, "end_date": end_date, "actor": actor, "created_at": now, "updated_at": now,
+            "start_date": start_date, "end_date": end_date, "owner": owner,
+            "actor": actor, "created_at": now, "updated_at": now,
         })
         self.audit.append("MEDIA_CAMPAIGN_CREATED", {"campaign_id": campaign_id, "brand_id": brand_id, "actor": actor})
         return campaign_id
@@ -151,6 +153,14 @@ class CampaignStore:
             raise MediaError(f"status must be one of {sorted(CAMPAIGN_STATUSES)}")
         self.store.update("media_campaigns", campaign_id, status=status)
         self.audit.append("MEDIA_CAMPAIGN_STATUS_CHANGED", {"campaign_id": campaign_id, "status": status, "actor": actor})
+        return self.get(campaign_id)
+
+    def set_owner(self, campaign_id: str, owner: str, actor: str) -> Dict[str, Any]:
+        self._require(campaign_id)
+        if not owner or not owner.strip():
+            raise MediaError("owner is required")
+        self.store.update("media_campaigns", campaign_id, owner=owner.strip())
+        self.audit.append("MEDIA_CAMPAIGN_OWNER_SET", {"campaign_id": campaign_id, "owner": owner.strip(), "actor": actor})
         return self.get(campaign_id)
 
     def _require(self, campaign_id: str) -> Dict[str, Any]:
