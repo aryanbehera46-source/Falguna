@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional
 
 from .audit import AuditLog
@@ -110,7 +111,8 @@ class TallyIntakeError(ValueError):
 
 
 def _norm_label(label: Optional[str]) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (label or "").strip().lower()).strip()
+    ascii_label = unicodedata.normalize("NFKD", (label or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_label.strip().lower()).strip()
 
 
 # Explicit, versioned per-logical-field label candidates. UNVERIFIED
@@ -118,25 +120,57 @@ def _norm_label(label: Optional[str]) -> str:
 # single place to tighten once Aryan supplies one real export per form.
 # One shared vocabulary; each handler below only reads what its form needs.
 FIELD_LABEL_CANDIDATES: Dict[str, List[str]] = {
-    "name": ["name", "your name", "full name", "contact name", "applicant name"],
+    "name": [
+        "name", "your name", "full name", "contact name", "applicant name",
+        "journalist name",
+    ],
     "email": ["email", "your email", "email address", "work email"],
     "phone": ["phone", "phone number", "your phone", "contact number", "mobile", "mobile number"],
     "message": [
         "message", "your message", "details", "tell us more", "how can we help you",
         "how can we help", "project requirements", "requirements", "description",
-        "what do you need help with",
+        "what do you need help with", "enquiry message", "project goals",
     ],
     "company": ["company", "company name", "organisation", "organization", "business name"],
     "budget": ["budget", "budget range", "estimated budget", "budget hint"],
     "timeline": ["timeline", "timeframe", "project timeline", "when do you need this", "deadline"],
     "service": ["service", "service requested", "what service", "what are you interested in", "project type"],
-    "role": ["role", "position", "job title", "role applying for", "which role", "role you're applying for"],
-    "resume": ["resume", "resume cv", "cv", "upload your resume", "attach your resume", "upload resume cv"],
-    "links": ["portfolio", "linkedin", "github", "portfolio url", "links", "portfolio linkedin github"],
+    "role": [
+        "role", "position", "job title", "role applying for", "which role",
+        "role you're applying for", "role you are applying for",
+    ],
+    "resume": [
+        "resume", "resume cv", "cv", "upload your resume", "attach your resume",
+        "upload resume cv", "resume cv pdf or docx only",
+    ],
+    "links": [
+        "portfolio", "linkedin", "github", "portfolio url", "links",
+        "portfolio linkedin github", "linkedin or portfolio url",
+    ],
     "outlet": ["outlet", "organization", "publication", "media outlet", "company organisation outlet", "outlet publication"],
     "media_deadline": ["deadline", "response needed by", "when do you need a response", "response deadline"],
-    "request": ["request", "media request", "what are you working on", "story details", "what is this regarding"],
+    "request": [
+        "request", "media request", "enquiry or request", "what are you working on",
+        "story details", "what is this regarding",
+    ],
+    # Phase 1, Requirement 2: an explicit consent/agreement checkbox, if a
+    # form has one. Absence is never treated as an answer either way -- see
+    # _consent_status(). UNVERIFIED against a real payload, same caveat as
+    # every other candidate list here.
+    "consent": [
+        "consent", "i agree", "i consent", "gdpr consent", "privacy policy",
+        "i agree to the privacy policy", "i agree to be contacted", "terms and conditions",
+        "i agree to the terms", "data processing consent", "privacy consent",
+    ],
 }
+
+# Phase 1, Requirement 2: a defensive cap on any single field's captured
+# text, applied uniformly by _field_text(). Real Tally submissions are
+# nowhere near this size; this only protects against an oversized/hostile
+# payload (relevant once a public webhook receiver exists) bloating
+# CommsStore/EnquiryStore state. Truncation is silent but auditable --
+# _record() below stores which fields, if any, were truncated.
+_MAX_FIELD_LEN = 10000
 
 
 def _find_field(fields: List[Dict[str, Any]], logical_name: str) -> Optional[Dict[str, Any]]:
@@ -158,9 +192,12 @@ def _field_text(fields: List[Dict[str, Any]], logical_name: str) -> Optional[str
         if value and isinstance(value[0], dict):
             return None  # file-upload-shaped value -- use _field_files() instead
         text = ", ".join(str(v) for v in value if v not in (None, ""))
-        return text.strip() or None
-    text = str(value).strip()
-    return text or None
+        text = text.strip()
+    else:
+        text = str(value).strip()
+    if not text:
+        return None
+    return text[:_MAX_FIELD_LEN]
 
 
 def _field_files(fields: List[Dict[str, Any]], logical_name: str) -> List[Dict[str, Any]]:
@@ -171,6 +208,28 @@ def _field_files(fields: List[Dict[str, Any]], logical_name: str) -> List[Dict[s
     if not isinstance(value, list):
         return []
     return [v for v in value if isinstance(v, dict)]
+
+
+def _consent_status(fields: List[Dict[str, Any]]) -> Optional[str]:
+    """Reads an explicit consent/agreement field if the form has one.
+    Returns "given", "declined", or None when no such field could be
+    matched by label -- absence is never treated as an answer either way,
+    same never-guess convention as every other optional field here. A
+    present-but-empty/false/negative value is "declined"; anything else
+    genuinely present is "given" (Tally typically sends a checkbox as a
+    boolean true/false, or omits the field entirely when unchecked --
+    both are handled)."""
+    f = _find_field(fields, "consent")
+    if f is None:
+        return None
+    value = f.get("value")
+    if isinstance(value, bool):
+        return "given" if value else "declined"
+    text = _norm_label(str(value)) if value not in (None, "") else ""
+    if not text:
+        return "declined"
+    declined_markers = {"no", "false", "n", "unchecked", "declined", "decline", "0", "i do not agree", "i disagree"}
+    return "declined" if text in declined_markers else "given"
 
 
 class TallyIntakeService:
@@ -203,8 +262,11 @@ class TallyIntakeService:
         field_labels = [f.get("label") for f in fields]
         form_type = TALLY_FORM_TYPES.get(form_id, "unknown")
 
+        consent_status = _consent_status(fields)
+        existing_event: Optional[Dict[str, Any]] = None
+
         def _record(status: str, reason: Optional[str] = None, **outcome: Any) -> None:
-            self.store.create("tally_intake_events", {
+            values = {
                 "form_id": form_id or None, "form_type": form_type,
                 "tally_submission_id": submission_id, "tally_response_id": response_id,
                 "tally_event_id": event_id, "status": status, "reason": reason,
@@ -213,30 +275,51 @@ class TallyIntakeService:
                 "application_id": outcome.get("application_id"),
                 "opportunity_id": outcome.get("opportunity_id"),
                 "raw_field_labels_json": json.dumps(field_labels),
-                "created_at": utcnow(),
-            })
+                "consent_status": consent_status,
+            }
+            if existing_event:
+                # A previously rejected submission may become valid after an
+                # explicit mapping correction. Re-evaluate it, but update its
+                # one audit row rather than creating a second rejection/event.
+                assignments = ",".join(f"{key}=?" for key in values)
+                with self.store.transaction() as db:
+                    db.execute(
+                        f"UPDATE tally_intake_events SET {assignments} WHERE id=?",
+                        [*values.values(), existing_event["id"]],
+                    )
+            else:
+                values["created_at"] = utcnow()
+                self.store.create("tally_intake_events", values)
 
         # -- 1. idempotency, checked before any other validation: a
         # webhook retry or a re-run of the manual-import script over the
         # same export is a safe no-op, never a duplicate lead/application.
         if dedup_key:
-            existing = self.store.list(
-                "tally_intake_events", "tally_submission_id=? AND status='ingested'", (dedup_key,),
-            )
-            if not existing and response_id and response_id != dedup_key:
+            # A submission is one intake attempt regardless of its outcome.
+            # Replaying a rejection must not add another rejection row, and a
+            # response-id-only payload must be deduplicated by response ID.
+            existing = []
+            if submission_id:
                 existing = self.store.list(
-                    "tally_intake_events", "tally_response_id=? AND status='ingested'", (response_id,),
+                    "tally_intake_events", "tally_submission_id=?", (submission_id,),
+                )
+            if not existing and response_id:
+                existing = self.store.list(
+                    "tally_intake_events", "tally_response_id=?", (response_id,),
                 )
             if existing:
                 row = existing[0]
-                self.audit.append("TALLY_INTAKE_DUPLICATE_SKIPPED", {
-                    "tally_submission_id": dedup_key, "form_type": form_type, "actor": actor,
-                })
-                return {
-                    "status": "duplicate", "form_type": form_type,
-                    "conversation_id": row.get("conversation_id"), "enquiry_id": row.get("enquiry_id"),
-                    "application_id": row.get("application_id"), "opportunity_id": row.get("opportunity_id"),
-                }
+                if row.get("status") == "ingested":
+                    self.audit.append("TALLY_INTAKE_DUPLICATE_SKIPPED", {
+                        "tally_submission_id": dedup_key, "form_type": form_type, "actor": actor,
+                    })
+                    return {
+                        "status": "duplicate", "form_type": form_type,
+                        "prior_status": row.get("status"), "reason": row.get("reason"),
+                        "conversation_id": row.get("conversation_id"), "enquiry_id": row.get("enquiry_id"),
+                        "application_id": row.get("application_id"), "opportunity_id": row.get("opportunity_id"),
+                    }
+                existing_event = row
 
         # -- 2. known, live form only. An id outside the four real forms is
         # never guessed at -- rejected and recorded for visibility.
@@ -252,27 +335,44 @@ class TallyIntakeService:
             return {"status": "rejected", "reason": "payload has no fields"}
 
         handler = {
-            "general": lambda: self._ingest_enquiry("general", fields),
-            "project": lambda: self._ingest_enquiry("project", fields),
+            "general": lambda: self._ingest_enquiry("general", fields, recover=existing_event is not None),
+            "project": lambda: self._ingest_enquiry("project", fields, recover=existing_event is not None),
             "careers": lambda: self._ingest_careers(fields),
             "media": lambda: self._ingest_media(fields, dedup_key),
         }[form_type]
 
         try:
+            # Phase 1, Requirement 2: an explicit decline is checked before
+            # any conversation/lead/application is created for ANY form
+            # type -- never processed as a normal enquiry just because the
+            # rest of the fields matched fine.
+            if consent_status == "declined":
+                raise TallyIntakeError("consent was explicitly declined on this submission; not processed")
             outcome = handler()
         except TallyIntakeError as exc:
             _record("rejected", str(exc))
             self.audit.append("TALLY_INTAKE_REJECTED", {
                 "reason": str(exc), "form_type": form_type, "form_id": form_id, "actor": actor,
             })
-            return {"status": "rejected", "reason": str(exc), "form_type": form_type}
+            return {"status": "rejected", "reason": str(exc), "form_type": form_type, "consent_status": consent_status}
 
         _record("ingested", None, **outcome)
         self.audit.append("TALLY_INTAKE_INGESTED", {
-            "form_type": form_type, "tally_submission_id": dedup_key, "actor": actor, **outcome,
+            "form_type": form_type, "tally_submission_id": dedup_key, "actor": actor,
+            "consent_status": consent_status, **outcome,
         })
 
-        result: Dict[str, Any] = {"status": "ingested", "form_type": form_type, **outcome}
+        if consent_status == "given" and outcome.get("conversation_id"):
+            # Compliance evidence: recorded as an internal note on the
+            # conversation itself, not just the audit log, so it is visible
+            # wherever the conversation is reviewed later.
+            self.comms.add_message(
+                outcome["conversation_id"], "INBOUND",
+                "Consent to be contacted was explicitly given on this Tally submission.",
+                kind="note", is_internal_note=True, actor="tally_intake",
+            )
+
+        result: Dict[str, Any] = {"status": "ingested", "form_type": form_type, "consent_status": consent_status, **outcome}
         if outcome.get("conversation_id"):
             from .comms_workforce import run_agent_for_conversation
             result["workforce_actions"] = run_agent_for_conversation(
@@ -282,7 +382,9 @@ class TallyIntakeService:
 
     # -- per-form-type handlers ------------------------------------------
 
-    def _ingest_enquiry(self, kind: str, fields: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _ingest_enquiry(
+        self, kind: str, fields: List[Dict[str, Any]], recover: bool = False,
+    ) -> Dict[str, Any]:
         name = _field_text(fields, "name")
         email = _field_text(fields, "email")
         message = _field_text(fields, "message") or _field_text(fields, "request")
@@ -306,6 +408,50 @@ class TallyIntakeService:
             if service:
                 extra["project_type"] = service
                 extra["project_title"] = f"Project enquiry: {service}"
+
+        # A crash can occur after EnquiryStore has committed the enquiry,
+        # contact, or conversation but before tally_intake_events is marked
+        # ingested. Only rejected-event replays enter this recovery path;
+        # a genuinely new, identical submission is still a separate intake.
+        if recover:
+            prior = self.store.list(
+                "site_enquiries",
+                "kind=? AND name=? AND email=? AND COALESCE(company, '')=? AND message=?",
+                (kind, name.strip(), email.strip(), (company or "").strip(), message.strip()),
+            )
+            if prior:
+                enquiry = prior[0]
+                conversations = self.store.list(
+                    "comm_conversations", "source_ref_type=? AND source_ref_id=?",
+                    ("site_enquiry", enquiry["id"]),
+                )
+                if conversations:
+                    conversation = conversations[0]
+                    contact_id = conversation.get("primary_contact_id")
+                    participants = self.store.list(
+                        "comm_participants", "conversation_id=? AND participant_type=?",
+                        (conversation["id"], "customer"),
+                    )
+                    if contact_id and not participants:
+                        self.store.create("comm_participants", {
+                            "conversation_id": conversation["id"], "participant_type": "customer",
+                            "contact_id": contact_id, "agent_role": None,
+                            **self.comms._participant_timestamps(utcnow()),
+                        })
+                    messages = self.store.list(
+                        "comm_messages", "conversation_id=? AND source_ref_type=? AND source_ref_id=?",
+                        (conversation["id"], "site_enquiry", enquiry["id"]),
+                    )
+                    if not messages:
+                        self.comms.add_message(
+                            conversation["id"], "INBOUND", message.strip(),
+                            sender_contact_id=contact_id, source_ref_type="site_enquiry",
+                            source_ref_id=enquiry["id"], actor="tally_intake_recovery",
+                        )
+                    return {
+                        "conversation_id": conversation["id"], "enquiry_id": enquiry["id"],
+                        "opportunity_id": enquiry.get("opportunity_id"),
+                    }
 
         try:
             result = self.enquiries.submit(kind, name, email, company, message, extra=extra or None)
@@ -336,19 +482,23 @@ class TallyIntakeService:
             "links": [links_field] if links_field else [],
             "cover_note": _field_text(fields, "message"),
             # Metadata only -- resume bytes are never fetched from Tally's
-            # hosted URL in this pass (see module docstring).
+            # hosted URL in this pass (see module docstring). The URL itself
+            # is preserved so the resume can still be retrieved manually --
+            # without it, the metadata-only record would be unretrievable.
             "resume_filename": (resume_meta or {}).get("name"),
             "resume_size_bytes": (resume_meta or {}).get("size"),
+            "resume_source_url": (resume_meta or {}).get("url"),
         })
 
         conv_matches = self.store.list("comm_conversations", "linked_application_id=?", (application_id,))
         conversation_id = conv_matches[0]["id"] if conv_matches else None
         if resume_meta and conversation_id:
+            url_note = f" URL: {resume_meta.get('url')}" if resume_meta.get("url") else " (no URL was present on the submission)"
             self.comms.add_message(
                 conversation_id, "INBOUND",
                 f"Resume on file via Tally: {resume_meta.get('name', '(unnamed)')} "
                 f"({resume_meta.get('mimeType', 'unknown type')}, {resume_meta.get('size', '?')} bytes). "
-                "Metadata only -- not fetched/stored locally in this pass.",
+                f"Metadata only -- bytes not fetched/stored locally in this pass.{url_note}",
                 kind="note", is_internal_note=True, actor="tally_intake",
             )
         elif not resume_meta and conversation_id:

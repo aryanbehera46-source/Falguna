@@ -32,6 +32,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .audit import AuditLog
+from .email_admin import EmailError, EmailProvider, NullEmailProvider
 from .store import StateStore, utcnow
 from .ttt_hq import NeedsAryanQueue
 
@@ -42,11 +43,13 @@ PRIORITIES = {"low", "normal", "high", "urgent"}
 MESSAGE_DIRECTIONS = {"INBOUND", "OUTBOUND"}
 MESSAGE_KINDS = {"message", "note", "system"}
 MESSAGE_STATUSES = {"RECEIVED", "DRAFT", "APPROVED", "SENT", "FAILED"}
-# FAILED is added for Milestone 8/9 forward-compatibility: no live
-# mailbox is connected this sprint (NullEmailProvider only), so nothing
-# in this codebase sets it today -- it exists so a real provider
-# integration later has somewhere real to record a failed send
-# without a schema/status-enum change at that point.
+# FAILED is set by mark_message_failed() (a human recording a manual send
+# attempt that didn't go through) and by send_message_via_provider() (a
+# real provider's send failing after exhausting its bounded retries) --
+# see both below. With NullEmailProvider (the default until real
+# credentials are opted in, Phase 1 Requirement 3) nothing ever attempts a
+# provider send, so FAILED only appears via the manual path in that
+# default configuration.
 PARTICIPANT_TYPES = {"customer", "agent", "watcher"}
 # TTT Communications V2, Milestone 5: a finer-grained lifecycle for support
 # and billing conversations, layered on top of the coarse `status` field
@@ -78,10 +81,35 @@ class CommsStore:
     existing Needs Aryan queue) and a per-conversation status/priority/
     assignment history."""
 
-    def __init__(self, store: StateStore, audit: AuditLog, needs_aryan: Optional[NeedsAryanQueue] = None):
+    def __init__(
+        self, store: StateStore, audit: AuditLog, needs_aryan: Optional[NeedsAryanQueue] = None,
+        provider: Optional[EmailProvider] = None,
+    ):
         self.store = store
         self.audit = audit
         self.needs_aryan = needs_aryan or NeedsAryanQueue(store, audit)
+        # Phase 1, Requirement 3: opt-in real send. Every existing call
+        # site that constructs CommsStore without a `provider` argument
+        # keeps today's exact behavior -- NullEmailProvider structurally
+        # cannot send, so send_message_via_provider() always refuses
+        # cleanly until a caller explicitly passes a real, configured
+        # provider (see hq_web.py's resolve_configured_email_provider()).
+        self.provider = provider or NullEmailProvider()
+
+    def _participant_timestamps(self, timestamp: str) -> Dict[str, str]:
+        """Write the timestamp names supported by this database.
+
+        Early Communications databases require ``added_at``; current ones
+        require ``created_at``. A migrated legacy database has both, so fill
+        both without dropping the old NOT NULL column or breaking rollback.
+        """
+        columns = {
+            row[1] for row in self.store.db.execute("PRAGMA table_info(comm_participants)").fetchall()
+        }
+        values = {"created_at": timestamp}
+        if "added_at" in columns:
+            values["added_at"] = timestamp
+        return values
 
     # -- organizations / contacts --------------------------------------
 
@@ -157,7 +185,7 @@ class CommsStore:
         if contact_id:
             self.store.create("comm_participants", {
                 "conversation_id": conv_id, "participant_type": "customer",
-                "contact_id": contact_id, "agent_role": None, "created_at": now,
+                "contact_id": contact_id, "agent_role": None, **self._participant_timestamps(now),
             })
         self.audit.append("COMM_CONVERSATION_OPENED", {
             "conversation_id": conv_id, "channel": channel, "department": department, "actor": actor,
@@ -248,22 +276,17 @@ class CommsStore:
         })
         return self.store.get("comm_messages", msg_id)
 
-    def mark_message_sent(self, message_id: str, actor: str) -> Dict[str, Any]:
-        """The one, explicit, owner-performed action that turns a drafted
-        OUTBOUND message into one that was actually sent -- same shape as
-        `EmailStore.mark_sent` / `FollowupStore` elsewhere in this
-        codebase. Nothing in this module ever calls this itself; it exists
-        only for a human (via the TTT HQ UI) to call after reviewing a
-        DRAFT and sending it through whatever real channel applies."""
-        message = self.store.get("comm_messages", message_id)
-        if not message:
-            raise CommsError("message not found")
-        if message["direction"] != "OUTBOUND":
-            raise CommsError("only an outbound (drafted) message can be marked sent")
-        if message["status"] != "DRAFT":
-            raise CommsError(f"message is already {message['status']}, not DRAFT")
+    def _finalize_sent(self, message: Dict[str, Any], actor: str, send_method: str, provider_name: Optional[str] = None) -> Dict[str, Any]:
+        """Shared side effects for a message that just became genuinely
+        SENT, however it got there (a human's manual mark-sent, or a real
+        provider accepting it) -- one place for first_response_at /
+        ticket_status, so the two paths can never silently drift apart."""
+        message_id = message["id"]
         now = utcnow()
-        self.store.update("comm_messages", message_id, status="SENT", updated_at=now)
+        self.store.update(
+            "comm_messages", message_id, status="SENT", updated_at=now,
+            send_method=send_method, provider_name=provider_name, failure_reason=None,
+        )
         conv = self.store.get("comm_conversations", message["conversation_id"])
         if conv and not conv.get("first_response_at"):
             self.store.update("comm_conversations", message["conversation_id"], first_response_at=now, updated_at=now)
@@ -274,19 +297,38 @@ class CommsStore:
         if conv and conv["department"] in ("support", "billing") and conv.get("ticket_status") not in (None, "RESOLVED", "CLOSED"):
             self.set_ticket_status(message["conversation_id"], "WAITING_CUSTOMER", actor="system",
                                     reason="an outbound reply was sent on this ticket")
-        self.audit.append("COMM_MESSAGE_SENT", {"message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor})
         return self.store.get("comm_messages", message_id)
 
+    def mark_message_sent(self, message_id: str, actor: str) -> Dict[str, Any]:
+        """The one, explicit, owner-performed action that turns a drafted
+        OUTBOUND message into one that was actually sent through some real
+        channel OUTSIDE this system (the owner's own mail client, a phone
+        call, etc.) -- same shape as `EmailStore.mark_sent` /
+        `FollowupStore` elsewhere in this codebase. Nothing in this module
+        ever calls this itself; it exists only for a human (via the TTT HQ
+        UI) to call after reviewing a DRAFT and sending it themselves. For
+        a real, in-system send attempt through a configured EmailProvider,
+        see `send_message_via_provider` instead -- the two are deliberately
+        separate actions so "I sent this myself" is never confused with
+        "the system attempted this via a real provider"."""
+        message = self.store.get("comm_messages", message_id)
+        if not message:
+            raise CommsError("message not found")
+        if message["direction"] != "OUTBOUND":
+            raise CommsError("only an outbound (drafted) message can be marked sent")
+        if message["status"] != "DRAFT":
+            raise CommsError(f"message is already {message['status']}, not DRAFT")
+        result = self._finalize_sent(message, actor, send_method="manual")
+        self.audit.append("COMM_MESSAGE_SENT", {"message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor, "send_method": "manual"})
+        return result
+
     def mark_message_failed(self, message_id: str, actor: str, reason: str) -> Dict[str, Any]:
-        """The FAILED counterpart to mark_message_sent -- for a real
-        provider integration (later, once a mailbox is connected) to
-        record a genuine delivery failure rather than silently leaving a
-        message stuck at DRAFT or falsely marked SENT. Nothing in this
-        codebase calls this yet (see MESSAGE_STATUSES' own note); it's
-        forward-compatible plumbing so TTT HQ's Failed Delivery view
-        (Milestone 8) has a real, structurally-correct place to read from
-        the moment a provider is actually wired in, with no later
-        redesign."""
+        """The FAILED counterpart to mark_message_sent, for a human
+        recording that a manual send attempt (outside this system) did not
+        go through. For a real provider's own send failure, see
+        `send_message_via_provider`, which records this same FAILED state
+        automatically with send_method="provider" after exhausting its
+        bounded retries -- this method is for the manual-send path only."""
         if not reason or not reason.strip():
             raise CommsError("reason is required to mark a message failed")
         message = self.store.get("comm_messages", message_id)
@@ -297,9 +339,114 @@ class CommsStore:
         if message["status"] != "DRAFT":
             raise CommsError(f"message is already {message['status']}, not DRAFT")
         now = utcnow()
-        self.store.update("comm_messages", message_id, status="FAILED", updated_at=now)
+        self.store.update(
+            "comm_messages", message_id, status="FAILED", updated_at=now,
+            send_method="manual", failure_reason=reason.strip(),
+        )
         self.audit.append("COMM_MESSAGE_FAILED", {
-            "message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor, "reason": reason,
+            "message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor,
+            "reason": reason, "send_method": "manual",
+        })
+        return self.store.get("comm_messages", message_id)
+
+    def send_message_via_provider(self, message_id: str, actor: str, max_attempts: int = 3) -> Dict[str, Any]:
+        """Phase 1, Requirement 3: the one real, in-system send path. Never
+        the default -- refuses immediately unless this CommsStore was
+        constructed with a real, configured EmailProvider (see
+        `resolve_configured_email_provider` in hq_web.py). Preconditions
+        (all raise CommsError, never silently coerced):
+          - the provider must actually be configured right now;
+          - the message must be an OUTBOUND, non-internal-note DRAFT
+            (identical precondition to mark_message_sent);
+          - if this message (or its conversation) was classified HIGH risk
+            (see risk_engine.RiskClassificationStore), that escalation's
+            Needs Aryan item must be APPROVED first -- this is the actual
+            enforcement point that stops a worker from bypassing approval
+            by calling this method (or the provider) directly, not merely
+            a UI-level checkbox.
+        On success: status -> SENT, exactly the same downstream side
+        effects as a manual mark-sent (see `_finalize_sent`), plus the
+        provider's own message id recorded for reference -- this records
+        that the provider ACCEPTED the message for delivery, never that it
+        reached the recipient's inbox (no provider here offers real
+        delivery-status callbacks yet; see EmailProvider.capabilities()).
+        On failure: retries up to `max_attempts` times (bounded, no
+        infinite retry loop), then marks the message FAILED with the real
+        failure reason recorded on the row itself (not just the audit
+        log) -- surfaced in TTT HQ's existing Failed Delivery panel."""
+        if not self.provider.is_configured():
+            raise CommsError(
+                "no real email provider is configured -- nothing was sent. "
+                "Configure a real provider (see falguna/email_admin.py) to enable this, "
+                "or use mark_message_sent to record that you sent this yourself."
+            )
+        message = self.store.get("comm_messages", message_id)
+        if not message:
+            raise CommsError("message not found")
+        if message["direction"] != "OUTBOUND" or message["is_internal_note"]:
+            raise CommsError("only an outbound, non-internal-note message can be sent")
+        if message["status"] != "DRAFT":
+            raise CommsError(f"message is already {message['status']}, not DRAFT")
+
+        from .risk_engine import RiskClassificationStore
+        risk_events = RiskClassificationStore(self.store, self.audit, self.needs_aryan).list_for_subject("comm_message", message_id)
+        for event in risk_events:
+            if event["risk"] != "HIGH":
+                continue
+            item = self.store.get("needs_aryan_items", event["needs_aryan_id"]) if event.get("needs_aryan_id") else None
+            if not item or item["status"] != "APPROVED":
+                raise CommsError(
+                    "this message was classified HIGH risk and its approval is not yet APPROVED -- "
+                    "it cannot be sent (manually or via a provider) until that is resolved."
+                )
+
+        conv = self.store.get("comm_conversations", message["conversation_id"])
+        contact = self.store.get("comm_contacts", conv["primary_contact_id"]) if conv and conv.get("primary_contact_id") else None
+        to_address = (contact or {}).get("email")
+        if not to_address:
+            raise CommsError("this conversation has no contact email on file -- cannot send via a provider")
+
+        prior_inbound = [
+            m for m in self.store.list("comm_messages", "conversation_id=? AND direction=?", (message["conversation_id"], "INBOUND"))
+            if m.get("provider_message_id")
+        ]
+        in_reply_to = prior_inbound[-1]["provider_message_id"] if prior_inbound else None
+        provider_name = self.provider.provider_name()
+
+        last_error: Optional[str] = None
+        attempts = 0
+        max_attempts = max(1, int(max_attempts))
+        for attempts in range(1, max_attempts + 1):
+            try:
+                result = self.provider.send(
+                    to_address, conv.get("subject") or "", message["body"],
+                    thread_id=conv.get("external_thread_id"), in_reply_to_message_id=in_reply_to,
+                )
+                self.store.update(
+                    "comm_messages", message_id,
+                    provider_message_id=result.get("provider_message_id"), send_attempts=attempts,
+                )
+                sent_message = self._finalize_sent(dict(message), actor, send_method="provider", provider_name=provider_name)
+                self.audit.append("COMM_MESSAGE_SENT_VIA_PROVIDER", {
+                    "message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor,
+                    "provider": provider_name, "attempts": attempts,
+                    "provider_message_id": result.get("provider_message_id"),
+                    # Deliberately not "delivered" -- this is provider acceptance, not an inbox-delivery guarantee.
+                    "note": "provider accepted the message for delivery; not a confirmation it reached the recipient's inbox",
+                })
+                return sent_message
+            except EmailError as exc:
+                last_error = str(exc)
+
+        now = utcnow()
+        self.store.update(
+            "comm_messages", message_id, status="FAILED", updated_at=now,
+            send_method="provider", provider_name=provider_name, send_attempts=attempts,
+            failure_reason=last_error or "provider send failed for an unknown reason",
+        )
+        self.audit.append("COMM_MESSAGE_SEND_FAILED", {
+            "message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor,
+            "provider": provider_name, "attempts": attempts, "reason": last_error,
         })
         return self.store.get("comm_messages", message_id)
 
@@ -384,7 +531,7 @@ class CommsStore:
         self.store.update("comm_conversations", conversation_id, assigned_agent=agent_role, updated_at=now)
         self.store.create("comm_participants", {
             "conversation_id": conversation_id, "participant_type": "agent",
-            "contact_id": None, "agent_role": agent_role, "created_at": now,
+            "contact_id": None, "agent_role": agent_role, **self._participant_timestamps(now),
         })
         self.store.create("comm_status_events", {
             "conversation_id": conversation_id, "field": "assigned_agent", "old_value": conv.get("assigned_agent"),
@@ -453,9 +600,11 @@ class CommsStore:
         active_conversations = all_open
         follow_ups_due = self.store.list("rh_followups", "status=?", ("DRAFT",))
         follow_ups_due = list(reversed(follow_ups_due))[:20]
-        # See MESSAGE_STATUSES' own note: nothing in this codebase can set
-        # FAILED yet (no live provider is connected this sprint), so this
-        # is honestly empty today -- structurally real, not simulated.
+        # Phase 1, Requirement 3: send_message_via_provider() can now set
+        # FAILED for real after exhausting its bounded retries against a
+        # configured provider. With NullEmailProvider (the default until
+        # real credentials are opted in) nothing ever attempts a send, so
+        # this stays honestly empty in that default configuration.
         failed_delivery = self.store.list("comm_messages", "status=?", ("FAILED",))
         failed_delivery = list(reversed(failed_delivery))[:20]
         recently_resolved = self.store.list("comm_conversations", "status IN ('resolved','closed')")

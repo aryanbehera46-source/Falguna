@@ -67,7 +67,7 @@ from .comms import CommsError, CommsStore
 from .comms_workforce import run_agent_for_conversation, run_workforce_pass
 from .conversations import ConversationError, ConversationStore
 from .documents import DocumentError, DocumentStore
-from .email_admin import EmailError, EmailStore
+from .email_admin import EmailError, EmailStore, resolve_configured_email_provider
 from .lifecycle import LifecycleError, LifecycleOrchestrator
 from .media import BrandStore, CampaignStore, ContentStore, MediaError, ScriptStore
 from .media_agents import (
@@ -547,7 +547,11 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 return self._json({
                     "recent_agent_messages": agent_messages[:25],
                     "pending_escalations": escalations[:25],
-                    "email_provider": EmailStore(store, control.audit).provider_status(),
+                    # Phase 1, Requirement 3: reflects whatever is actually
+                    # configured in the environment right now -- never
+                    # hardcoded to NullEmailProvider once real credentials
+                    # exist, and never claims "configured" when they don't.
+                    "email_provider": EmailStore(store, control.audit, provider=resolve_configured_email_provider()).provider_status(),
                 })
             if path == "/api/cc/snapshot":
                 return self._json(command_center_snapshot(store))
@@ -1203,8 +1207,17 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     result = recommend_allocation(store, body.get("available_amount"), actor=body.get("actor", "Aryan"))
                     return self._json(result, HTTPStatus.CREATED)
                 if path == "/api/cc/reserve-policy":
-                    policy = ReservePolicyStore(store).save(body)
-                    return self._json(policy)
+                    # Phase 1, Requirement 1: this route never writes the
+                    # policy directly any more -- it proposes a change and
+                    # the active policy stays in effect until Aryan
+                    # approves it via the Needs Aryan queue (see
+                    # ReservePolicyStore.propose_change / the
+                    # cc_reserve_policy hook below the decision route).
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    result = ReservePolicyStore(store, control.audit, needs_aryan=needs_aryan).propose_change(
+                        body, actor=body.get("actor", "Aryan"),
+                    )
+                    return self._json(result, HTTPStatus.ACCEPTED)
                 if path == "/api/cc/risks":
                     needs_aryan = NeedsAryanQueue(store, control.audit, control)
                     risk_id = RiskRegisterStore(store, control.audit, needs_aryan=needs_aryan).create(
@@ -1253,6 +1266,26 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     needs_aryan = NeedsAryanQueue(store, control.audit, control)
                     message = CommsStore(store, control.audit, needs_aryan).mark_message_sent(message_id, body.get("actor", "Aryan"))
                     return self._json(message)
+                if path.startswith("/api/comms/messages/") and path.endswith("/mark-failed"):
+                    message_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    message = CommsStore(store, control.audit, needs_aryan).mark_message_failed(
+                        message_id, body.get("actor", "Aryan"), body.get("reason", ""),
+                    )
+                    return self._json(message)
+                if path.startswith("/api/comms/messages/") and path.endswith("/send"):
+                    # Phase 1, Requirement 3: the one real, in-system send
+                    # path -- opt-in (resolve_configured_email_provider()
+                    # returns NullEmailProvider, and this cleanly refuses,
+                    # unless real SMTP/IMAP env vars are actually set on
+                    # this machine), and gated by send_message_via_provider
+                    # itself (never bypassable by calling this route
+                    # directly), not just by hiding a button in the UI.
+                    message_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    comms_send = CommsStore(store, control.audit, needs_aryan, provider=resolve_configured_email_provider())
+                    message = comms_send.send_message_via_provider(message_id, body.get("actor", "Aryan"))
+                    return self._json(message)
                 if path == "/api/needs-aryan":
                     item_id = NeedsAryanQueue(store, control.audit, control).create_item(
                         body.get("kind", ""), body.get("title", ""), body.get("what_is_needed", ""),
@@ -1286,6 +1319,12 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                             # closing immediately -- approval is the one
                             # moment the real close actually executes.
                             ClosingService(store, control.audit, orchestrator=orchestrator, needs_aryan=queue).finalize_pending_closing(item_id, body.get("actor", "Aryan"))
+                        if before.get("ref_type") == "cc_reserve_policy" and result["action"] == "APPROVED":
+                            # Phase 1, Requirement 1: approval is the one
+                            # moment a proposed reserve-policy change is
+                            # actually written -- the exact same pattern as
+                            # the rh_closing_package hook right above.
+                            ReservePolicyStore(store, control.audit).apply_pending_change(item_id, body.get("actor", "Aryan"))
                     return self._json(result)
 
                 if path == "/api/rh/opportunities":
@@ -2547,6 +2586,7 @@ Ask Falguna
 <div class="row"><input id="rpEmergency" type="number" step="any" placeholder="Emergency reserve %"><input id="rpReinvestment" type="number" step="any" placeholder="Reinvestment pool %"></div>
 <div class="row"><input id="rpOwnerDist" type="number" step="any" placeholder="Owner distribution %"><input id="rpExperimental" type="number" step="any" placeholder="Experimental capital %"></div>
 <div class="actions"><button id="rpSave" type="button">Save reserve policy</button></div>
+<div class="meta" id="rpStatus"></div>
 </div>
 </div>
 <div class="section"><h2 id="ccExpCapital">$0</h2><div class="sub">Available experimental capital (owner_contribution inflows minus spend -- never client funds)</div></div>
@@ -3366,7 +3406,7 @@ async function loadCcCapital(){const p=await api('/api/cc/reserve-policy');
 $('ccReservePolicy').innerHTML=p.configured?`<div class="item"><div class="meta"><span>operating ${(p.operating_reserve_pct*100).toFixed(0)}%</span><span>tax ${(p.tax_reserve_pct*100).toFixed(0)}%</span><span>emergency ${(p.emergency_reserve_pct*100).toFixed(0)}%</span><span>reinvestment ${(p.reinvestment_pool_pct*100).toFixed(0)}%</span><span>owner dist. ${(p.owner_distribution_pct*100).toFixed(0)}%</span><span>experimental ${(p.experimental_capital_pct*100).toFixed(0)}%</span></div></div>`:'<div class="empty">Reserve policy not configured yet -- all percentages default to 0.</div>';
 const ec=await api('/api/cc/experimental-capital');$('ccExpCapital').textContent='$'+ec.available;
 }
-$('rpSave').onclick=async()=>{const pct=v=>v===''?0:parseFloat(v)/100;await api('/api/cc/reserve-policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operating_reserve_pct:pct($('rpOperating').value),tax_reserve_pct:pct($('rpTax').value),emergency_reserve_pct:pct($('rpEmergency').value),reinvestment_pool_pct:pct($('rpReinvestment').value),owner_distribution_pct:pct($('rpOwnerDist').value),experimental_capital_pct:pct($('rpExperimental').value)})});await loadCcCapital()};
+$('rpSave').onclick=async()=>{const pct=v=>v===''?0:parseFloat(v)/100;const statusEl=$('rpStatus');statusEl.textContent='';try{const r=await api('/api/cc/reserve-policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operating_reserve_pct:pct($('rpOperating').value),tax_reserve_pct:pct($('rpTax').value),emergency_reserve_pct:pct($('rpEmergency').value),reinvestment_pool_pct:pct($('rpReinvestment').value),owner_distribution_pct:pct($('rpOwnerDist').value),experimental_capital_pct:pct($('rpExperimental').value)})});if(r.already_pending){statusEl.textContent='A reserve-policy change is already awaiting your approval in Needs Aryan -- this request was not added as a duplicate.';}else{statusEl.textContent='Proposed -- awaiting your approval in Needs Aryan. The policy shown above will not change until you approve it there.';}}catch(e){statusEl.textContent='Could not propose this change: '+(e&&e.message?e.message:'see console for details');}await loadCcCapital()};
 $('caRecommend').onclick=async()=>{const amount=parseFloat($('caAvailable').value);if(isNaN(amount))return alert('Enter an available amount first.');const r=await api('/api/cc/capital-allocation/recommend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({available_amount:amount,actor:'Aryan'})});$('ccCapitalRecs').innerHTML=(r.recommendations||[]).length?r.recommendations.map(rec=>`<div class="item"><h3>${esc(rec.category)}: $${esc(rec.amount)}</h3><div class="meta"><span>confidence ${esc(rec.confidence)}</span><span>${esc(rec.risk)}</span></div><div>${esc(rec.reason)}</div><div class="meta"><span>${esc(rec.expected_benefit)}</span></div><div class="meta"><span>alternative: ${esc(rec.alternative)}</span></div></div>`).join(''):'<div class="empty">No recommendations for the current state.</div>'};
 async function loadCcDeptPerf(){const dp=await api('/api/cc/department-performance');const depts=[['Sales',dp.sales],['Delivery',dp.delivery],['Digital Workforce',dp.digital_workforce],['Media/Growth',dp.media_growth],['Falguna Engineering',dp.falguna_engineering]];
 $('ccDeptPerfList').innerHTML=depts.map(([name,m])=>`<div class="section"><h2>${esc(name)}</h2><div class="list">${Object.entries(m).map(([k,v])=>renderMetric(k,v)).join('')}</div></div>`).join('');
@@ -3588,7 +3628,7 @@ $('commsSupportIssuesList').innerHTML=(ov.support_issues||[]).length?(ov.support
 $('commsAwaitingApprovalList').innerHTML=(ov.awaiting_approval||[]).length?(ov.awaiting_approval||[]).map(i=>`<div class="item"><h3>${esc(i.title)}</h3><div class="meta"><span>${esc(i.kind)}</span></div><div class="contrib">${esc(i.what_is_needed||'')}</div></div>`).join(''):'<div class="empty">Nothing awaiting approval.</div>';
 $('commsAwaitingClientList').innerHTML=(ov.awaiting_client||[]).length?(ov.awaiting_client||[]).map(convItem).join(''):'<div class="empty">Nothing awaiting a client reply.</div>';
 $('commsFollowUpsDueList').innerHTML=(ov.follow_ups_due||[]).length?(ov.follow_ups_due||[]).map(f=>`<div class="item"><h3>${esc(f.kind)}</h3><div class="meta"><span>opportunity ${esc(f.opportunity_id)}</span><span>${esc(f.status)}</span></div><div class="contrib">${esc((f.draft_content||'').slice(0,160))}</div></div>`).join(''):'<div class="empty">No follow-ups due.</div>';
-$('commsFailedDeliveryList').innerHTML=(ov.failed_delivery||[]).length?(ov.failed_delivery||[]).map(m=>`<div class="item"><h3>Failed delivery</h3><div class="meta"><span>conversation ${esc(m.conversation_id)}</span></div><div class="contrib">${esc((m.body||'').slice(0,160))}</div></div>`).join(''):'<div class="empty">No failed deliveries -- no live mailbox connected yet, so nothing has attempted to send.</div>';
+$('commsFailedDeliveryList').innerHTML=(ov.failed_delivery||[]).length?(ov.failed_delivery||[]).map(m=>`<div class="item"><h3>Failed delivery</h3><div class="meta"><span>conversation ${esc(m.conversation_id)}</span><span>${esc(m.send_method||'')}</span><span>${m.send_attempts||0} attempt${(m.send_attempts||0)===1?'':'s'}</span></div><div class="contrib">${esc((m.body||'').slice(0,160))}</div>${m.failure_reason?`<div class="contrib"><b>Reason:</b> ${esc(m.failure_reason)}</div>`:''}</div>`).join(''):'<div class="empty">No failed deliveries -- no live mailbox connected yet, so nothing has attempted to send.</div>';
 $('commsWebsiteIntakeErrors').textContent=(ov.website_intake_errors||[]).length;
 $('commsWebsiteIntakeErrorsList').innerHTML=(ov.website_intake_errors||[]).length?(ov.website_intake_errors||[]).map(e=>`<div class="item"><h3>${esc(e.form_type||'unknown form')} submission rejected</h3><div class="meta"><span>${esc(e.reason||'')}</span><span>${hqTimeAgo(e.created_at)} ago</span></div>${e.tally_submission_id?`<div class="contrib">Tally submission ${esc(e.tally_submission_id)}</div>`:''}</div>`).join(''):'<div class="empty">No website intake errors.</div>';
 $('commsRecentlyResolvedList').innerHTML=(ov.recently_resolved||[]).length?(ov.recently_resolved||[]).map(convItem).join(''):'<div class="empty">Nothing resolved recently.</div>';
@@ -3596,13 +3636,14 @@ $('commsRecentlyResolvedList').innerHTML=(ov.recently_resolved||[]).length?(ov.r
 document.querySelectorAll('.commsRunAgent').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const r=await api(`/api/comms/conversations/${b.dataset.id}/run-agent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});alert(r.actions&&r.actions.length?'Agent actions:\n'+r.actions.join('\n'):(r.note||'No action taken.'));await loadCommunications()}catch(e){alert(e.message)}finally{b.disabled=false}});
 document.querySelectorAll('.commsResolve').forEach(b=>b.onclick=async()=>{await api(`/api/comms/conversations/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'resolved',actor:'Aryan'})});await loadCommunications()});
 document.querySelectorAll('.commsExpand').forEach(b=>b.onclick=async()=>{const el=$('commsmsgs-'+b.dataset.id);if(el.dataset.loaded==='1'){el.innerHTML='';el.dataset.loaded='0';return}const conv=await api('/api/comms/conversations/'+b.dataset.id);el.dataset.loaded='1';
-const msgsHtml=(conv.messages||[]).map(m=>`<div class="contrib"><b>${esc(m.direction)}${m.is_internal_note?' note':''} (${esc(m.status)})${m.sender_agent?' -- '+esc(m.sender_agent):''}:</b> ${esc(m.body)}${m.direction==='OUTBOUND'&&m.status==='DRAFT'?` <button class="secondary commsMarkSent" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}">Approve & mark sent</button>`:''}</div>`).join('')||'<div class="empty">No messages yet.</div>';
+const msgsHtml=(conv.messages||[]).map(m=>`<div class="contrib"><b>${esc(m.direction)}${m.is_internal_note?' note':''} (${esc(m.status)})${m.sender_agent?' -- '+esc(m.sender_agent):''}:</b> ${esc(m.body)}${m.direction==='OUTBOUND'&&m.status==='DRAFT'&&!m.is_internal_note?` <button class="secondary commsMarkSent" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}">Approve & mark sent</button> <button class="secondary commsSendViaEmail" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}" title="Attempts a real send through the currently configured email provider (Null by default -- refuses until real credentials are opted in). Requires any HIGH-risk approval on this message to already be APPROVED.">Send via email</button>`:''}${m.failure_reason?` <span class="meta" style="color:#b91c1c">Last attempt failed (${esc(m.send_method||'')}, ${m.send_attempts||0} attempt${(m.send_attempts||0)===1?'':'s'}): ${esc(m.failure_reason)}</span>`:''}</div>`).join('')||'<div class="empty">No messages yet.</div>';
 // Milestone 8 drill-down: risk classification + approval/audit history
 // alongside the thread, so a full review never requires leaving this card.
 const riskHtml=(conv.risk_events||[]).length?`<div class="contrib"><b>Risk classification:</b> ${(conv.risk_events||[]).map(r=>`${esc(r.risk)}`).join(', ')}</div>`:'';
 const historyHtml=(conv.history||[]).length?`<div class="contrib"><b>Audit history:</b> ${(conv.history||[]).map(h=>`${esc(h.field)}: ${esc(h.old_value||'--')} -> ${esc(h.new_value)} (${esc(h.actor)})`).join('; ')}</div>`:'';
 el.innerHTML=msgsHtml+riskHtml+historyHtml;
 el.querySelectorAll('.commsMarkSent').forEach(mb=>mb.onclick=async()=>{if(!confirm('Confirm you have actually sent this message through the real channel, and mark it sent?'))return;await api(`/api/comms/messages/${mb.dataset.mid}/mark-sent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCommunications()})});
+el.querySelectorAll('.commsSendViaEmail').forEach(sb=>sb.onclick=async()=>{if(!confirm('Attempt a REAL send through the configured email provider now? (Refuses safely if no real provider is configured, if this message needs an approval that has not been granted yet, or if it is not an outbound draft.)'))return;sb.disabled=true;try{const r=await api(`/api/comms/messages/${sb.dataset.mid}/send`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});if(r.status==='SENT'){alert('Sent via '+(r.provider_name||'provider')+'.');}else{alert('Send did not complete: '+(r.failure_reason||r.status||'unknown'));}}catch(e){alert('Send failed: '+e.message)}finally{sb.disabled=false;await loadCommunications()}});
 }
 $('commsRunWorkforce').onclick=async()=>{$('commsRunWorkforce').disabled=true;$('commsWorkforceRunStatus').innerHTML='<div class="empty">Running AI Workforce across open conversations...</div>';try{const r=await api('/api/comms/workforce/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});$('commsWorkforceRunStatus').innerHTML=`<div class="item"><div class="meta"><span>checked ${r.conversations_checked}</span><span>acted on ${r.conversations_acted_on}</span></div></div>`;await loadCommunications()}catch(e){$('commsWorkforceRunStatus').innerHTML=`<div class="empty">Run failed: ${esc(e.message)}</div>`}finally{$('commsRunWorkforce').disabled=false}};
 

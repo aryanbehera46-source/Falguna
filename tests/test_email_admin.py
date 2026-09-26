@@ -15,6 +15,7 @@ from falguna.audit import AuditLog
 from falguna.email_admin import (
     EmailError, EmailStore, IMAPEmailProvider, NullEmailProvider,
     ProviderAPIEmailProvider, SMTPEmailProvider, SMTPIMAPEmailProvider,
+    resolve_configured_email_provider,
 )
 from falguna.store import StateStore
 from falguna.ttt_hq import NeedsAryanQueue
@@ -232,6 +233,41 @@ class SMTPProviderInterfaceTests(_CleanProviderEnv):
         with self.assertRaises(EmailError):
             SMTPEmailProvider().poll_inbound()
 
+    def test_a_failure_during_send_message_itself_still_raises_emailerror(self):
+        """Regression guard for the retry-duplication fix below: a
+        failure that happens BEFORE the server has accepted the message
+        (send_message() itself raising) must still be reported as a real
+        failure, so send_message_via_provider() still retries a
+        genuinely-failed send exactly as before."""
+        os.environ.update(_SMTP_ENV)
+        p = SMTPEmailProvider()
+        with patch("falguna.email_admin.smtplib.SMTP") as mock_smtp:
+            instance = mock_smtp.return_value.__enter__.return_value
+            instance.send_message.side_effect = OSError("connection reset before DATA completed")
+            with self.assertRaises(EmailError):
+                p.send("client@example.com", "Hello", "Test body")
+
+    def test_a_teardown_failure_after_a_successful_send_is_reported_as_sent_not_retried(self):
+        """The retry-duplication risk this Phase 1 verification pass was
+        asked to investigate: send_message() itself succeeds (the SMTP
+        server has already accepted the message), but the `with` block's
+        own __exit__ (which sends QUIT) then raises -- e.g. a connection
+        reset during teardown. Before the fix, this would raise
+        EmailError just like a genuine pre-send failure, causing
+        send_message_via_provider()'s retry loop to send the same email a
+        second time. After the fix, this must be reported as SENT (no
+        exception at all), since the message was already, definitively
+        accepted by the server before the teardown-only failure occurred."""
+        os.environ.update(_SMTP_ENV)
+        p = SMTPEmailProvider()
+        with patch("falguna.email_admin.smtplib.SMTP") as mock_smtp:
+            instance = mock_smtp.return_value.__enter__.return_value
+            mock_smtp.return_value.__exit__.side_effect = OSError("connection reset during QUIT")
+            result = p.send("client@example.com", "Hello", "Test body")
+        self.assertTrue(instance.send_message.called)
+        self.assertEqual(result["status"], "SENT")
+        self.assertIsNone(result["failure_reason"])
+
 
 class IMAPProviderInterfaceTests(_CleanProviderEnv):
     def test_unconfigured_without_env_vars(self):
@@ -274,6 +310,37 @@ class SMTPIMAPComposedProviderTests(_CleanProviderEnv):
     def test_capabilities_cover_both_send_and_poll(self):
         caps = SMTPIMAPEmailProvider().capabilities()
         self.assertTrue(caps["send"] and caps["poll_inbound"])
+
+
+
+class ResolveConfiguredEmailProviderTests(_CleanProviderEnv):
+    """Phase 1, Requirement 3: resolve_configured_email_provider() is the
+    one place that decides real-vs-Null -- explicit, opt-in, env-only, and
+    re-evaluated on every call (never cached), so a credential change
+    takes effect immediately with no process restart."""
+
+    def test_defaults_to_null_when_nothing_is_configured(self):
+        self.assertIsInstance(resolve_configured_email_provider(), NullEmailProvider)
+
+    def test_smtp_only_wins_over_null_when_smtp_alone_is_configured(self):
+        os.environ.update(_SMTP_ENV)
+        provider = resolve_configured_email_provider()
+        self.assertIsInstance(provider, SMTPEmailProvider)
+        self.assertNotIsInstance(provider, SMTPIMAPEmailProvider)
+
+    def test_smtp_imap_pair_wins_over_smtp_alone_when_both_are_configured(self):
+        os.environ.update(_SMTP_ENV)
+        os.environ.update(_IMAP_ENV)
+        self.assertIsInstance(resolve_configured_email_provider(), SMTPIMAPEmailProvider)
+
+    def test_partial_imap_only_configuration_still_falls_back_to_null(self):
+        os.environ.update(_IMAP_ENV)  # IMAP alone, no SMTP -- this codebase has no receive-only real provider
+        self.assertIsInstance(resolve_configured_email_provider(), NullEmailProvider)
+
+    def test_reflects_a_credential_change_on_the_very_next_call(self):
+        self.assertIsInstance(resolve_configured_email_provider(), NullEmailProvider)
+        os.environ.update(_SMTP_ENV)
+        self.assertIsInstance(resolve_configured_email_provider(), SMTPEmailProvider)
 
 
 class ProviderAPIEmailProviderTests(unittest.TestCase):

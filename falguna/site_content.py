@@ -230,6 +230,10 @@ class ApplicationStore:
             "resume_storage_rel_path": fields.get("resume_storage_rel_path"),
             "resume_sha256": fields.get("resume_sha256"),
             "resume_size_bytes": fields.get("resume_size_bytes"),
+            # Phase 1, Requirement 2: an external hosted URL (e.g. a Tally
+            # submission's file-upload field) when bytes were never fetched
+            # -- without this the metadata-only record was unretrievable.
+            "resume_source_url": fields.get("resume_source_url"),
             "status": "new",
             "source_ip_hash": fields.get("source_ip_hash"),
             "created_at": now, "updated_at": now,

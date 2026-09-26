@@ -200,12 +200,33 @@ class StateStore:
         # column existed, and for every non-support/billing conversation --
         # `status` alone continues to drive every existing view/test.
         "comm_conversations": [("external_thread_id", "TEXT"), ("ticket_status", "TEXT")],
-        "comm_messages": [("provider_message_id", "TEXT")],
+        # Compatibility repair for databases created by the original
+        # Communications schema, where this timestamp was named added_at.
+        # Keep added_at intact for rolled-back code and add the current name
+        # used by CommsStore/StateStore.list().
+        "comm_participants": [("created_at", "TEXT")],
+        "comm_messages": [
+            ("provider_message_id", "TEXT"),
+            # Phase 1, Requirement 3 (real, opt-in email send): real-send
+            # bookkeeping absent from every comm_messages row created before
+            # this phase existed.
+            ("send_method", "TEXT"), ("provider_name", "TEXT"),
+            ("send_attempts", "INTEGER"), ("failure_reason", "TEXT"),
+        ],
         # TTT Communications V2, Milestone 11 (Digital Marketing Operations
         # Foundation): a real campaign owner -- NULL for every campaign
         # created before this column existed, exactly the same additive
         # convention as every other column in this table.
         "media_campaigns": [("owner", "TEXT")],
+        # Phase 1, Requirement 2 (TTT / Falguna production readiness):
+        # resume_source_url preserves the external (Tally-hosted) URL for a
+        # career application's resume when only metadata was captured --
+        # without it the earlier metadata-only note was unretrievable.
+        # consent_status records an explicit consent answer when a form
+        # asks for one; NULL for every event recorded before this column
+        # existed and for any form that has no consent field to match.
+        "site_applications": [("resume_source_url", "TEXT")],
+        "tally_intake_events": [("consent_status", "TEXT")],
     }
 
     def migrate(self) -> None:
@@ -220,6 +241,17 @@ class StateStore:
             for name, coltype in columns:
                 if name not in existing:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
+        # Legacy comm_participants rows must remain sortable/readable after
+        # created_at is added. This is an idempotent copy, not a rename or
+        # destructive rebuild, and deliberately preserves added_at.
+        participant_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(comm_participants)").fetchall()
+        }
+        if {"added_at", "created_at"}.issubset(participant_columns):
+            self.db.execute(
+                "UPDATE comm_participants SET created_at=added_at "
+                "WHERE created_at IS NULL AND added_at IS NOT NULL"
+            )
 
     @contextmanager
     def transaction(self):

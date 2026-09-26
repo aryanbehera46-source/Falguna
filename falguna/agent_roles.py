@@ -38,6 +38,7 @@ requires real evidence (enforced by WorkerResult itself); a missing
 capability, input, or approval is reported as BLOCKED or FAILED, never
 guessed into a false COMPLETED.
 """
+import fnmatch
 import json
 import subprocess
 import urllib.error
@@ -304,10 +305,30 @@ class EngineeringAgentWorker(WorkforceWorker):
         protected = [".git/**", ".env", "**/.env", "**/*.env", "render.yaml", "server/**", "falguna/policy.py", "schema/**"]
         # A file the caller explicitly listed as editable is allowed even if it
         # would otherwise match one of the broad protected globs above (e.g. a
-        # test file under server/ for a repo whose backend IS in scope) --
+        # single file under server/ for a repo whose backend IS in scope) --
         # protected_globs is a default fence, not a way to silently override an
         # explicit, human-reviewed editable_files list.
-        protected = [g for g in protected if g not in editable_files]
+        #
+        # Phase 1, Requirement 4 fix: this previously compared each default
+        # protected glob against editable_files with plain string membership
+        # (`g not in editable_files`), so it only ever matched if a caller
+        # listed the exact glob pattern itself (e.g. the literal string
+        # "server/**") as an editable "file" -- listing a real, concrete
+        # file that merely falls under a protected pattern (e.g.
+        # "server/config.py") never removed "server/**" from protected_globs.
+        # PermissionEngine.require_write() (falguna/policy.py) checks
+        # protected_globs BEFORE allowed_write_globs and protected always
+        # wins, so that concrete, explicitly-authorized file was silently
+        # blocked anyway -- directly contradicting this comment's own
+        # documented intent. Fixed to use the same fnmatch semantics
+        # require_write() itself uses: a default protected glob is dropped
+        # only when one of the explicitly-listed editable_files actually
+        # matches it. This does not widen access beyond what was asked for
+        # -- allowed_write_globs stays scoped to exactly editable_files, so
+        # only the file(s) a human actually listed become writable; every
+        # other path still under that protected pattern remains fenced by
+        # the allowed_write_globs check on its own.
+        protected = [g for g in protected if not any(fnmatch.fnmatch(f, g) for f in editable_files)]
         policy = RunPolicy(
             allowed_write_globs=editable_files,
             protected_globs=protected,

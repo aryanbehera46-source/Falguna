@@ -131,6 +131,124 @@ class ReservePolicyTests(CapitalRiskBase):
         store.save({"totally_made_up_field": 999})
         self.assertNotIn("totally_made_up_field", store.get())
 
+    def test_save_rejects_non_numeric_value(self):
+        store = ReservePolicyStore(self.store)
+        with self.assertRaises(CapitalRiskError):
+            store.save({"tax_reserve_pct": "fifteen percent"})
+
+    def test_save_rejects_out_of_range_value(self):
+        store = ReservePolicyStore(self.store)
+        with self.assertRaises(CapitalRiskError):
+            store.save({"tax_reserve_pct": 1.5})
+        with self.assertRaises(CapitalRiskError):
+            store.save({"tax_reserve_pct": -0.1})
+
+
+class ReservePolicyApprovalGateTests(CapitalRiskBase):
+    """Phase 1, Requirement 1: /api/cc/reserve-policy must never write the
+    policy directly any more -- a change is proposed, gated through
+    NeedsAryanQueue exactly like every other capital-governance decision,
+    and only takes effect once approved. Exercises ReservePolicyStore
+    directly (the same primitives hq_web.py's route and decision hook call)
+    so these tests do not depend on spinning up the HTTP server."""
+
+    def setUp(self):
+        super().setUp()
+        self.reserve = ReservePolicyStore(self.store, self.audit, needs_aryan=self.needs_aryan)
+
+    def test_propose_change_does_not_write_the_active_policy(self):
+        result = self.reserve.propose_change({"tax_reserve_pct": 0.2}, actor="Aryan")
+        self.assertEqual(result["status"], "AWAITING_APPROVAL")
+        self.assertIsNotNone(result["needs_aryan_id"])
+        # The policy is unchanged -- still the default, still unconfigured.
+        policy = self.reserve.get()
+        self.assertFalse(policy["configured"])
+        self.assertEqual(policy["tax_reserve_pct"], 0.0)
+
+    def test_propose_change_creates_exactly_one_pending_needs_aryan_item(self):
+        self.reserve.propose_change({"tax_reserve_pct": 0.2}, actor="Aryan")
+        pending = self.needs_aryan.list_pending()
+        reserve_items = [i for i in pending if i["kind"] == "reserve_policy_change"]
+        self.assertEqual(len(reserve_items), 1)
+        self.assertEqual(reserve_items[0]["ref_type"], "cc_reserve_policy")
+
+    def test_second_proposal_while_one_pending_is_idempotent_not_duplicated(self):
+        first = self.reserve.propose_change({"tax_reserve_pct": 0.2}, actor="Aryan")
+        second = self.reserve.propose_change({"tax_reserve_pct": 0.3}, actor="Aryan")
+        self.assertEqual(second["needs_aryan_id"], first["needs_aryan_id"])
+        self.assertTrue(second["already_pending"])
+        pending = [i for i in self.needs_aryan.list_pending() if i["kind"] == "reserve_policy_change"]
+        self.assertEqual(len(pending), 1)
+
+    def test_approval_applies_the_proposed_change_exactly_once(self):
+        result = self.reserve.propose_change({"tax_reserve_pct": 0.2}, actor="Aryan")
+        needs_aryan_id = result["needs_aryan_id"]
+        self.needs_aryan.decide(needs_aryan_id, "approve", "Aryan")
+        applied = self.reserve.apply_pending_change(needs_aryan_id, "Aryan")
+        self.assertEqual(applied["tax_reserve_pct"], 0.2)
+        self.assertTrue(applied["configured"])
+        # Re-applying the same already-applied item is a safe no-op, not a
+        # second write or a second audit entry's worth of duplicated state.
+        applied_again = self.reserve.apply_pending_change(needs_aryan_id, "Aryan")
+        self.assertEqual(applied_again["tax_reserve_pct"], 0.2)
+
+    def test_rejection_leaves_the_existing_policy_unchanged(self):
+        self.reserve.save({"tax_reserve_pct": 0.1})  # an existing, already-configured baseline
+        result = self.reserve.propose_change({"tax_reserve_pct": 0.9}, actor="Aryan")
+        self.needs_aryan.decide(result["needs_aryan_id"], "reject", "Aryan")
+        policy = self.reserve.get()
+        self.assertEqual(policy["tax_reserve_pct"], 0.1)
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.apply_pending_change(result["needs_aryan_id"], "Aryan")
+
+    def test_apply_refuses_an_item_that_is_still_pending(self):
+        result = self.reserve.propose_change({"tax_reserve_pct": 0.2}, actor="Aryan")
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.apply_pending_change(result["needs_aryan_id"], "Aryan")
+        # Confirms it truly was never written.
+        self.assertEqual(self.reserve.get()["tax_reserve_pct"], 0.0)
+
+    def test_apply_refuses_a_needs_aryan_item_of_the_wrong_ref_type(self):
+        other_id = self.needs_aryan.create_item(
+            "pricing_decision", "Unrelated approval", "not a reserve-policy change",
+            actor="Aryan", ref_type="rh_closing_package", ref_id="some-opportunity",
+        )
+        self.needs_aryan.decide(other_id, "approve", "Aryan")
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.apply_pending_change(other_id, "Aryan")
+
+    def test_apply_refuses_an_unknown_needs_aryan_id(self):
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.apply_pending_change("does-not-exist", "Aryan")
+
+    def test_propose_change_rejects_malformed_updates(self):
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.propose_change("not-a-dict", actor="Aryan")
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.propose_change({}, actor="Aryan")
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.propose_change({"totally_made_up_field": 1}, actor="Aryan")
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.propose_change({"tax_reserve_pct": "a lot"}, actor="Aryan")
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.propose_change({"tax_reserve_pct": 2.0}, actor="Aryan")
+
+    def test_propose_change_requires_a_non_empty_actor(self):
+        with self.assertRaises(CapitalRiskError):
+            self.reserve.propose_change({"tax_reserve_pct": 0.2}, actor="")
+
+    def test_proposal_survives_restart_before_approval(self):
+        result = self.reserve.propose_change({"tax_reserve_pct": 0.2}, actor="Aryan")
+        self.store.close()
+        reopened_store = StateStore(self.root / "state.db")
+        reopened_store.migrate()
+        reopened_reserve = ReservePolicyStore(reopened_store, self.audit, needs_aryan=NeedsAryanQueue(reopened_store, self.audit))
+        item = reopened_store.get("needs_aryan_items", result["needs_aryan_id"])
+        self.assertIsNotNone(item)
+        self.assertEqual(item["status"], "PENDING")
+        self.assertFalse(reopened_reserve.get()["configured"])
+        self.store = reopened_store  # let tearDown close this live handle
+
 
 class ExperimentalCapitalTests(CapitalRiskBase):
     def test_zero_when_nothing_contributed(self):

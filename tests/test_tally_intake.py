@@ -5,6 +5,7 @@ real CommsStore/NeedsAryanQueue -- same convention as
 tests/test_email_ingestion.py.
 """
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,45 @@ MEDIA_FIELDS = [
     {"key": "q2", "label": "Email", "type": "INPUT_EMAIL", "value": "sam@presswire.example"},
     {"key": "q3", "label": "Media Outlet", "type": "INPUT_TEXT", "value": "Press Wire"},
     {"key": "q4", "label": "Media Request", "type": "TEXTAREA", "value": "Requesting comment for a story."},
+]
+
+# Exact labels observed in the four live Tally forms during the supervised
+# Phase 1 verification. Values remain synthetic and clearly test-only.
+GENUINE_GENERAL_FIELDS = [
+    {"key": "live1", "label": "Full Name", "value": "TEST — Aryan Phase 1 Verification"},
+    {"key": "live2", "label": "Work Email", "value": "aryanbehera46@gmail.com"},
+    {"key": "live3", "label": "Enquiry Message", "value": "TEST ONLY — general enquiry"},
+    {"key": "live4", "label": "Privacy Consent", "value": "I agree to be contacted"},
+]
+
+GENUINE_PROJECT_FIELDS = [
+    {"key": "live1", "label": "Full Name", "value": "TEST — Aryan Phase 1 Verification"},
+    {"key": "live2", "label": "Work Email", "value": "aryanbehera46@gmail.com"},
+    {"key": "live3", "label": "Company", "value": "TEST ONLY — project company"},
+    {"key": "live4", "label": "Project Type", "value": "Web Development"},
+    {"key": "live5", "label": "Budget Range", "value": "$1k - $5k"},
+    {"key": "live6", "label": "Project Goals", "value": "TEST ONLY — project goals"},
+    {"key": "live7", "label": "Privacy Consent", "value": "I agree to be contacted"},
+]
+
+GENUINE_CAREERS_FIELDS = [
+    {"key": "live1", "label": "Full Name", "value": "TEST — Aryan Phase 1 Verification"},
+    {"key": "live2", "label": "Work Email", "value": "aryanbehera46@gmail.com"},
+    {"key": "live3", "label": "Role You Are Applying For", "value": "TEST ONLY — Verification Role"},
+    {"key": "live4", "label": "LinkedIn or Portfolio URL", "value": "https://example.com/test-only"},
+    {"key": "live5", "label": "Résumé/CV (PDF or DOCX only)", "value": [
+        {"id": "test-file", "name": "TTT-P1-CAREERS-20260926-01-TEST-ONLY.pdf",
+         "url": "https://tally.so/test-only", "mimeType": "application/pdf", "size": 1234},
+    ]},
+    {"key": "live6", "label": "Privacy Consent", "value": "I agree to be contacted"},
+]
+
+GENUINE_MEDIA_FIELDS = [
+    {"key": "live1", "label": "Journalist Name", "value": "TEST — Aryan Phase 1 Verification"},
+    {"key": "live2", "label": "Publication", "value": "TEST ONLY — publication"},
+    {"key": "live3", "label": "Work Email", "value": "aryanbehera46@gmail.com"},
+    {"key": "live4", "label": "Enquiry or Request", "value": "TEST ONLY — media request"},
+    {"key": "live5", "label": "Privacy Consent", "value": "I agree to be contacted"},
 ]
 
 
@@ -99,6 +139,37 @@ class FormMappingTests(_IntakeCase):
         result = self.svc.ingest(_payload("VLgxN6", [], "empty-1"))
         self.assertEqual(result["status"], "rejected")
         self.assertEqual(result["reason"], "payload has no fields")
+
+    def test_genuine_labels_from_all_four_forms_map_exactly(self):
+        cases = [
+            ("VLgxN6", GENUINE_GENERAL_FIELDS, "live-general", "general"),
+            ("vGkWW4", GENUINE_PROJECT_FIELDS, "live-project", "project"),
+            ("XxXNNz", GENUINE_CAREERS_FIELDS, "live-careers", "careers"),
+            ("obWxxN", GENUINE_MEDIA_FIELDS, "live-media", "media"),
+        ]
+        for form_id, fields, submission_id, form_type in cases:
+            with self.subTest(form_type=form_type):
+                result = self.svc.ingest(_payload(form_id, fields, submission_id))
+                self.assertEqual(result["status"], "ingested")
+                self.assertEqual(result["form_type"], form_type)
+                self.assertEqual(result["consent_status"], "given")
+
+        general = self.store.get("site_enquiries", self.store.list("tally_intake_events", "tally_submission_id=?", ("live-general",))[0]["enquiry_id"])
+        self.assertEqual(general["message"], "TEST ONLY — general enquiry")
+        project_event = self.store.list("tally_intake_events", "tally_submission_id=?", ("live-project",))[0]
+        project = self.store.get("rh_opportunities", project_event["opportunity_id"])
+        self.assertEqual(project["budget_rate"], "$1k - $5k")
+        careers_event = self.store.list("tally_intake_events", "tally_submission_id=?", ("live-careers",))[0]
+        application = self.store.get("site_applications", careers_event["application_id"])
+        self.assertEqual(application["job_title_snapshot"], "TEST ONLY — Verification Role")
+        self.assertEqual(application["resume_filename"], "TTT-P1-CAREERS-20260926-01-TEST-ONLY.pdf")
+        self.assertEqual(json.loads(application["links_json"]), ["https://example.com/test-only"])
+        media_event = self.store.list("tally_intake_events", "tally_submission_id=?", ("live-media",))[0]
+        media = self.comms.get_conversation(media_event["conversation_id"])
+        # The same test email was intentionally used on all four live forms,
+        # so contact matching may reuse its existing organization. The media
+        # subject still proves the Publication label mapped to the outlet.
+        self.assertIn("TEST ONLY — publication", media["subject"])
 
 
 class GeneralEnquiryTests(_IntakeCase):
@@ -159,6 +230,10 @@ class CareersApplicationTests(_IntakeCase):
         self.assertEqual(app["applicant_name"], "Alex Kim")
         self.assertEqual(app["resume_filename"], "resume.pdf")
         self.assertEqual(app["resume_size_bytes"], 12345)
+        # Phase 1, Requirement 2: the hosted URL is preserved (metadata,
+        # never the bytes) so the resume can still be retrieved manually --
+        # without it a metadata-only record would be unretrievable.
+        self.assertEqual(app["resume_source_url"], "https://tally.so/f1")
         # Bytes were never fetched -- no storage path was ever set.
         self.assertIsNone(app.get("resume_storage_rel_path"))
         self.assertIsNone(app.get("resume_sha256"))
@@ -213,12 +288,48 @@ class IdempotencyTests(_IntakeCase):
         self.svc.ingest(_payload("XxXNNz", CAREERS_FIELDS, "car-replay-1"))
         self.assertEqual(len(self.store.list("site_applications")), 1)
 
-    def test_rejected_payload_retried_unchanged_is_rejected_again_not_duplicate(self):
+    def test_rejected_payload_replay_is_a_noop_without_another_rejection_record(self):
         bad_fields = [{"key": "q1", "label": "Name", "type": "INPUT_TEXT", "value": "No Email"}]
         first = self.svc.ingest(_payload("VLgxN6", bad_fields, "bad-retry-1"))
         second = self.svc.ingest(_payload("VLgxN6", bad_fields, "bad-retry-1"))
         self.assertEqual(first["status"], "rejected")
         self.assertEqual(second["status"], "rejected")
+        self.assertEqual(second["reason"], first["reason"])
+        events = self.store.list("tally_intake_events", "tally_submission_id=?", ("bad-retry-1",))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "rejected")
+
+    def test_response_id_only_rejection_is_also_idempotent(self):
+        payload = _payload("VLgxN6", [], "placeholder", response_id="response-only-reject")
+        payload["data"].pop("submissionId")
+        first = self.svc.ingest(payload)
+        second = self.svc.ingest(payload)
+        self.assertEqual(first["status"], "rejected")
+        self.assertEqual(second["status"], "rejected")
+        events = self.store.list("tally_intake_events", "tally_response_id=?", ("response-only-reject",))
+        self.assertEqual(len(events), 1)
+
+    def test_previously_rejected_submission_can_be_ingested_after_mapping_correction(self):
+        payload = _payload("VLgxN6", [
+            {"key": "q1", "label": "Full Name", "value": "Corrected Mapping"},
+            {"key": "q2", "label": "Work Email", "value": "corrected@example.com"},
+            {"key": "q3", "label": "Previously Unknown Message Label", "value": "Hello"},
+        ], "mapping-corrected-1")
+        first = self.svc.ingest(payload)
+        self.assertEqual(first["status"], "rejected")
+
+        from falguna.tally_intake import FIELD_LABEL_CANDIDATES
+        FIELD_LABEL_CANDIDATES["message"].append("previously unknown message label")
+        try:
+            second = self.svc.ingest(payload)
+        finally:
+            FIELD_LABEL_CANDIDATES["message"].remove("previously unknown message label")
+
+        self.assertEqual(second["status"], "ingested")
+        events = self.store.list("tally_intake_events", "tally_submission_id=?", ("mapping-corrected-1",))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "ingested")
+        self.assertEqual(len(self.store.list("site_enquiries")), 1)
 
 
 class PersistenceTests(_IntakeCase):
@@ -233,6 +344,67 @@ class PersistenceTests(_IntakeCase):
         conv = reopened_comms.get_conversation(conv_id)
         self.assertIsNotNone(conv)
         self.assertEqual(conv["primary_contact"]["email"], "jordan@acmecorp.example")
+
+
+class InterruptedIngestionRecoveryTests(_IntakeCase):
+    def test_rejected_replay_finishes_partial_general_without_duplicates(self):
+        payload = _payload("VLgxN6", GENUINE_GENERAL_FIELDS, "interrupted-general-1")
+        now = "2026-09-26T10:00:00+00:00"
+        enquiry_id = self.store.create("site_enquiries", {
+            "kind": "general", "name": "TEST — Aryan Phase 1 Verification",
+            "email": "aryanbehera46@gmail.com", "company": None,
+            "message": "TEST ONLY — general enquiry", "opportunity_id": None,
+            "source_ip_hash": None, "created_at": now,
+        })
+        contact_id = self.store.create("comm_contacts", {
+            "organization_id": None, "name": "TEST — Aryan Phase 1 Verification",
+            "email": "aryanbehera46@gmail.com", "phone": None, "role_title": None,
+            "notes": None, "created_at": now, "updated_at": now,
+        })
+        conversation_id = self.store.create("comm_conversations", {
+            "channel": "WEBSITE", "department": "general", "subject": "General enquiry",
+            "status": "new", "priority": "normal", "tags_json": None,
+            "organization_id": None, "primary_contact_id": contact_id, "assigned_agent": None,
+            "linked_opportunity_id": None, "linked_project_id": None, "linked_client_id": None,
+            "linked_application_id": None, "source_ref_type": "site_enquiry",
+            "source_ref_id": enquiry_id, "first_response_due_at": None,
+            "first_response_at": None, "resolution_due_at": None, "resolved_at": None,
+            "created_at": now, "updated_at": now,
+        })
+        self.store.create("tally_intake_events", {
+            "form_id": "VLgxN6", "form_type": "general",
+            "tally_submission_id": "interrupted-general-1", "tally_response_id": None,
+            "tally_event_id": None, "status": "rejected", "reason": "interrupted",
+            "conversation_id": None, "enquiry_id": None, "application_id": None,
+            "opportunity_id": None, "raw_field_labels_json": "[]",
+            "consent_status": None, "created_at": now,
+        })
+
+        result = self.svc.ingest(payload)
+        self.assertEqual(result["status"], "ingested")
+        self.assertEqual(result["enquiry_id"], enquiry_id)
+        self.assertEqual(result["conversation_id"], conversation_id)
+        self.assertEqual(len(self.store.list("site_enquiries")), 1)
+        self.assertEqual(len(self.store.list("comm_contacts")), 1)
+        self.assertEqual(len(self.store.list("comm_conversations")), 1)
+        self.assertEqual(len(self.store.list(
+            "comm_participants", "conversation_id=? AND participant_type=?",
+            (conversation_id, "customer"),
+        )), 1)
+        inbound = self.store.list(
+            "comm_messages", "conversation_id=? AND source_ref_type=? AND source_ref_id=?",
+            (conversation_id, "site_enquiry", enquiry_id),
+        )
+        self.assertEqual(len(inbound), 1)
+
+        duplicate = self.svc.ingest(payload)
+        self.assertEqual(duplicate["status"], "duplicate")
+        self.assertEqual(len(self.store.list("site_enquiries")), 1)
+        self.assertEqual(len(self.store.list("comm_conversations")), 1)
+        self.assertEqual(len(self.store.list(
+            "comm_participants", "conversation_id=? AND participant_type=?",
+            (conversation_id, "customer"),
+        )), 1)
 
 
 class WorkforceDispatchTests(_IntakeCase):
@@ -265,6 +437,72 @@ class OverviewSurfacingTests(_IntakeCase):
         self.svc.ingest(_payload("VLgxN6", GENERAL_FIELDS, "good-1"))
         overview = self.comms.overview()
         self.assertEqual(len(overview["website_intake_errors"]), 0)
+
+
+class ConsentHandlingTests(_IntakeCase):
+    """Phase 1, Requirement 2: an explicit decline must never become a
+    lead/application/conversation, regardless of form type; an explicit
+    grant is recorded as compliance evidence; absence of the field (the
+    common case today, since no real Tally payload has confirmed a
+    consent field on any of the four forms) is never treated as an answer
+    either way -- the submission processes exactly as it did before this
+    phase."""
+
+    def test_form_with_no_consent_field_processes_normally(self):
+        result = self.svc.ingest(_payload("VLgxN6", GENERAL_FIELDS, "consent-none-1"))
+        self.assertEqual(result["status"], "ingested")
+        self.assertIsNone(result["consent_status"])
+        event = self.store.list("tally_intake_events", "tally_submission_id=?", ("consent-none-1",))[0]
+        self.assertIsNone(event["consent_status"])
+
+    def test_explicit_boolean_true_consent_is_given_and_processes(self):
+        fields = GENERAL_FIELDS + [{"key": "qc", "label": "I agree to the privacy policy", "value": True}]
+        result = self.svc.ingest(_payload("VLgxN6", fields, "consent-true-1"))
+        self.assertEqual(result["status"], "ingested")
+        self.assertEqual(result["consent_status"], "given")
+        conv = self.comms.get_conversation(result["conversation_id"])
+        notes = [m["body"] for m in conv["messages"] if m.get("is_internal_note")]
+        self.assertTrue(any("Consent to be contacted was explicitly given" in n for n in notes))
+
+    def test_explicit_boolean_false_consent_is_declined_and_never_processed(self):
+        fields = GENERAL_FIELDS + [{"key": "qc", "label": "I agree to the privacy policy", "value": False}]
+        result = self.svc.ingest(_payload("VLgxN6", fields, "consent-false-1"))
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["consent_status"], "declined")
+        self.assertIn("consent", result["reason"].lower())
+        # Genuinely never processed -- no conversation, no lead of any kind.
+        self.assertEqual(self.store.list("comm_conversations"), [])
+
+    def test_explicit_text_decline_is_recognized(self):
+        fields = CAREERS_FIELDS + [{"key": "qc", "label": "Terms and Conditions", "value": "No"}]
+        result = self.svc.ingest(_payload("XxXNNz", fields, "consent-textno-1"))
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(self.store.list("site_applications"), [])
+
+    def test_decline_is_never_a_duplicate_of_a_different_field_shape(self):
+        # A declined submission still gets its own tally_intake_events row
+        # (for the Website intake errors panel), same as any other rejection.
+        self.svc.ingest(_payload("VLgxN6", GENERAL_FIELDS + [
+            {"key": "qc", "label": "I consent", "value": False},
+        ], "consent-decline-visible-1"))
+        overview = self.comms.overview()
+        self.assertEqual(len(overview["website_intake_errors"]), 1)
+        self.assertIn("declined", overview["website_intake_errors"][0]["reason"])
+
+
+class FieldLengthCapTests(_IntakeCase):
+    def test_oversized_message_field_is_truncated_not_rejected_or_crashed(self):
+        huge_message = "A" * 50000
+        fields = [
+            {"key": "q1", "label": "Name", "value": "Jordan Lee"},
+            {"key": "q2", "label": "Email", "value": "jordan@acmecorp.example"},
+            {"key": "q3", "label": "Message", "value": huge_message},
+        ]
+        result = self.svc.ingest(_payload("VLgxN6", fields, "huge-1"))
+        self.assertEqual(result["status"], "ingested")
+        conv = self.comms.get_conversation(result["conversation_id"])
+        inbound = [m for m in conv["messages"] if m["direction"] == "INBOUND" and not m.get("is_internal_note")]
+        self.assertTrue(len(inbound[0]["body"]) <= 10000)
 
 
 if __name__ == "__main__":

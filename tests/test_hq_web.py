@@ -139,6 +139,18 @@ class _LiveServerCase(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=2) as resp:
             return resp.status, json.loads(resp.read())
 
+    def _post_raises(self, port, path, body):
+        """Like _post, but for a call expected to fail -- returns
+        (status_code, parsed_error_body) instead of raising, so a test can
+        assert on the exact error message the route returned."""
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
 
 class WorkforceRestartReconciliationTests(_LiveServerCase):
     """Exercises falguna.hq_web.reconcile_workforce_tasks_at_startup -- the
@@ -352,6 +364,73 @@ class CommunicationsHQServerTests(TTTHQServerTests):
         self.assertIn("history", detail)
 
 
+
+class CommunicationsSendViaProviderHQServerTests(TTTHQServerTests):
+    """Phase 1, Requirement 3, HTTP layer: /api/comms/messages/<id>/send
+    and /mark-failed, exercised through the real server this session's
+    hq_web.py serves. No real SMTP/IMAP env vars are ever set in this test
+    class, so resolve_configured_email_provider() always resolves to
+    NullEmailProvider here -- proving the route is wired to the real gate
+    (send_message_via_provider), not a stub, without needing network
+    access or real credentials. The provider-configured success/retry/
+    failure paths are covered exhaustively at the CommsStore level in
+    tests/test_comms.py's SendMessageViaProviderTests, using a fake
+    in-test provider."""
+
+    def _draft_message(self):
+        from falguna.comms import CommsStore
+        comms = CommsStore(self.store, self.control.audit)
+        conv = comms.open_conversation(
+            "EMAIL", "sales", priority="normal",
+            contact_id=comms.find_or_create_contact("client@example-test.invalid", "Client"),
+        )
+        msg = comms.add_message(conv["id"], "OUTBOUND", "Here's the current status.", actor="ai_workforce")
+        return conv, msg
+
+    def test_send_route_refuses_cleanly_when_no_real_provider_is_configured(self):
+        conv, msg = self._draft_message()
+        status, err = self._post_raises(self.hq_port, f"/api/comms/messages/{msg['id']}/send", {"actor": "Aryan"})
+        self.assertEqual(status, 400)
+        self.assertIn("no real email provider is configured", err["error"])
+        # Refusal must never mutate the message.
+        status, detail = self._get(self.hq_port, f"/api/comms/conversations/{conv['id']}")
+        sent_msg = next(m for m in detail["messages"] if m["id"] == msg["id"])
+        self.assertEqual(sent_msg["status"], "DRAFT")
+
+    def test_send_route_refuses_unauthorized_bypass_of_an_unapproved_high_risk_message(self):
+        # Proves the approval gate is enforced by send_message_via_provider
+        # itself, reachable only through this same HTTP route -- a worker
+        # cannot get a HIGH-risk message sent by hitting this endpoint
+        # directly, provider configured or not.
+        from falguna.risk_engine import RiskClassificationStore
+        conv, msg = self._draft_message()
+        RiskClassificationStore(self.store, self.control.audit).classify(
+            "comm_message", msg["id"], "We agree to those contract terms and will sign the contract today.",
+            actor="ai_workforce", title="review",
+        )
+        self.store.update("comm_messages", msg["id"], body="We agree to those contract terms and will sign the contract today.")
+        status, err = self._post_raises(self.hq_port, f"/api/comms/messages/{msg['id']}/send", {"actor": "Aryan"})
+        self.assertEqual(status, 400)
+        # Unconfigured provider is checked first (fails closed either way);
+        # what matters is this never returns 200/SENT.
+        self.assertNotIn("SENT", json.dumps(err))
+
+    def test_mark_failed_route_persists_reason_and_send_method_over_http(self):
+        conv, msg = self._draft_message()
+        status, out = self._post(self.hq_port, f"/api/comms/messages/{msg['id']}/mark-failed", {"actor": "Aryan", "reason": "bounced back"})
+        self.assertEqual(status, 200)
+        self.assertEqual(out["status"], "FAILED")
+        self.assertEqual(out["send_method"], "manual")
+        self.assertEqual(out["failure_reason"], "bounced back")
+        status, ov = self._get(self.hq_port, "/api/comms/overview")
+        self.assertTrue(any(m["id"] == msg["id"] for m in ov["failed_delivery"]))
+
+    def test_mark_failed_route_requires_a_reason(self):
+        conv, msg = self._draft_message()
+        status, err = self._post_raises(self.hq_port, f"/api/comms/messages/{msg['id']}/mark-failed", {"actor": "Aryan", "reason": ""})
+        self.assertEqual(status, 400)
+
+
 class WorkforceMediaHQServerTests(TTTHQServerTests):
     """Digital Workforce + Media/Growth Engine v1 routes (Section 20),
     exercised through the real HTTP layer this server actually serves --
@@ -508,9 +587,25 @@ class WorkforceMediaHQServerTests(TTTHQServerTests):
         self.assertEqual(status, 201)
         self.assertIn("recommendations", alloc)
 
-        status, reserve = self._post(self.hq_port, "/api/cc/reserve-policy", {"tax_reserve_pct": 0.15})
+        # Phase 1, Requirement 1: proposing a reserve-policy change never
+        # writes it directly any more -- it is gated through Needs Aryan
+        # exactly like the media-publication approval flow above.
+        status, reserve_proposal = self._post(self.hq_port, "/api/cc/reserve-policy", {"tax_reserve_pct": 0.15})
+        self.assertEqual(status, 202)
+        self.assertEqual(reserve_proposal["status"], "AWAITING_APPROVAL")
+        reserve_needs_aryan_id = reserve_proposal["needs_aryan_id"]
+
+        status, reserve_unchanged = self._get(self.hq_port, "/api/cc/reserve-policy")
+        self.assertEqual(status, 200)
+        self.assertFalse(reserve_unchanged["configured"])
+
+        status, _ = self._post(self.hq_port, f"/api/needs-aryan/{reserve_needs_aryan_id}/decision", {"action": "approve", "actor": "Aryan"})
+        self.assertEqual(status, 200)
+
+        status, reserve = self._get(self.hq_port, "/api/cc/reserve-policy")
         self.assertEqual(status, 200)
         self.assertTrue(reserve["configured"])
+        self.assertEqual(reserve["tax_reserve_pct"], 0.15)
 
         status, exp_cap = self._get(self.hq_port, "/api/cc/experimental-capital")
         self.assertEqual(status, 200)

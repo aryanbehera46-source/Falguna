@@ -243,6 +243,26 @@ class SMTPEmailProvider(EmailProvider):
                     filename=att.get("filename") or "attachment",
                 )
         recipients = [to_address] + list(cc or []) + list(bcc or [])
+        # Phase 1 remaining-verification pass: SMTP retry-duplication risk.
+        # send_message_via_provider() (falguna/comms.py) retries this call
+        # up to max_attempts times whenever it raises EmailError. Before
+        # this fix, ANY exception anywhere in the `with smtplib.SMTP(...)`
+        # block -- including one raised by the `with` block's own
+        # __exit__ (which sends QUIT) *after* client.send_message() had
+        # already returned normally -- was treated identically to a
+        # pre-send failure and triggered a retry, which would genuinely
+        # resend the same email to the same recipient.
+        #
+        # client.send_message() only returns normally once the SMTP
+        # server has responded with a successful final status for the
+        # DATA command (smtplib itself raises SMTPResponseException /
+        # SMTPDataError / SMTPRecipientsRefused for any non-success
+        # response), so once it has returned without raising, the message
+        # is already, definitively accepted by the server -- nothing that
+        # happens afterward (a QUIT that times out, a connection reset
+        # during __exit__) can un-send it, and must never be reported as
+        # a send failure to the retrying caller.
+        sent_ok = False
         try:
             host, port = _env("SMTP_HOST"), int(_env("SMTP_PORT"))
             use_tls = (_env("SMTP_USE_TLS") or "true").lower() != "false"
@@ -251,8 +271,14 @@ class SMTPEmailProvider(EmailProvider):
                     client.starttls(context=ssl.create_default_context())
                 client.login(_env("SMTP_USERNAME"), _env("SMTP_PASSWORD"))
                 client.send_message(msg, from_addr=sender, to_addrs=recipients)
+                sent_ok = True
         except Exception as exc:
-            raise EmailError(f"SMTP send failed ({type(exc).__name__})") from exc
+            if not sent_ok:
+                raise EmailError(f"SMTP send failed ({type(exc).__name__})") from exc
+            # else: the server already accepted the message before this
+            # exception was raised during connection teardown -- fall
+            # through to the normal SENT return below instead of raising,
+            # so the caller's retry loop does not duplicate-send it.
         return {
             "status": "SENT", "provider_message_id": msg.get("Message-Id"),
             "thread_id": thread_id, "failure_reason": None,
@@ -436,6 +462,27 @@ class ProviderAPIEmailProvider(EmailProvider):
 
     def poll_inbound(self, since: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         raise EmailError("no provider API has been selected/implemented yet")
+
+
+def resolve_configured_email_provider() -> EmailProvider:
+    """Phase 1, Requirement 3: the one place that decides which real
+    EmailProvider (if any) this environment has actually been configured
+    for -- explicit and opt-in, never a silent default. Reads only from
+    the environment (via `_env()`, same as every adapter above); nothing
+    here reads a file, a DB row, or a hardcoded value. Precedence: a fully
+    configured SMTP+IMAP pair wins (send + receive), then SMTP alone
+    (send-only), otherwise NullEmailProvider -- the exact same safe
+    default this codebase has always used. Callers (e.g. hq_web.py) call
+    this once per request/action rather than caching a provider instance,
+    so a credential change takes effect on the very next call with no
+    process restart."""
+    smtp_imap = SMTPIMAPEmailProvider()
+    if smtp_imap.is_configured():
+        return smtp_imap
+    smtp_only = SMTPEmailProvider()
+    if smtp_only.is_configured():
+        return smtp_only
+    return NullEmailProvider()
 
 
 def _first_sentence(text: Optional[str]) -> str:

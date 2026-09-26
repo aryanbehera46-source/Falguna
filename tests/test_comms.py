@@ -3,14 +3,54 @@
 Service V1 sprint). No mocking of the store -- a real temp SQLite DB per
 test, exactly like the rest of this codebase's non-live-server test files
 (e.g. tests/test_revenue_hunter.py)."""
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from falguna.audit import AuditLog
 from falguna.comms import CommsError, CommsStore
+from falguna.email_admin import EmailError, EmailProvider
 from falguna.store import StateStore
 from falguna.ttt_hq import NeedsAryanQueue
+
+
+class _FakeEmailProvider(EmailProvider):
+    """An in-test-only EmailProvider double -- never touches a real
+    network/SMTP/IMAP connection. `fail_times` lets a test simulate N
+    transient provider failures before a send eventually succeeds (or,
+    set >= max_attempts, a permanent failure that exhausts retries)."""
+
+    def __init__(self, configured: bool = True, fail_times: int = 0, error_message: str = "simulated provider failure"):
+        self.configured = configured
+        self.fail_times = fail_times
+        self.error_message = error_message
+        self.calls = []
+
+    def provider_name(self) -> str:
+        return "FakeTestProvider"
+
+    def capabilities(self):
+        return {"send": True, "poll_inbound": False, "delivery_status": False, "attachments": False, "cc_bcc": False, "reply_to": False}
+
+    def is_configured(self) -> bool:
+        return self.configured
+
+    def validate_configuration(self):
+        return {"valid": self.configured, "errors": [] if self.configured else ["fake provider not configured"]}
+
+    def health_check(self):
+        return {"healthy": self.configured, "detail": "fake provider"}
+
+    def send(self, to_address, subject, body, from_address=None, cc=None, bcc=None, reply_to=None,
+              thread_id=None, in_reply_to_message_id=None, attachments=None):
+        self.calls.append({"to": to_address, "subject": subject, "body": body, "in_reply_to": in_reply_to_message_id})
+        if len(self.calls) <= self.fail_times:
+            raise EmailError(self.error_message)
+        return {"status": "SENT", "provider_message_id": f"fake-msg-{len(self.calls)}", "thread_id": thread_id, "failure_reason": None}
+
+    def poll_inbound(self, since=None, limit=50):
+        return []
 
 
 class _CommsTestCase(unittest.TestCase):
@@ -216,6 +256,156 @@ class Milestone8OverviewViewsTests(_CommsTestCase):
         ids = {c["id"] for c in self.comms.overview()["active_conversations"]}
         self.assertEqual(ids, {c1["id"]})
 
+
+
+class SendMessageViaProviderTests(_CommsTestCase):
+    """Phase 1, Requirement 3: send_message_via_provider() -- the one
+    real, in-system send path. Every test here uses _FakeEmailProvider,
+    never a real network/SMTP/IMAP call."""
+
+    def _comms_with(self, provider):
+        return CommsStore(self.store, self.audit, self.needs_aryan, provider=provider)
+
+    def _draft(self, comms=None, body="Here's the current status on your project."):
+        comms = comms or self.comms
+        conv = comms.open_conversation("EMAIL", "sales", priority="normal", contact_id=comms.find_or_create_contact("client@example-test.invalid", "Client"))
+        return conv, comms.add_message(conv["id"], "OUTBOUND", body, actor="ai_workforce")
+
+    def _audit_events(self, event_name):
+        lines = self.audit.path.read_text().splitlines()
+        return [json.loads(line) for line in lines if json.loads(line)["event"] == event_name]
+
+    def test_refuses_when_no_real_provider_is_configured(self):
+        # Default CommsStore() (no provider kwarg) uses NullEmailProvider,
+        # matching every existing call site -- this must never silently
+        # attempt a send.
+        conv, msg = self._draft()
+        with self.assertRaises(CommsError):
+            self.comms.send_message_via_provider(msg["id"], "Aryan")
+        self.assertEqual(self.store.get("comm_messages", msg["id"])["status"], "DRAFT")
+
+    def test_refuses_inbound_message(self):
+        comms = self._comms_with(_FakeEmailProvider())
+        conv = comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg = comms.add_message(conv["id"], "INBOUND", "Customer message", actor="website")
+        with self.assertRaises(CommsError):
+            comms.send_message_via_provider(msg["id"], "Aryan")
+
+    def test_refuses_internal_note(self):
+        comms = self._comms_with(_FakeEmailProvider())
+        conv = comms.open_conversation("EMAIL", "sales", priority="normal")
+        note = comms.add_message(conv["id"], "OUTBOUND", "Internal note", kind="note", is_internal_note=True, actor="ai_workforce")
+        with self.assertRaises(CommsError):
+            comms.send_message_via_provider(note["id"], "Aryan")
+
+    def test_refuses_a_message_that_is_not_draft(self):
+        comms = self._comms_with(_FakeEmailProvider())
+        conv, msg = self._draft(comms)
+        comms.mark_message_sent(msg["id"], "Aryan")
+        with self.assertRaises(CommsError):
+            comms.send_message_via_provider(msg["id"], "Aryan")
+
+    def test_duplicate_send_protection_after_provider_success(self):
+        # Second attempt on an already-SENT message must raise cleanly,
+        # never silently re-send or fabricate a second success.
+        provider = _FakeEmailProvider()
+        comms = self._comms_with(provider)
+        conv, msg = self._draft(comms)
+        comms.send_message_via_provider(msg["id"], "Aryan")
+        with self.assertRaises(CommsError):
+            comms.send_message_via_provider(msg["id"], "Aryan")
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_refuses_without_a_contact_email_on_file(self):
+        comms = self._comms_with(_FakeEmailProvider())
+        conv = comms.open_conversation("EMAIL", "sales", priority="normal")  # no contact_id
+        msg = comms.add_message(conv["id"], "OUTBOUND", "Draft reply", actor="ai_workforce")
+        with self.assertRaises(CommsError):
+            comms.send_message_via_provider(msg["id"], "Aryan")
+
+    def test_high_risk_unapproved_blocks_send_even_with_a_real_provider(self):
+        from falguna.risk_engine import RiskClassificationStore
+        comms = self._comms_with(_FakeEmailProvider())
+        conv, msg = self._draft(comms, body="We agree to those contract terms and will sign the contract today.")
+        RiskClassificationStore(self.store, self.audit, self.needs_aryan).classify(
+            "comm_message", msg["id"], msg["body"], actor="ai_workforce", title="review",
+        )
+        with self.assertRaises(CommsError):
+            comms.send_message_via_provider(msg["id"], "Aryan")
+        self.assertEqual(self.store.get("comm_messages", msg["id"])["status"], "DRAFT")
+
+    def test_high_risk_approved_allows_send(self):
+        from falguna.risk_engine import RiskClassificationStore
+        provider = _FakeEmailProvider()
+        comms = self._comms_with(provider)
+        conv, msg = self._draft(comms, body="We agree to those contract terms and will sign the contract today.")
+        result = RiskClassificationStore(self.store, self.audit, self.needs_aryan).classify(
+            "comm_message", msg["id"], msg["body"], actor="ai_workforce", title="review",
+        )
+        self.assertEqual(result["risk"], "HIGH")
+        self.needs_aryan.decide(result["needs_aryan_id"], "approve", "Aryan")
+        sent = comms.send_message_via_provider(msg["id"], "Aryan")
+        self.assertEqual(sent["status"], "SENT")
+
+    def test_successful_send_records_provider_evidence_not_a_delivery_guarantee(self):
+        provider = _FakeEmailProvider()
+        comms = self._comms_with(provider)
+        conv, msg = self._draft(comms)
+        sent = comms.send_message_via_provider(msg["id"], "Aryan")
+        self.assertEqual(sent["status"], "SENT")
+        self.assertEqual(sent["send_method"], "provider")
+        self.assertEqual(sent["provider_name"], "FakeTestProvider")
+        self.assertEqual(sent["send_attempts"], 1)
+        self.assertIsNotNone(sent["provider_message_id"])
+        self.assertIsNone(sent["failure_reason"])
+        events = self._audit_events("COMM_MESSAGE_SENT_VIA_PROVIDER")
+        self.assertEqual(len(events), 1)
+        self.assertIn("not a confirmation it reached the recipient's inbox", events[0]["data"]["note"])
+
+    def test_succeeds_after_transient_failures_within_bounded_retries(self):
+        provider = _FakeEmailProvider(fail_times=2)
+        comms = self._comms_with(provider)
+        conv, msg = self._draft(comms)
+        sent = comms.send_message_via_provider(msg["id"], "Aryan", max_attempts=3)
+        self.assertEqual(sent["status"], "SENT")
+        self.assertEqual(sent["send_attempts"], 3)
+        self.assertEqual(len(provider.calls), 3)
+
+    def test_exhausts_bounded_retries_and_marks_failed_with_reason(self):
+        provider = _FakeEmailProvider(fail_times=99, error_message="mailbox rejected the message")
+        comms = self._comms_with(provider)
+        conv, msg = self._draft(comms)
+        failed = comms.send_message_via_provider(msg["id"], "Aryan", max_attempts=3)
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["send_method"], "provider")
+        self.assertEqual(failed["send_attempts"], 3)
+        self.assertEqual(failed["failure_reason"], "mailbox rejected the message")
+        self.assertEqual(len(provider.calls), 3)
+        events = self._audit_events("COMM_MESSAGE_SEND_FAILED")
+        self.assertEqual(len(events), 1)
+        # A message that failed via a real provider must still show up in
+        # the existing Failed Delivery panel, same as a manual failure.
+        ov = comms.overview()
+        self.assertTrue(any(m["id"] == msg["id"] for m in ov["failed_delivery"]))
+
+    def test_never_calls_the_provider_at_all_when_unconfigured(self):
+        provider = _FakeEmailProvider(configured=False)
+        comms = self._comms_with(provider)
+        conv, msg = self._draft(comms)
+        with self.assertRaises(CommsError):
+            comms.send_message_via_provider(msg["id"], "Aryan")
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(self.store.get("comm_messages", msg["id"])["status"], "DRAFT")
+
+
+class MarkMessageFailedRecordsProviderFieldsTests(_CommsTestCase):
+    def test_manual_mark_failed_records_send_method_and_reason_on_the_row(self):
+        conv = self.comms.open_conversation("EMAIL", "sales", priority="normal")
+        msg = self.comms.add_message(conv["id"], "OUTBOUND", "Draft", actor="ai_workforce")
+        self.comms.mark_message_failed(msg["id"], "Aryan", reason="bounced")
+        row = self.store.get("comm_messages", msg["id"])
+        self.assertEqual(row["send_method"], "manual")
+        self.assertEqual(row["failure_reason"], "bounced")
 
 class MarkMessageFailedTests(_CommsTestCase):
     def test_requires_a_reason(self):

@@ -33,6 +33,7 @@ Master Vision Backlog on their own:
 """
 
 import json
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +65,46 @@ _ESCALATING_SEVERITIES = {"high", "critical"}
 
 class CapitalRiskError(ValueError):
     pass
+
+
+# Guards ReservePolicyStore.propose_change/apply_pending_change's
+# check-then-act sections (list existing pending item, then create/apply).
+# Every route in this app already opens a fresh StateStore connection per
+# request (see hq_web.py's open_control_plane), so this in-process lock
+# only closes the race between concurrent requests handled by this same
+# process -- the same scope every other in-file lock in hq_web.py
+# (_askf_operations_lock, _askf_cancel_events_lock) already covers, and the
+# realistic concurrency here is one operator (Aryan) using the local HQ UI,
+# not a distributed multi-writer system.
+_RESERVE_POLICY_LOCK = threading.Lock()
+
+
+def _validate_reserve_policy_updates(updates: Any, *, require_nonempty: bool = False) -> Dict[str, float]:
+    """Shared validation for both the direct write (`ReservePolicyStore.save`)
+    and the gated proposal path (`propose_change`). Rejects a malformed
+    request (wrong type, non-numeric, out-of-range) explicitly instead of
+    silently coercing it. Unknown fields are still silently ignored exactly
+    as before this phase (`save()` calls this with `require_nonempty=False`,
+    preserving `test_save_ignores_unknown_fields`); `propose_change` passes
+    `require_nonempty=True` since a proposal with zero real, settable
+    changes is a malformed request worth rejecting clearly, not a silent
+    no-op approval item."""
+    if updates is None:
+        updates = {}
+    if not isinstance(updates, dict):
+        raise CapitalRiskError("updates must be an object")
+    validated: Dict[str, float] = {}
+    for key, value in updates.items():
+        if key not in DEFAULT_RESERVE_POLICY or key == "configured":
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CapitalRiskError(f"{key} must be a number")
+        if value < 0 or value > 1:
+            raise CapitalRiskError(f"{key} must be between 0 and 1 (a fraction, e.g. 0.15 for 15%)")
+        validated[key] = float(value)
+    if require_nonempty and not validated:
+        raise CapitalRiskError("updates did not contain any recognized, settable reserve-policy field")
+    return validated
 
 
 class BudgetStore:
@@ -227,12 +268,30 @@ def recommend_allocation(store: StateStore, available_amount: float, actor: str 
 class ReservePolicyStore:
     """A single persisted, editable settings row -- same pattern as
     `SalesPolicyStore`/`AcquisitionProfileStore`, stored in the existing
-    generic `rh_settings` table rather than a new one."""
+    generic `rh_settings` table rather than a new one.
+
+    Approval gate (Phase 1, Requirement 1): a reserve-policy change is a
+    capital-governance decision -- exactly the kind of thing
+    `NEEDS_ARYAN_KINDS` already lists `reserve_policy_change` for. External
+    callers (the HQ UI's `/api/cc/reserve-policy` route) must go through
+    `propose_change()`, never `save()` directly. `propose_change()` never
+    writes the policy: it creates exactly one pending Needs Aryan item, and
+    the active policy stays unchanged until `apply_pending_change()` runs
+    that item after it has genuinely been approved (called only from the
+    same Needs Aryan decision route that already performs this exact
+    pattern for `rh_closing_package` -- see
+    `sales_ops.ClosingService.finalize_pending_closing`). `save()` remains
+    as the low-level direct write: used internally by `apply_pending_change`
+    once approved, and by tests/fixtures that deliberately set up a policy
+    state directly -- Company OS's own docstring already states it never
+    calls `ReservePolicyStore.save` for exactly this reason."""
 
     KEY = "cc_reserve_policy"
 
-    def __init__(self, store: StateStore):
+    def __init__(self, store: StateStore, audit: Optional[AuditLog] = None, needs_aryan=None):
         self.store = store
+        self.audit = audit
+        self.needs_aryan = needs_aryan
 
     def get(self) -> Dict[str, Any]:
         rows = self.store.list("rh_settings", "key=?", (self.KEY,))
@@ -244,8 +303,14 @@ class ReservePolicyStore:
         return merged
 
     def save(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Direct, ungated write -- see the class docstring for who may call
+        this. Validates numeric fields the same way `propose_change` does;
+        unknown fields are still silently ignored and an empty/all-unknown
+        update is still a harmless no-op (both unchanged from before this
+        phase -- see test_save_ignores_unknown_fields)."""
+        validated = _validate_reserve_policy_updates(updates, require_nonempty=False)
         merged = self.get()
-        merged.update({k: v for k, v in (updates or {}).items() if k in DEFAULT_RESERVE_POLICY})
+        merged.update(validated)
         merged["configured"] = True
         rows = self.store.list("rh_settings", "key=?", (self.KEY,))
         now = utcnow()
@@ -254,6 +319,81 @@ class ReservePolicyStore:
         else:
             self.store.create("rh_settings", {"key": self.KEY, "value_json": json.dumps(merged), "created_at": now, "updated_at": now})
         return merged
+
+    def propose_change(self, updates: Dict[str, Any], actor: str = "Aryan") -> Dict[str, Any]:
+        """The gated entry point every external caller must use. Never
+        writes the policy -- creates one pending `reserve_policy_change`
+        Needs Aryan item and returns AWAITING_APPROVAL. A second proposal
+        while one is already pending returns that same pending item instead
+        of creating a duplicate (idempotent, same convention as
+        `ClosingService._prepare_closing_package`) -- this also structurally
+        rules out a "stale" superseded proposal, since only one reserve-
+        policy change can ever be in flight at a time."""
+        validated = _validate_reserve_policy_updates(updates, require_nonempty=True)
+        if not actor or not str(actor).strip():
+            raise CapitalRiskError("actor is required")
+        actor = str(actor).strip()
+
+        with _RESERVE_POLICY_LOCK:
+            pending = self.store.list("needs_aryan_items", "ref_type=? AND ref_id=? AND status=?", ("cc_reserve_policy", self.KEY, "PENDING"))
+            if pending:
+                item = pending[-1]
+                return {
+                    "status": "AWAITING_APPROVAL", "needs_aryan_id": item["id"],
+                    "current_policy": self.get(),
+                    "proposed_changes": json.loads(item["payload_json"]) if item.get("payload_json") else {},
+                    "already_pending": True,
+                }
+            current = self.get()
+            changes_desc = ", ".join(f"{k}: {current.get(k)} -> {v}" for k, v in sorted(validated.items()))
+            needs_aryan_id = None
+            if self.needs_aryan is not None:
+                needs_aryan_id = self.needs_aryan.create_item(
+                    "reserve_policy_change",
+                    "Reserve policy change requested",
+                    (f"A change to the reserve policy has been proposed ({changes_desc}). "
+                     "Review and approve or reject before it takes effect -- the current policy "
+                     "stays active until you decide."),
+                    actor=actor, rationale=changes_desc,
+                    ref_type="cc_reserve_policy", ref_id=self.KEY,
+                    payload_json=json.dumps(validated),
+                )
+            if self.audit is not None:
+                self.audit.append("CC_RESERVE_POLICY_PROPOSED", {"needs_aryan_id": needs_aryan_id, "actor": actor, "changes": validated})
+            return {
+                "status": "AWAITING_APPROVAL", "needs_aryan_id": needs_aryan_id,
+                "current_policy": current, "proposed_changes": validated, "already_pending": False,
+            }
+
+    def apply_pending_change(self, needs_aryan_id: str, actor: str) -> Dict[str, Any]:
+        """Performs the real reserve-policy write for a proposal that has
+        just been approved. Called only from the Needs Aryan decision route,
+        immediately after `NeedsAryanQueue.decide()` records the approval --
+        never invoked on its own initiative, and `decide()` itself already
+        refuses to decide the same item twice (raises if it is no longer
+        PENDING), which is what makes a retried decision-request safe.
+        Idempotent against a direct retry of this method too: an item
+        already marked applied is detected and returned without writing
+        again."""
+        item = self.store.get("needs_aryan_items", needs_aryan_id)
+        if not item:
+            raise CapitalRiskError("needs aryan item not found")
+        if item.get("ref_type") != "cc_reserve_policy":
+            raise CapitalRiskError("this needs aryan item is not a reserve-policy change")
+        if item.get("status") != "APPROVED":
+            raise CapitalRiskError("reserve-policy change has not been approved")
+
+        marker = f"[applied:{needs_aryan_id}]"
+        with _RESERVE_POLICY_LOCK:
+            if item.get("decision_note") and marker in item["decision_note"]:
+                return self.get()
+            updates = json.loads(item["payload_json"]) if item.get("payload_json") else {}
+            policy = self.save(updates)
+            note = f"{item.get('decision_note') or ''} {marker}".strip()
+            self.store.update("needs_aryan_items", needs_aryan_id, decision_note=note)
+        if self.audit is not None:
+            self.audit.append("CC_RESERVE_POLICY_APPLIED", {"needs_aryan_id": needs_aryan_id, "actor": actor, "changes": updates})
+        return policy
 
 
 def allowed_experimental_capital(store: StateStore) -> Dict[str, Any]:

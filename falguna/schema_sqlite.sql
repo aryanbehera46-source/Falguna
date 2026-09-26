@@ -594,6 +594,7 @@ CREATE TABLE IF NOT EXISTS site_applications (
     resume_storage_rel_path TEXT,
     resume_sha256 TEXT,
     resume_size_bytes INTEGER,
+    resume_source_url TEXT,           -- Phase 1 R2: external hosted URL (e.g. Tally) when bytes were never fetched/stored locally -- NULL for a native upload that already has resume_storage_rel_path
     status TEXT NOT NULL DEFAULT 'new', -- new | reviewed | rejected | shortlisted
     source_ip_hash TEXT,
     created_at TEXT NOT NULL,
@@ -732,6 +733,10 @@ CREATE TABLE IF NOT EXISTS comm_messages (
     is_internal_note INTEGER NOT NULL DEFAULT 0,
     source_ref_type TEXT,
     source_ref_id TEXT,
+    send_method TEXT,                  -- Phase 1 R3: NULL | manual | provider
+    provider_name TEXT,                -- Phase 1 R3: the EmailProvider class name that attempted/sent this
+    send_attempts INTEGER NOT NULL DEFAULT 0,  -- Phase 1 R3: real provider-send attempts made (0 = never attempted)
+    failure_reason TEXT,               -- Phase 1 R3: set when status=FAILED, so Failed Delivery is never a bare status with no reason
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -799,6 +804,7 @@ CREATE TABLE IF NOT EXISTS tally_intake_events (
     application_id TEXT,
     opportunity_id TEXT,
     raw_field_labels_json TEXT,
+    consent_status TEXT,               -- Phase 1 R2: given | declined | NULL (form had no consent field to match)
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tally_intake_events_submission ON tally_intake_events(tally_submission_id);
