@@ -778,3 +778,28 @@ CREATE TABLE IF NOT EXISTS comm_risk_events (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_comm_risk_events_subject ON comm_risk_events(subject_type, subject_id);
+
+-- Twenty Two Technologies -- Live Enquiry Activation V1 (falguna/tally_intake.py)
+-- One row per Tally.so webhook/export payload processed (ingested, duplicate,
+-- or rejected) -- the idempotency + audit + error-visibility record for the
+-- real public website's four live forms. Never stores resume bytes or full
+-- raw payload text, only field LABELS seen (for diagnosing field-mapping
+-- drift) plus the outcome.
+CREATE TABLE IF NOT EXISTS tally_intake_events (
+    id TEXT PRIMARY KEY,
+    form_id TEXT,                      -- Tally form id from the payload (e.g. VLgxN6)
+    form_type TEXT NOT NULL,           -- general | project | careers | media | unknown
+    tally_submission_id TEXT,          -- Tally's data.submissionId (idempotency key)
+    tally_response_id TEXT,            -- Tally's data.responseId
+    tally_event_id TEXT,               -- Tally's top-level eventId
+    status TEXT NOT NULL,              -- ingested | duplicate | rejected
+    reason TEXT,                       -- set when status != ingested
+    conversation_id TEXT,
+    enquiry_id TEXT,
+    application_id TEXT,
+    opportunity_id TEXT,
+    raw_field_labels_json TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tally_intake_events_submission ON tally_intake_events(tally_submission_id);
+CREATE INDEX IF NOT EXISTS idx_tally_intake_events_status ON tally_intake_events(status, created_at);

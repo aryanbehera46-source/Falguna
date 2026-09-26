@@ -2718,6 +2718,7 @@ Ask Falguna
 <div class="section" style="flex:1"><h2>Follow-ups due</h2><div class="list" id="commsFollowUpsDueList"></div></div>
 <div class="section" style="flex:1"><h2>Failed delivery</h2><div class="list" id="commsFailedDeliveryList"></div></div>
 </div>
+<div class="section"><h2 id="commsWebsiteIntakeErrors">0</h2><div class="sub">Website intake errors (Tally form submissions this system could not route -- check field mapping)</div><div class="list" id="commsWebsiteIntakeErrorsList"></div></div>
 <div class="section"><h2>Active conversations</h2><div class="list" id="commsConversationsList"></div></div>
 <div class="section"><h2>Recently resolved</h2><div class="list" id="commsRecentlyResolvedList"></div></div>
 </div>
@@ -3588,6 +3589,8 @@ $('commsAwaitingApprovalList').innerHTML=(ov.awaiting_approval||[]).length?(ov.a
 $('commsAwaitingClientList').innerHTML=(ov.awaiting_client||[]).length?(ov.awaiting_client||[]).map(convItem).join(''):'<div class="empty">Nothing awaiting a client reply.</div>';
 $('commsFollowUpsDueList').innerHTML=(ov.follow_ups_due||[]).length?(ov.follow_ups_due||[]).map(f=>`<div class="item"><h3>${esc(f.kind)}</h3><div class="meta"><span>opportunity ${esc(f.opportunity_id)}</span><span>${esc(f.status)}</span></div><div class="contrib">${esc((f.draft_content||'').slice(0,160))}</div></div>`).join(''):'<div class="empty">No follow-ups due.</div>';
 $('commsFailedDeliveryList').innerHTML=(ov.failed_delivery||[]).length?(ov.failed_delivery||[]).map(m=>`<div class="item"><h3>Failed delivery</h3><div class="meta"><span>conversation ${esc(m.conversation_id)}</span></div><div class="contrib">${esc((m.body||'').slice(0,160))}</div></div>`).join(''):'<div class="empty">No failed deliveries -- no live mailbox connected yet, so nothing has attempted to send.</div>';
+$('commsWebsiteIntakeErrors').textContent=(ov.website_intake_errors||[]).length;
+$('commsWebsiteIntakeErrorsList').innerHTML=(ov.website_intake_errors||[]).length?(ov.website_intake_errors||[]).map(e=>`<div class="item"><h3>${esc(e.form_type||'unknown form')} submission rejected</h3><div class="meta"><span>${esc(e.reason||'')}</span><span>${hqTimeAgo(e.created_at)} ago</span></div>${e.tally_submission_id?`<div class="contrib">Tally submission ${esc(e.tally_submission_id)}</div>`:''}</div>`).join(''):'<div class="empty">No website intake errors.</div>';
 $('commsRecentlyResolvedList').innerHTML=(ov.recently_resolved||[]).length?(ov.recently_resolved||[]).map(convItem).join(''):'<div class="empty">Nothing resolved recently.</div>';
 
 document.querySelectorAll('.commsRunAgent').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const r=await api(`/api/comms/conversations/${b.dataset.id}/run-agent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});alert(r.actions&&r.actions.length?'Agent actions:\n'+r.actions.join('\n'):(r.note||'No action taken.'));await loadCommunications()}catch(e){alert(e.message)}finally{b.disabled=false}});

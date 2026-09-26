@@ -460,6 +460,13 @@ class CommsStore:
         failed_delivery = list(reversed(failed_delivery))[:20]
         recently_resolved = self.store.list("comm_conversations", "status IN ('resolved','closed')")
         recently_resolved = list(reversed(recently_resolved))[:20]
+        # Live Enquiry Activation V1: real website (Tally) submissions this
+        # codebase could not confidently route -- an unknown form id, a
+        # payload missing a required field it could match by label, etc.
+        # Surfaced here (not a new dashboard) so a broken form mapping is
+        # never silently invisible.
+        website_intake_errors = self.store.list("tally_intake_events", "status='rejected'")
+        website_intake_errors = list(reversed(website_intake_errors))[:20]
 
         return {
             "open_total": len(all_open),
@@ -475,4 +482,5 @@ class CommsStore:
             "follow_ups_due": follow_ups_due,
             "failed_delivery": failed_delivery,
             "recently_resolved": recently_resolved,
+            "website_intake_errors": website_intake_errors,
         }
