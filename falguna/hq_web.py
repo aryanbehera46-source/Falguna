@@ -2381,6 +2381,23 @@ main{padding:0 max(28px,calc((100vw - 278px - 1120px)/2))}.hqtopbar{min-height:6
 .askf-fab{padding:12px 18px;border-radius:14px;background:linear-gradient(145deg,var(--panel),var(--soft));box-shadow:0 18px 50px -24px var(--shadow)}.askf-fab-dot{background:var(--accent);box-shadow:0 0 14px var(--accent)}
 .askf-panel{width:min(480px,94vw)}.askf-msg{border-radius:14px;line-height:1.65}.askf-msg.user{background:var(--accent)}
 @media(max-width:820px){.app{grid-template-columns:1fr}main{padding:0 16px}.col{padding-top:24px}.hqhero-greeting{font-size:27px}.section{padding:18px;border-radius:16px}.hqpulse-card{min-width:0}.hqcore{width:42px;height:42px}}
+
+/* ---------- HQ V3: executive operating system, not a dashboard skin ---------- */
+:root{--navy:#071218;--navy-2:#0d1b22;--paper:#f3f1ea;--paper-2:#e9e6dc;--card:#fffdf8;--graphite:#14232a;--slate:#617078;--rule:#d8d5ca;--signal:#0c7c69;--signal-2:#8be0c8;--amber:#c47b22;--danger:#bd4651}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:var(--navy);--side:#09171d;--panel:#102129;--soft:#152a33;--soft2:#1c333c;--line:#29414a;--text:#f5f3ec;--muted:#a6b3b6;--muted-dim:#71868c;--accent:#6bd8bc;--accent-hi:#a0ead6;--accent-ink:#06231c;--accent-dim:#2c6f61;--accent-soft:#12352f}}
+@media(prefers-color-scheme:light){:root:not([data-theme="dark"]){--side:var(--navy);--text:var(--graphite);--muted:var(--slate);--muted-dim:#899397;--accent:var(--signal);--accent-hi:#075e51;--accent-ink:#fff;--accent-dim:#99c9bd;--accent-soft:#dcefe9}}
+:root[data-theme="light"]{--bg:var(--paper);--side:var(--navy);--panel:var(--card);--soft:var(--paper-2);--soft2:#dedbd0;--line:var(--rule);--text:var(--graphite);--muted:var(--slate);--muted-dim:#899397;--accent:var(--signal);--accent-hi:#075e51;--accent-ink:#fff;--accent-dim:#99c9bd;--accent-soft:#dcefe9}
+body{background:var(--bg);font-size:14px}.app{grid-template-columns:264px minmax(0,1fr)}
+aside{background:var(--side);border-right:0;padding:18px 12px;color:#eff5f3}.brand{color:#fff;padding:2px 10px 22px;font-size:14px}.mark{width:34px;height:34px;background:var(--signal-2);color:#08251f;box-shadow:none}.navitem{color:#9bb0b6;border-radius:8px;min-height:36px;padding:8px 10px}.navitem:hover{color:#fff;background:#ffffff0c}.navitem.active{background:#ffffff12;color:#fff;box-shadow:inset 3px 0 0 var(--signal-2)}.navsec,.navgroup summary,.navexec>summary.navsec-exec{color:#708890}.navgroup.has-active summary,.navexec.has-active>summary.navsec-exec{color:#bde9dc}.theme-toggle{margin-top:12px;background:#ffffff09;border-color:#ffffff18;color:#d5e2df}.boundary{color:#71858a;border-color:#ffffff16}
+main{padding:0 max(28px,calc((100vw - 264px - 1180px)/2))}.hqtopbar{min-height:58px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(16px);position:sticky;top:0}.hqtopbar-crumb{font-weight:700}.hqtopbar-askf{border-color:var(--line);background:var(--panel);border-radius:9px}.hqtopbar-command{border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:8px;padding:6px 10px;font-size:11px;cursor:pointer}.hqtopbar-command:hover{color:var(--text);background:var(--panel)}
+.col{width:100%;min-width:0;max-width:1180px;padding:26px 0 80px;gap:20px}.hqhero{padding:8px 0 10px;align-items:flex-end}.hqhero-greeting{font-family:Georgia,"Times New Roman",serif;font-size:clamp(34px,4vw,54px);font-weight:500;letter-spacing:-.045em}.hqhero-sub{font-size:13px;text-transform:uppercase;letter-spacing:.11em;color:var(--muted-dim);margin-top:8px}.pageintro{max-width:820px;line-height:1.7;margin-bottom:14px}
+.hqcore{width:auto;height:auto;display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:8px 12px;background:var(--panel)}.hqcore-ring{position:static;width:8px;height:8px;background:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 14%,transparent)}.hqcore-glow{display:none}.hqcore-label{font-size:11px;font-weight:700;color:var(--muted);white-space:nowrap}.hqcore[data-state="needs_aryan"] .hqcore-ring{background:var(--warn);box-shadow:0 0 0 4px color-mix(in srgb,var(--warn) 15%,transparent)}
+.hq-jumpbar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 20px}.hq-jumpbar button{border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:9px;padding:8px 12px;font-size:12px;cursor:pointer}.hq-jumpbar button:hover{border-color:var(--accent);color:var(--accent-hi)}
+.section{border-radius:12px;padding:18px;margin-bottom:16px;box-shadow:none;background:var(--panel)}.section h2{font-size:15px;letter-spacing:-.015em}.sub{font-size:11.5px}.hqpulse-row{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}.hqpulse-card{min-width:0}.hqpulse-card:first-child{border-top:3px solid var(--warn)}.hqpulse-card:last-child{border-top:3px solid var(--accent)}
+#view-commandCenter>.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}#view-commandCenter>.row>.section{margin:0;min-height:112px;display:flex;flex-direction:column;justify-content:flex-end;position:relative;overflow:hidden}#view-commandCenter>.row>.section h2{font-family:Georgia,"Times New Roman",serif;font-size:30px;font-weight:500;margin:0 0 8px}#view-commandCenter>.row>.section .sub{margin:0;text-transform:uppercase;letter-spacing:.07em}#view-commandCenter>.row>.section::after{content:'';position:absolute;right:-22px;top:-28px;width:88px;height:88px;border:1px solid color-mix(in srgb,var(--accent) 14%,transparent);border-radius:50%}
+.item{border-radius:9px;padding:13px;border-color:var(--line);background:color-mix(in srgb,var(--soft) 70%,transparent)}.item h3{font-size:13px;line-height:1.45}.meta span{background:var(--panel)}.hq-changed-item{padding:10px 2px}.hq-changed-time{font-variant-numeric:tabular-nums}
+.empty{border:1px dashed var(--line);border-radius:9px;padding:15px;text-align:center}.askf-fab{border-radius:10px}.askf-panel{width:min(500px,96vw)}
+@media(max-width:820px){.app{grid-template-columns:1fr}main{padding:0 14px;min-width:0}.col{width:100%!important;max-width:none;flex:1 1 0;min-width:0!important;overflow-x:hidden;padding-top:18px}.hqhero{align-items:flex-start}.hqhero-greeting{font-size:34px}.hqpulse-row,#view-commandCenter>.row{grid-template-columns:1fr}.hq-jumpbar{overflow-x:auto;flex-wrap:nowrap;padding-bottom:4px}.hq-jumpbar button{white-space:nowrap}.hqcore-label{display:none}.hqcore{padding:9px}.section{padding:15px}.hqtopbar-command{display:none}}
 </style></head><body><div id="globalLoadingBar" aria-hidden="true"></div>
 <button type="button" id="askFalgunaFab" class="askf-fab">
 <span class="askf-fab-dot" id="askfFabDot" aria-hidden="true"></span>
@@ -2500,7 +2517,7 @@ Ask Falguna
 <main>
 <header class="hqtopbar" id="hqTopbar">
 <div class="hqtopbar-left"><button type="button" class="hq-menu" id="hqMenuBtn" aria-label="Open navigation" aria-expanded="false">&#9776;</button><span id="hqBreadcrumb" class="hqtopbar-crumb"></span><span id="hqTopbarStatus"><span class="hqtopbar-dot" id="hqTopbarDot"></span>Checking Falguna&hellip;</span></div>
-<div class="hqtopbar-right"><button type="button" class="hqtopbar-askf" id="hqTopbarAskf"><span class="askf-fab-dot" aria-hidden="true"></span>Ask Falguna</button></div>
+<div class="hqtopbar-right"><button type="button" class="hqtopbar-command" id="hqCommandBtn">⌘ K &nbsp; Quick switch</button><button type="button" class="hqtopbar-askf" id="hqTopbarAskf"><span class="askf-fab-dot" aria-hidden="true"></span>Ask Falguna</button></div>
 </header>
 <div class="col">
 <div class="view active" id="view-commandCenter">
@@ -2512,9 +2529,11 @@ Ask Falguna
 <div class="hqcore" id="hqCore" data-state="idle" role="img" aria-label="Falguna: idle">
 <div class="hqcore-glow"></div>
 <div class="hqcore-ring"></div>
+<span class="hqcore-label" id="hqCoreLabel">Falguna idle</span>
 </div>
 </div>
 <div class="pageintro">What the company is doing right now -- sourced live from Revenue Hunter, billing, Digital Workforce, and Media/Growth. No vanity metrics; every card below is a real, sourced read.</div>
+<div class="hq-jumpbar" aria-label="Command center shortcuts"><button type="button" data-hq-jump="needsAryan">Review decisions</button><button type="button" data-hq-jump="rhPipeline">Open revenue pipeline</button><button type="button" data-hq-jump="wfTasks">Inspect workforce</button><button type="button" data-hq-jump="ccCash">Cash &amp; runway</button><button type="button" data-hq-jump="ccRiskRegister">Risk register</button></div>
 <div class="hqpulse-row">
 <div class="section hqpulse-card">
 <h2>Needs Your Attention</h2>
@@ -3298,6 +3317,7 @@ else if(Number(hqCoreExecState.needs_you||0)>0)state='needs_aryan';
 else if(Number(hqCoreExecState.running||0)>0)state='executing';
 core.dataset.state=state;
 core.setAttribute('aria-label','Falguna: '+state.replace('_',' '));
+const label=$('hqCoreLabel');if(label)label.textContent='Falguna '+state.replace('_',' ');
 }
 async function hqLoadActiveExecution(){
 try{
@@ -4329,6 +4349,8 @@ const CMDK_QUICK_ACTIONS=[
 {label:'Add Opportunity',cat:'Action',run:()=>navTo('rhOpportunities')},
 ];
 function navTo(view){const btn=document.querySelector(`.navitem[data-view="${view}"]`);if(btn)btn.click()}
+$('hqCommandBtn').onclick=cmdkOpen;
+document.querySelectorAll('[data-hq-jump]').forEach(b=>b.onclick=()=>navTo(b.dataset.hqJump));
 function cmdkNavItems(){
 return Array.from(document.querySelectorAll('.navitem[data-view]:not(.disabled)')).map(b=>{
 const group=b.closest('.navgroup');
