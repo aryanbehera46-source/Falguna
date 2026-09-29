@@ -28,9 +28,10 @@ from pathlib import Path
 from falguna.attachments import AttachmentError, AttachmentStore
 from falguna.chat import ChatError, ConversationStore
 from falguna.models import RunPolicy, WorkerResult
+from falguna.model_router import ModelRegistry
 from falguna.notifications import NotificationStore
 from falguna.runtime import open_control_plane
-from falguna.web import FalgunaHandler, WORK_MODE_SETTINGS
+from falguna.web import FalgunaHandler, WORK_MODE_SETTINGS, wait_for_background_tasks
 from falguna.workers import ScriptedWorker
 
 
@@ -283,7 +284,12 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "seed"], check=True, capture_output=True)
         self.control, self.store = open_control_plane(self.repo)
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), FalgunaHandler)
+        # HTTP behavior tests must not depend on whether this developer Mac
+        # happens to have an authenticated Codex or Ollama runtime today.
+        ModelRegistry(self.store).save({"privacy_mode": "LOCAL_ONLY", "providers": {"ollama": {"enabled": False}, "codex": {"enabled": False}, "openai_compatible": {"enabled": False}}})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FalgunaHandler)
+        self.server.daemon_threads = False
+        self.port = self.server.server_port
         self.server.app_root = self.repo
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -293,6 +299,7 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self.assertTrue(wait_for_background_tasks(self.repo), "chat worker did not stop before repository cleanup")
         self.store.close()
         self.temp.cleanup()
 

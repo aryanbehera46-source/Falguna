@@ -71,6 +71,58 @@ _operations_lock = threading.Lock()
 # operation token) because _stop_message only ever receives message_id.
 _cancel_events = {}
 _cancel_events_lock = threading.Lock()
+_background_threads = {}
+_background_threads_lock = threading.Lock()
+
+
+def _tracked_background_target(app_root, target, *args, **kwargs):
+    """Run a background task while making controlled shutdown observable.
+
+    Production requests remain asynchronous.  The registry exists so a test,
+    launcher, or other controlled shutdown can wait for workers to finish
+    before removing the repository (and its SQLite database) underneath them.
+    """
+    key = str(Path(app_root).resolve())
+    thread = threading.current_thread()
+    try:
+        target(*args, **kwargs)
+    finally:
+        with _background_threads_lock:
+            workers = _background_threads.get(key)
+            if workers is not None:
+                workers.discard(thread)
+                if not workers:
+                    _background_threads.pop(key, None)
+
+
+def start_tracked_background_thread(app_root, target, *args, **kwargs):
+    key = str(Path(app_root).resolve())
+    thread = threading.Thread(
+        target=_tracked_background_target,
+        args=(app_root, target, *args),
+        kwargs=kwargs,
+        daemon=True,
+    )
+    with _background_threads_lock:
+        _background_threads.setdefault(key, set()).add(thread)
+    thread.start()
+    return thread
+
+
+def wait_for_background_tasks(app_root, timeout=10.0):
+    """Wait for this repository's already-started workers to unwind."""
+    key = str(Path(app_root).resolve())
+    deadline = time.monotonic() + timeout
+    while True:
+        with _background_threads_lock:
+            workers = list(_background_threads.get(key, ()))
+        if not workers:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        for thread in workers:
+            thread.join(min(remaining, 0.2))
 
 # Product Experience V2 -- Work Mode (Section 6). Falguna does not control
 # any model's internal reasoning depth and never claims to; these three
@@ -1633,11 +1685,12 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             _operations[token] = {"state": "QUEUED", "conversation_id": conversation_id, "message_id": pending["id"], "started_at": utcnow()}
         with _cancel_events_lock:
             _cancel_events[pending["id"]] = cancel_event
-        threading.Thread(
-            target=_run_chat_reply,
-            args=(self.app_root, token, conversation_id, pending["id"], history, model, work_mode, conversation.get("project_id"), cancel_event),
-            daemon=True,
-        ).start()
+        start_tracked_background_thread(
+            self.app_root,
+            _run_chat_reply,
+            self.app_root, token, conversation_id, pending["id"], history, model,
+            work_mode, conversation.get("project_id"), cancel_event,
+        )
         return token
 
     def _stop_message(self, conversation_id, message_id):

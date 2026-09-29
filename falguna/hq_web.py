@@ -88,6 +88,7 @@ from .revenue_hunter import (
     FollowupStore, OpportunityError, OpportunityStore, ProposalError, ProposalStore,
     QualificationStore, apply_decision_side_effect, extract_fields_from_text, extract_from_csv_rows,
 )
+from .revenue_delivery import RevenueDeliveryError, RevenueDeliveryService
 from .runtime import open_control_plane
 from .sales_manager import SalesManagerService
 from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
@@ -629,6 +630,10 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 if source:
                     items = [o for o in items if o.get("source") == source]
                 return self._json({"items": items})
+            if path == "/api/rh/revenue-delivery":
+                opportunities = OpportunityStore(store, control.audit).list()
+                service = RevenueDeliveryService(store, control.audit)
+                return self._json({"items": [service.snapshot(item["id"]) for item in opportunities]})
             if path.startswith("/api/rh/opportunities/") and path.endswith("/lifecycle"):
                 # Checked ahead of the bare opportunity-fetch route below (same
                 # ordering trick that route's own suffix checks already use),
@@ -1538,6 +1543,15 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         active_job_id=body.get("active_job_id"), checklist=body.get("checklist"),
                     )
                     return self._json({"record_id": record_id}, HTTPStatus.CREATED)
+
+                if path.startswith("/api/rh/opportunities/") and path.endswith("/handover-package"):
+                    opportunity_id = path.split("/")[4]
+                    result = RevenueDeliveryService(store, control.audit).prepare_handover_and_invoice_draft(
+                        opportunity_id, body.get("actor", "Aryan"), evidence=body.get("evidence"),
+                        qa_checklist=body.get("qa_checklist") or {}, amount=body.get("amount"),
+                        currency=body.get("currency"), due_date=body.get("due_date"),
+                    )
+                    return self._json(result, HTTPStatus.CREATED)
 
                 if path.startswith("/api/rh/clients/") and path.endswith("/invoices"):
                     client_id = path.split("/")[4]
@@ -2481,6 +2495,7 @@ Ask Falguna
 <button class="navitem" data-view="rhOpportunities">Opportunities</button>
 <button class="navitem" data-view="rhOutboundLeads">Outbound Leads</button>
 <button class="navitem" data-view="rhPipeline">Sales Pipeline</button>
+<button class="navitem" data-view="rhDeliveryEngine">Revenue &amp; Delivery Engine</button>
 <button class="navitem" data-view="rhClients">Clients</button>
 <button class="navitem" data-view="rhActiveJobs">Active Jobs / Delivery</button>
 <button class="navitem" data-view="rhRevenue">Revenue</button>
@@ -2930,6 +2945,11 @@ Ask Falguna
 <div class="pageintro">opportunity &middot; value &middot; client &middot; next action &middot; last activity &middot; deadline, grouped by stage.</div>
 <div id="rhPipelineBoard"></div>
 </div>
+<div class="view" id="view-rhDeliveryEngine">
+<h1>Revenue &amp; Delivery Engine</h1>
+<div class="pageintro">One persisted journey from enquiry to approved proposal, project intake, Falguna delivery, evidence-backed handover, and invoice draft. Nothing here sends email, deploys, charges, or marks an invoice sent.</div>
+<div class="list" id="rhDeliveryEngineList"></div>
+</div>
 <div class="view" id="view-rhClients">
 <h1>Clients</h1>
 <div class="pageintro">Opportunities grouped by client.</div>
@@ -3234,7 +3254,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -3836,6 +3856,7 @@ ${(o.research||[]).length?`<div class="contrib"><b>Research (client/company cont
 }
 async function loadRhPipeline(){const d=await api('/api/rh/opportunities');const items=d.items||[];const byStage={};RH_STAGES.forEach(s=>byStage[s]=[]);items.forEach(o=>{(byStage[o.stage]||(byStage[o.stage]=[])).push(o)});
 $('rhPipelineBoard').innerHTML=RH_STAGES.map(s=>`<div class="section"><h2>${s} (${(byStage[s]||[]).length})</h2><div class="list">${(byStage[s]||[]).length?(byStage[s]||[]).map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta">${o.client_name?`<span>${esc(o.client_name)}</span>`:''}${o.budget_rate?`<span>${esc(o.budget_rate)}</span>`:''}${o.deadline?`<span>due ${esc(o.deadline)}</span>`:''}</div></div>`).join(''):'<div class="empty">Empty</div>'}</div></div>`).join('')}
+async function loadRhDeliveryEngine(){const d=await api('/api/rh/revenue-delivery');const items=d.items||[];$('rhDeliveryEngineList').innerHTML=items.length?items.map(j=>{const ready=j.steps.find(s=>s.key==='handover')&&!j.steps.find(s=>s.key==='handover').complete&&j.steps.slice(0,6).every(s=>s.complete);return `<div class="item"><h3>${esc(j.opportunity.title)}</h3><div class="meta"><span>${esc(j.opportunity.client_name||'No client name')}</span><span>Next: ${esc(j.next_action)}</span>${j.active_job?`<span>Delivery ${esc(j.active_job.handoff_status)}</span>`:''}</div><div class="rh-journey" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:14px">${j.steps.map(s=>`<div class="contrib" style="margin:0"><b>${s.complete?'✓':'○'} ${esc(s.label)}</b>${s.needs_human?'<br><span class="badge">Human approval</span>':''}</div>`).join('')}</div>${ready?`<div class="form" style="margin-top:14px"><textarea class="rhHandoverEvidence" data-id="${esc(j.opportunity.id)}" placeholder="Real delivery evidence: test results, QA report, handover artifact references"></textarea><div class="row"><input class="rhInvoiceAmount" data-id="${esc(j.opportunity.id)}" type="number" step="0.01" placeholder="Invoice amount (defaults to approved final price)"><input class="rhInvoiceDue" data-id="${esc(j.opportunity.id)}" type="date" aria-label="Invoice due date"></div><div class="actions"><button class="rhPrepareHandover" data-id="${esc(j.opportunity.id)}">Confirm QA &amp; create handover + invoice draft</button></div><div class="sub">This records your confirmation that delivery, independent QA, acceptance criteria, and handover readiness are complete. It creates a DRAFT invoice only.</div></div>`:''}</div>`}).join(''):'<div class="empty">No opportunities yet. Website/Tally enquiries and manually added opportunities will appear here.</div>';document.querySelectorAll('.rhPrepareHandover').forEach(b=>b.onclick=async()=>{const id=b.dataset.id;const evidence=document.querySelector(`.rhHandoverEvidence[data-id="${id}"]`).value.trim();if(!evidence)return alert('Add real delivery and QA evidence first.');if(!confirm('Confirm delivery verified, independent QA passed, acceptance criteria met, and handover is ready? This creates a DRAFT invoice only.'))return;const amount=document.querySelector(`.rhInvoiceAmount[data-id="${id}"]`).value;const due=document.querySelector(`.rhInvoiceDue[data-id="${id}"]`).value;try{await api(`/api/rh/opportunities/${id}/handover-package`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({evidence:{operator_note:evidence},qa_checklist:{delivery_verified:true,independent_qa:true,acceptance_criteria_met:true,handover_ready:true},amount:amount?Number(amount):null,due_date:due||null})});await loadRhDeliveryEngine()}catch(e){alert(e.message)}})}
 async function loadRhClients(){const d=await api('/api/rh/opportunities');const items=d.items||[];const byClient={};items.forEach(o=>{const key=o.client_name||'(no client name)';(byClient[key]=byClient[key]||[]).push(o)});
 const rows=Object.entries(byClient);
 $('rhClientsList').innerHTML=rows.length?rows.map(([client,opps])=>{const won=opps.filter(o=>o.stage==='Won');const revenue=won.reduce((sum,o)=>sum+(o.final_price||0),0);return `<div class="item"><h3>${esc(client)}</h3><div class="meta"><span>${opps.length} opportunit${opps.length===1?'y':'ies'}</span><span>${won.length} won</span><span>$${revenue} revenue</span></div></div>`}).join(''):'<div class="empty">No clients yet.</div>'}

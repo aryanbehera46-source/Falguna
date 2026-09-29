@@ -21,7 +21,8 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from falguna.runtime import open_control_plane
-from falguna.web import FalgunaHandler
+from falguna.model_router import ModelRegistry
+from falguna.web import FalgunaHandler, wait_for_background_tasks
 
 
 class _LiveFalgunaServerCase(unittest.TestCase):
@@ -41,7 +42,10 @@ class _LiveFalgunaServerCase(unittest.TestCase):
 
     def _start_server(self):
         self.control, self.store = open_control_plane(self.repo)
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), FalgunaHandler)
+        ModelRegistry(self.store).save({"privacy_mode": "LOCAL_ONLY", "providers": {"ollama": {"enabled": False}, "codex": {"enabled": False}, "openai_compatible": {"enabled": False}}})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FalgunaHandler)
+        self.server.daemon_threads = False
+        self.port = self.server.server_port
         self.server.app_root = self.repo
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -55,6 +59,7 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self.assertTrue(wait_for_background_tasks(self.repo), "chat worker did not stop before repository cleanup")
         self.store.close()
         self._start_server()
 
@@ -62,6 +67,7 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self.assertTrue(wait_for_background_tasks(self.repo), "chat worker did not stop before repository cleanup")
         self.store.close()
         self.temp.cleanup()
 
