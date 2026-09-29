@@ -76,7 +76,24 @@ class ProjectDiscovery:
         implementation = [path for _, path in scored if not self._is_verification(path)][:1]
         tests = [path for _, path in scored if self._is_verification(path)][:1]
         implementation_required = objective_kind == "FEATURE_CHANGE"
-        editable = (implementation if implementation_required else []) + tests
+        # Held-out acceptance test (opt-in, default off -- every existing caller and
+        # profile keeps today's behavior unchanged): when the approved project profile
+        # sets hide_verification_files_from_worker, the verification/test file that
+        # DefinitionOfDone independently grades the mission against is deliberately
+        # left out of `editable`. StructuredEditWorker only ever reads and writes
+        # files listed in editable_files (falguna/workers.py), so excluding the graded
+        # test here makes it genuinely neither readable nor writable by the
+        # implementer -- independent verification still runs it, but as a separate
+        # subprocess the worker's own model call never sees. This is off by default
+        # because the ordinary, already-shipped pattern of the worker also adding or
+        # updating a regression test alongside its fix (see the system prompt in
+        # StructuredEditWorker) depends on the test file being in scope; opt in only
+        # for missions that specifically want a real held-out acceptance test.
+        hide_from_worker = bool(self.profile.get("hide_verification_files_from_worker", False))
+        if implementation_required and hide_from_worker:
+            editable = list(implementation)
+        else:
+            editable = (implementation if implementation_required else []) + tests
         if not editable and objective_kind == "DOCUMENTATION_ONLY":
             editable = [path for _, path in scored if Path(path).suffix.lower() == ".md"][:1]
         commands, sources = self._verification(tests[0] if tests else None)

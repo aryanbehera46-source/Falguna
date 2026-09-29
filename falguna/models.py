@@ -47,6 +47,21 @@ class RunPolicy:
     verification_write_regexes: List[str] = field(default_factory=list)
     require_implementation_change: bool = False
     implementation_files: List[str] = field(default_factory=list)
+    # Phase 3 Milestone 1 adversarial fix: verification/test files that must be
+    # physically absent from the worker's own worktree while it runs, not merely
+    # excluded from editable_files. An adversarial probe against the real,
+    # unmodified CodexCliJSONTransport (falguna/codex_transport.py) proved its
+    # `--sandbox read-only` mode restricts writes, not reads: a worker's shell
+    # tool could `cat` a file at its real worktree path even though that file
+    # was never copied into the transport's own ephemeral context directory.
+    # Listing a file here (ControlPlane._stash_hidden_files/_restore_hidden_files
+    # in orchestrator.py) makes it genuinely unreadable -- it does not exist on
+    # disk anywhere the worker's process can reach -- for the entire span the
+    # worker (or a repair re-run of it) is executing, and it is restored into
+    # the worktree only afterward, for independent verification. Empty by
+    # default, so every existing caller and ordinary editable-test mission is
+    # unaffected.
+    hidden_verification_files: List[str] = field(default_factory=list)
 
 
 @dataclass

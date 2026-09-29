@@ -11,10 +11,14 @@ producing real, verifiable output via the stores it wraps.
 
 import json
 import tempfile
+import threading
+import time
 import unittest
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from falguna.audit import AuditLog
+from falguna.browser_runtime import BrowserSessionStatus, BrowserSessionStore, playwright_available
 from falguna.documents import DocumentStore
 from falguna.email_admin import EmailStore
 from falguna.research import SourceResult
@@ -28,10 +32,13 @@ from falguna.workforce_workers import (
     DocumentWorker,
     EmailAdminWorker,
     ManualBrowserChannel,
+    RealPlaywrightBrowserChannel,
     ResearchWorker,
     SimulatedBrowserChannel,
     SpreadsheetWorker,
 )
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 class WorkerTestBase(unittest.TestCase):
@@ -251,6 +258,128 @@ class RoutingTests(WorkerTestBase):
         task_id = self.tasks.create("media", "Draft brief", "document_creation", actor="system")
         result = orch.execute(task_id)
         self.assertEqual(result["status"], "NEEDS_ARYAN")
+
+
+class _RealBrowserFixtureHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(FIXTURES_DIR), **kwargs)
+
+    def log_message(self, fmt, *args):
+        pass  # keep test output quiet
+
+
+class RealPlaywrightBrowserChannelWorkforceTests(unittest.TestCase):
+    """Phase 3 Milestone 2: proves the Workforce-initiated browser path is
+    wired to the SAME real, already-tested Playwright engine the
+    human/chat-initiated `/api/browser/sessions` path uses (see
+    `falguna/browser_runtime.py::PlaywrightBrowserRuntime` and its own
+    real-execution tests in `tests/test_browser_runtime.py`) -- not a
+    second browser engine, and not the honest-BLOCKED `ManualBrowserChannel`
+    default `BrowserWorker()` used before this milestone. Runs a real
+    headless Chromium against the same local fixture page
+    (`tests/fixtures/browser_fixture.html`) served over a real local HTTP
+    server, exactly like `test_browser_runtime.py`'s own real-execution
+    tests, so a regression in the actual end-to-end wiring -- not just the
+    new channel class's internal logic -- would be caught here."""
+
+    @classmethod
+    def setUpClass(cls):
+        check = playwright_available()
+        if not check["launchable"]:
+            raise unittest.SkipTest(f"playwright not usable in this environment: {check['detail']}")
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _RealBrowserFixtureHandler)
+        cls.port = cls.server.server_address[1]
+        cls.base_url = f"http://127.0.0.1:{cls.port}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.store = StateStore(self.root / "state.db")
+        self.store.migrate()
+        self.audit = AuditLog(self.root / "audit.jsonl")
+        self.needs_aryan = NeedsAryanQueue(self.store, self.audit)
+        self.tasks = WorkforceTaskStore(self.store, self.audit)
+        self.channel = RealPlaywrightBrowserChannel(self.root, self.store, audit=self.audit)
+        self.orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        self.orch.register_worker(BrowserWorker(channel=self.channel))
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_bounded_low_risk_workforce_browser_task_completes_with_real_evidence(self):
+        # Real Chromium: open the fixture page, type into a real field,
+        # click a real (non-gated) button, extract the real DOM result it
+        # produced -- an ordinary, low-risk task with no sensitive action
+        # anywhere on this path.
+        steps = [
+            {"action": "open", "target": f"{self.base_url}/browser_fixture.html", "value": None, "description": "open fixture"},
+            {"action": "type", "target": "#name-field", "value": "Aryan", "description": "type name"},
+            {"action": "click", "target": "#submit-btn", "value": None, "description": "submit the form"},
+            {"action": "extract", "target": "#result", "value": None, "description": "read the result"},
+        ]
+        task_id = self.tasks.create(
+            "media", "Fill out and submit the test fixture form", "web_navigation",
+            actor="Workforce", inputs={"steps": steps},
+        )
+        result = self.orch.execute(task_id, actor="Workforce")
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(result["execution_method"], "BROWSER")
+        evidence = json.loads(result["evidence_json"])
+        self.assertEqual(evidence["status"], BrowserSessionStatus.COMPLETED)
+        self.assertGreaterEqual(evidence["actions_recorded"], len(steps))
+        # Independent check against the real session/action rows this task
+        # actually produced -- not just the WorkforceOrchestrator summary --
+        # proving the real Chromium instance really navigated, typed, and
+        # clicked, rather than the channel fabricating a COMPLETED result.
+        sessions = BrowserSessionStore(self.store)
+        row = sessions.get(evidence["session_id"])
+        self.assertEqual(row["status"], BrowserSessionStatus.COMPLETED)
+        actions = sessions.list_actions(evidence["session_id"])
+        self.assertTrue(any(a["action_type"] == "click" and a["result"] == "OK" for a in actions))
+        self.assertTrue(any(a["action_type"] == "type" and a["result"] == "OK" for a in actions))
+
+    def test_sensitive_action_encountered_by_workforce_task_still_pauses_for_aryan(self):
+        # Adversarial case for Milestone 2's explicit instruction ("preserve
+        # all existing sensitive-action approval gates"): a Workforce task
+        # that reaches a real payment-shaped control must still pause for a
+        # fresh human approval through the EXISTING gate/queue, never
+        # auto-proceed and never invent a second escalation mechanism.
+        steps = [
+            {"action": "open", "target": f"{self.base_url}/browser_fixture.html", "value": None, "description": "open fixture"},
+            {"action": "click", "target": "#buy-now-btn", "value": None, "description": "buy now"},
+        ]
+        task_id = self.tasks.create(
+            "media", "Buy the featured item", "web_navigation",
+            actor="Workforce", inputs={"steps": steps},
+        )
+        result = self.orch.execute(task_id, actor="Workforce")
+        self.assertEqual(result["status"], "NEEDS_ARYAN")
+        self.assertIsNotNone(result["needs_aryan_id"])
+        item = self.store.get("needs_aryan_items", result["needs_aryan_id"])
+        self.assertEqual(item["kind"], "workforce_action_approval")
+        # WorkforceOrchestrator.transition() only threads `evidence` into the
+        # wf_task_events history row on this path, not the wf_tasks row's
+        # own evidence_json column (pre-existing framework behavior, not
+        # something this milestone changes) -- so the real evidence is
+        # verified directly against the browser session/action rows this
+        # task actually produced, proving the real PlaywrightBrowserRuntime
+        # sensitive-action gate fired rather than the new channel
+        # fabricating a BLOCKED result itself.
+        sessions = BrowserSessionStore(self.store)
+        rows = sessions.list()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["status"], BrowserSessionStatus.NEEDS_ARYAN)
+        self.assertEqual(row["needs_aryan_reason"], "sensitive_action:payment_or_purchase")
 
 
 if __name__ == "__main__":

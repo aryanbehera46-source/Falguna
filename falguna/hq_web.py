@@ -112,8 +112,8 @@ from .ventures import (
 from .video_pipeline import VideoPipeline
 from .workforce import WorkforceError, WorkforceOrchestrator, WorkforceTaskStore
 from .workforce_workers import (
-    BrowserWorker, ContentWorker, DataWorker, DocumentWorker, EmailAdminWorker, ResearchWorker,
-    SpreadsheetWorker,
+    BrowserWorker, ContentWorker, DataWorker, DocumentWorker, EmailAdminWorker, RealPlaywrightBrowserChannel,
+    ResearchWorker, SpreadsheetWorker,
 )
 from .agent_roles import (
     ChiefOfStaffWorker, EngineeringAgentWorker, ProposalSpecialistWorker, QAAgentWorker, SalesResearcherWorker,
@@ -452,8 +452,15 @@ def _build_workforce_orchestrator(app_root, store, audit, needs_aryan, control=N
     growth = GrowthAgent(analytics)
 
     orch = WorkforceOrchestrator(store, audit, needs_aryan=needs_aryan)
+    # Phase 3 Milestone 2: BrowserWorker is wired to the real Playwright
+    # engine (RealPlaywrightBrowserChannel), not the honest-BLOCKED
+    # ManualBrowserChannel default -- see workforce_workers.py's docstring
+    # on that class for why this introduces no new escalation path and
+    # degrades to the same BLOCKED outcome ManualBrowserChannel gave
+    # whenever Playwright itself is unavailable on this machine.
+    browser_channel = RealPlaywrightBrowserChannel(app_root, store, audit=audit)
     workers = [
-        BrowserWorker(), ResearchWorker(), DataWorker(), DocumentWorker(documents), SpreadsheetWorker(documents),
+        BrowserWorker(channel=browser_channel), ResearchWorker(), DataWorker(), DocumentWorker(documents), SpreadsheetWorker(documents),
         EmailAdminWorker(emails), ContentWorker(documents),
         ContentStrategistAgent(content), ScriptWriterAgent(content, scripts), CreativeDirectorAgent(content, scripts),
         VisualAssetAgent(content, assets), VoiceAgent(content, assets), VideoEditAgent(content, assets, pipeline),
@@ -2096,6 +2103,7 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         capital_requirement=body.get("capital_requirement"), workforce_requirement=body.get("workforce_requirement"),
                         falguna_work_requirement=body.get("falguna_work_requirement"), sales_media_needs=body.get("sales_media_needs"),
                         risks=body.get("risks"), approvals=body.get("approvals"), expected_evidence=body.get("expected_evidence"),
+                        workforce_assignments=body.get("workforce_assignments"),
                     )
                     return self._json({"plan_id": plan_id}, HTTPStatus.CREATED)
                 if path.startswith("/api/co/objectives/") and path.endswith("/department-objectives"):
@@ -2132,7 +2140,19 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     return self._json(plan)
                 if path.startswith("/api/co/plans/") and path.endswith("/route"):
                     plan_id = path.split("/")[4]
-                    result = ExecutionOrchestrator(store, control.audit).route_plan(plan_id, actor=body.get("actor", "system"))
+                    # Phase 3, Milestone 4: reuse the exact same, already-built
+                    # WorkforceOrchestrator every other workforce entry point
+                    # uses (see /api/wf/tasks/{id}/execute above) -- never a
+                    # second orchestrator -- so a routed Digital Workforce
+                    # task with a real task_type is genuinely executed
+                    # (through the real worker registry and its existing
+                    # approval gates) in the same call that routes it,
+                    # instead of being created and then left to rot at
+                    # CREATED with nothing left to ever pick it up.
+                    workforce_orch = _build_workforce_orchestrator(self.app_root, store, control.audit, needs_aryan_q, control=control)
+                    result = ExecutionOrchestrator(store, control.audit, workforce_orchestrator=workforce_orch).route_plan(
+                        plan_id, actor=body.get("actor", "system"),
+                    )
                     return self._json(result, HTTPStatus.CREATED)
                 if path.startswith("/api/co/department-objectives/") and path.endswith("/status"):
                     dept_objective_id = path.split("/")[4]

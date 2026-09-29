@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Optional
@@ -112,13 +113,27 @@ class ControlPlane:
         self.store.create("run_controls", {"run_id": run_id, "action": action, "status": "REQUESTED", "detail_json": json.dumps({"mode": "safe-boundary"}), "created_at": utcnow(), "updated_at": utcnow()})
         self.audit.append(f"RUN_{action}_REQUESTED", {"run_id": run_id, "mode": "safe-boundary"})
 
-    def _control_boundary(self, run_id: str, stage: str) -> bool:
+    def _control_boundary(self, run_id: str, stage: str, policy: Optional[RunPolicy] = None) -> bool:
         pending = self.store.list("run_controls", "run_id=? AND status=?", (run_id, "REQUESTED"))
         if not pending:
             return False
         control = pending[-1]
         action = control["action"]
-        self._checkpoint(run_id, stage, safe_boundary=True, control=action, worktree=self.store.get("runs", run_id).get("worktree"))
+        worktree_str = self.store.get("runs", run_id).get("worktree")
+        if action == "CANCEL" and policy is not None and worktree_str and getattr(policy, "hidden_verification_files", None):
+            # Final security-gate audit fix: resume() permanently refuses to
+            # resume a CANCELLED run, so this is the LAST point at which a
+            # currently-stashed hidden_verification_files entry can ever be
+            # restored. Without this, a cancel applied while the file is
+            # stashed (e.g. between the WORKER_COMPLETE checkpoint and this
+            # stage's own restore call) leaves the real hidden-test content
+            # permanently stranded in the stash directory -- never
+            # reintegrated, never cleaned up -- demonstrated live by this
+            # audit. Restoring here leaves a cancelled worktree in the same
+            # complete, honest state as any other cancelled worktree, using
+            # the existing restore mechanism only.
+            self._restore_hidden_files(Path(worktree_str), run_id, policy)
+        self._checkpoint(run_id, stage, safe_boundary=True, control=action, worktree=worktree_str)
         self.store.update("run_controls", control["id"], status="APPLIED")
         status = RunStatus.PAUSED.value if action == "PAUSE" else RunStatus.CANCELLED.value
         self.store.update("runs", run_id, status=status, error=None)
@@ -132,6 +147,52 @@ class ControlPlane:
         self.store.checkpoint(run_id, stage, payload)
         self.audit.append("CHECKPOINT", {"run_id": run_id, "stage": stage})
 
+    def _hidden_stash_root(self, run_id: str) -> Path:
+        return self.state_root / "hidden_verification_stash" / run_id
+
+    def _stash_hidden_files(self, worktree: Path, run_id: str, policy: RunPolicy) -> None:
+        """Physically remove policy.hidden_verification_files from the worktree
+        before the worker (or a repair re-run of it) executes. Deterministic,
+        run_id-keyed stash location (rather than a value returned and held only
+        in a local variable) so this is safe across a process restart/resume:
+        a resumed run recomputes the same stash path and finds the file already
+        there, rather than losing track of where it went. No-op for every
+        caller that doesn't set hidden_verification_files (every pre-existing
+        policy)."""
+        hidden = getattr(policy, "hidden_verification_files", None)
+        if not hidden:
+            return
+        root = worktree.resolve()
+        stash_root = self._hidden_stash_root(run_id)
+        for relative in hidden:
+            source = (root / relative).resolve()
+            if source == root or root not in source.parents:
+                continue
+            if not source.is_file():
+                continue  # already stashed (e.g. a resumed run) or genuinely absent
+            target = stash_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+
+    def _restore_hidden_files(self, worktree: Path, run_id: str, policy: RunPolicy) -> None:
+        """Inverse of _stash_hidden_files, called only once the worker's own
+        process has fully exited (worker.execute() is a blocking call; by the
+        time control returns here nothing of the worker's is still running) and
+        immediately before independent verification, which is the only thing
+        that needs these files present on disk."""
+        hidden = getattr(policy, "hidden_verification_files", None)
+        if not hidden:
+            return
+        root = worktree.resolve()
+        stash_root = self._hidden_stash_root(run_id)
+        for relative in hidden:
+            stashed = stash_root / relative
+            if not stashed.is_file():
+                continue  # nothing stashed for this file right now
+            target = (root / relative).resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(stashed), str(target))
+
     def _continue(self, run_id: str, worker: WorkerAdapter, policy: RunPolicy, force_stop_after: Optional[str]) -> str:
         total_started = time.monotonic()
         run = self.store.get("runs", run_id)
@@ -143,10 +204,24 @@ class ControlPlane:
         payload = json.loads(checkpoint["payload"]) if checkpoint else {}
         try:
             if stage == "CREATED":
-                if self._control_boundary(run_id, "CREATED"):
+                if self._control_boundary(run_id, "CREATED", policy):
                     return run_id
                 self.store.update("runs", run_id, status=RunStatus.PLANNING.value)
-                worktree = manager.create(run_id, task["base_ref"])
+                hidden_for_worktree = getattr(policy, "hidden_verification_files", None)
+                if hidden_for_worktree:
+                    # Requirement 1 audit fix: a plain create() worktree shares
+                    # source_repo's object database, so the pre-existing
+                    # working-tree stash/restore alone does not stop `git show
+                    # <ref>:<path>` / `git log -p` / `git cat-file
+                    # --batch-all-objects` from retrieving the hidden file --
+                    # demonstrated live during this audit. create_confidential()
+                    # gives the worker a worktree of a fully independent,
+                    # history-scrubbed clone instead, so the hidden blob is
+                    # never reachable through any git command, not just absent
+                    # from the working directory.
+                    worktree = manager.create_confidential(run_id, task["base_ref"], hidden_for_worktree, self._hidden_stash_root(run_id))
+                else:
+                    worktree = manager.create(run_id, task["base_ref"])
                 self.store.update("runs", run_id, worktree=str(worktree), head_sha=manager.head(worktree))
                 self._checkpoint(run_id, "WORKTREE_READY", worktree=str(worktree))
                 if force_stop_after == "WORKTREE_READY":
@@ -154,9 +229,10 @@ class ControlPlane:
                 stage, payload = "WORKTREE_READY", {"worktree": str(worktree)}
             worktree = Path(payload.get("worktree") or self.store.get("runs", run_id)["worktree"])
             if stage == "WORKTREE_READY":
-                if self._control_boundary(run_id, "WORKTREE_READY"):
+                if self._control_boundary(run_id, "WORKTREE_READY", policy):
                     return run_id
                 self.store.update("runs", run_id, status=RunStatus.WORKING.value)
+                self._stash_hidden_files(worktree, run_id, policy)
                 worker_started = time.monotonic()
                 result = None
                 worker_requirement = requirement
@@ -196,9 +272,15 @@ class ControlPlane:
                     return run_id
                 stage = "WORKER_COMPLETE"
             if stage == "WORKER_COMPLETE":
-                if self._control_boundary(run_id, "WORKER_COMPLETE"):
+                if self._control_boundary(run_id, "WORKER_COMPLETE", policy):
                     return run_id
                 self.store.update("runs", run_id, status=RunStatus.VERIFYING.value)
+                # Restore only now: the worker's own process (worker.execute()
+                # above) is a blocking call that has already returned, so
+                # nothing of the worker's is still running when this file
+                # reappears on disk. Independent verification is the only
+                # thing this restore is for.
+                self._restore_hidden_files(worktree, run_id, policy)
                 verification_started = time.monotonic()
                 passed, changed, results, browser, isolation, containment_probe = DefinitionOfDone(manager, policy).verify(worktree)
                 self._timed(run_id, "verification", verification_started, passed=passed, browser_applicable=policy.browser_applicable)
@@ -225,6 +307,12 @@ class ControlPlane:
                     repair_requirement = requirement + "\n\nThe control-plane verification failed. Diagnose and repair only the permitted files, then rerun tests. Verification evidence:\n" + failure_summary
                     repair_attempt = int(self.store.get("runs", run_id)["attempt"]) + 1
                     self.store.update("runs", run_id, status=RunStatus.WORKING.value, attempt=repair_attempt)
+                    # The prior VERIFYING step just restored the hidden files
+                    # for DefinitionOfDone to run against; re-stash before
+                    # handing the worktree back to the worker for this repair
+                    # attempt so the confidentiality guarantee holds across a
+                    # repair pass too, not only the first attempt.
+                    self._stash_hidden_files(worktree, run_id, policy)
                     repair = worker.execute(worktree, repair_requirement, run_id)
                     self.audit.append("REPAIR_ATTEMPT", {"run_id": run_id, "attempt": repair_attempt, "verification_attempt": verification_attempt, "success": repair.success, "exit_code": repair.exit_code})
                     for call in repair.model_calls:
@@ -245,7 +333,7 @@ class ControlPlane:
                 self._checkpoint(run_id, "VERIFIED", worktree=str(worktree), changed_files=changed)
                 stage, payload = "VERIFIED", {"worktree": str(worktree), "changed_files": changed}
             if stage == "VERIFIED":
-                if self._control_boundary(run_id, "VERIFIED"):
+                if self._control_boundary(run_id, "VERIFIED", policy):
                     return run_id
                 self.store.update("runs", run_id, status=RunStatus.REVIEWING.value)
                 review_started = time.monotonic()
@@ -301,6 +389,12 @@ class ControlPlane:
                     self.supervisor.record(run_id, "REVIEW_FAILURE: " + "; ".join(review.findings), retry_budget=policy.max_attempts, phase="ADDRESSING_REVIEW")
                     repair_attempt = int(self.store.get("runs", run_id)["attempt"]) + 1
                     self.store.update("runs", run_id, status=RunStatus.WORKING.value, attempt=repair_attempt)
+                    # Same reasoning as the VERIFICATION_FAILURE repair path above:
+                    # the VERIFIED stage above restored the hidden files for the
+                    # reviewer's own diff/verification-evidence read, so they must
+                    # be re-stashed before the worktree goes back to the worker for
+                    # this review-correction pass too.
+                    self._stash_hidden_files(worktree, run_id, policy)
                     repair = worker.execute(worktree, correction, run_id)
                     self.audit.append("REVIEW_REPAIR_ATTEMPT", {"run_id": run_id, "attempt": repair_attempt, "success": repair.success, "findings": review.findings})
                     repair_path = evidence_dir / f"review-repair-output-{repair_attempt}.txt"

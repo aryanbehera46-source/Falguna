@@ -9,8 +9,13 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from falguna.hq_web import HQ_INDEX_HTML, PRODUCT_NAME, TTTHQHandler, reconcile_workforce_tasks_at_startup
+from falguna.audit import AuditLog
+from falguna.hq_web import (
+    HQ_INDEX_HTML, PRODUCT_NAME, TTTHQHandler, _build_workforce_orchestrator, reconcile_workforce_tasks_at_startup,
+)
 from falguna.runtime import open_control_plane
+from falguna.store import StateStore
+from falguna.ttt_hq import NeedsAryanQueue
 from falguna.web import FalgunaHandler, INDEX_HTML
 from falguna.workforce import WorkforceTaskStore
 
@@ -98,6 +103,45 @@ class HTMLSeparationTests(unittest.TestCase):
         # so a broken revert would fail loudly here too, not just there.
         for label in ("Falguna", "Chat", "Work", "Approve", "Reject", "Request Changes"):
             self.assertIn(label, INDEX_HTML)
+
+
+class WorkforceAutoResumeClassificationTests(unittest.TestCase):
+    """Phase 3 Milestone 3: closes the loop between the unit-level
+    auto_resumable_after_restart tests in test_workforce.py/
+    test_workforce_workers.py and the ACTUAL production wiring this
+    instruction is about -- every worker `_build_workforce_orchestrator`
+    (falguna/hq_web.py) really registers today. No live server needed:
+    this constructs the orchestrator directly against a scratch store,
+    the same way the real HQ server does, and inspects its registered
+    workers' classification."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.store = StateStore(self.root / "state.db")
+        self.store.migrate()
+        self.audit = AuditLog(self.root / "audit.jsonl")
+        self.needs_aryan = NeedsAryanQueue(self.store, self.audit)
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_only_dataworker_and_researchworker_are_auto_resumable_today(self):
+        orch = _build_workforce_orchestrator(self.root, self.store, self.audit, self.needs_aryan, control=None)
+        resumable = {w.name for w in orch._workers if getattr(w, "auto_resumable_after_restart", False)}
+        not_resumable = {w.name for w in orch._workers if not getattr(w, "auto_resumable_after_restart", False)}
+        self.assertEqual(resumable, {"data_worker", "research_worker"})
+        # Every other currently-registered role -- including the real
+        # RealPlaywrightBrowserChannel-backed BrowserWorker Milestone 2
+        # just wired in -- stays escalate-only after a restart, exactly as
+        # it was before this milestone.
+        self.assertIn("browser_worker", not_resumable)
+        self.assertIn("document_worker", not_resumable)
+        self.assertIn("spreadsheet_worker", not_resumable)
+        self.assertIn("email_admin_worker", not_resumable)
+        self.assertIn("content_worker", not_resumable)
+        self.assertGreaterEqual(len(not_resumable), 10)  # every other registered role, not a narrow accident
 
 
 class _LiveServerCase(unittest.TestCase):
@@ -455,14 +499,97 @@ class WorkforceMediaHQServerTests(TTTHQServerTests):
         status, history = self._get(self.hq_port, f"/api/wf/tasks/{task_id}/history")
         self.assertGreaterEqual(len(history["items"]), 2)
 
-    def test_workforce_task_with_no_adapter_escalates_not_crashes(self):
+    def test_workforce_browser_task_over_http_runs_the_real_adapter_without_crashing(self):
+        # Phase 3 Milestone 2: BrowserWorker is now wired to
+        # RealPlaywrightBrowserChannel, not the always-BLOCKED
+        # ManualBrowserChannel this test originally exercised (renamed
+        # from test_workforce_task_with_no_adapter_escalates_not_crashes,
+        # whose premise -- "no adapter exists" -- this milestone
+        # deliberately fixed). Explicit `steps` on a self-contained
+        # data: URL avoid any dependency on a configured model provider
+        # or external network access, so this stays a fast, deterministic
+        # HTTP-layer smoke test: the real adapter must run synchronously
+        # inside this one HTTP request and return cleanly, never crash or
+        # hang the server thread.
         status, out = self._post(self.hq_port, "/api/wf/tasks", {
-            "department": "media", "objective": "Research a topic", "task_type": "browser_research",
+            "department": "media", "objective": "Open a self-contained test page", "task_type": "browser_research",
+            "inputs": {"steps": [
+                {"action": "open", "target": "data:text/html,<html><body>ok</body></html>", "value": None, "description": "open test page"},
+                {"action": "extract", "target": "body", "value": None, "description": "read the page"},
+            ]},
         })
         task_id = out["task_id"]
-        status, result = self._post(self.hq_port, f"/api/wf/tasks/{task_id}/execute", {"actor": "Aryan"})
+        # A real headless Chromium launch (Milestone 2's whole point) can
+        # legitimately take longer than this file's default 2-second smoke-
+        # test timeout, especially under parallel test load -- exactly like
+        # an EngineeringAgentWorker/QAAgentWorker mission already can on
+        # this same synchronous execute() contract. A dedicated, generous
+        # timeout here avoids a client-side give-up racing the server's own
+        # in-flight request and corrupting this test's own scratch database
+        # out from under it (a real failure mode observed while writing
+        # this test, not a hypothetical one).
+        data = json.dumps({"actor": "Aryan"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.hq_port}/api/wf/tasks/{task_id}/execute",
+            data=data, method="POST", headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status, result = resp.status, json.loads(resp.read())
         self.assertEqual(status, 200)
-        self.assertEqual(result["status"], "NEEDS_ARYAN")
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(result["execution_method"], "BROWSER")
+
+    def test_company_os_route_plan_over_http_drives_a_real_multi_worker_workforce_assignment(self):
+        # Phase 3, Milestone 4: the whole Company OS -> Digital Workforce
+        # loop, driven entirely through TTT HQ's real HTTP layer (never by
+        # reaching into the store objects directly) -- objective -> ACTIVE
+        # -> plan (naming two distinct, genuinely worker-supported
+        # task_types) -> APPROVED -> route. Before this milestone's fix,
+        # route_plan always created a single wf_task hardcoded to
+        # task_type="company_os_routed", which no worker has ever
+        # recognized -- a guaranteed dead end. This proves the repaired
+        # route_plan spans at least two distinct real worker roles in one
+        # call and that each routed task is genuinely, permittedly executed
+        # (not merely created) through the same WorkforceOrchestrator/
+        # worker registry every other workforce entry point uses.
+        status, obj_out = self._post(self.hq_port, "/api/co/objectives", {
+            "title": "HTTP Company OS Routing Test", "actor": "Aryan",
+        })
+        self.assertEqual(status, 201)
+        objective_id = obj_out["objective_id"]
+        status, _ = self._post(self.hq_port, f"/api/co/objectives/{objective_id}/transition", {
+            "to_status": "ACTIVE", "actor": "Aryan",
+        })
+        self.assertEqual(status, 200)
+
+        status, plan_out = self._post(self.hq_port, f"/api/co/objectives/{objective_id}/plans", {
+            "desired_outcome": "Stand up the HTTP routing proof", "actor": "Aryan",
+            "departments": ["Digital Workforce"],
+            "workforce_assignments": [
+                {"task_type": "data_processing", "inputs": {"records": [{"email": "a@x.com"}, {"email": "a@x.com"}], "dedupe_key": "email"}},
+                {"task_type": "document_creation", "inputs": {"title": "Routing Proof Note", "content_text": "created by the HTTP routing test"}},
+            ],
+        })
+        self.assertEqual(status, 201)
+        plan_id = plan_out["plan_id"]
+        status, _ = self._post(self.hq_port, f"/api/co/plans/{plan_id}/status", {"status": "APPROVED", "actor": "Aryan"})
+        self.assertEqual(status, 200)
+
+        status, route_out = self._post(self.hq_port, f"/api/co/plans/{plan_id}/route", {"actor": "Aryan"})
+        self.assertEqual(status, 201)
+        self.assertEqual(len(route_out["created_wf_tasks"]), 2)
+        self.assertEqual(len(route_out["executed"]), 2)
+        self.assertEqual({e["status"] for e in route_out["executed"]}, {"COMPLETED"})
+        self.assertEqual({e["task_type"] for e in route_out["executed"]}, {"data_processing", "document_creation"})
+
+        # Independently re-verify against real stores over the same HTTP
+        # layer, not just the route response.
+        for task_id in route_out["created_wf_tasks"]:
+            status, task = self._get(self.hq_port, f"/api/wf/tasks/{task_id}")
+            self.assertEqual(status, 200)
+            self.assertEqual(task["status"], "COMPLETED")
+            self.assertIsNotNone(task["evidence_json"])
+            self.assertEqual(task["co_objective_id"], objective_id)
 
     def test_command_center_snapshot_and_ceo_brief_over_http(self):
         # Real data through the real HTTP layer: a won opportunity, an

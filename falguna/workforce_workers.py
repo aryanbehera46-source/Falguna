@@ -16,8 +16,19 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from .attachments import AttachmentStore
+from .browser_planner import plan_steps_from_objective
+from .browser_runtime import (
+    ALL_ACTION_TYPES,
+    BrowserRuntimeError,
+    BrowserSessionStatus,
+    BrowserSessionStore,
+    PlaywrightBrowserRuntime,
+)
 from .documents import DocumentStore
 from .email_admin import EmailStore
+from .model_router import ModelRegistry
+from .providers import FalgunaModelError
 from .workforce import WorkerResult, WorkforceWorker
 
 # --------------------------------------------------------------------------
@@ -71,6 +82,133 @@ class SimulatedBrowserChannel(BrowserChannel):
         )
 
 
+class RealPlaywrightBrowserChannel(BrowserChannel):
+    """Phase 3 Milestone 2: the real adapter. Reuses the exact same,
+    already-tested `BrowserSessionStore` / `AttachmentStore` /
+    `PlaywrightBrowserRuntime` engine the human/chat-initiated
+    `POST /api/browser/sessions` endpoint uses (see
+    `falguna/web.py::_start_browser_session` /
+    `_run_browser_session_background`) -- no second browser engine, no
+    second sensitive-action classifier, no new escalation machinery.
+
+    The HTTP path kicks off a background thread and lets the caller poll
+    the session row for state. `WorkforceWorker.execute()` is instead a
+    synchronous, blocking-call contract, so `attempt()` runs
+    `PlaywrightBrowserRuntime.run()` directly on the calling thread (it
+    mutates the session row as it progresses and returns None -- exactly
+    as `browser_runtime.py` documents) and then re-reads that row for the
+    session's final status.
+
+    A session that ends anywhere other than COMPLETED -- NEEDS_ARYAN (a
+    sensitive action or an unplanned challenge/login wall), FAILED, or an
+    unexpected error caught here -- maps to a BLOCKED `BrowserResult`.
+    `BrowserWorker.execute()` (unmodified) turns that into a BLOCKED
+    `WorkerResult`, which `WorkforceOrchestrator.execute()` (also
+    unmodified) already escalates to NEEDS_ARYAN with a real
+    `workforce_action_approval` needs-Aryan item. That is the existing
+    gate `PlaywrightBrowserRuntime.run()`'s own sensitive-action check
+    (`classify_sensitive_action`) already feeds into for the human/chat
+    path -- this channel does not weaken, bypass, or duplicate it, which
+    is what Aryan's Milestone 2 instruction to preserve every existing
+    sensitive-action approval gate requires."""
+
+    name = "real_playwright_browser"
+
+    def __init__(self, app_root, store, audit=None, actor: str = "Workforce"):
+        self.app_root = app_root
+        self.store = store
+        self.audit = audit
+        self.actor = actor
+
+    def attempt(self, task: Dict[str, Any]) -> BrowserResult:
+        inputs = json.loads(task["inputs_json"]) if task.get("inputs_json") else {}
+        objective = str(inputs.get("objective") or task.get("objective") or "").strip()
+        if not objective:
+            return BrowserResult(
+                status="BLOCKED",
+                evidence={"reason_detail": "no objective provided for this browser task"},
+                blocked_reason="no_objective_provided",
+            )
+        task_type = str(inputs.get("task_type") or task.get("task_type") or "browser_research")
+        project_id = inputs.get("project_id")
+        headless = bool(inputs.get("headless", True))
+        explicit_steps = inputs.get("steps")
+        sessions = BrowserSessionStore(self.store)
+        if explicit_steps:
+            steps = [s for s in explicit_steps if isinstance(s, dict) and s.get("action") in ALL_ACTION_TYPES][:20]
+            if not steps:
+                return BrowserResult(
+                    status="BLOCKED",
+                    evidence={"reason_detail": "no valid browser steps provided"},
+                    blocked_reason="no_valid_steps",
+                )
+        else:
+            try:
+                steps = plan_steps_from_objective(self.store, objective, task_type, model_override=inputs.get("model"))
+            except FalgunaModelError as exc:
+                return BrowserResult(
+                    status="BLOCKED",
+                    evidence={"reason_detail": exc.message},
+                    blocked_reason="browser_planning_failed",
+                )
+        privacy_mode = ModelRegistry(self.store).load()["privacy_mode"]
+        session_id = sessions.create(
+            objective, task_type, project_id, self.actor, headless, privacy_mode,
+            plan=steps, conversation_id=None, research_id=None,
+        )
+        if self.audit is not None:
+            self.audit.append("browser_session_created", {
+                "session_id": session_id, "objective": objective[:200], "steps": len(steps), "source": "workforce",
+            })
+        try:
+            attachments = AttachmentStore(self.store, self.app_root)
+            runtime = PlaywrightBrowserRuntime(self.app_root, self.store, sessions, attachments, audit=self.audit)
+            runtime.run(session_id, steps)
+        except Exception as exc:
+            # Mirrors _run_browser_session_background's own last-resort net:
+            # PlaywrightBrowserRuntime.run() already converts every real
+            # failure into a clean session status internally, so this only
+            # catches a genuinely unexpected error in the calling thread
+            # itself, and it never leaves the row stuck showing RUNNING.
+            try:
+                sessions.set_status(
+                    session_id, BrowserSessionStatus.FAILED,
+                    error="Falguna hit an unexpected internal error running this browser task.",
+                    error_category=BrowserRuntimeError.UNEXPECTED_FAILURE, error_detail=str(exc)[:2000],
+                )
+            except Exception:
+                pass
+        session = sessions.get(session_id)
+        if not session:
+            return BrowserResult(
+                status="BLOCKED",
+                evidence={"session_id": session_id, "reason_detail": "browser session row disappeared after run()"},
+                blocked_reason="session_missing",
+            )
+        status = session.get("status")
+        actions = sessions.list_actions(session_id)
+        evidence = {
+            "session_id": session_id,
+            "status": status,
+            "objective": objective,
+            "task_type": task_type,
+            "step_count": len(steps),
+            "actions_recorded": len(actions),
+            "last_action": actions[-1] if actions else None,
+        }
+        if status == BrowserSessionStatus.COMPLETED:
+            return BrowserResult(status="COMPLETED", evidence=evidence)
+        blocked_reason = "browser_session_not_completed"
+        if status == BrowserSessionStatus.NEEDS_ARYAN:
+            blocked_reason = session.get("needs_aryan_reason") or "sensitive_action"
+            evidence["needs_aryan_reason"] = session.get("needs_aryan_reason")
+        elif status == BrowserSessionStatus.FAILED:
+            blocked_reason = session.get("error_category") or "browser_session_failed"
+            evidence["error"] = session.get("error")
+        evidence["reason_detail"] = f"browser session ended with status {status!r}"
+        return BrowserResult(status="BLOCKED", evidence=evidence, blocked_reason=blocked_reason)
+
+
 class BrowserWorker(WorkforceWorker):
     """Handles browser research, web navigation, data collection, and
     forms/admin task types -- the ones that need a real page. Prefers API
@@ -117,6 +255,14 @@ class ResearchWorker(WorkforceWorker):
 
     name = "research_worker"
     _SUPPORTED = {"research", "trend_discovery"}
+    # Phase 3 Milestone 3: execute() below writes nothing of its own -- it
+    # only calls self.search_provider (a read) and returns a WorkerResult;
+    # WorkforceOrchestrator is the one that durably records COMPLETED
+    # afterward. There is no half-done state a restart could leave behind
+    # (no document, no draft, no browser session), so re-running this from
+    # scratch after an interruption is safe and produces an equivalent
+    # result -- verified auto-resumable per WorkforceWorker's own docstring.
+    auto_resumable_after_restart = True
 
     def __init__(self, search_provider: Optional[Callable[[str, int], List[Any]]] = None):
         self.search_provider = search_provider
@@ -157,6 +303,14 @@ class DataWorker(WorkforceWorker):
 
     name = "data_worker"
     _SUPPORTED = {"data_processing", "file_organization", "crm_admin"}
+    # Phase 3 Milestone 3: execute() below is a pure, in-memory transform
+    # of task.inputs_json (dedupe against records already given at task
+    # creation) -- it never calls a store, a provider, or anything external,
+    # so it has literally zero durable side effect to half-complete. Re-
+    # running it from scratch after a restart always reproduces the exact
+    # same output for the exact same inputs -- verified auto-resumable per
+    # WorkforceWorker's own docstring.
+    auto_resumable_after_restart = True
 
     def supports(self, task_type: str) -> bool:
         return task_type in self._SUPPORTED

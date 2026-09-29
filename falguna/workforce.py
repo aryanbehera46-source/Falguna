@@ -42,11 +42,16 @@ TERMINAL_TASK_STATUSES = {"COMPLETED", "CANCELLED"}
 # Explicit, checked graph -- no silent state jumps, same discipline as
 # lifecycle.ALLOWED_TRANSITIONS. FAILED -> READY is the one edge that exists
 # purely to let a bounded retry happen without inventing a new status.
+# EXECUTING -> READY exists purely for Phase 3 Milestone 3's restart
+# reconciliation (reconcile_after_restart()) to requeue a task interrupted
+# mid-execution when, and only when, the worker currently registered for
+# its task_type is explicitly verified auto_resumable_after_restart --
+# nothing else in this module ever takes this edge.
 ALLOWED_TASK_TRANSITIONS: Dict[str, set] = {
     "CREATED": {"PLANNING", "CANCELLED"},
     "PLANNING": {"READY", "BLOCKED", "CANCELLED"},
     "READY": {"EXECUTING", "CANCELLED"},
-    "EXECUTING": {"VERIFYING", "BLOCKED", "NEEDS_ARYAN", "FAILED", "CANCELLED"},
+    "EXECUTING": {"VERIFYING", "READY", "BLOCKED", "NEEDS_ARYAN", "FAILED", "CANCELLED"},
     "BLOCKED": {"READY", "NEEDS_ARYAN", "CANCELLED", "FAILED"},
     "NEEDS_ARYAN": {"READY", "EXECUTING", "CANCELLED", "FAILED"},
     "VERIFYING": {"COMPLETED", "FAILED", "BLOCKED"},
@@ -101,6 +106,20 @@ class WorkforceWorker:
     honest result is BLOCKED (escalate) or FAILED, not a guessed COMPLETED."""
 
     name = "worker"
+
+    # Phase 3 Milestone 3: fail-closed by default. `reconcile_after_restart()`
+    # below only ever auto-resumes an interrupted task when the worker
+    # CURRENTLY registered for its task_type explicitly overrides this to
+    # True -- and only a worker whose `execute()` performs zero durable
+    # side effect of its own (a pure computation over its own inputs, or a
+    # read that writes nothing) may honestly do that, because "resuming" a
+    # stateless worker is indistinguishable from safely re-running it from
+    # scratch. Every existing worker keeps this False unless explicitly
+    # reviewed and overridden (see DataWorker/ResearchWorker in
+    # workforce_workers.py for the two current exceptions, each with its
+    # own justification) -- a new worker added later is escalate-only until
+    # someone deliberately marks it otherwise.
+    auto_resumable_after_restart = False
 
     def supports(self, task_type: str) -> bool:
         raise NotImplementedError
@@ -351,20 +370,85 @@ class WorkforceOrchestrator:
         never silently retries it either -- an engineering task's worktree
         may hold a real, half-applied patch, and re-running it blind risks
         exactly the duplicate/conflicting execution the durable-autonomy
-        requirement rules out. Instead it moves every PLANNING/EXECUTING
-        task to BLOCKED with an honest, specific reason and escalates to
-        Needs Aryan through the same `workforce_action_approval` path
-        `execute()`'s own BLOCKED branch already uses -- a person decides
-        whether to retry, reassign, or cancel, with the task's own
+        requirement rules out. So by default it moves every PLANNING/
+        EXECUTING task to BLOCKED with an honest, specific reason and
+        escalates to Needs Aryan through the same `workforce_action_approval`
+        path `execute()`'s own BLOCKED branch already uses -- a person
+        decides whether to retry, reassign, or cancel, with the task's own
         evidence/outputs (if any -- e.g. an engineering task's underlying
         `run_id`/worktree, still on disk and independently resumable via
         the Engineering Runs UI) intact rather than lost.
+
+        Phase 3 Milestone 3's one narrow exception: when the worker
+        CURRENTLY registered for the interrupted task's task_type has
+        explicitly declared itself `auto_resumable_after_restart` (see that
+        attribute's docstring on `WorkforceWorker` -- today only DataWorker
+        and ResearchWorker, each independently verified to perform zero
+        durable side effect inside `execute()` itself), "resuming" it is
+        indistinguishable from safely re-running it from scratch: nothing
+        it could have half-done needs to survive, because it never wrote
+        anything of its own. Only THAT narrow case is requeued to READY and
+        actually re-executed here, synchronously, before this method
+        returns -- genuine automatic resumption, not just a flag for later.
+        Everything else -- every task type with any uncertain external side
+        effect, which today means every other registered worker -- keeps
+        exactly the escalate-and-wait-for-a-human behavior above, unchanged
+        byte-for-byte from before this milestone.
+
+        If the auto-resume attempt itself raises (a genuinely unexpected
+        error, not an ordinary worker-reported BLOCKED/FAILED, which
+        `execute()` already turns into the right outcome on its own), this
+        falls back to the same honest escalate-to-Needs-Aryan path rather
+        than letting a fresh, unrelated exception take down process startup.
 
         Returns the ids it reconciled (empty if none)."""
         reconciled: List[str] = []
         for old_status in ("EXECUTING", "PLANNING"):
             for task in self.tasks.list(status=old_status):
                 task_id = task["id"]
+                worker = self._find_worker(task["task_type"])
+                if worker is not None and getattr(worker, "auto_resumable_after_restart", False):
+                    self.tasks.transition(
+                        task_id, "READY", actor,
+                        reason=(
+                            f"Falguna restarted while this task was {old_status.lower()}. "
+                            f"'{worker.name}' is verified safe to auto-resume after a restart "
+                            "(no durable side effect of its own), so this task was requeued "
+                            "and re-executed automatically rather than escalated."
+                        ),
+                        assigned_worker=worker.name,
+                    )
+                    self.audit.append("WF_TASK_AUTO_RESUMED_AFTER_RESTART", {
+                        "task_id": task_id, "from_status": old_status, "worker": worker.name, "actor": actor,
+                    })
+                    try:
+                        self.execute(task_id, actor=actor)
+                    except Exception as exc:
+                        # Never let a genuinely unexpected error during
+                        # automatic resumption crash startup or leave the
+                        # task in limbo -- fall back to the same honest
+                        # escalation every other interrupted task gets.
+                        reason = (
+                            f"Falguna restarted while this task was {old_status.lower()}, and an attempt to "
+                            f"automatically resume it (via '{worker.name}', verified safe to auto-resume) "
+                            f"failed unexpectedly: {exc}"
+                        )
+                        needs_aryan_id = None
+                        if self.needs_aryan is not None:
+                            needs_aryan_id = self.needs_aryan.create_item(
+                                "workforce_action_approval",
+                                f"Workforce task's automatic resume after restart failed: {task['objective']}",
+                                reason, actor=actor, rationale="auto-resume attempt raised unexpectedly",
+                                risk="automatic resumption failed; true state is unknown", ref_type="wf_task", ref_id=task_id,
+                            )
+                        current = self.tasks.get(task_id)
+                        if current and current["status"] not in TERMINAL_TASK_STATUSES:
+                            self.tasks.transition(task_id, "BLOCKED", actor, reason=reason, needs_aryan_id=needs_aryan_id)
+                        self.audit.append("WF_TASK_AUTO_RESUME_FAILED", {
+                            "task_id": task_id, "worker": worker.name, "actor": actor, "error": str(exc)[:500],
+                        })
+                    reconciled.append(task_id)
+                    continue
                 reason = (
                     f"Falguna restarted while this task was {old_status.lower()} "
                     f"(assigned to {task.get('assigned_worker') or 'an unassigned worker'}). "

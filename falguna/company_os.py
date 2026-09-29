@@ -218,6 +218,7 @@ class PlanStore:
         falguna_work_requirement: Optional[str] = None, sales_media_needs: Optional[str] = None,
         risks: Optional[List[str]] = None, approvals: Optional[List[str]] = None,
         expected_evidence: Optional[str] = None,
+        workforce_assignments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         objective = self.store.get("co_objectives", objective_id)
         if not objective:
@@ -229,6 +230,22 @@ class PlanStore:
         bad_departments = set(departments or []) - DEPARTMENTS
         if bad_departments:
             raise CompanyOSError(f"unknown departments: {sorted(bad_departments)}")
+        # Phase 3, Milestone 4: `workforce_assignments`, when given, is the
+        # structured description of the real Digital Workforce work this
+        # plan needs -- each item a {"task_type": ..., "objective": ...
+        # (optional), "inputs": ... (optional)} dict. This module never
+        # invents which task_type a piece of work needs (that would be
+        # exactly the kind of fabricated certainty the module docstring
+        # forbids), so it only checks shape here -- whether a given
+        # task_type is one any currently-registered worker actually
+        # supports is checked at route time, by the real WorkforceOrchestrator
+        # itself (see ExecutionOrchestrator.route_plan), never guessed here.
+        if workforce_assignments is not None:
+            if not isinstance(workforce_assignments, list):
+                raise CompanyOSError("workforce_assignments must be a list")
+            for item in workforce_assignments:
+                if not isinstance(item, dict) or not str(item.get("task_type") or "").strip():
+                    raise CompanyOSError("each workforce_assignments item requires a non-empty task_type")
         now = utcnow()
         plan_id = self.store.create("co_plans", {
             "objective_id": objective_id, "desired_outcome": desired_outcome.strip(),
@@ -237,7 +254,8 @@ class PlanStore:
             "capital_requirement": capital_requirement, "workforce_requirement": workforce_requirement,
             "falguna_work_requirement": falguna_work_requirement, "sales_media_needs": sales_media_needs,
             "risks_json": _json_dumps(risks), "approvals_json": _json_dumps(approvals),
-            "expected_evidence": expected_evidence, "status": "DRAFT",
+            "expected_evidence": expected_evidence,
+            "workforce_assignments_json": _json_dumps(workforce_assignments), "status": "DRAFT",
             "actor": actor, "created_at": now, "updated_at": now,
         })
         self.audit.append("CO_PLAN_CREATED", {"plan_id": plan_id, "objective_id": objective_id, "actor": actor})
@@ -272,6 +290,7 @@ class PlanStore:
         plan = dict(plan)
         for field in ("milestones", "dependencies", "ventures", "departments", "risks", "approvals"):
             plan[field] = _json_loads(plan.get(f"{field}_json"))
+        plan["workforce_assignments"] = _json_loads(plan.get("workforce_assignments_json"))
         return plan
 
 
@@ -724,13 +743,52 @@ class ExecutionOrchestrator:
     needs a real repository and policy the caller must supply; this
     orchestrator only records the *intent* via a traceability link and a
     company event so the need is visible, never silently invents a
-    mission)."""
+    mission).
 
-    def __init__(self, store: StateStore, audit: AuditLog):
+    Phase 3, Milestone 4 (routing repair): every wf_task this orchestrator
+    used to create for "Digital Workforce" was hardcoded to
+    task_type="company_os_routed" -- a string that has never matched any
+    real WorkforceWorker.supports() (see falguna/workforce_workers.py's
+    `_SUPPORTED` sets: "browser_research", "research", "data_processing",
+    "document_creation", ... -- never "company_os_routed"). Every task
+    Company OS ever routed this way was therefore a guaranteed dead end:
+    it would sit at CREATED forever if nothing called execute() on it, and
+    would immediately and permanently escalate to Needs Aryan as
+    "no registered worker supports task_type 'company_os_routed'" the one
+    time something did. This was a routing *mismatch*, not a capacity or
+    approval problem, and no amount of retrying or resuming could ever
+    have fixed it.
+
+    The fix does not add a second orchestrator: it reuses the plan's own
+    `workforce_assignments` (PlanStore.create, each a real
+    {"task_type": ..., "inputs": ...} the plan's author explicitly chose --
+    this module still never guesses which task_type a department needs) to
+    create one real, potentially-executable wf_task per assignment, and,
+    when the caller hands this orchestrator a real, already-built
+    `WorkforceOrchestrator` (the exact same one `_build_workforce_orchestrator`
+    in falguna/hq_web.py wires up for every other workforce entry point --
+    never a new one constructed here), immediately calls its own tested
+    `execute()` on each new task so real, permitted work happens through
+    the same worker registry, the same sensitive-action approval gates, and
+    the same honest COMPLETED/BLOCKED/FAILED/escalation contract as every
+    other workforce task in the system. A plan naming "Digital Workforce"
+    with no workforce_assignments is routed honestly: a department
+    objective is still created, but no fabricated task_type is invented in
+    its place -- `skipped` says plainly why nothing was created."""
+
+    def __init__(self, store: StateStore, audit: AuditLog, workforce_orchestrator: Optional[Any] = None):
         self.store = store
         self.audit = audit
         self.dept_objectives = DepartmentObjectiveStore(store, audit)
         self.events = EventBus(store, audit)
+        # Optional, real falguna.workforce.WorkforceOrchestrator (built by
+        # the caller, typically via hq_web.py's _build_workforce_orchestrator
+        # -- never constructed inside this module). When absent, route_plan
+        # still creates real, correctly-typed wf_tasks; it just leaves them
+        # at CREATED for whatever already calls execute() (e.g. the
+        # existing POST /api/wf/tasks/{id}/execute route, or restart
+        # reconciliation) to pick up, exactly like any other wf_task.
+        self.workforce_orchestrator = workforce_orchestrator
 
     def route_plan(self, plan_id: str, actor: str = "system") -> Dict[str, Any]:
         plan = self.store.get("co_plans", plan_id)
@@ -739,8 +797,10 @@ class ExecutionOrchestrator:
         if plan["status"] not in {"APPROVED", "IN_EXECUTION"}:
             raise CompanyOSError("a plan must be APPROVED before it can be routed for execution")
         departments = _json_loads(plan.get("departments_json"))
+        workforce_assignments = _json_loads(plan.get("workforce_assignments_json")) or []
         created_dept_objectives: List[str] = []
         created_wf_tasks: List[str] = []
+        executed: List[Dict[str, Any]] = []
         skipped: List[str] = []
 
         existing = {row["department"] for row in self.store.list("co_department_objectives", "company_objective_id=?", (plan["objective_id"],))}
@@ -759,29 +819,104 @@ class ExecutionOrchestrator:
             link(self.store, self.audit, "co_plans", plan_id, "co_department_objectives", dept_objective_id, actor)
 
             if department == "Digital Workforce":
+                if not workforce_assignments:
+                    skipped.append(
+                        "Digital Workforce: plan has no workforce_assignments -- a department objective was "
+                        "created, but no wf_task was, rather than inventing a task_type no worker recognizes"
+                    )
+                    continue
                 from .workforce import WorkforceTaskStore
-                task_id = WorkforceTaskStore(self.store, self.audit).create(
-                    department=department, objective=plan["desired_outcome"], task_type="company_os_routed",
-                    actor=actor, source="company_os",
-                )
-                self.store.update("wf_tasks", task_id, co_objective_id=plan["objective_id"])
-                created_wf_tasks.append(task_id)
-                link(self.store, self.audit, "co_department_objectives", dept_objective_id, "wf_tasks", task_id, actor)
+                tasks = WorkforceTaskStore(self.store, self.audit)
+                # Phase 3 audit fix: `executed_rows[i]` holds assignment i's real,
+                # completed wf_task row (or None if it wasn't created/executed),
+                # indexed positionally within workforce_assignments. An assignment
+                # may declare `depends_on: <earlier index>` plus
+                # `input_from_dependency: {local_input_key: dependency_output_key}`
+                # to have this task's actual inputs populated from the DEPENDENCY
+                # TASK'S REAL, JUST-PRODUCED output (task_row["outputs_json"]) --
+                # e.g. an "engineering_fix" task's real run_id flowing into a
+                # dependent "qa_independent_verification" task's inputs.run_id --
+                # rather than two independently-completed, unrelated assignments.
+                # This only resolves when assignments execute inline in order
+                # (self.workforce_orchestrator is not None); a dependency on an
+                # assignment that did not complete, or an out-of-range/forward
+                # index, skips the dependent task rather than creating it with
+                # missing or stale inputs.
+                executed_rows: List[Optional[Dict[str, Any]]] = []
+                for idx, assignment in enumerate(workforce_assignments):
+                    task_type = str((assignment or {}).get("task_type") or "").strip()
+                    if not task_type:
+                        skipped.append(f"Digital Workforce: workforce_assignments[{idx}] is missing task_type")
+                        executed_rows.append(None)
+                        continue
+                    inputs = dict(assignment.get("inputs") or {})
+                    depends_on = assignment.get("depends_on")
+                    if depends_on is not None:
+                        valid_index = isinstance(depends_on, int) and 0 <= depends_on < idx
+                        dependency_row = executed_rows[depends_on] if valid_index else None
+                        if dependency_row is None or dependency_row.get("status") != "COMPLETED":
+                            skipped.append(
+                                f"Digital Workforce: workforce_assignments[{idx}] depends_on={depends_on!r}, "
+                                "which is not a prior, COMPLETED assignment in this same routing call -- "
+                                "not creating the dependent task with unresolved/stale inputs"
+                            )
+                            executed_rows.append(None)
+                            continue
+                        dependency_outputs = _json_loads(dependency_row.get("outputs_json")) or {}
+                        for local_key, dependency_key in (assignment.get("input_from_dependency") or {}).items():
+                            if dependency_key in dependency_outputs:
+                                inputs[local_key] = dependency_outputs[dependency_key]
+                    task_id = tasks.create(
+                        department=department, objective=assignment.get("objective") or plan["desired_outcome"],
+                        task_type=task_type, actor=actor, source="company_os",
+                        inputs=inputs,
+                    )
+                    self.store.update("wf_tasks", task_id, co_objective_id=plan["objective_id"])
+                    created_wf_tasks.append(task_id)
+                    link(self.store, self.audit, "co_department_objectives", dept_objective_id, "wf_tasks", task_id, actor)
+                    if self.workforce_orchestrator is not None:
+                        # WorkforceOrchestrator.execute()'s own bounded-retry contract
+                        # (falguna/workforce.py, pre-existing): on a FAILED worker
+                        # result that hasn't exhausted task["retries"] vs max_retries
+                        # yet, it resets the task to READY and returns -- by design,
+                        # expecting the CALLER to invoke execute() again to actually
+                        # drive the retry. A single call here would otherwise report
+                        # an ambiguous "READY" to HQ (`executed` below) after a real
+                        # attempt was already made and failed once, and would leave a
+                        # dependent assignment skipped even though retry budget was
+                        # still available. Re-invoking is bounded by the orchestrator's
+                        # own max_retries (it flips to FAILED/NEEDS_ARYAN once
+                        # exhausted), so this cannot loop indefinitely.
+                        result = self.workforce_orchestrator.execute(task_id, actor=actor)
+                        while result.get("status") == "READY":
+                            result = self.workforce_orchestrator.execute(task_id, actor=actor)
+                        executed_rows.append(result)
+                        executed.append({
+                            "task_id": task_id, "task_type": task_type, "status": result["status"],
+                            "evidence": _json_loads(result.get("evidence_json")),
+                            "needs_aryan_id": result.get("needs_aryan_id"),
+                        })
+                    else:
+                        executed_rows.append(None)
 
         if plan["status"] == "APPROVED":
             self.store.update("co_plans", plan_id, status="IN_EXECUTION")
 
         self.events.emit("EXECUTION_ROUTED", "company_os", ref_type="co_plans", ref_id=plan_id, payload={
-            "created_dept_objectives": created_dept_objectives, "created_wf_tasks": created_wf_tasks, "skipped": skipped,
+            "created_dept_objectives": created_dept_objectives, "created_wf_tasks": created_wf_tasks,
+            "executed": executed, "skipped": skipped,
         })
-        self.audit.append("CO_EXECUTION_ORCHESTRATED", {"plan_id": plan_id, "created_dept_objectives": created_dept_objectives, "created_wf_tasks": created_wf_tasks, "actor": actor})
+        self.audit.append("CO_EXECUTION_ORCHESTRATED", {"plan_id": plan_id, "created_dept_objectives": created_dept_objectives, "created_wf_tasks": created_wf_tasks, "executed": executed, "actor": actor})
         return {
             "plan_id": plan_id, "created_dept_objectives": created_dept_objectives,
-            "created_wf_tasks": created_wf_tasks, "skipped": skipped,
+            "created_wf_tasks": created_wf_tasks, "executed": executed, "skipped": skipped,
             "note": (
                 "Falguna Engineering missions, real sales outreach, and financial execution are not created "
                 "automatically here -- they remain explicit actions in their own systems. This call only "
-                "routes internal planning/task-creation work, per the orchestrator autonomy boundary."
+                "routes internal planning/task-creation work, per the orchestrator autonomy boundary. Each "
+                "created wf_task's task_type is one drawn from the plan's own workforce_assignments, so it can "
+                "actually be picked up by a real registered worker; 'executed' is only populated when this call "
+                "was given a real WorkforceOrchestrator to run it through immediately."
             ),
         }
 

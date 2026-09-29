@@ -19,6 +19,24 @@ class DefinitionOfDone:
     def verify(self, worktree: Path):
         permissions = PermissionEngine(worktree, self.policy)
         changed = self.git.changed_files(worktree)
+        # Requirement 1 audit fix: when hidden_verification_files is set, the
+        # worker's worktree now originates from a history-scrubbed clone
+        # (GitWorktreeManager.create_confidential) that never had these paths
+        # committed, so restoring the real file for this verification step
+        # makes `git status` report it as a brand-new untracked addition
+        # rather than an unmodified tracked file. Excluding it here restores
+        # the same "restoring the hidden file is invisible to changed-file
+        # accounting" contract the pre-existing non-scrubbed architecture had
+        # implicitly (there, restoring put the file back byte-for-byte
+        # identical to a tracked HEAD entry, so git status already showed
+        # nothing). This never hides a worker's own write to that path: an
+        # attempted write is rejected earlier, at write time, by
+        # PermissionEngine.require_write against allowed_write_globs (see
+        # HiddenTestBypassAttemptAdversarialTests) -- this filter only ever
+        # sees the independent verifier's own restore, never the worker's.
+        hidden_paths = set(getattr(self.policy, "hidden_verification_files", None) or [])
+        if hidden_paths:
+            changed = [path for path in changed if path not in hidden_paths]
         permissions.validate_changed_files(changed)
         terminal = TerminalCapability(permissions)
         results = []

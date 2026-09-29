@@ -13,7 +13,7 @@ from falguna.browser import BrowserDiscovery
 from falguna.capabilities import TerminalCapability
 from falguna.review import CalibrationCase, ModelSemanticReviewer, ReviewerCalibrator, ScriptedSemanticReviewer, SemanticIndependentReviewer
 from falguna.runtime import open_control_plane
-from falguna.workers import ScriptedWorker, StructuredEditWorker
+from falguna.workers import PatchTargetError, ScriptedWorker, StructuredEditWorker
 from falguna.gateway import OpenAICompatibleGateway
 from falguna.codex_transport import CodexCliJSONTransport, ModelUnsupportedError, ResilientCodexTransport
 from falguna.continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
@@ -684,6 +684,47 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(plan.editable_files, ["falguna/web.py", "browser-tests/mission.spec.js"])
         self.assertEqual(plan.confidence, "HIGH")
 
+    def test_hide_verification_files_from_worker_excludes_the_graded_test_from_editable_scope(self):
+        # Phase 3, Milestone 1: a genuinely held-out acceptance test must be neither
+        # writable nor readable by the implementer. StructuredEditWorker only ever
+        # reads/writes files listed in editable_files (it never gets arbitrary
+        # filesystem access), so excluding the graded test from editable_files here
+        # is sufficient to hide it from the worker entirely -- independent
+        # verification still runs it via verification_commands in a separate
+        # subprocess the worker's own model call never sees.
+        (self.repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0'\n")
+        (self.repo / "falguna/web.py").write_text("live mission progress pause cancel resume timeline ui state\n")
+        (self.repo / "browser-tests").mkdir()
+        (self.repo / "browser-tests/mission.spec.js").write_text("live mission progress pause cancel resume timeline ui\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "hidden test fixture"], check=True, capture_output=True)
+
+        default_plan = ProjectDiscovery(self.repo, {"discovery_roots": ["falguna", "tests", "browser-tests"]}).discover(
+            "Improve live mission progress, pause, cancel, resume, and timeline UI"
+        )
+        self.assertIn("browser-tests/mission.spec.js", default_plan.editable_files, "default behavior must stay unchanged for every existing caller/profile")
+
+        hidden_plan = ProjectDiscovery(self.repo, {
+            "discovery_roots": ["falguna", "tests", "browser-tests"],
+            "hide_verification_files_from_worker": True,
+        }).discover("Improve live mission progress, pause, cancel, resume, and timeline UI")
+
+        self.assertEqual(hidden_plan.implementation_files, ["falguna/web.py"])
+        self.assertEqual(hidden_plan.verification_files, ["browser-tests/mission.spec.js"], "DefinitionOfDone must still independently grade the hidden test")
+        self.assertEqual(hidden_plan.editable_files, ["falguna/web.py"], "the graded test must not appear in the implementer's writable/readable scope")
+        self.assertNotIn("browser-tests/mission.spec.js", hidden_plan.editable_files)
+
+        # A worker built from this scope cannot read or write the hidden test:
+        # StructuredEditWorker.execute() only reads files in editable_files into
+        # the model prompt, and _apply_patches rejects any path not in that set.
+        worker = StructuredEditWorker(gateway=None, editable_files=hidden_plan.editable_files)
+        self.assertNotIn("browser-tests/mission.spec.js", worker.editable_files)
+        with self.assertRaises(PatchTargetError):
+            worker._apply_patches(self.repo, [{
+                "path": "browser-tests/mission.spec.js", "old": "live mission", "new": "weakened",
+                "before": "", "after": "", "task": 1,
+            }])
+
     def test_falguna_self_development_profile_includes_core_implementation(self):
         profile = next(item for item in load_profiles(Path(__file__).parents[1]) if item["id"] == "falguna-engineering")
         self.assertIn("falguna", profile["discovery_roots"])
@@ -783,6 +824,57 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(self.store.get("runs", run_id)["status"], "CANCELLED")
         self.assertEqual(self.store.list("approvals", "run_id=?", (run_id,)), [])
         self.assertTrue(Path(self.store.get("runs", run_id)["worktree"]).is_dir())
+
+    def test_cancel_while_hidden_file_stashed_restores_it_before_finalizing(self):
+        # Final security-gate audit (this round): resume() permanently refuses
+        # to resume a CANCELLED run (see test_cancelled_run_cannot_resume_after_restart
+        # below), so if a hidden_verification_files entry is currently stashed
+        # out of the worktree at the exact moment CANCEL takes effect, that is
+        # the LAST chance to ever restore it. force_stop_after="WORKER_COMPLETE"
+        # stops right after the worker succeeds (file stashed, WORKER_COMPLETE
+        # checkpoint written) and before that stage's own restore call runs --
+        # reproducing the exact window a cancel request could land in.
+        policy = RunPolicy(hidden_verification_files=["tests/test_feature.py"])
+        ids = self.control.create_mission("cancel-hidden", "set value to 2", self.repo, policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", policy, force_stop_after="WORKER_COMPLETE")
+        worktree = Path(self.store.get("runs", run_id)["worktree"])
+        stash_path = self.control._hidden_stash_root(run_id) / "tests" / "test_feature.py"
+        self.assertTrue(stash_path.is_file(), "the hidden file must genuinely be stashed at this point, not still in the worktree")
+        self.assertFalse((worktree / "tests" / "test_feature.py").is_file())
+        self.control.request_control(run_id, "CANCEL")
+        self.control.resume(run_id, self.worker(), policy)
+        self.assertEqual(self.store.get("runs", run_id)["status"], "CANCELLED")
+        self.assertTrue((worktree / "tests" / "test_feature.py").is_file(),
+                         "a cancelled run must not leave the hidden verification file permanently stranded in the stash directory")
+        self.assertIn("test_value", (worktree / "tests" / "test_feature.py").read_text(),
+                       "the restored file must be the real, untampered hidden test")
+        self.assertFalse(stash_path.exists(), "the stash location must be empty once the file has been restored")
+
+    def test_resume_after_unexpected_termination_mid_worker_execution_still_restores_hidden_file(self):
+        # Final security-gate audit (this round): simulates an orchestrator
+        # process crash (SIGKILL, power loss) that lands after the real
+        # worker.execute() call had already stashed the hidden file but before
+        # the process could reach the WORKER_COMPLETE checkpoint -- the only
+        # durable evidence of this window on disk is the checkpoint left at
+        # "WORKTREE_READY" plus the file already sitting in the stash
+        # directory. force_stop_after="WORKTREE_READY" stops before the real
+        # stash+worker call ever runs, so the stash call here reproduces
+        # exactly what a real interrupted worker.execute() would have already
+        # done to the worktree by the time the process died.
+        policy = RunPolicy(hidden_verification_files=["tests/test_feature.py"])
+        ids = self.control.create_mission("crash-resume-hidden", "set value to 2", self.repo, policy)
+        run_id = self.control.start(ids["task_id"], self.worker(), "scripted", "none", policy, force_stop_after="WORKTREE_READY")
+        worktree = Path(self.store.get("runs", run_id)["worktree"])
+        self.control._stash_hidden_files(worktree, run_id, policy)
+        self.assertFalse((worktree / "tests" / "test_feature.py").is_file(),
+                          "precondition: the hidden file must be stashed, simulating the crash window")
+        self.control.resume(run_id, self.worker(), policy)
+        run = self.store.get("runs", run_id)
+        self.assertEqual(run["status"], "DONE_CANDIDATE",
+                          f"resume after a crash mid-stash must still reach a real terminal success: {run.get('error')!r}")
+        self.assertTrue((worktree / "tests" / "test_feature.py").is_file(),
+                         "the hidden file must be genuinely restored after a crash-and-resume cycle, not lost")
+        self.assertFalse((self.control._hidden_stash_root(run_id) / "tests" / "test_feature.py").exists())
 
     def test_model_preflight_cache_and_bounded_fallback(self):
         class FakeTransport:

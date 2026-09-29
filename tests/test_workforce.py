@@ -402,6 +402,166 @@ class RestartReconciliationTests(WorkforceTestBase):
         self.assertEqual(first, [task_id])
         self.assertEqual(second, [])  # already BLOCKED -- nothing left in EXECUTING/PLANNING
 
+    def test_non_auto_resumable_worker_is_the_universal_default_and_still_escalates(self):
+        # Direct guarantee for Phase 3 Milestone 3: every worker anyone has
+        # actually registered before this milestone -- exercised here via
+        # the base WorkforceWorker class itself, which every concrete role
+        # subclasses without overriding this attribute unless explicitly
+        # reviewed -- keeps the exact pre-milestone escalate-and-wait
+        # behavior, with zero special-casing needed at the call site.
+        self.assertFalse(WorkforceWorker.auto_resumable_after_restart)
+        self.assertFalse(EchoWorker().auto_resumable_after_restart)
+
+
+class AutoResumeAfterRestartTests(WorkforceTestBase):
+    """Phase 3 Milestone 3: 'allow automatic resumption only for explicitly
+    verified safe, read-only or idempotent operations; uncertain external
+    side effects require fresh approval.' These simulate the exact same
+    crash point RestartReconciliationTests does (transition straight to
+    EXECUTING/PLANNING, never call the worker) but against a worker that
+    has explicitly opted in via `auto_resumable_after_restart = True`."""
+
+    class IdempotentEchoWorker(WorkforceWorker):
+        """Stand-in for DataWorker/ResearchWorker's real property: execute()
+        performs no durable side effect of its own, so re-running it after
+        an interruption is safe and reproduces an equivalent result."""
+
+        name = "idempotent_echo_worker"
+        auto_resumable_after_restart = True
+
+        def supports(self, task_type):
+            return task_type == "idempotent_echo"
+
+        def execute(self, task):
+            return WorkerResult(
+                status="COMPLETED", result={"echo": task["objective"]},
+                evidence={"echoed": True}, execution_method="API",
+            )
+
+    class AutoResumableButBlockedWorker(WorkforceWorker):
+        """Verified safe to re-run, but this particular run still honestly
+        can't complete alone -- proves resumption really re-invokes the
+        worker (and reaches the worker's OWN BLOCKED escalation, unchanged)
+        rather than fabricating a COMPLETED result just because the worker
+        is marked resumable."""
+
+        name = "auto_resumable_blocked_worker"
+        auto_resumable_after_restart = True
+
+        def supports(self, task_type):
+            return task_type == "auto_resumable_blocked_type"
+
+        def execute(self, task):
+            return WorkerResult(status="BLOCKED", blockers=["needs a human for this specific run"], next_action="review manually")
+
+    class AutoResumableButExplodingWorker(WorkforceWorker):
+        """A genuinely unexpected error during the resume attempt itself
+        (not an ordinary worker-reported BLOCKED/FAILED) -- must fall back
+        to the same honest escalation every other interrupted task gets,
+        never crash reconciliation or leave the task stuck mid-status."""
+
+        name = "auto_resumable_exploding_worker"
+        auto_resumable_after_restart = True
+
+        def supports(self, task_type):
+            return task_type == "auto_resumable_exploding_type"
+
+        def execute(self, task):
+            raise RuntimeError("simulated unexpected crash during resume")
+
+    def _orch(self, *workers):
+        o = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        for w in workers:
+            o.register_worker(w)
+        return o
+
+    def test_idempotent_worker_task_stuck_executing_is_auto_resumed_and_completes(self):
+        orch = self._orch(self.IdempotentEchoWorker())
+        task_id = self.tasks.create("media", "Say hi", "idempotent_echo", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        self.tasks.transition(task_id, "READY", "system", assigned_worker="idempotent_echo_worker")
+        self.tasks.transition(task_id, "EXECUTING", "system", started_at="2026-01-01T00:00:00+00:00")
+        # Crash lands exactly like RestartReconciliationTests' cases -- no
+        # worker.execute() call happens before reconcile() runs.
+
+        reconciled = orch.reconcile_after_restart(actor="system")
+
+        self.assertEqual(reconciled, [task_id])
+        task = self.tasks.get(task_id)
+        # Genuinely resumed and completed -- not merely un-stuck.
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertIsNone(task["needs_aryan_id"])
+        self.assertEqual(json.loads(task["outputs_json"]), {"echo": "Say hi"})
+        # No escalation was created for this task -- automatic resumption,
+        # not a relabeled version of the same human hand-off.
+        escalations = [
+            item for item in self.store.list("needs_aryan_items")
+            if item["ref_type"] == "wf_task" and item["ref_id"] == task_id
+        ]
+        self.assertEqual(escalations, [])
+        history = self.tasks.history(task_id)
+        self.assertTrue(any(e["to_status"] == "READY" and "auto-resume" in (e["reason"] or "") for e in history))
+
+    def test_idempotent_worker_task_stuck_planning_is_auto_resumed_and_completes(self):
+        orch = self._orch(self.IdempotentEchoWorker())
+        task_id = self.tasks.create("media", "Say hi", "idempotent_echo", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        # Crash lands mid-plan(), before a worker was even assigned yet.
+
+        reconciled = orch.reconcile_after_restart(actor="system")
+
+        self.assertEqual(reconciled, [task_id])
+        task = self.tasks.get(task_id)
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertEqual(task["assigned_worker"], "idempotent_echo_worker")
+
+    def test_auto_resumable_worker_that_itself_blocks_still_escalates_through_its_own_gate(self):
+        orch = self._orch(self.AutoResumableButBlockedWorker())
+        task_id = self.tasks.create("media", "Needs a human this time", "auto_resumable_blocked_type", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        self.tasks.transition(task_id, "READY", "system", assigned_worker="auto_resumable_blocked_worker")
+        self.tasks.transition(task_id, "EXECUTING", "system")
+
+        orch.reconcile_after_restart(actor="system")
+
+        task = self.tasks.get(task_id)
+        # NEEDS_ARYAN (the worker's own BLOCKED-result escalation path),
+        # not BLOCKED (the restart-interrupted escalation path) -- proof
+        # the worker was genuinely re-invoked, not just relabeled.
+        self.assertEqual(task["status"], "NEEDS_ARYAN")
+        self.assertIsNotNone(task["needs_aryan_id"])
+        item = self.store.get("needs_aryan_items", task["needs_aryan_id"])
+        self.assertIn("needs a human for this specific run", item["rationale"] or "")
+
+    def test_auto_resumable_worker_that_raises_falls_back_to_honest_escalation(self):
+        orch = self._orch(self.AutoResumableButExplodingWorker())
+        task_id = self.tasks.create("media", "Doomed resume", "auto_resumable_exploding_type", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        self.tasks.transition(task_id, "READY", "system", assigned_worker="auto_resumable_exploding_worker")
+        self.tasks.transition(task_id, "EXECUTING", "system")
+
+        reconciled = orch.reconcile_after_restart(actor="system")  # must not raise
+
+        self.assertEqual(reconciled, [task_id])
+        task = self.tasks.get(task_id)
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertIsNotNone(task["needs_aryan_id"])
+        item = self.store.get("needs_aryan_items", task["needs_aryan_id"])
+        self.assertIn("simulated unexpected crash during resume", item["what_is_needed"] or item["rationale"] or "")
+
+    def test_second_reconcile_after_auto_resume_finds_nothing_left(self):
+        orch = self._orch(self.IdempotentEchoWorker())
+        task_id = self.tasks.create("media", "Say hi", "idempotent_echo", actor="Aryan")
+        self.tasks.transition(task_id, "PLANNING", "system")
+        self.tasks.transition(task_id, "READY", "system", assigned_worker="idempotent_echo_worker")
+        self.tasks.transition(task_id, "EXECUTING", "system")
+
+        first = orch.reconcile_after_restart(actor="system")
+        second = orch.reconcile_after_restart(actor="system")
+
+        self.assertEqual(first, [task_id])
+        self.assertEqual(second, [])  # COMPLETED is terminal -- nothing left in EXECUTING/PLANNING
+
 
 class PersistenceTests(WorkforceTestBase):
     def test_task_state_survives_a_fresh_store_reconnect(self):

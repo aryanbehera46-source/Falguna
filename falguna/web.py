@@ -1956,7 +1956,14 @@ def _run_mission(app_root, token, profile, objective, editable, commands, cap, d
     try:
         dependency_path = Path(profile["repository"]) / profile.get("package_root", ".") / "node_modules"
         browser_applicable = browser_e2e_applicable(objective, editable, profile)
-        policy = RunPolicy(allowed_write_globs=editable, verification_commands=commands, max_cost_usd=cap, dependency_node_path=str(dependency_path) if dependency_path.is_dir() else None, verification_write_regexes=profile.get("verification_write_regexes", []), browser_applicable=browser_applicable, browser_base_url=profile.get("browser_base_url") if browser_applicable else None, browser_project_roots=profile.get("browser_project_roots", ["."]), browser_cached_install_allowed=bool(profile.get("browser_cached_install_allowed", False)), browser_external_probe_required=bool(profile.get("browser_external_probe_required", False)), require_implementation_change=discovery.get("objective_kind") == "FEATURE_CHANGE", implementation_files=discovery.get("implementation_files", []), max_attempts=settings["max_attempts"])
+        # Phase 3 Milestone 1 adversarial fix: a verification file discovery
+        # ranked but did NOT put in `editable` (hide_verification_files_from_worker
+        # was on) is a genuinely hidden acceptance test -- structurally derived
+        # here (present in verification_files, absent from editable) rather than
+        # threading the profile's boolean flag through, so this is correct
+        # whenever discovery hid a file for any reason, not just today's one.
+        hidden_verification_files = [path for path in discovery.get("verification_files", []) if path not in editable]
+        policy = RunPolicy(allowed_write_globs=editable, verification_commands=commands, max_cost_usd=cap, dependency_node_path=str(dependency_path) if dependency_path.is_dir() else None, verification_write_regexes=profile.get("verification_write_regexes", []), browser_applicable=browser_applicable, browser_base_url=profile.get("browser_base_url") if browser_applicable else None, browser_project_roots=profile.get("browser_project_roots", ["."]), browser_cached_install_allowed=bool(profile.get("browser_cached_install_allowed", False)), browser_external_probe_required=bool(profile.get("browser_external_probe_required", False)), require_implementation_change=discovery.get("objective_kind") == "FEATURE_CHANGE", implementation_files=discovery.get("implementation_files", []), hidden_verification_files=hidden_verification_files, max_attempts=settings["max_attempts"])
         gateway = OpenAICompatibleGateway(model, "http://127.0.0.1:1/v1", "")
         transport = _build_router(store, use_fallback=settings["fallback"])
         try:

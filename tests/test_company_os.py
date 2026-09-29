@@ -6,16 +6,25 @@ escalation engine, objective->execution traceability, persistence across a
 simulated restart, and cross-department isolation.
 """
 
+import json
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer, BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from falguna.audit import AuditLog
+from falguna.agent_roles import EngineeringAgentWorker, QAAgentWorker
 from falguna.goals import GoalStore
+from falguna.orchestrator import ControlPlane
 from falguna.store import StateStore
 from falguna.ttt_hq import NeedsAryanQueue
 from falguna.ventures import VentureStore
-from falguna.workforce import WorkforceTaskStore
+from falguna.workforce import WorkforceOrchestrator, WorkforceTaskStore
 from falguna.company_os import (
     ALLOWED_OBJECTIVE_TRANSITIONS, CapitalRecommendationStore, CompanyMemoryStore,
     CompanyOSError, CompanyPolicyStore, CostEstimateStore, DecisionStore,
@@ -162,6 +171,31 @@ class PlanEngineTests(CompanyOSBase):
         plan_id = self._approved_plan(objective_id)
         with self.assertRaises(CompanyOSError):
             self.plans.set_status(plan_id, "MAYBE", "Aryan")
+
+    def test_plan_persists_real_workforce_assignments_verbatim(self):
+        # Phase 3, Milestone 4: structured, real task_types the plan's
+        # author explicitly chose -- PlanStore still never invents which
+        # task_type a department needs, it only persists what it is given.
+        objective_id = self._active_objective()
+        plan_id = self.plans.create(
+            objective_id, "Ship v2", actor="Aryan", departments=["Digital Workforce"],
+            workforce_assignments=[{"task_type": "research", "inputs": {"query": "x"}}],
+        )
+        plan = self.plans.get(plan_id)
+        self.assertEqual(plan["workforce_assignments"], [{"task_type": "research", "inputs": {"query": "x"}}])
+
+    def test_plan_defaults_workforce_assignments_to_empty_not_fabricated(self):
+        objective_id = self._active_objective()
+        plan_id = self.plans.create(objective_id, "Ship v2", actor="Aryan")
+        self.assertEqual(self.plans.get(plan_id)["workforce_assignments"], [])
+
+    def test_plan_rejects_workforce_assignment_without_task_type(self):
+        objective_id = self._active_objective()
+        with self.assertRaises(CompanyOSError):
+            self.plans.create(
+                objective_id, "Ship v2", actor="Aryan",
+                workforce_assignments=[{"inputs": {"query": "x"}}],
+            )
 
 
 class PriorityEngineTests(CompanyOSBase):
@@ -366,12 +400,96 @@ class ExecutionOrchestratorTests(CompanyOSBase):
 
     def test_route_plan_creates_real_workforce_task_not_a_parallel_table(self):
         objective_id = self._active_objective()
-        plan_id = self._approved_plan(objective_id, departments=["Digital Workforce"])
+        # Phase 3, Milestone 4: the task_type must be one a real worker
+        # actually recognizes (see falguna/workforce_workers.py's
+        # `_SUPPORTED` sets) -- never the fabricated "company_os_routed"
+        # placeholder that used to guarantee an unroutable dead end.
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[{"task_type": "data_processing", "inputs": {"records": [{"a": 1}]}}],
+        )
         result = ExecutionOrchestrator(self.store, self.audit).route_plan(plan_id, actor="system")
         self.assertEqual(len(result["created_wf_tasks"]), 1)
         task = self.store.get("wf_tasks", result["created_wf_tasks"][0])
         self.assertEqual(task["co_objective_id"], objective_id)
         self.assertEqual(task["department"], "Digital Workforce")
+        self.assertEqual(task["task_type"], "data_processing")
+
+    def test_route_plan_with_no_workforce_assignments_creates_no_dead_end_task(self):
+        # Phase 3, Milestone 4 (routing-mismatch repair): before this fix,
+        # a Digital Workforce plan with no structured assignment still got
+        # a wf_task, hardcoded to a task_type ("company_os_routed") no
+        # worker has ever recognized -- a guaranteed, permanent dead end.
+        # The honest behavior is to create nothing routable and say why,
+        # while still recording that a department objective exists.
+        objective_id = self._active_objective()
+        plan_id = self._approved_plan(objective_id, departments=["Digital Workforce"])
+        result = ExecutionOrchestrator(self.store, self.audit).route_plan(plan_id, actor="system")
+        self.assertEqual(result["created_wf_tasks"], [])
+        self.assertEqual(len(result["created_dept_objectives"]), 1)
+        self.assertTrue(any("no workforce_assignments" in s for s in result["skipped"]))
+
+    def test_route_plan_creates_one_real_wf_task_per_assignment_spanning_multiple_worker_roles(self):
+        # Verifies Aryan's explicit Milestone 4 requirement: one plan can
+        # route real work to at least two distinct worker roles in a single
+        # call, each with its own genuinely-supported task_type.
+        objective_id = self._active_objective()
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[
+                {"task_type": "data_processing", "inputs": {"records": [{"a": 1}, {"a": 1}]}},
+                {"task_type": "research", "objective": "Survey competitor pricing"},
+            ],
+        )
+        result = ExecutionOrchestrator(self.store, self.audit).route_plan(plan_id, actor="system")
+        self.assertEqual(len(result["created_wf_tasks"]), 2)
+        task_types = {self.store.get("wf_tasks", tid)["task_type"] for tid in result["created_wf_tasks"]}
+        self.assertEqual(task_types, {"data_processing", "research"})
+
+    def test_route_plan_skips_an_assignment_missing_task_type_without_crashing(self):
+        objective_id = self._active_objective()
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[{"task_type": "data_processing", "inputs": {"records": [{"a": 1}]}}],
+        )
+        # Directly corrupt the persisted assignments to simulate a
+        # malformed one slipping through, without relying on PlanStore's
+        # own (already-tested) create-time validation.
+        import json as _json
+        self.store.update("co_plans", plan_id, workforce_assignments_json=_json.dumps([{"inputs": {}}]))
+        result = ExecutionOrchestrator(self.store, self.audit).route_plan(plan_id, actor="system")
+        self.assertEqual(result["created_wf_tasks"], [])
+        self.assertTrue(any("missing task_type" in s for s in result["skipped"]))
+
+    def test_route_plan_with_a_real_workforce_orchestrator_genuinely_executes_the_routed_task(self):
+        # No new orchestrator: register the exact same WorkforceOrchestrator/
+        # DataWorker classes production code uses, inject that single real
+        # orchestrator into ExecutionOrchestrator, and prove the routed task
+        # actually runs to a real, evidenced COMPLETED -- not just created.
+        from falguna.workforce import WorkforceOrchestrator
+        from falguna.workforce_workers import DataWorker
+
+        objective_id = self._active_objective()
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[{
+                "task_type": "data_processing",
+                "inputs": {"records": [{"email": "a@x.com"}, {"email": "a@x.com"}, {"email": "b@x.com"}], "dedupe_key": "email"},
+            }],
+        )
+        wf_orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        wf_orch.register_worker(DataWorker())
+        result = ExecutionOrchestrator(self.store, self.audit, workforce_orchestrator=wf_orch).route_plan(plan_id, actor="system")
+
+        self.assertEqual(len(result["created_wf_tasks"]), 1)
+        self.assertEqual(len(result["executed"]), 1)
+        self.assertEqual(result["executed"][0]["status"], "COMPLETED")
+        task = self.store.get("wf_tasks", result["created_wf_tasks"][0])
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertIsNotNone(task["evidence_json"])
+        import json as _json
+        evidence = _json.loads(task["evidence_json"])
+        self.assertEqual(evidence["output_count"], 2)  # deduped from 3 to 2
 
     def test_route_plan_is_not_re_applied_for_departments_already_routed(self):
         objective_id = self._active_objective()
@@ -675,6 +793,564 @@ class CapitalRecommendationTests(CompanyOSBase):
         open_recs = recs.list(status="OPEN")
         self.assertEqual(len(open_recs), 1)
         self.assertEqual(open_recs[0]["id"], rec_id)
+
+
+class ExecutionOrchestratorIdempotencyAdversarialTests(CompanyOSBase):
+    """Phase 3, Milestone 5: adversarial check on the Milestone 4 routing
+    repair -- can calling route_plan a second time on an already-routed
+    plan duplicate real, side-effecting work (a second document, a second
+    execution)? It must not: the existing "department already routed"
+    guard runs before any wf_task is created for that department, so a
+    repeat call is a genuine no-op for Digital Workforce too, not just for
+    the department objective it was originally proven for."""
+
+    def test_re_routing_an_already_routed_plan_never_duplicates_wf_tasks_or_executions(self):
+        from falguna.workforce_workers import DataWorker
+
+        objective_id = self._active_objective()
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[{"task_type": "data_processing", "inputs": {"records": [{"a": 1}]}}],
+        )
+        wf_orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        wf_orch.register_worker(DataWorker())
+        orchestrator = ExecutionOrchestrator(self.store, self.audit, workforce_orchestrator=wf_orch)
+
+        first = orchestrator.route_plan(plan_id, actor="system")
+        self.assertEqual(len(first["created_wf_tasks"]), 1)
+        self.assertEqual(first["executed"][0]["status"], "COMPLETED")
+
+        self.plans.set_status(plan_id, "APPROVED", "Aryan")
+        second = orchestrator.route_plan(plan_id, actor="system")
+        self.assertEqual(second["created_wf_tasks"], [])
+        self.assertEqual(second["executed"], [])
+        self.assertEqual(len(self.store.list("wf_tasks", "co_objective_id=?", (objective_id,))), 1)
+
+
+class CompanyOSRoutedBrowsingSensitiveActionAdversarialTests(unittest.TestCase):
+    """Phase 3, Milestone 5: the adversarial question the Milestone 4
+    routing repair raises on its own -- now that Company OS can route real,
+    executing Digital Workforce work, can a routed task ever slip a
+    sensitive browser action (Milestone 2's payment/purchase/destructive-
+    deletion gate) past Needs Aryan just because it arrived via route_plan
+    instead of a directly-created wf_task? It must not: route_plan never
+    constructs its own worker registry -- it only ever runs a task through
+    whatever real WorkforceOrchestrator the caller hands it (in production,
+    the exact same one every other workforce entry point uses), so the same
+    RealPlaywrightBrowserChannel and the same sensitive-action classifier
+    apply completely unconditionally, regardless of which caller created
+    the task. Exercised against a real local fixture page and a real
+    headless Chromium, exactly like the Milestone 2 tests this composes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from falguna.browser_runtime import playwright_available
+        check = playwright_available()
+        if not check["launchable"]:
+            raise unittest.SkipTest(f"playwright not usable in this environment: {check['detail']}")
+
+        fixtures_dir = Path(__file__).parent / "fixtures"
+
+        class _Handler(SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=str(fixtures_dir), **kwargs)
+
+            def log_message(self, *args, **kwargs):
+                pass  # keep test output quiet
+
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.store = StateStore(self.root / "state.db")
+        self.store.migrate()
+        self.audit = AuditLog(self.root / "audit.jsonl")
+        self.needs_aryan = NeedsAryanQueue(self.store, self.audit)
+        self.objectives = ObjectiveStore(self.store, self.audit)
+        self.plans = PlanStore(self.store, self.audit)
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_company_os_routed_browser_task_hitting_a_sensitive_action_still_escalates_not_completes(self):
+        from falguna.workforce_workers import BrowserWorker, RealPlaywrightBrowserChannel
+
+        objective_id = self.objectives.create("Adversarial Routing Check", actor="Aryan")
+        self.objectives.transition(objective_id, "ACTIVE", "Aryan")
+        plan_id = self.plans.create(
+            objective_id, "Attempt a purchase via routed browsing", actor="Aryan",
+            departments=["Digital Workforce"],
+            workforce_assignments=[{
+                "task_type": "browser_research",
+                "inputs": {"steps": [
+                    {"action": "open", "target": f"http://127.0.0.1:{self.port}/browser_fixture.html", "value": None, "description": "open fixture"},
+                    {"action": "click", "target": "#buy-now-btn", "value": None, "description": "attempt purchase"},
+                ]},
+            }],
+        )
+        self.plans.set_status(plan_id, "APPROVED", "Aryan")
+
+        wf_orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        channel = RealPlaywrightBrowserChannel(self.root, self.store, audit=self.audit)
+        wf_orch.register_worker(BrowserWorker(channel=channel))
+
+        result = ExecutionOrchestrator(self.store, self.audit, workforce_orchestrator=wf_orch).route_plan(plan_id, actor="system")
+
+        self.assertEqual(len(result["created_wf_tasks"]), 1)
+        self.assertEqual(result["executed"][0]["status"], "NEEDS_ARYAN")
+        task = self.store.get("wf_tasks", result["created_wf_tasks"][0])
+        self.assertEqual(task["status"], "NEEDS_ARYAN")
+        self.assertIsNotNone(task["needs_aryan_id"])
+        item = self.store.get("needs_aryan_items", task["needs_aryan_id"])
+        self.assertEqual(item["status"], "PENDING")
+        self.assertIn("payment_or_purchase", item["rationale"] or "")
+
+
+def _ollama_ready_for_engineering() -> bool:
+    """Checks the real, already-running local Ollama daemon for the exact
+    model EngineeringAgentWorker.DEFAULT_MODEL uses (falguna/agent_roles.py).
+    If a coding-specialized model such as qwen2.5-coder:3b-instruct is also
+    installed, EngineeringAgentWorker's own _select_engineering_model prefers
+    it automatically -- this check only confirms the floor requirement is
+    met, never a specific model choice."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=3) as response:
+            tags = json.loads(response.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    names = {entry.get("name") for entry in tags.get("models", [])}
+    return EngineeringAgentWorker.DEFAULT_MODEL in names
+
+
+class WorkforceDependencyFailurePropagationTests(CompanyOSBase):
+    """Phase 3 audit, Requirement 2 (failure propagation): when the
+    dependency assignment does not reach COMPLETED, the dependent assignment
+    must be skipped -- never created with missing/stale inputs. Fully
+    deterministic and needs no live model: the first assignment is
+    engineering_fix with no repository/requirement/etc, which the real,
+    pre-existing EngineeringAgentWorker (falguna/agent_roles.py) honestly
+    reports BLOCKED for without ever touching the control plane or a model."""
+
+    def setUp(self):
+        super().setUp()
+        self.control_state_root = self.root / "control_state"
+        self.control_state_root.mkdir()
+        self.control = ControlPlane(self.store, self.audit, self.control_state_root)
+        self.wf_orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        self.wf_orch.register_worker(EngineeringAgentWorker(self.control))
+        self.wf_orch.register_worker(QAAgentWorker(self.control))
+        self.exec_orch = ExecutionOrchestrator(self.store, self.audit, workforce_orchestrator=self.wf_orch)
+
+    def test_dependent_qa_task_is_skipped_not_created_when_dependency_does_not_complete(self):
+        objective_id = self._active_objective()
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[
+                # Deliberately missing repository/requirement/editable_files/
+                # verification_commands -- EngineeringAgentWorker's own
+                # required-input check reports this honestly as BLOCKED.
+                {"task_type": "engineering_fix", "inputs": {}},
+                {
+                    "task_type": "qa_independent_verification",
+                    "depends_on": 0,
+                    "input_from_dependency": {"run_id": "run_id"},
+                    "inputs": {},
+                },
+            ],
+        )
+        result = self.exec_orch.route_plan(plan_id, actor="Aryan")
+
+        self.assertEqual(len(result["created_wf_tasks"]), 1, "the dependent task must never be created")
+        self.assertEqual(len(result["executed"]), 1, "only the dependency assignment should have executed")
+        eng_entry = result["executed"][0]
+        self.assertEqual(eng_entry["task_type"], "engineering_fix")
+        self.assertEqual(eng_entry["status"], "NEEDS_ARYAN")
+        self.assertIsNotNone(eng_entry.get("needs_aryan_id"), "a BLOCKED workforce task must escalate to Needs Aryan")
+
+        skip_reasons = " ".join(result["skipped"])
+        self.assertIn("workforce_assignments[1]", skip_reasons)
+        self.assertIn("depends_on=0", skip_reasons)
+
+        # The escalation is real: a pending Needs Aryan item actually exists
+        # for this exact id, not merely a status string on the task row.
+        pending_ids = {item["id"] for item in self.needs_aryan.list_pending()}
+        self.assertIn(eng_entry["needs_aryan_id"], pending_ids)
+
+
+@unittest.skipUnless(
+    _ollama_ready_for_engineering(),
+    f"live Ollama daemon or {EngineeringAgentWorker.DEFAULT_MODEL} not available in this environment",
+)
+class WorkforceDependencyChainLiveEndToEndTests(CompanyOSBase):
+    """Phase 3 audit, Requirement 2 (genuine dependency + real output-passing
+    + independent QA + HQ evidence/escalation visibility). Deliberately NOT
+    mocked: uses the real, pre-existing EngineeringAgentWorker and
+    QAAgentWorker (falguna/agent_roles.py, predates this audit) against a
+    real disposable git repo and a real local Ollama model, routed through
+    the real ExecutionOrchestrator.route_plan dependency-chaining mechanism
+    (falguna/company_os.py) added for this audit. If the real local model
+    does not reach DONE_CANDIDATE, this test fails loudly with the honest
+    measured outcome rather than papering over model unreliability -- the
+    same philosophy tests/test_real_model_engineering_demo.py already uses."""
+
+    def setUp(self):
+        super().setUp()
+        self._repo_tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._repo_tmp.name) / "repo"
+        self.repo.mkdir()
+        (self.repo / "calc.py").write_text(
+            "def add(a, b):\n"
+            "    \"\"\"Return the sum of a and b.\"\"\"\n"
+            "    return a - b\n"
+        )
+        tests_dir = self.repo / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "__init__.py").write_text("")
+        (tests_dir / "test_calc.py").write_text(
+            "import unittest\n"
+            "from calc import add\n\n"
+            "class CalcTests(unittest.TestCase):\n"
+            "    def test_add_returns_sum_not_difference(self):\n"
+            "        self.assertEqual(add(2, 3), 5)\n"
+            "        self.assertEqual(add(10, -4), 6)\n"
+        )
+        for cmd in (["git", "init", "-q"], ["git", "add", "-A"]):
+            subprocess.run(cmd, cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=demo@example.com", "-c", "user.name=Demo", "commit", "-q", "-m", "initial"],
+            cwd=self.repo, check=True,
+        )
+        self.control_state_root = self.root / "control_state"
+        self.control_state_root.mkdir()
+        self.control = ControlPlane(self.store, self.audit, self.control_state_root)
+        self.wf_orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        self.wf_orch.register_worker(EngineeringAgentWorker(self.control))
+        self.wf_orch.register_worker(QAAgentWorker(self.control))
+        self.exec_orch = ExecutionOrchestrator(self.store, self.audit, workforce_orchestrator=self.wf_orch)
+
+    def tearDown(self):
+        self._repo_tmp.cleanup()
+        super().tearDown()
+
+    def test_engineering_fix_run_id_genuinely_flows_into_dependent_qa_task_and_qa_independently_reverifies(self):
+        objective_id = self._active_objective()
+        requirement = (
+            "The add(a, b) function in calc.py is documented to return the sum of a and b, "
+            "but it currently returns their difference (a - b) instead. Fix the implementation "
+            "so it returns the correct sum, without changing its signature or docstring."
+        )
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[
+                {
+                    "task_type": "engineering_fix",
+                    "objective": "Fix calc.add() sum bug",
+                    "inputs": {
+                        "repository": str(self.repo),
+                        "requirement": requirement,
+                        "editable_files": ["calc.py"],
+                        "verification_commands": [
+                            {"argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+                             "label": "unit tests", "timeout_seconds": 90},
+                        ],
+                        "max_attempts": 2,
+                        "max_cost_usd": 0.05,
+                    },
+                },
+                {
+                    "task_type": "qa_independent_verification",
+                    "objective": "Independently re-verify the engineering fix",
+                    # The genuine dependency declaration: this task's real inputs.run_id
+                    # is resolved from assignment 0's REAL, just-produced outputs_json
+                    # at route time (ExecutionOrchestrator.route_plan), not hardcoded here.
+                    "depends_on": 0,
+                    "input_from_dependency": {"run_id": "run_id"},
+                    "inputs": {},
+                },
+            ],
+        )
+        result = self.exec_orch.route_plan(plan_id, actor="Aryan")
+
+        # Check the engineering (dependency) assignment's own real outcome FIRST,
+        # before asserting on created_wf_tasks count -- a genuinely BLOCKED/FAILED
+        # engineering run is expected to leave created_wf_tasks at 1 (the dependent
+        # QA task correctly skipped, not a bug in the skip logic), so asserting
+        # count==2 first would misreport an honest model-reliability limitation as
+        # a dependency-mechanism failure.
+        eng_entry = result["executed"][0]
+        self.assertEqual(eng_entry["task_type"], "engineering_fix")
+        if eng_entry["status"] != "COMPLETED":
+            self.fail(
+                "Real local-model engineering_fix task did not reach COMPLETED -- this is the "
+                f"honest measured outcome, not a mock: {eng_entry}. skipped={result['skipped']}. "
+                "Per the mission's own instruction, a local-model reliability limitation should be "
+                "reported and approval requested before switching providers, rather than papered over."
+            )
+
+        self.assertEqual(len(result["created_wf_tasks"]), 2, f"skipped={result['skipped']}")
+        self.assertEqual(len(result["executed"]), 2)
+        qa_entry = result["executed"][1]
+        self.assertEqual(qa_entry["task_type"], "qa_independent_verification")
+        real_run_id = eng_entry["evidence"]["run_id"]
+        self.assertTrue(real_run_id)
+
+        # Genuine data-flow proof: read the QA wf_task's OWN PERSISTED inputs_json
+        # directly from the store (not route_plan's return value) to confirm the
+        # real run_id was actually written into it before that task ever executed.
+        qa_task_id = result["created_wf_tasks"][1]
+        qa_task_row = self.store.get("wf_tasks", qa_task_id)
+        qa_inputs = json.loads(qa_task_row["inputs_json"])
+        self.assertEqual(qa_inputs["run_id"], real_run_id,
+                          "the dependent task's stored inputs must carry the dependency's REAL run_id")
+
+        if qa_entry["status"] != "COMPLETED":
+            self.fail(f"independent QA re-verification did not pass: {qa_entry}")
+        self.assertTrue(qa_entry["evidence"]["independent_rerun_passed"])
+        self.assertTrue(qa_entry["evidence"]["matches_original_verification"])
+        joined = " ".join(r.get("stdout_tail", "") + r.get("stderr_tail", "") for r in qa_entry["evidence"]["rerun_results"])
+        self.assertIn("test_add_returns_sum_not_difference", joined, "the QA re-run must have genuinely re-executed the real test")
+
+        # HQ visibility: the route response itself already carries real evidence
+        # and the engineering task's real escalation/approval outcome, without a
+        # second round-trip -- and that outcome is a PENDING human merge
+        # approval, never an auto-merge.
+        self.assertIsNone(eng_entry.get("needs_aryan_id"), "a clean COMPLETED engineering run has nothing to escalate")
+        approvals = self.store.list("approvals", "run_id=?", (real_run_id,))
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["status"], "PENDING", "no auto-merge: a human approval must remain pending")
+        self.assertEqual(approvals[0]["kind"], "PROTECTED_BRANCH_MERGE")
+
+
+class _DeterministicLocalModelHandler(BaseHTTPRequestHandler):
+    """Stands in for the local Ollama daemon's OpenAI-compatible endpoint so
+    the test below can exercise the REAL, unmodified EngineeringAgentWorker
+    -> StructuredEditWorker -> ModelSemanticReviewer chain end-to-end
+    without depending on a genuinely running (and non-deterministic) local
+    model. Per this audit's own instruction ("a deterministic transport may
+    be used to provide predictable code changes... but the orchestration,
+    persistence, worktrees, verification, dependency resolution and
+    independent QA must be real"): only the model HTTP backend is scripted
+    here. Every other component -- ControlPlane, GitWorktreeManager, the
+    real worktree, the real verification subprocess, the real
+    WorkforceOrchestrator/ExecutionOrchestrator dependency chaining, and the
+    real, separate QAAgentWorker re-verification (which makes no model call
+    at all) -- runs completely real and unmodified, exactly as a live
+    mission would."""
+
+    def log_message(self, *args, **kwargs):
+        pass  # keep test output quiet
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length))
+        schema_name = ((payload.get("response_format") or {}).get("json_schema") or {}).get("name")
+        if schema_name == "bounded_file_edits":
+            content = {
+                "summary": "Fix add() to return the sum instead of the difference",
+                "patches": [{
+                    "path": "calc.py", "old": "return a - b", "new": "return a + b",
+                    "before": "", "after": "", "task": 1,
+                }],
+            }
+        elif schema_name == "semantic_release_review":
+            dims = {
+                name: {"passed": True, "evidence": "deterministic stub reviewer: real verification evidence supplied and passing"}
+                for name in ("requirement_satisfaction", "scope_compliance", "regression_evidence", "unresolved_uncertainty")
+            }
+            content = {"summary": "approved", "blocking_findings": [], "unresolved_uncertainty": [], "dimensions": dims}
+        else:
+            self.send_response(400)
+            self.end_headers()
+            return
+        body = json.dumps({
+            "choices": [{"message": {"content": json.dumps(content)}}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 50},
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class WorkforceDependencyChainDeterministicEndToEndTests(CompanyOSBase):
+    """Phase 3 audit (Requirement 2), the deterministic positive-path
+    counterpart to WorkforceDependencyChainLiveEndToEndTests above. That
+    test proved failure propagation live against a genuinely unreliable
+    local model, but could not positively demonstrate the happy path in
+    this environment. Per Aryan's own explicit instruction, a deterministic
+    transport may stand in for the model backend to reach exactly that
+    happy path: this drives the real EngineeringAgentWorker through
+    ExecutionOrchestrator.route_plan's real dependency-chaining mechanism
+    into a real QAAgentWorker independent re-verification, with only the
+    model HTTP backend scripted (see _DeterministicLocalModelHandler above)
+    -- proving the full positive path (COMPLETED -> the dependency's real
+    run_id flows into the dependent task's real stored inputs -> COMPLETED
+    independent QA re-verification -> HQ-visible evidence and a real
+    PENDING merge approval) genuinely end-to-end at least once,
+    reproducibly, rather than leaving it entirely to an unreliable live
+    model's mood."""
+
+    @classmethod
+    def setUpClass(cls):
+        # EngineeringAgentWorker hardcodes LocalGateway's default base_url
+        # (http://127.0.0.1:11434/v1) with no injection seam, so this binds
+        # the exact address a real local Ollama daemon would use. Confirmed
+        # free in this environment for the duration of this test class.
+        cls.server = HTTPServer(("127.0.0.1", 11434), _DeterministicLocalModelHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        super().setUp()
+        self._repo_tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._repo_tmp.name) / "repo"
+        self.repo.mkdir()
+        (self.repo / "calc.py").write_text(
+            "def add(a, b):\n"
+            "    \"\"\"Return the sum of a and b.\"\"\"\n"
+            "    return a - b\n"
+        )
+        tests_dir = self.repo / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "__init__.py").write_text("")
+        (tests_dir / "test_calc.py").write_text(
+            "import unittest\n"
+            "from calc import add\n\n"
+            "class CalcTests(unittest.TestCase):\n"
+            "    def test_add_returns_sum_not_difference(self):\n"
+            "        self.assertEqual(add(2, 3), 5)\n"
+            "        self.assertEqual(add(10, -4), 6)\n"
+        )
+        for cmd in (["git", "init", "-q"], ["git", "add", "-A"]):
+            subprocess.run(cmd, cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=demo@example.com", "-c", "user.name=Demo", "commit", "-q", "-m", "initial"],
+            cwd=self.repo, check=True,
+        )
+        self.control_state_root = self.root / "control_state"
+        self.control_state_root.mkdir()
+        self.control = ControlPlane(self.store, self.audit, self.control_state_root)
+        self.wf_orch = WorkforceOrchestrator(self.store, self.audit, needs_aryan=self.needs_aryan)
+        self.wf_orch.register_worker(EngineeringAgentWorker(self.control))
+        self.wf_orch.register_worker(QAAgentWorker(self.control))
+        self.exec_orch = ExecutionOrchestrator(self.store, self.audit, workforce_orchestrator=self.wf_orch)
+
+    def tearDown(self):
+        self._repo_tmp.cleanup()
+        super().tearDown()
+
+    def test_engineering_fix_reaches_completed_and_run_id_genuinely_flows_into_completed_dependent_qa(self):
+        objective_id = self._active_objective()
+        requirement = (
+            "The add(a, b) function in calc.py is documented to return the sum of a and b, "
+            "but it currently returns their difference (a - b) instead. Fix the implementation "
+            "so it returns the correct sum, without changing its signature or docstring."
+        )
+        plan_id = self._approved_plan(
+            objective_id, departments=["Digital Workforce"],
+            workforce_assignments=[
+                {
+                    "task_type": "engineering_fix",
+                    "objective": "Fix calc.add() sum bug",
+                    "inputs": {
+                        "repository": str(self.repo),
+                        "requirement": requirement,
+                        "editable_files": ["calc.py"],
+                        "verification_commands": [
+                            {"argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+                             "label": "unit tests", "timeout_seconds": 60},
+                        ],
+                        # EngineeringAgentWorker's own default allowed_commands is
+                        # ["node", "git"] (falguna/agent_roles.py) -- Node-repo-
+                        # centric, with Python support an explicit, caller-supplied
+                        # opt-in exactly like verification_commands itself. This
+                        # fixture targets a Python repo, so it must be requested.
+                        "allowed_commands": ["python3", "git"],
+                        # Names the deterministic stub above rather than a real
+                        # pulled Ollama model; also skips EngineeringAgentWorker's
+                        # own model-auto-selection HTTP call to /api/tags, which
+                        # this stub server deliberately does not implement.
+                        "model": "deterministic-stub-model",
+                        "max_attempts": 1,
+                        "max_cost_usd": 0.05,
+                    },
+                },
+                {
+                    "task_type": "qa_independent_verification",
+                    "objective": "Independently re-verify the engineering fix",
+                    "depends_on": 0,
+                    "input_from_dependency": {"run_id": "run_id"},
+                    "inputs": {},
+                },
+            ],
+        )
+        result = self.exec_orch.route_plan(plan_id, actor="Aryan")
+
+        self.assertEqual(len(result["created_wf_tasks"]), 2, f"skipped={result['skipped']}")
+        self.assertEqual(len(result["executed"]), 2)
+        eng_entry, qa_entry = result["executed"]
+        self.assertEqual(eng_entry["task_type"], "engineering_fix")
+        self.assertEqual(qa_entry["task_type"], "qa_independent_verification")
+        self.assertEqual(eng_entry["status"], "COMPLETED",
+                          f"the deterministic transport must reliably reach COMPLETED: {eng_entry}")
+        real_run_id = eng_entry["evidence"]["run_id"]
+        self.assertTrue(real_run_id)
+
+        # Genuine data-flow proof: read the QA wf_task's OWN PERSISTED
+        # inputs_json directly from the store (not route_plan's return
+        # value) to confirm the real run_id was actually written into it
+        # before that task ever executed.
+        qa_task_id = result["created_wf_tasks"][1]
+        qa_task_row = self.store.get("wf_tasks", qa_task_id)
+        qa_inputs = json.loads(qa_task_row["inputs_json"])
+        self.assertEqual(qa_inputs["run_id"], real_run_id,
+                          "the dependent task's stored inputs must carry the dependency's REAL run_id")
+
+        self.assertEqual(qa_entry["status"], "COMPLETED", f"independent QA re-verification should pass: {qa_entry}")
+        self.assertTrue(qa_entry["evidence"]["original_verification_passed"])
+        qa_task_row_full = self.store.get("wf_tasks", qa_task_id)
+        qa_outputs = json.loads(qa_task_row_full["outputs_json"])
+        self.assertTrue(qa_outputs["independent_rerun_passed"], f"QA's own genuine second execution of the verification command must pass: {qa_outputs}")
+        self.assertTrue(qa_outputs["matches_original_verification"], "QA's independent re-run must agree with Engineering's original verification, not merely re-state it")
+        joined = " ".join(
+            r.get("stdout_tail", "") + r.get("stderr_tail", "") for r in qa_entry["evidence"]["rerun_results"]
+        )
+        self.assertIn("test_add_returns_sum_not_difference", joined,
+                       "the QA re-run must have genuinely re-executed the real test")
+
+        # HQ visibility: the route response itself already carries real
+        # evidence and the engineering task's real escalation/approval
+        # outcome, without a second round-trip -- and that outcome is a
+        # PENDING human merge approval, never an auto-merge.
+        self.assertIsNone(eng_entry.get("needs_aryan_id"), "a clean COMPLETED engineering run has nothing to escalate")
+        approvals = self.store.list("approvals", "run_id=?", (real_run_id,))
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["status"], "PENDING", "no auto-merge: a human approval must remain pending")
+        self.assertEqual(approvals[0]["kind"], "PROTECTED_BRANCH_MERGE")
+
+        # Acceptance item 10: re-routing must not duplicate tasks or
+        # external actions. ExecutionOrchestrator.route_plan's own
+        # department-objective-exists guard makes this idempotent.
+        result2 = self.exec_orch.route_plan(plan_id, actor="Aryan")
+        self.assertEqual(result2["created_wf_tasks"], [], "re-routing an already-executed plan must not create duplicate tasks")
 
 
 if __name__ == "__main__":

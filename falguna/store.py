@@ -227,6 +227,17 @@ class StateStore:
         # existed and for any form that has no consent field to match.
         "site_applications": [("resume_source_url", "TEXT")],
         "tally_intake_events": [("consent_status", "TEXT")],
+        # Phase 3, Milestone 4 (Company OS execution-routing repair): a plan
+        # can now name the actual, structured Digital Workforce assignments
+        # it needs (each a real, worker-supported task_type plus optional
+        # inputs) instead of ExecutionOrchestrator.route_plan inventing a
+        # single placeholder task_type ("company_os_routed") that no
+        # registered worker has ever recognized -- see company_os.py's
+        # ExecutionOrchestrator docstring for the full explanation. NULL/
+        # absent for every plan created before this column existed, exactly
+        # like every other additive column here; PlanStore.create() and
+        # route_plan() both treat that the same as an explicit empty list.
+        "co_plans": [("workforce_assignments_json", "TEXT")],
     }
 
     def migrate(self) -> None:
