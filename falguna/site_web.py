@@ -243,6 +243,15 @@ form.stack{display:flex;flex-direction:column;gap:18px;max-width:640px}
 table{width:100%;border-collapse:collapse;font-size:.92rem}
 th,td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--line)}
 th{color:var(--ink-soft);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}
+
+/* 2026 cohesion pass: editorial depth without changing truthful content. */
+.site-header{background:rgba(8,8,9,.78);backdrop-filter:saturate(150%) blur(22px)}
+.site-header .bar{min-height:82px}.nav{gap:28px}.nav a{font-size:.86rem;letter-spacing:.015em}
+.home-hero{min-height:min(840px,88vh)}.home-hero:before{width:720px;height:720px;background:radial-gradient(circle,rgba(237,28,36,.16) 0,rgba(242,154,22,.055) 35%,transparent 70%)}
+.home-hero .container{position:relative}.home-hero h1{letter-spacing:-.055em;text-wrap:balance}.hero-sub{line-height:1.7}
+.card{box-shadow:0 30px 80px -70px rgba(0,0,0,.9)}.card-link{transition:border-color .2s var(--ease),transform .2s var(--ease),background .2s var(--ease)}.card-link:hover{background:linear-gradient(145deg,#19191c,#111113)}
+.btn{min-height:48px}.btn-primary{box-shadow:0 18px 48px -24px rgba(237,28,36,.65)}
+@media(max-width:760px){.site-header .bar{min-height:72px}.home-hero{min-height:auto}.home-hero h1{text-wrap:pretty}.hero-sub{line-height:1.6}}
 """
 
 
