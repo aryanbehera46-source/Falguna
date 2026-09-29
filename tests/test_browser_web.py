@@ -24,7 +24,7 @@ from unittest import mock
 
 from falguna.browser_runtime import BrowserRuntimeError, BrowserSessionStatus, BrowserSessionStore, playwright_available
 from falguna.runtime import open_control_plane
-from falguna.web import FalgunaHandler, reconcile_browser_sessions_at_startup
+from falguna.web import FalgunaHandler, reconcile_browser_sessions_at_startup, wait_for_background_tasks
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -97,6 +97,10 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         self._wait_ready()
 
     def tearDown(self):
+        # Browser routes launch tracked workers. Drain them before shutting
+        # down the HTTP server and removing the temporary repository; this
+        # keeps SQLite/profile cleanup from racing an in-flight worker.
+        self.assertTrue(wait_for_background_tasks(self.repo), "browser worker did not stop before repository cleanup")
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
