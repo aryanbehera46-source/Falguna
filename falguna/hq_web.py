@@ -49,6 +49,9 @@ from .application_executor import ApplicationExecutor, ApplicationExecutorError
 from .billing import BillingError, BillingStore, CompletionError, CompletionService, RetentionError, RetentionStore
 from .command_center import CEOBriefStore, command_center_snapshot, kpi_snapshot
 from .company_state import CompanyStateService
+from .decisions import unified_decision_queue
+from .alerts import AlertAckStore, alerts_snapshot
+from .orchestration import workflow_monitor_snapshot
 from .company_os import (
     CompanyMemoryStore, CompanyOSError, CompanyPolicyStore, CostEstimateStore, DecisionStore,
     DepartmentObjectiveStore, EventBus, ExecutionOrchestrator, FailureStore, ObjectiveStore, PlanStore,
@@ -569,6 +572,18 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 return self._json(command_center_snapshot(store))
             if path == "/api/company-state":
                 return self._json(CompanyStateService(store).snapshot())
+            if path == "/api/orchestration/workflows":
+                return self._json(workflow_monitor_snapshot(store, control.audit))
+            if path == "/api/decisions/unified":
+                query = parse_qs(urlparse(self.path).query)
+                return self._json(unified_decision_queue(
+                    store, control.audit, control,
+                    status=(query.get("status") or [None])[0],
+                    kind=(query.get("kind") or [None])[0],
+                    ref_type=(query.get("ref_type") or [None])[0],
+                ))
+            if path == "/api/alerts":
+                return self._json(alerts_snapshot(store, control.audit))
             if path == "/api/cc/ceo-brief/latest":
                 brief = CEOBriefStore(store, control.audit).latest()
                 return self._json(brief or {"error": "no brief generated yet"}, HTTPStatus.OK if brief else HTTPStatus.NOT_FOUND)
@@ -1354,6 +1369,15 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     comms_send = CommsStore(store, control.audit, needs_aryan, provider=resolve_configured_email_provider())
                     message = comms_send.send_message_via_provider(message_id, body.get("actor", "Aryan"))
                     return self._json(message)
+                if path.startswith("/api/alerts/") and path.endswith("/acknowledge"):
+                    alert_id = unquote(path.split("/")[3])
+                    try:
+                        AlertAckStore(store, control.audit).acknowledge(alert_id, body.get("actor", "Aryan"), note=body.get("note"))
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return self._json({"alert_id": alert_id, "acknowledged": True})
+                if path == "/api/orchestration/sync":
+                    return self._json({"workflows": workflow_monitor_snapshot(store, control.audit)["workflows"]})
                 if path == "/api/needs-aryan":
                     item_id = NeedsAryanQueue(store, control.audit, control).create_item(
                         body.get("kind", ""), body.get("title", ""), body.get("what_is_needed", ""),
@@ -2589,6 +2613,9 @@ Ask Falguna
 <button class="navitem" data-view="needsAryan">Needs Aryan</button>
 <button class="navitem" data-view="communications">Communications</button>
 <button class="navitem" data-view="boardroom">Boardroom</button>
+<button class="navitem" data-view="orchWorkflows">Workflow Monitor</button>
+<button class="navitem" data-view="orchDecisions">Unified Decisions</button>
+<button class="navitem" data-view="orchAlerts">Operational Alerts</button>
 <details class="navexec" data-exec="briefing" open>
 <summary class="navsec navsec-exec">Briefing<span class="chev" aria-hidden="true"></span></summary>
 <button class="navitem" data-view="coCeoV2">CEO Brief</button>
@@ -2964,6 +2991,39 @@ Ask Falguna
 <h1>Needs Aryan</h1>
 <div class="pageintro">Every pending decision in one place -- business approvals and Falguna Engineering missions awaiting a merge decision.</div>
 <div class="list" id="needsAryanList"></div>
+</div>
+<div class="view" id="view-orchWorkflows">
+<h1>Workflow Monitor</h1>
+<div class="pageintro">Every commercial delivery journey (Opportunity -&gt; Proposal -&gt; Project -&gt; Delivery -&gt; Handover -&gt; Invoice), detected live from real persisted records -- never a second commercial state machine.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="orchTotal">0</h2><div class="sub">Total workflows</div></div>
+<div class="section" style="flex:1"><h2 id="orchInProgress">0</h2><div class="sub">In progress</div></div>
+<div class="section" style="flex:1"><h2 id="orchBlocked">0</h2><div class="sub">Blocked on a decision</div></div>
+<div class="section" style="flex:1"><h2 id="orchDone">0</h2><div class="sub">Complete</div></div>
+</div>
+<div class="list" id="orchWorkflowsList"></div>
+</div>
+<div class="view" id="view-orchDecisions">
+<h1>Unified Decisions</h1>
+<div class="pageintro">Every pending and recently-decided owner approval, across departments, in one queue. Decisions here are approved, rejected, deferred, or sent back for changes through the exact same authorized action as their originating screen -- never a generic bypass button.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="decPending">0</h2><div class="sub">Pending</div></div>
+<div class="section" style="flex:1"><h2 id="decHigh">0</h2><div class="sub">High urgency</div></div>
+<div class="section" style="flex:1"><h2 id="decMedium">0</h2><div class="sub">Medium urgency</div></div>
+<div class="section" style="flex:1"><h2 id="decLow">0</h2><div class="sub">Low urgency</div></div>
+</div>
+<div class="list" id="orchDecisionsList"></div>
+</div>
+<div class="view" id="view-orchAlerts">
+<h1>Operational Alerts</h1>
+<div class="pageintro">Deterministic, rule-based alerts computed live from real persisted state. A resolved problem stops appearing here on its own; acknowledging one only records that a human has seen it.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="alertActive">0</h2><div class="sub">Active</div></div>
+<div class="section" style="flex:1"><h2 id="alertHigh">0</h2><div class="sub">High severity</div></div>
+<div class="section" style="flex:1"><h2 id="alertMedium">0</h2><div class="sub">Medium severity</div></div>
+<div class="section" style="flex:1"><h2 id="alertLow">0</h2><div class="sub">Low severity</div></div>
+</div>
+<div class="list" id="orchAlertsList"></div>
 </div>
 <div class="view" id="view-communications">
 <h1>Communications</h1>
@@ -3495,7 +3555,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -3920,6 +3980,51 @@ ${i.source==='falguna_engineering'?`<a class="secondary" style="border:0;border-
 </div>
 </div>`).join(''):'<div class="empty">Nothing needs Aryan right now.</div>';
 document.querySelectorAll('.na').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadNeedsAryan()}catch(e){alert(e.message)}})}
+async function loadOrchWorkflows(){const d=await api('/api/orchestration/workflows');renderOrchWorkflows(d)}
+function renderOrchWorkflows(d){
+$('orchTotal').textContent=d.total;$('orchInProgress').textContent=d.in_progress.length;$('orchBlocked').textContent=d.blocked_on_human.length;$('orchDone').textContent=d.done.length;
+const ordered=[...d.blocked_on_human,...d.in_progress,...d.done];
+$('orchWorkflowsList').innerHTML=ordered.length?ordered.map(w=>`<div class="item">
+<h3>${esc(w.title||w.opportunity_id)}</h3>
+<div class="meta"><span>${esc(w.client_name||'No client name')}</span><span class="${w.blocked_needs_human?'badge':(w.done?'badge-actionable':'badge-inspect')}">${w.done?'complete':(w.blocked_needs_human?'blocked on decision':'in progress')}</span></div>
+<div class="rh-journey" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px;margin-top:10px">${w.steps.map(s=>`<div class="contrib" style="margin:0"><b>${s.complete?'✓':'○'} ${esc(s.label)}</b></div>`).join('')}</div>
+<div class="contrib"><b>Next:</b> ${esc(w.next_action)}</div>
+${w.decision?`<div class="actions">
+<button class="secondary orchDecide" data-id="${esc(w.decision.id)}" data-action="approve">Approve</button>
+<button class="secondary orchDecide" data-id="${esc(w.decision.id)}" data-action="request-changes">Request Changes</button>
+<button class="danger orchDecide" data-id="${esc(w.decision.id)}" data-action="reject">Reject</button>
+<button class="secondary orchDecide" data-id="${esc(w.decision.id)}" data-action="defer">Defer</button>
+</div>`:''}
+</div>`).join(''):'<div class="empty">No opportunities yet.</div>';
+document.querySelectorAll('.orchDecide').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadOrchWorkflows()}catch(e){alert(e.message)}})}
+async function loadOrchDecisions(){const d=await api('/api/decisions/unified');renderOrchDecisions(d)}
+function renderOrchDecisions(d){
+$('decPending').textContent=d.pending_count;$('decHigh').textContent=d.by_urgency.HIGH;$('decMedium').textContent=d.by_urgency.MEDIUM;$('decLow').textContent=d.by_urgency.LOW;
+$('orchDecisionsList').innerHTML=d.items.length?d.items.map(i=>`<div class="item">
+<h3>${esc(i.requested_action||'')}</h3>
+<div class="meta"><span>${esc(i.department)}</span><span>${esc(i.decision_type||'')}</span><span class="${i.urgency==='HIGH'?'badge':''}">${esc(i.urgency)}</span><span>${esc(i.status)}</span></div>
+<div>${esc(i.reason||'')}</div>
+${i.financial_impact?`<div class="contrib"><b>Financial impact:</b> ${esc(i.financial_impact)}</div>`:''}
+${i.evidence.recommendation?`<div class="contrib"><b>Recommendation:</b> ${esc(i.evidence.recommendation)}</div>`:''}
+${i.evidence.rationale?`<div class="contrib"><b>Rationale:</b> ${esc(i.evidence.rationale)}</div>`:''}
+<div class="actions">
+${i.authorized_actions.map(a=>`<button class="${a==='reject'?'danger':'secondary'} orchDec2" data-id="${esc(i.id)}" data-action="${a}">${esc(a)}</button>`).join('')}
+${i.source_link.view?`<button class="secondary orchJump" data-view="${esc(i.source_link.view)}">Open source</button>`:''}
+</div>
+</div>`).join(''):'<div class="empty">No decisions right now.</div>';
+document.querySelectorAll('.orchDec2').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadOrchDecisions()}catch(e){alert(e.message)}});
+document.querySelectorAll('.orchJump').forEach(b=>b.onclick=()=>{const btn=document.querySelector(`.navitem[data-view="${b.dataset.view}"]`);if(btn)btn.click()})}
+async function loadOrchAlerts(){const d=await api('/api/alerts');renderOrchAlerts(d)}
+function renderOrchAlerts(d){
+$('alertActive').textContent=d.active_count;$('alertHigh').textContent=d.by_severity.HIGH;$('alertMedium').textContent=d.by_severity.MEDIUM;$('alertLow').textContent=d.by_severity.LOW;
+$('orchAlertsList').innerHTML=d.alerts.length?d.alerts.map(a=>`<div class="item">
+<h3>${esc(a.category.replace(/_/g,' '))}</h3>
+<div class="meta"><span class="${a.severity==='HIGH'?'badge':''}">${esc(a.severity)}</span><span>${esc(a.source)}</span><span>${esc(a.current_state)}</span>${a.acknowledged?'<span>acknowledged</span>':''}</div>
+<div>${esc(a.explanation)}</div>
+${a.acknowledged&&a.note?`<div class="contrib"><b>Note:</b> ${esc(a.note)}</div>`:''}
+${!a.acknowledged?`<div class="actions"><button class="secondary orchAck" data-id="${esc(a.id)}">Acknowledge</button></div>`:''}
+</div>`).join(''):'<div class="empty">No active alerts.</div>';
+document.querySelectorAll('.orchAck').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/alerts/${encodeURIComponent(b.dataset.id)}/acknowledge`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',note})});await loadOrchAlerts()}catch(e){alert(e.message)}})}
 async function loadCommunications(){const [ov,list,activity]=await Promise.all([api('/api/comms/overview'),api('/api/comms/conversations'),api('/api/comms/workforce/activity')]);renderCommunications(ov,list.items||[],activity)}
 function renderCommunications(ov,items,activity){
 $('commsOpenTotal').textContent=ov.open_total||0;

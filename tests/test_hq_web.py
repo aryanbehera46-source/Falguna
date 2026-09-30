@@ -13,7 +13,10 @@ from falguna.audit import AuditLog
 from falguna.hq_web import (
     HQ_INDEX_HTML, PRODUCT_NAME, TTTHQHandler, _build_workforce_orchestrator, reconcile_workforce_tasks_at_startup,
 )
+from falguna.lifecycle import LifecycleOrchestrator
+from falguna.revenue_hunter import OpportunityStore, ProposalStore
 from falguna.runtime import open_control_plane
+from falguna.sales_ops import ClosingService
 from falguna.store import StateStore
 from falguna.ttt_hq import NeedsAryanQueue
 from falguna.web import FalgunaHandler, INDEX_HTML
@@ -1105,6 +1108,98 @@ class CLISubcommandTests(unittest.TestCase):
         source = Path(m.__file__).read_text()
         self.assertIn("default=8765", source)
         self.assertIn("default=8766", source)
+
+
+class OrchestrationHQServerTests(TTTHQServerTests):
+    """HTTP-level coverage for Phase 4 Sprint 2: Company-wide Orchestration,
+    the Unified Decision Queue, and Operational Alerts."""
+
+    def _make_pending_proposal(self):
+        opportunities = OpportunityStore(self.store, self.control.audit)
+        opp_id = opportunities.create({"title": "Build a site", "client_name": "Acme"}, "Aryan")
+        needs_aryan = NeedsAryanQueue(self.store, self.control.audit)
+        proposal = ProposalStore(self.store, self.control.audit, needs_aryan=needs_aryan).generate(opp_id, "detailed", "Aryan")
+        return opp_id, proposal["needs_aryan_id"]
+
+    def test_workflow_monitor_route_buckets_a_blocked_opportunity(self):
+        opp_id, _ = self._make_pending_proposal()
+        status, body = self._get(self.hq_port, "/api/orchestration/workflows")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(len(body["blocked_on_human"]), 1)
+        self.assertEqual(body["blocked_on_human"][0]["opportunity_id"], opp_id)
+
+    def test_unified_decisions_route_lists_the_pending_proposal(self):
+        _, needs_aryan_id = self._make_pending_proposal()
+        status, body = self._get(self.hq_port, "/api/decisions/unified")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["pending_count"], 1)
+        self.assertEqual(body["items"][0]["id"], needs_aryan_id)
+        self.assertEqual(body["items"][0]["department"], "Revenue Hunter")
+
+    def test_unified_decisions_route_status_filter(self):
+        self._make_pending_proposal()
+        status, body = self._get(self.hq_port, "/api/decisions/unified?status=APPROVED")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 0)
+
+    def test_deciding_through_the_existing_endpoint_clears_it_from_both_queues(self):
+        _, needs_aryan_id = self._make_pending_proposal()
+        status, body = self._post(self.hq_port, f"/api/needs-aryan/{needs_aryan_id}/decision", {"action": "approve", "actor": "Aryan"})
+        self.assertEqual(status, 200)
+        _, workflows = self._get(self.hq_port, "/api/orchestration/workflows")
+        self.assertEqual(len(workflows["blocked_on_human"]), 0)
+        _, decisions = self._get(self.hq_port, "/api/decisions/unified")
+        self.assertEqual(decisions["pending_count"], 0)
+        _, alerts = self._get(self.hq_port, "/api/alerts")
+        self.assertFalse(any(a["category"] == "quotation_awaiting_approval" for a in alerts["alerts"]))
+
+    def test_stale_decision_is_rejected_not_silently_reapplied(self):
+        _, needs_aryan_id = self._make_pending_proposal()
+        status, _ = self._post(self.hq_port, f"/api/needs-aryan/{needs_aryan_id}/decision", {"action": "approve", "actor": "Aryan"})
+        self.assertEqual(status, 200)
+        code, err = self._post_raises(self.hq_port, f"/api/needs-aryan/{needs_aryan_id}/decision", {"action": "reject", "actor": "Aryan"})
+        self.assertEqual(code, 400)
+        self.assertIn("already been decided", err["error"])
+
+    def test_duplicate_http_decision_requests_do_not_double_execute_the_close(self):
+        opp_id, needs_aryan_id = self._make_pending_proposal()
+        self._post(self.hq_port, f"/api/needs-aryan/{needs_aryan_id}/decision", {"action": "approve", "actor": "Aryan"})
+        orchestrator = LifecycleOrchestrator(self.store, self.control.audit)
+        needs_aryan = NeedsAryanQueue(self.store, self.control.audit)
+        outcome = ClosingService(self.store, self.control.audit, orchestrator=orchestrator, needs_aryan=needs_aryan).close(
+            opp_id, "Aryan", client_name="Acme",
+        )
+        self.assertEqual(outcome["status"], "AWAITING_APPROVAL")
+        closing_needs_aryan_id = outcome["needs_aryan_id"]
+        status1, _ = self._post(self.hq_port, f"/api/needs-aryan/{closing_needs_aryan_id}/decision", {"action": "approve", "actor": "Aryan"})
+        code2, err2 = self._post_raises(self.hq_port, f"/api/needs-aryan/{closing_needs_aryan_id}/decision", {"action": "approve", "actor": "Aryan"})
+        self.assertEqual(status1, 200)
+        self.assertEqual(code2, 400)
+        closings = self.store.list("rh_closing_records", "opportunity_id=?", (opp_id,))
+        self.assertEqual(len(closings), 1)
+
+    def test_alerts_route_and_acknowledge_round_trip(self):
+        self._make_pending_proposal()
+        status, before = self._get(self.hq_port, "/api/alerts")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(before["active_count"], 1)
+        alert_id = next(a["id"] for a in before["alerts"] if a["category"] == "quotation_awaiting_approval")
+        ack_status, ack_body = self._post(self.hq_port, f"/api/alerts/{alert_id}/acknowledge", {"actor": "Aryan", "note": "seen"})
+        self.assertEqual(ack_status, 200)
+        self.assertTrue(ack_body["acknowledged"])
+        status, after = self._get(self.hq_port, "/api/alerts")
+        acked = next(a for a in after["alerts"] if a["id"] == alert_id)
+        self.assertTrue(acked["acknowledged"])
+        self.assertEqual(after["active_count"], before["active_count"] - 1)
+
+    def test_alert_acknowledge_without_actor_returns_400(self):
+        self._make_pending_proposal()
+        _, before = self._get(self.hq_port, "/api/alerts")
+        alert_id = before["alerts"][0]["id"]
+        code, err = self._post_raises(self.hq_port, f"/api/alerts/{alert_id}/acknowledge", {"actor": ""})
+        self.assertEqual(code, 400)
+        self.assertIn("actor", err["error"])
 
 
 if __name__ == "__main__":
