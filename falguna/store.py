@@ -325,7 +325,11 @@ class StateStore:
             "tally_intake_events",
             # Sales Partner Pilot V1 (falguna/partner_management.py)
             "pm_partners", "pm_partner_status_events", "pm_referrals", "pm_duplicate_reviews",
-            "pm_commissions", "pm_commission_events"}
+            "pm_commissions", "pm_commission_events",
+            # Phase 5 Sprint 1: Commercial Operating Foundation (falguna/commercial.py)
+            "cs_services", "cs_foundations", "cs_intakes", "cs_intake_events",
+            "cs_projects", "cs_project_events", "cs_disputes", "cs_dispute_events",
+            "cs_project_costs"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

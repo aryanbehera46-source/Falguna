@@ -97,6 +97,10 @@ from .revenue_delivery import RevenueDeliveryError, RevenueDeliveryService
 from .partner_management import (
     CommissionError, CommissionStore, PartnerError, PartnerStore, ReferralError, ReferralStore,
 )
+from .commercial import (
+    CommercialError, CostEntryStore, DisputeStore, FoundationStore, IntakeStore,
+    ProjectStore, ServiceCatalogStore, economics_for_project, recommend_route,
+)
 from .runtime import open_control_plane
 from .sales_manager import SalesManagerService
 from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
@@ -864,6 +868,77 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 commission_id = path.rsplit("/", 1)[-1]
                 commission = CommissionStore(store, control.audit).get(commission_id)
                 return self._json(commission or {"error": "commission not found"}, HTTPStatus.OK if commission else HTTPStatus.NOT_FOUND)
+
+            # -- Phase 5 Sprint 1: Commercial Operating Foundation (see
+            # falguna/commercial.py) --
+            if path == "/api/cs/services":
+                query = parse_qs(urlparse(self.path).query)
+                active_only = (query.get("active_only") or ["false"])[0].lower() == "true"
+                category = (query.get("category") or [None])[0]
+                return self._json({"items": ServiceCatalogStore(store, control.audit).list(active_only=active_only, category=category)})
+            if path.startswith("/api/cs/services/"):
+                service_id = path.rsplit("/", 1)[-1]
+                service = ServiceCatalogStore(store, control.audit).get(service_id)
+                return self._json(service or {"error": "service not found"}, HTTPStatus.OK if service else HTTPStatus.NOT_FOUND)
+            if path == "/api/cs/foundations":
+                query = parse_qs(urlparse(self.path).query)
+                category = (query.get("category") or [None])[0]
+                maturity = (query.get("maturity") or [None])[0]
+                return self._json({"items": FoundationStore(store, control.audit).list(category=category, maturity=maturity)})
+            if path.startswith("/api/cs/foundations/"):
+                foundation_id = path.rsplit("/", 1)[-1]
+                foundation = FoundationStore(store, control.audit).get(foundation_id)
+                return self._json(foundation or {"error": "foundation not found"}, HTTPStatus.OK if foundation else HTTPStatus.NOT_FOUND)
+            if path == "/api/cs/intakes":
+                query = parse_qs(urlparse(self.path).query)
+                qualification_status = (query.get("qualification_status") or [None])[0]
+                return self._json({"items": IntakeStore(store, control.audit).list(qualification_status=qualification_status)})
+            if path.startswith("/api/cs/intakes/") and path.endswith("/history"):
+                intake_id = path.split("/")[4]
+                return self._json({"items": IntakeStore(store, control.audit).history(intake_id)})
+            if path.startswith("/api/cs/intakes/") and path.endswith("/recommend-route"):
+                intake_id = path.split("/")[4]
+                intake = IntakeStore(store, control.audit).get(intake_id)
+                if not intake:
+                    return self._json({"error": "intake not found"}, HTTPStatus.NOT_FOUND)
+                service = ServiceCatalogStore(store, control.audit).get(intake.get("service_id")) if intake.get("service_id") else None
+                return self._json(recommend_route(store, service, intake.get("complexity")))
+            if path.startswith("/api/cs/intakes/"):
+                intake_id = path.rsplit("/", 1)[-1]
+                intake = IntakeStore(store, control.audit).get(intake_id)
+                return self._json(intake or {"error": "intake not found"}, HTTPStatus.OK if intake else HTTPStatus.NOT_FOUND)
+            if path == "/api/cs/projects":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": ProjectStore(store, control.audit).list(status=status)})
+            if path.startswith("/api/cs/projects/") and path.endswith("/history"):
+                project_id = path.split("/")[4]
+                return self._json({"items": ProjectStore(store, control.audit).history(project_id)})
+            if path.startswith("/api/cs/projects/") and path.endswith("/economics"):
+                project_id = path.split("/")[4]
+                try:
+                    return self._json(economics_for_project(store, project_id))
+                except CommercialError as exc:
+                    return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/cs/projects/") and path.endswith("/costs"):
+                project_id = path.split("/")[4]
+                return self._json({"items": CostEntryStore(store, control.audit).list_for_project(project_id)})
+            if path.startswith("/api/cs/projects/"):
+                project_id = path.rsplit("/", 1)[-1]
+                project = ProjectStore(store, control.audit).get(project_id)
+                return self._json(project or {"error": "project not found"}, HTTPStatus.OK if project else HTTPStatus.NOT_FOUND)
+            if path == "/api/cs/disputes":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                invoice_id = (query.get("invoice_id") or [None])[0]
+                return self._json({"items": DisputeStore(store, control.audit).list(status=status, invoice_id=invoice_id)})
+            if path.startswith("/api/cs/disputes/") and path.endswith("/history"):
+                dispute_id = path.split("/")[4]
+                return self._json({"items": DisputeStore(store, control.audit).history(dispute_id)})
+            if path.startswith("/api/cs/disputes/"):
+                dispute_id = path.rsplit("/", 1)[-1]
+                dispute = DisputeStore(store, control.audit).get(dispute_id)
+                return self._json(dispute or {"error": "dispute not found"}, HTTPStatus.OK if dispute else HTTPStatus.NOT_FOUND)
 
             # -- Digital Workforce (Section 20) --
             if path == "/api/wf/tasks":
@@ -1915,6 +1990,123 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     )
                     return self._json(result)
 
+                # -- Phase 5 Sprint 1: Commercial Operating Foundation (see
+                # falguna/commercial.py). FALGUNA can draft/recommend; every
+                # binding step (approve, convert-to-project, resolve a
+                # refund) requires a human actor and is never reachable
+                # from a discovery-only or automation-only code path. --
+                if path == "/api/cs/services":
+                    service_id = ServiceCatalogStore(store, control.audit).create(
+                        body.get("service_key", ""), body.get("category", ""), body.get("title", ""),
+                        body.get("customer_description", ""), body.get("pricing_model", ""), body.get("delivery_mode", ""),
+                        actor=body.get("actor", "Aryan"), scope_boundaries=body.get("scope_boundaries"),
+                        supported_regions=body.get("supported_regions"), price_min=body.get("price_min"),
+                        price_max=body.get("price_max"), currency=body.get("currency", "USD"),
+                        required_specialists=body.get("required_specialists"),
+                        automation_eligible=bool(body.get("automation_eligible", False)),
+                        foundation_id=body.get("foundation_id"),
+                    )
+                    return self._json({"service_id": service_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cs/services/") and path.endswith("/approval"):
+                    service_id = path.split("/")[4]
+                    result = ServiceCatalogStore(store, control.audit).set_approval(
+                        service_id, body.get("actor", "Aryan"), body.get("approval_status", ""),
+                    )
+                    return self._json(result)
+                if path == "/api/cs/foundations":
+                    foundation_id = FoundationStore(store, control.audit).register(
+                        body.get("name", ""), body.get("category"), body.get("maturity", ""),
+                        actor=body.get("actor", "Aryan"), description=body.get("description"),
+                        repository_ref=body.get("repository_ref"), supported_versions=body.get("supported_versions"),
+                        service_categories=body.get("service_categories"), qa_requirements=body.get("qa_requirements"),
+                        known_limitations=body.get("known_limitations"), reuse_restrictions=body.get("reuse_restrictions"),
+                    )
+                    return self._json({"foundation_id": foundation_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cs/foundations/") and path.endswith("/maturity"):
+                    foundation_id = path.split("/")[4]
+                    result = FoundationStore(store, control.audit).set_maturity(
+                        foundation_id, body.get("actor", "Aryan"), body.get("maturity", ""), note=body.get("note"),
+                    )
+                    return self._json(result)
+                if path == "/api/cs/intakes":
+                    intake_id = IntakeStore(store, control.audit).create(
+                        body.get("customer_name", ""), body.get("requested_outcome", ""),
+                        actor=body.get("actor", "Aryan"), customer_contact=body.get("customer_contact"),
+                        business_name=body.get("business_name"), industry=body.get("industry"),
+                        region=body.get("region"), country=body.get("country"), service_id=body.get("service_id"),
+                        requirements=body.get("requirements"), timeline=body.get("timeline"),
+                        budget_amount=body.get("budget_amount"), budget_currency=body.get("budget_currency"),
+                        regulatory_flags=body.get("regulatory_flags"), required_integrations=body.get("required_integrations"),
+                        assets_provided=body.get("assets_provided"), complexity=body.get("complexity"),
+                    )
+                    return self._json({"intake_id": intake_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cs/intakes/") and path.endswith("/ai-draft"):
+                    intake_id = path.split("/")[4]
+                    result = IntakeStore(store, control.audit).ai_draft(
+                        intake_id, body.get("actor", "Falguna"), body.get("requirement_summary", ""),
+                        missing_questions=body.get("missing_questions"), proposed_scope=body.get("proposed_scope"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/cs/intakes/") and path.endswith("/qualify"):
+                    intake_id = path.split("/")[4]
+                    result = IntakeStore(store, control.audit).qualify(
+                        intake_id, body.get("actor", "Aryan"), body.get("qualification_status", ""),
+                        potential_value=body.get("potential_value"), risks=body.get("risks"),
+                        recommended_route=body.get("recommended_route"), reason=body.get("reason"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/cs/intakes/") and path.endswith("/approve"):
+                    intake_id = path.split("/")[4]
+                    result = IntakeStore(store, control.audit).approve(intake_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+                if path.startswith("/api/cs/intakes/") and path.endswith("/convert-to-project"):
+                    intake_id = path.split("/")[4]
+                    project_id = IntakeStore(store, control.audit).convert_to_project(
+                        intake_id, body.get("actor", "Aryan"), body.get("delivery_route", ""),
+                        foundation_id=body.get("foundation_id"),
+                    )
+                    return self._json({"project_id": project_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cs/projects/") and path.endswith("/transition"):
+                    project_id = path.split("/")[4]
+                    result = ProjectStore(store, control.audit).transition(
+                        project_id, body.get("actor", "Aryan"), body.get("to_status", ""), reason=body.get("reason"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/cs/projects/") and path.endswith("/link-mission"):
+                    project_id = path.split("/")[4]
+                    result = ProjectStore(store, control.audit).link_mission(project_id, body.get("actor", "Aryan"), body.get("mission_id", ""))
+                    return self._json(result)
+                if path.startswith("/api/cs/projects/") and path.endswith("/costs"):
+                    project_id = path.split("/")[4]
+                    cost_id = CostEntryStore(store, control.audit).record(
+                        project_id, body.get("actor", "Aryan"), body.get("cost_category", ""), body.get("amount"),
+                        currency=body.get("currency", "USD"), note=body.get("note"),
+                    )
+                    return self._json({"cost_id": cost_id}, HTTPStatus.CREATED)
+                if path == "/api/cs/disputes":
+                    dispute_id = DisputeStore(store, control.audit).open(
+                        body.get("invoice_id", ""), body.get("actor", "Aryan"), body.get("reason", ""),
+                        body.get("amount_disputed"), body.get("evidence"), project_id=body.get("project_id"),
+                    )
+                    return self._json({"dispute_id": dispute_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/cs/disputes/") and path.endswith("/review"):
+                    dispute_id = path.split("/")[4]
+                    result = DisputeStore(store, control.audit).start_review(
+                        dispute_id, body.get("actor", "Aryan"), body.get("reviewer", ""), note=body.get("note"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/cs/disputes/") and path.endswith("/resolve"):
+                    dispute_id = path.split("/")[4]
+                    result = DisputeStore(store, control.audit).resolve(
+                        dispute_id, body.get("actor", "Aryan"), body.get("resolution", ""),
+                        refund_amount=body.get("refund_amount"), evidence=body.get("evidence"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/cs/disputes/") and path.endswith("/close"):
+                    dispute_id = path.split("/")[4]
+                    result = DisputeStore(store, control.audit).close(dispute_id, body.get("actor", "Aryan"), reason=body.get("reason"))
+                    return self._json(result)
+
                 # -- Digital Workforce (Section 20) --
                 needs_aryan_q = NeedsAryanQueue(store, control.audit, control)
                 if path == "/api/wf/tasks":
@@ -2778,6 +2970,14 @@ Ask Falguna
 <button class="navitem" data-view="pmCommissions">Commission Ledger</button>
 <button class="navitem" data-view="pmPerformance">Partner Performance</button>
 </details>
+<details class="navgroup" data-cat="commercial">
+<summary class="navsec">Commercial (Phase 5)<span class="chev" aria-hidden="true"></span></summary>
+<button class="navitem" data-view="csServices">Service Catalogue</button>
+<button class="navitem" data-view="csFoundations">Product Foundations</button>
+<button class="navitem" data-view="csIntakes">Customer Intakes</button>
+<button class="navitem" data-view="csProjects">Delivery Projects</button>
+<button class="navitem" data-view="csDisputes">Disputes &amp; Refunds</button>
+</details>
 <details class="navgroup" data-cat="growth">
 <summary class="navsec">Media<span class="chev" aria-hidden="true"></span></summary>
 <button class="navitem" data-view="mediaBrands">Brands</button>
@@ -3412,6 +3612,63 @@ Ask Falguna
 <div class="pageintro">Referral and commission totals per partner, computed from persisted state only.</div>
 <div class="list" id="pmPerformanceList"></div>
 </div>
+<div class="view" id="view-csServices">
+<h1>Sellable Service Catalogue</h1>
+<div class="pageintro">The real, internal service catalogue -- distinct from the public marketing site. A service is DRAFT until approved; only APPROVED, active services are ever offered as a FALGUNA routing recommendation. We never publish a capability we cannot actually deliver.</div>
+<div class="form">
+<div class="row"><input id="csSvcKey" placeholder="Service key (unique, e.g. website-v1)"><input id="csSvcCategory" placeholder="Category (e.g. web_dev, booking, ecommerce)"></div>
+<input id="csSvcTitle" placeholder="Title">
+<textarea id="csSvcDescription" placeholder="Customer-facing description (required)"></textarea>
+<textarea id="csSvcScope" placeholder="Scope boundaries (what is NOT included)"></textarea>
+<div class="row"><select id="csSvcPricingModel"><option value="fixed">Fixed price</option><option value="hourly">Hourly</option><option value="retainer">Retainer</option></select><select id="csSvcDeliveryMode"><option value="remote">Remote</option><option value="onsite">Onsite</option><option value="hybrid">Hybrid</option></select></div>
+<div class="row"><input id="csSvcPriceMin" type="number" step="0.01" placeholder="Indicative price min"><input id="csSvcPriceMax" type="number" step="0.01" placeholder="Indicative price max"><input id="csSvcCurrency" placeholder="Currency" value="USD"></div>
+<input id="csSvcRegions" placeholder="Supported regions, comma-separated">
+<input id="csSvcSpecialists" placeholder="Required specialists/tools, comma-separated">
+<label style="display:flex;gap:8px;align-items:center"><input id="csSvcAutomation" type="checkbox"> Automation-eligible (FALGUNA may execute this without escalation)</label>
+<div class="actions"><button id="csSvcCreate" type="button">Add service (DRAFT)</button></div>
+</div>
+<div class="list" id="csServicesList"></div>
+</div>
+<div class="view" id="view-csFoundations">
+<h1>Product Foundation Registry</h1>
+<div class="pageintro">Reusable products/components honestly labelled by maturity. Only PRODUCTION_READY foundations are ever offered as a reuse candidate to a real customer commitment -- a prototype or internal-only asset never is, regardless of how good it looks.</div>
+<div class="form">
+<div class="row"><input id="csFndName" placeholder="Foundation name"><input id="csFndCategory" placeholder="Category"></div>
+<select id="csFndMaturity"><option value="PRODUCTION_READY">Production-ready</option><option value="PROTOTYPE">Prototype</option><option value="INTERNAL">Internal only</option><option value="NEEDS_HARDENING">Needs hardening</option></select>
+<textarea id="csFndDescription" placeholder="Description"></textarea>
+<input id="csFndServiceCategories" placeholder="Matches these service categories, comma-separated">
+<input id="csFndQaRequirements" placeholder="QA requirements">
+<input id="csFndLimitations" placeholder="Known limitations">
+<input id="csFndReuseRestrictions" placeholder="IP / reuse restrictions (if any)">
+<div class="actions"><button id="csFndCreate" type="button">Register foundation</button></div>
+</div>
+<div class="list" id="csFoundationsList"></div>
+</div>
+<div class="view" id="view-csIntakes">
+<h1>Customer Intake &amp; Qualification</h1>
+<div class="pageintro">FALGUNA may draft a requirement summary, missing-information questions, and a proposed scope here -- but human approval is always required before an intake can be converted into a real, binding project. FALGUNA can never make a binding customer promise by itself.</div>
+<div class="form">
+<div class="row"><input id="csIntCustomer" placeholder="Customer / business name"><input id="csIntContact" placeholder="Contact (email/phone, optional)"></div>
+<textarea id="csIntOutcome" placeholder="Requested outcome (required)"></textarea>
+<div class="row"><input id="csIntRegion" placeholder="Region"><input id="csIntCountry" placeholder="Country"></div>
+<select id="csIntService"><option value="">No catalogue service selected</option></select>
+<textarea id="csIntRequirements" placeholder="Requirements"></textarea>
+<div class="row"><input id="csIntTimeline" placeholder="Timeline"><input id="csIntBudget" type="number" step="0.01" placeholder="Budget amount"><input id="csIntCurrency" placeholder="Currency" value="USD"></div>
+<select id="csIntComplexity"><option value="standard">Standard</option><option value="high">High</option></select>
+<div class="actions"><button id="csIntCreate" type="button">Create intake</button></div>
+</div>
+<div class="list" id="csIntakesList"></div>
+</div>
+<div class="view" id="view-csProjects">
+<h1>Delivery Projects</h1>
+<div class="pageintro">The Sell-&gt;Deliver backbone -- each project links back to its intake, service, optional reusable foundation, and the real opportunity/invoice trail in the existing Revenue &amp; Delivery Engine. Every economics figure shown is computed from persisted invoices, payments, disputes, and recorded costs; a figure that has never been recorded is shown as <b>unknown</b>, never as $0.</div>
+<div class="list" id="csProjectsList"></div>
+</div>
+<div class="view" id="view-csDisputes">
+<h1>Disputes &amp; Refunds</h1>
+<div class="pageintro">State-management only -- no dispute or refund here ever executes an external financial transfer. Resolving with a refund amount records it on the dispute and, where a partner referral exists, reverses the proportional commission through the existing commission ledger; it never edits an invoice's own record of cash actually received.</div>
+<div class="list" id="csDisputesList"></div>
+</div>
 <div class="view" id="view-mediaBrands">
 <h1>Brands</h1>
 <div class="pageintro">Persistent voice/tone, audience, platforms, content pillars, visual guidelines, and approval policy -- one definition per brand, read by every piece of content and every Media agent.</div>
@@ -3664,7 +3921,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,csServices:loadCsServices,csFoundations:loadCsFoundations,csIntakes:loadCsIntakes,csProjects:loadCsProjects,csDisputes:loadCsDisputes,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -4762,6 +5019,334 @@ $('pmPerformanceList').innerHTML=rows.map(r=>`<div class="item"><h3>${esc(r.p.fu
 <div class="meta"><span>eligible commission: $${r.eligibleTotal.toFixed(2)}</span><span>provisional: $${r.provisionalTotal.toFixed(2)}</span>${r.heldCount?`<span>${r.heldCount} held</span>`:''}${r.reversedCount?`<span>${r.reversedCount} reversed</span>`:''}</div>
 </div>`).join('');
 }catch(e){$('pmPerformanceList').innerHTML=`<div class="empty">Unable to load performance summary: ${esc(e.message)}</div>`}
+}
+// ---------- Phase 5 Sprint 1: Commercial Operating Foundation (see
+// falguna/commercial.py). FALGUNA may draft/recommend; every binding
+// step (approve, convert-to-project, resolve a refund) requires a
+// human actor and hits a real, persisted, audited endpoint. ----------
+async function loadCsServices(){
+$('csSvcCreate').onclick=async()=>{
+const service_key=$('csSvcKey').value.trim();
+const category=$('csSvcCategory').value.trim();
+const title=$('csSvcTitle').value.trim();
+const customer_description=$('csSvcDescription').value.trim();
+if(!service_key||!title||!customer_description)return alert('Service key, title, and a customer-facing description are required.');
+try{
+await api('/api/cs/services',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+service_key,category,title,customer_description,scope_boundaries:$('csSvcScope').value.trim()||null,
+pricing_model:$('csSvcPricingModel').value,delivery_mode:$('csSvcDeliveryMode').value,
+price_min:$('csSvcPriceMin').value?Number($('csSvcPriceMin').value):null,price_max:$('csSvcPriceMax').value?Number($('csSvcPriceMax').value):null,
+currency:$('csSvcCurrency').value.trim()||'USD',
+supported_regions:$('csSvcRegions').value.split(',').map(s=>s.trim()).filter(Boolean),
+required_specialists:$('csSvcSpecialists').value.split(',').map(s=>s.trim()).filter(Boolean),
+automation_eligible:$('csSvcAutomation').checked,actor:'Aryan',
+})});
+['csSvcKey','csSvcCategory','csSvcTitle','csSvcDescription','csSvcScope','csSvcPriceMin','csSvcPriceMax','csSvcRegions','csSvcSpecialists'].forEach(id=>$(id).value='');
+$('csSvcAutomation').checked=false;$('csSvcCurrency').value='USD';
+await loadCsServices();
+}catch(e){alert(e.message)}
+};
+try{const d=await api('/api/cs/services');renderCsServices(d.items||[])}
+catch(e){$('csServicesList').innerHTML=`<div class="empty">Unable to load services: ${esc(e.message)}</div>`}
+}
+function csApprovalBadge(s){
+if(s==='APPROVED')return '<span class="stat-good">APPROVED</span>';
+if(s==='RETIRED')return '<span class="stat-bad">RETIRED</span>';
+return '<span class="badge">DRAFT</span>';
+}
+function renderCsServices(items){
+$('csServicesList').innerHTML=items.length?items.map(s=>`<div class="item"><h3>${esc(s.title)} <span class="sub">(${esc(s.service_key)})</span></h3>
+<div class="meta">${csApprovalBadge(s.approval_status)}<span>${esc(s.category)}</span><span>${esc(s.pricing_model)}</span><span>${esc(s.delivery_mode)}</span>${s.price_min!=null||s.price_max!=null?`<span>${s.price_min??'?'}-${s.price_max??'?'} ${esc(s.currency)}</span>`:''}${s.automation_eligible?'<span class="badge">automation-eligible</span>':''}</div>
+<div class="contrib">${esc(s.customer_description)}</div>
+${s.scope_boundaries?`<div class="contrib"><b>Not included:</b> ${esc(s.scope_boundaries)}</div>`:''}
+<div class="actions">
+${s.approval_status!=='APPROVED'?`<button class="csSvcApprove" data-id="${esc(s.id)}">Approve</button>`:''}
+${s.approval_status!=='RETIRED'?`<button class="secondary csSvcRetire" data-id="${esc(s.id)}">Retire</button>`:''}
+</div>
+</div>`).join(''):'<div class="empty">No services in the catalogue yet.</div>';
+document.querySelectorAll('.csSvcApprove').forEach(b=>b.onclick=async()=>{try{await api(`/api/cs/services/${b.dataset.id}/approval`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',approval_status:'APPROVED'})});await loadCsServices()}catch(e){alert(e.message)}});
+document.querySelectorAll('.csSvcRetire').forEach(b=>b.onclick=async()=>{if(!confirm('Retire this service? It will no longer be offered as an active catalogue entry.'))return;try{await api(`/api/cs/services/${b.dataset.id}/approval`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',approval_status:'RETIRED'})});await loadCsServices()}catch(e){alert(e.message)}});
+}
+async function loadCsFoundations(){
+$('csFndCreate').onclick=async()=>{
+const name=$('csFndName').value.trim();
+const maturity=$('csFndMaturity').value;
+if(!name)return alert('Foundation name is required.');
+try{
+await api('/api/cs/foundations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+name,category:$('csFndCategory').value.trim()||null,maturity,description:$('csFndDescription').value.trim()||null,
+service_categories:$('csFndServiceCategories').value.split(',').map(s=>s.trim()).filter(Boolean),
+qa_requirements:$('csFndQaRequirements').value.trim()||null,known_limitations:$('csFndLimitations').value.trim()||null,
+reuse_restrictions:$('csFndReuseRestrictions').value.trim()||null,actor:'Aryan',
+})});
+['csFndName','csFndCategory','csFndDescription','csFndServiceCategories','csFndQaRequirements','csFndLimitations','csFndReuseRestrictions'].forEach(id=>$(id).value='');
+await loadCsFoundations();
+}catch(e){alert(e.message)}
+};
+try{const d=await api('/api/cs/foundations');renderCsFoundations(d.items||[])}
+catch(e){$('csFoundationsList').innerHTML=`<div class="empty">Unable to load foundations: ${esc(e.message)}</div>`}
+}
+function csMaturityBadge(m){
+if(m==='PRODUCTION_READY')return '<span class="stat-good">PRODUCTION-READY</span>';
+if(m==='NEEDS_HARDENING')return '<span class="stat-warn">NEEDS HARDENING</span>';
+if(m==='PROTOTYPE')return '<span class="badge">PROTOTYPE</span>';
+return '<span class="badge">INTERNAL</span>';
+}
+function renderCsFoundations(items){
+$('csFoundationsList').innerHTML=items.length?items.map(f=>`<div class="item"><h3>${esc(f.name)}</h3>
+<div class="meta">${csMaturityBadge(f.maturity)}${f.category?`<span>${esc(f.category)}</span>`:''}</div>
+${f.description?`<div class="contrib">${esc(f.description)}</div>`:''}
+${f.known_limitations?`<div class="contrib"><b>Known limitations:</b> ${esc(f.known_limitations)}</div>`:''}
+${f.reuse_restrictions?`<div class="contrib"><b>Reuse restrictions:</b> ${esc(f.reuse_restrictions)}</div>`:''}
+<div class="actions">
+${['PRODUCTION_READY','PROTOTYPE','INTERNAL','NEEDS_HARDENING'].filter(m=>m!==f.maturity).map(m=>`<button class="secondary csFndMaturity" data-id="${esc(f.id)}" data-maturity="${m}">Mark ${m.replace('_',' ').toLowerCase()}</button>`).join('')}
+</div>
+</div>`).join(''):'<div class="empty">No product foundations registered yet.</div>';
+document.querySelectorAll('.csFndMaturity').forEach(b=>b.onclick=async()=>{try{await api(`/api/cs/foundations/${b.dataset.id}/maturity`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',maturity:b.dataset.maturity})});await loadCsFoundations()}catch(e){alert(e.message)}});
+}
+let csOpenIntakeId=null;
+let csFoundationCache=[];
+function csIntakeBadge(status){
+if(status==='CONVERTED')return '<span class="stat-good">CONVERTED</span>';
+if(status==='DISQUALIFIED')return '<span class="stat-bad">DISQUALIFIED</span>';
+if(status==='QUALIFIED')return '<span class="badge">QUALIFIED</span>';
+if(status==='QUALIFYING')return '<span class="badge">QUALIFYING</span>';
+return '<span class="badge">NEW</span>';
+}
+async function loadCsIntakes(){
+try{
+const svcs=await api('/api/cs/services?active_only=true');
+$('csIntService').innerHTML='<option value="">No catalogue service selected</option>'+(svcs.items||[]).map(s=>`<option value="${esc(s.id)}">${esc(s.title)} (${esc(s.service_key)})</option>`).join('');
+}catch(e){}
+$('csIntCreate').onclick=async()=>{
+const customer_name=$('csIntCustomer').value.trim();
+const requested_outcome=$('csIntOutcome').value.trim();
+if(!customer_name||!requested_outcome)return alert('Customer name and requested outcome are required.');
+try{
+await api('/api/cs/intakes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+customer_name,requested_outcome,customer_contact:$('csIntContact').value.trim()||null,
+region:$('csIntRegion').value.trim()||null,country:$('csIntCountry').value.trim()||null,
+service_id:$('csIntService').value||null,requirements:$('csIntRequirements').value.trim()||null,
+timeline:$('csIntTimeline').value.trim()||null,budget_amount:$('csIntBudget').value?Number($('csIntBudget').value):null,
+budget_currency:$('csIntCurrency').value.trim()||'USD',complexity:$('csIntComplexity').value,actor:'Aryan',
+})});
+['csIntCustomer','csIntContact','csIntOutcome','csIntRegion','csIntCountry','csIntRequirements','csIntTimeline','csIntBudget'].forEach(id=>$(id).value='');
+await loadCsIntakes();
+}catch(e){alert(e.message)}
+};
+try{
+const [ints,fnds]=await Promise.all([api('/api/cs/intakes'),api('/api/cs/foundations?maturity=PRODUCTION_READY')]);
+csFoundationCache=fnds.items||[];
+renderCsIntakes(ints.items||[]);
+}catch(e){$('csIntakesList').innerHTML=`<div class="empty">Unable to load intakes: ${esc(e.message)}</div>`}
+}
+function renderCsIntakes(items){
+$('csIntakesList').innerHTML=items.length?items.map(i=>csOpenIntakeId===i.id?csIntakeDetailCard(i):csIntakeCard(i)).join(''):'<div class="empty">No customer intakes yet.</div>';
+document.querySelectorAll('.csIntOpen').forEach(b=>b.onclick=()=>{csOpenIntakeId=b.dataset.id;loadCsIntakes()});
+document.querySelectorAll('.csIntClose').forEach(b=>b.onclick=()=>{csOpenIntakeId=null;loadCsIntakes()});
+document.querySelectorAll('.csIntRecommend').forEach(b=>b.onclick=async()=>{
+try{const r=await api(`/api/cs/intakes/${b.dataset.id}/recommend-route`);
+$('csIntRecommendOut_'+b.dataset.id).innerHTML=`<div class="contrib"><b>Recommended: ${esc(r.route)}</b> -- ${esc(r.rationale)}</div>`;
+}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csIntQualify').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const qualification_status=document.querySelector(`.csIntQualStatus[data-id="${id}"]`).value;
+const potential_value=document.querySelector(`.csIntPotentialValue[data-id="${id}"]`).value;
+const risks=document.querySelector(`.csIntRisks[data-id="${id}"]`).value.trim();
+try{await api(`/api/cs/intakes/${id}/qualify`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',qualification_status,potential_value:potential_value?Number(potential_value):null,risks:risks||null})});await loadCsIntakes()}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csIntApprove').forEach(b=>b.onclick=async()=>{
+if(!confirm('Human-approve this intake? This is the one gate that allows converting it into a real, binding project.'))return;
+try{await api(`/api/cs/intakes/${b.dataset.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCsIntakes()}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csIntConvert').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const delivery_route=document.querySelector(`.csIntRoute[data-id="${id}"]`).value;
+const foundation_id=document.querySelector(`.csIntFoundation[data-id="${id}"]`).value||null;
+if(!confirm('Convert this intake into a real project? This creates a binding opportunity and client record.'))return;
+try{await api(`/api/cs/intakes/${id}/convert-to-project`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',delivery_route,foundation_id})});csOpenIntakeId=null;alert('Converted to a project. See it under Delivery Projects.');await loadCsIntakes()}catch(e){alert(e.message)}
+});
+}
+let csOpenProjectId=null;
+const CS_PROJECT_STATUSES=['SCOPED','IN_DELIVERY','QA','HANDED_OVER','INVOICED','CLOSED'];
+function csProjectBadge(status){
+if(status==='CLOSED')return '<span class="stat-good">CLOSED</span>';
+if(status==='HANDED_OVER'||status==='INVOICED')return '<span class="badge">'+esc(status)+'</span>';
+return '<span class="badge">'+esc(status)+'</span>';
+}
+async function loadCsProjects(){
+try{const d=await api('/api/cs/projects');renderCsProjects(d.items||[])}
+catch(e){$('csProjectsList').innerHTML=`<div class="empty">Unable to load projects: ${esc(e.message)}</div>`}
+}
+function renderCsProjects(items){
+$('csProjectsList').innerHTML=items.length?items.map(p=>csOpenProjectId===p.id?csProjectDetailCard(p):csProjectCard(p)).join(''):'<div class="empty">No delivery projects yet -- convert an approved customer intake to create one.</div>';
+document.querySelectorAll('.csProjOpen').forEach(b=>b.onclick=async()=>{csOpenProjectId=b.dataset.id;await loadCsProjects();await csLoadProjectExtras(b.dataset.id)});
+document.querySelectorAll('.csProjClose').forEach(b=>b.onclick=()=>{csOpenProjectId=null;loadCsProjects()});
+document.querySelectorAll('.csProjTransition').forEach(b=>b.onclick=async()=>{
+try{await api(`/api/cs/projects/${b.dataset.id}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',to_status:b.dataset.status})});await loadCsProjects();await csLoadProjectExtras(b.dataset.id)}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csCostRecord').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const cost_category=document.querySelector(`.csCostCategory[data-id="${id}"]`).value;
+const amount=Number(document.querySelector(`.csCostAmount[data-id="${id}"]`).value||'0');
+const note=document.querySelector(`.csCostNote[data-id="${id}"]`).value.trim();
+if(!amount)return alert('Enter a cost amount.');
+try{await api(`/api/cs/projects/${id}/costs`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',cost_category,amount,note:note||null})});await csLoadProjectExtras(id)}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csInvoiceCreate').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const amount=Number(document.querySelector(`.csInvoiceAmount[data-id="${id}"]`).value||'0');
+if(!amount)return alert('Enter an invoice amount.');
+try{
+const project=await api(`/api/cs/projects/${id}`);
+if(!project.client_id)return alert('This project has no client linked yet.');
+await api(`/api/rh/clients/${project.client_id}/invoices`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',amount,opportunity_id:project.opportunity_id})});
+await csLoadProjectExtras(id);
+}catch(e){alert(e.message)}
+});
+}
+let csOpenDisputeId=null;
+function csDisputeBadge(status){
+if(status==='CLOSED')return '<span class="stat-good">CLOSED</span>';
+if(status==='FULL_REFUND_APPROVED'||status==='PARTIAL_REFUND_APPROVED')return '<span class="stat-warn">'+esc(status.replace(/_/g,' '))+'</span>';
+if(status==='RESOLVED_NO_REFUND')return '<span class="badge">RESOLVED, NO REFUND</span>';
+if(status==='UNDER_REVIEW')return '<span class="badge">UNDER REVIEW</span>';
+return '<span class="badge">OPEN</span>';
+}
+async function loadCsDisputes(){
+try{const d=await api('/api/cs/disputes');renderCsDisputes(d.items||[])}
+catch(e){$('csDisputesList').innerHTML=`<div class="empty">Unable to load disputes: ${esc(e.message)}</div>`}
+}
+function renderCsDisputes(items){
+$('csDisputesList').innerHTML=items.length?items.map(d=>csOpenDisputeId===d.id?csDisputeDetailCard(d):csDisputeCard(d)).join(''):'<div class="empty">No disputes yet.</div>';
+document.querySelectorAll('.csDispOpen').forEach(b=>b.onclick=()=>{csOpenDisputeId=b.dataset.id;loadCsDisputes()});
+document.querySelectorAll('.csDispClose').forEach(b=>b.onclick=()=>{csOpenDisputeId=null;loadCsDisputes()});
+document.querySelectorAll('.csDispStartReview').forEach(b=>b.onclick=async()=>{
+const reviewer=prompt('Reviewer name:','Aryan');if(!reviewer)return;
+try{await api(`/api/cs/disputes/${b.dataset.id}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reviewer})});await loadCsDisputes()}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csDispResolveNoRefund').forEach(b=>b.onclick=async()=>{
+const resolution=prompt('Resolution note (required):');if(!resolution)return;
+try{await api(`/api/cs/disputes/${b.dataset.id}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',resolution})});await loadCsDisputes()}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csDispResolveRefund').forEach(b=>b.onclick=async()=>{
+const resolution=prompt('Resolution note (required):');if(!resolution)return;
+const refund_amount=Number(prompt('Approved refund amount:')||'0');if(!refund_amount)return;
+const evidenceNote=prompt('Evidence for the approved refund (required):');if(!evidenceNote)return;
+if(!confirm(`Approve a refund of ${refund_amount}? This never executes an external transfer -- it only records the approved amount and reverses any linked partner commission.`))return;
+try{await api(`/api/cs/disputes/${b.dataset.id}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',resolution,refund_amount,evidence:{note:evidenceNote}})});await loadCsDisputes()}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csDispCloseDispute').forEach(b=>b.onclick=async()=>{
+try{await api(`/api/cs/disputes/${b.dataset.id}/close`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCsDisputes()}catch(e){alert(e.message)}
+});
+}
+function csDisputeCard(d){
+return `<div class="item"><h3>Dispute ${esc(d.id.slice(0,8))}</h3><div class="meta">${csDisputeBadge(d.status)}<span>disputed: ${d.amount_disputed}</span>${d.refund_amount?`<span>refunded: ${d.refund_amount}</span>`:''}</div><div class="contrib">${esc(d.reason)}</div><div class="actions"><button class="secondary csDispOpen" data-id="${esc(d.id)}">Open</button></div></div>`;
+}
+function csDisputeDetailCard(d){
+const id=esc(d.id);
+const openOrReview=d.status==='OPEN'||d.status==='UNDER_REVIEW';
+const resolved=['RESOLVED_NO_REFUND','PARTIAL_REFUND_APPROVED','FULL_REFUND_APPROVED'].includes(d.status);
+return `<div class="item"><h3>Dispute ${id.slice(0,8)}</h3>
+<div class="meta">${csDisputeBadge(d.status)}<span>disputed: ${d.amount_disputed}</span>${d.refund_amount?`<span><b>refunded: ${d.refund_amount}</b></span>`:''}</div>
+<div class="contrib"><b>Reason:</b> ${esc(d.reason)}</div>
+${d.resolution?`<div class="contrib"><b>Resolution:</b> ${esc(d.resolution)}</div>`:''}
+<div class="actions">
+${d.status==='OPEN'?`<button class="secondary csDispStartReview" data-id="${id}">Start review</button>`:''}
+${openOrReview?`<button class="csDispResolveNoRefund" data-id="${id}">Resolve: no refund</button><button class="csDispResolveRefund" data-id="${id}">Resolve: approve refund</button>`:''}
+${resolved?`<button class="secondary csDispCloseDispute" data-id="${id}">Close dispute</button>`:''}
+<button class="secondary csDispClose" data-id="${id}">Close panel</button>
+</div>
+</div>`;
+}
+function csProjectCard(p){
+return `<div class="item"><h3>Project ${esc(p.id.slice(0,8))}</h3><div class="meta">${csProjectBadge(p.status)}<span>${esc(p.delivery_route)}</span></div><div class="actions"><button class="secondary csProjOpen" data-id="${esc(p.id)}">Open</button></div></div>`;
+}
+function csProjectDetailCard(p){
+const id=esc(p.id);
+return `<div class="item"><h3>Project ${id.slice(0,8)}</h3>
+<div class="meta">${csProjectBadge(p.status)}<span>route: ${esc(p.delivery_route)}</span></div>
+<div class="contrib"><b>Opportunity:</b> ${esc(p.opportunity_id||'-')} &nbsp; <b>Client:</b> ${esc(p.client_id||'-')}</div>
+<div class="actions">${CS_PROJECT_STATUSES.filter(s=>s!==p.status).map(s=>`<button class="secondary csProjTransition" data-id="${id}" data-status="${s}">${s.replace('_',' ')}</button>`).join('')}</div>
+<div class="form" style="margin-top:10px"><div class="sub">Record a direct cost (model/API, infrastructure, human/expert, or other direct)</div>
+<select class="csCostCategory" data-id="${id}"><option value="MODEL_API">Model/API</option><option value="INFRASTRUCTURE">Infrastructure</option><option value="HUMAN_EXPERT">Human/expert</option><option value="OTHER_DIRECT">Other direct</option></select>
+<input class="csCostAmount" data-id="${id}" type="number" step="0.01" placeholder="Amount">
+<input class="csCostNote" data-id="${id}" placeholder="Note (optional)">
+<div class="actions"><button class="csCostRecord" data-id="${id}">Record cost</button></div>
+</div>
+<div class="form" style="margin-top:10px"><div class="sub">Create an invoice for this project (uses the existing Billing / Revenue &amp; Delivery Engine)</div>
+<input class="csInvoiceAmount" data-id="${id}" type="number" step="0.01" placeholder="Invoice amount">
+<div class="actions"><button class="csInvoiceCreate" data-id="${id}">Create draft invoice</button></div>
+</div>
+<div class="section"><h2>Project economics</h2><div id="csEconOut_${id}" class="contrib">Loading...</div></div>
+<div class="section"><h2>Invoices &amp; disputes</h2><div id="csInvoicesOut_${id}" class="list">Loading...</div></div>
+<div class="actions"><button class="secondary csProjClose" data-id="${id}">Close</button></div>
+</div>`;
+}
+function csFmtMoney(v){return v==null?'<i>unknown</i>':('$'+Number(v).toFixed(2))}
+async function csLoadProjectExtras(projectId){
+const econOut=$('csEconOut_'+projectId);
+const invOut=$('csInvoicesOut_'+projectId);
+if(!econOut||!invOut)return;
+try{
+const econ=await api(`/api/cs/projects/${projectId}/economics`);
+econOut.innerHTML=`<div class="meta">
+<span>Quoted: ${csFmtMoney(econ.quoted_value)}</span><span>Invoiced: ${csFmtMoney(econ.invoiced_total)}</span><span>Collected: ${csFmtMoney(econ.collected_total)}</span>
+<span>Refunds: ${csFmtMoney(econ.refunds_total)}</span><span><b>Net collected: ${csFmtMoney(econ.net_collected)}</b></span><span>Commission: ${csFmtMoney(econ.partner_commission)}</span>
+</div><div class="meta">
+<span>Model/API cost: ${csFmtMoney(econ.costs.MODEL_API)}</span><span>Infra cost: ${csFmtMoney(econ.costs.INFRASTRUCTURE)}</span>
+<span>Human cost: ${csFmtMoney(econ.costs.HUMAN_EXPERT)}</span><span>Other direct: ${csFmtMoney(econ.costs.OTHER_DIRECT)}</span>
+<span><b>Gross contribution: ${csFmtMoney(econ.gross_contribution)}</b></span>
+</div>${econ.note?`<div class="sub">${esc(econ.note)}</div>`:''}`;
+}catch(e){econOut.innerHTML=`<div class="empty">Unable to load economics: ${esc(e.message)}</div>`}
+const project=await api(`/api/cs/projects/${projectId}`);
+if(!project.client_id){invOut.innerHTML='<div class="empty">No client linked yet.</div>';return}
+try{
+const invs=await api(`/api/rh/clients/${project.client_id}/invoices`);
+const items=(invs.items||[]).filter(i=>i.opportunity_id===project.opportunity_id);
+invOut.innerHTML=items.length?items.map(inv=>`<div class="item"><h3>Invoice ${esc(inv.id.slice(0,8))}</h3><div class="meta"><span>${esc(inv.status)}</span><span>${inv.amount} ${esc(inv.currency)}</span><span>received: ${inv.amount_received}</span></div><div class="actions"><button class="secondary csOpenDisputeFor" data-id="${esc(inv.id)}">Open a dispute on this invoice</button></div></div>`).join(''):'<div class="empty">No invoices for this project yet.</div>';
+document.querySelectorAll('.csOpenDisputeFor').forEach(b=>b.onclick=async()=>{
+const reason=prompt('Dispute reason:');if(!reason)return;
+const amount_disputed=Number(prompt('Amount disputed:')||'0');if(!amount_disputed)return;
+const evidenceNote=prompt('Evidence (a short note -- required):');if(!evidenceNote)return;
+try{await api('/api/cs/disputes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({invoice_id:b.dataset.id,actor:'Aryan',reason,amount_disputed,evidence:{note:evidenceNote},project_id:projectId})});alert('Dispute opened. See it under Disputes & Refunds.');navTo('csDisputes')}catch(e){alert(e.message)}
+});
+}catch(e){invOut.innerHTML=`<div class="empty">Unable to load invoices: ${esc(e.message)}</div>`}
+}
+function csIntakeCard(i){
+return `<div class="item"><h3>${esc(i.customer_name)}</h3><div class="meta">${csIntakeBadge(i.qualification_status)}${i.region?`<span>${esc(i.region)}</span>`:''}${i.budget_amount!=null?`<span>${i.budget_amount} ${esc(i.budget_currency||'')}</span>`:''}</div><div class="contrib">${esc(i.requested_outcome)}</div><div class="actions"><button class="secondary csIntOpen" data-id="${esc(i.id)}">Open</button></div></div>`;
+}
+function csIntakeDetailCard(i){
+const id=esc(i.id);
+const canQualify=i.qualification_status!=='CONVERTED';
+const canApprove=i.qualification_status==='QUALIFYING'||i.qualification_status==='QUALIFIED';
+const canConvert=!!i.human_approved&&i.qualification_status!=='CONVERTED';
+const fndOptions=csFoundationCache.map(f=>`<option value="${esc(f.id)}">${esc(f.name)}</option>`).join('');
+return `<div class="item"><h3>${esc(i.customer_name)}</h3>
+<div class="meta">${csIntakeBadge(i.qualification_status)}${i.region?`<span>${esc(i.region)}, ${esc(i.country||'')}</span>`:''}${i.budget_amount!=null?`<span>${i.budget_amount} ${esc(i.budget_currency||'')}</span>`:''}${i.human_approved?'<span class="stat-good">Human-approved</span>':'<span class="badge">Not yet approved</span>'}</div>
+<div class="contrib"><b>Requested outcome:</b> ${esc(i.requested_outcome)}</div>
+${i.requirements?`<div class="contrib"><b>Requirements:</b> ${esc(i.requirements)}</div>`:''}
+${i.ai_requirement_summary?`<div class="contrib"><b>FALGUNA draft summary:</b> ${esc(i.ai_requirement_summary)}</div>`:''}
+${i.ai_proposed_scope?`<div class="contrib"><b>FALGUNA proposed scope:</b> ${esc(i.ai_proposed_scope)}</div>`:''}
+${i.recommended_route?`<div class="contrib"><b>Recommended route:</b> ${esc(i.recommended_route)}</div>`:''}
+${i.opportunity_id?`<div class="contrib"><b>Opportunity:</b> ${esc(i.opportunity_id)}</div>`:''}
+<div class="actions"><button class="secondary csIntRecommend" data-id="${id}">Get routing recommendation</button></div>
+<div id="csIntRecommendOut_${id}"></div>
+${canQualify?`<div class="form" style="margin-top:10px"><div class="sub">Qualify</div>
+<select class="csIntQualStatus" data-id="${id}"><option value="QUALIFYING">Qualifying</option><option value="QUALIFIED">Qualified</option><option value="DISQUALIFIED">Disqualified</option></select>
+<input class="csIntPotentialValue" data-id="${id}" type="number" step="0.01" placeholder="Potential value">
+<input class="csIntRisks" data-id="${id}" placeholder="Risks (optional)">
+<div class="actions"><button class="csIntQualify" data-id="${id}">Save qualification</button></div>
+</div>`:''}
+${canApprove?`<div class="actions" style="margin-top:8px"><button class="csIntApprove" data-id="${id}">Human-approve this intake</button></div>`:''}
+${canConvert?`<div class="form" style="margin-top:10px"><div class="sub">Convert to project (requires human approval, already satisfied)</div>
+<select class="csIntRoute" data-id="${id}"><option value="USE_FOUNDATION">Use existing foundation</option><option value="CUSTOMIZE">Customize a foundation</option><option value="CUSTOM_BUILD">Custom build</option><option value="ESCALATE">Escalate to a specialist</option></select>
+<select class="csIntFoundation" data-id="${id}"><option value="">No foundation</option>${fndOptions}</select>
+<div class="actions"><button class="csIntConvert" data-id="${id}">Convert to project</button></div>
+</div>`:''}
+<div class="actions"><button class="secondary csIntClose" data-id="${id}">Close</button></div>
+</div>`;
 }
 // ---------- Media / Growth ----------
 async function loadMediaBrands(){const d=await api('/api/media/brands');$('mediaBrandsList').innerHTML=(d.items||[]).length?d.items.map(b=>`<div class="item"><h3>${esc(b.name)}</h3><div class="meta">${b.voice_tone?`<span>${esc(b.voice_tone)}</span>`:''}${b.audience?`<span>${esc(b.audience)}</span>`:''}</div></div>`).join(''):'<div class="empty">No brands yet.</div>'}

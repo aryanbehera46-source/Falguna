@@ -891,3 +891,81 @@ CREATE TABLE IF NOT EXISTS pm_commission_events (
     evidence_json TEXT, reason TEXT, event_ref TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pm_commission_events_commission ON pm_commission_events(commission_id, created_at);
+
+-- ============================================================
+-- Phase 5 Sprint 1: Commercial Operating Foundation (falguna/commercial.py)
+-- Added: Phase 5 Sprint 1 (Sell -> Accept -> Deliver -> Collect -> Retain).
+-- Additive only, cs_ prefixed. Distinct from the public marketing
+-- catalogue in site_services -- these are the internal sellable/
+-- operational records (service catalogue, intake, foundations,
+-- projects, disputes/refunds, unit economics).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS cs_services (
+    id TEXT PRIMARY KEY, service_key TEXT NOT NULL UNIQUE, category TEXT NOT NULL, title TEXT NOT NULL,
+    customer_description TEXT NOT NULL, scope_boundaries TEXT, supported_regions_json TEXT,
+    pricing_model TEXT NOT NULL, price_min REAL, price_max REAL, currency TEXT NOT NULL DEFAULT 'USD',
+    delivery_mode TEXT NOT NULL, required_specialists_json TEXT, automation_eligible INTEGER NOT NULL DEFAULT 0,
+    foundation_id TEXT REFERENCES cs_foundations(id), approval_status TEXT NOT NULL DEFAULT 'DRAFT',
+    active INTEGER NOT NULL DEFAULT 0, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_services_status ON cs_services(approval_status, active);
+CREATE INDEX IF NOT EXISTS idx_cs_services_category ON cs_services(category);
+
+CREATE TABLE IF NOT EXISTS cs_foundations (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT, description TEXT, repository_ref TEXT,
+    supported_versions TEXT, service_categories_json TEXT, qa_requirements TEXT, known_limitations TEXT,
+    reuse_restrictions TEXT, maturity TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_foundations_maturity ON cs_foundations(maturity, category);
+
+CREATE TABLE IF NOT EXISTS cs_intakes (
+    id TEXT PRIMARY KEY, customer_name TEXT NOT NULL, customer_contact TEXT, business_name TEXT, industry TEXT,
+    region TEXT, country TEXT, requested_outcome TEXT NOT NULL, service_id TEXT REFERENCES cs_services(id),
+    requirements TEXT, timeline TEXT, budget_amount REAL, budget_currency TEXT,
+    regulatory_flags_json TEXT, required_integrations_json TEXT, assets_provided_json TEXT, complexity TEXT,
+    qualification_status TEXT NOT NULL DEFAULT 'NEW', potential_value REAL, risks TEXT, recommended_route TEXT,
+    ai_requirement_summary TEXT, ai_missing_questions_json TEXT, ai_proposed_scope TEXT,
+    human_approved INTEGER NOT NULL DEFAULT 0, approved_by TEXT, approved_at TEXT,
+    opportunity_id TEXT REFERENCES rh_opportunities(id), actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_intakes_status ON cs_intakes(qualification_status, created_at);
+
+CREATE TABLE IF NOT EXISTS cs_intake_events (
+    id TEXT PRIMARY KEY, intake_id TEXT NOT NULL REFERENCES cs_intakes(id), from_status TEXT, to_status TEXT NOT NULL,
+    actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_intake_events_intake ON cs_intake_events(intake_id, created_at);
+
+CREATE TABLE IF NOT EXISTS cs_projects (
+    id TEXT PRIMARY KEY, intake_id TEXT REFERENCES cs_intakes(id), service_id TEXT REFERENCES cs_services(id),
+    opportunity_id TEXT REFERENCES rh_opportunities(id), foundation_id TEXT REFERENCES cs_foundations(id),
+    client_id TEXT REFERENCES clients(id), delivery_route TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'SCOPED',
+    mission_id TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_projects_status ON cs_projects(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_cs_projects_opportunity ON cs_projects(opportunity_id);
+CREATE TABLE IF NOT EXISTS cs_project_events (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES cs_projects(id), from_status TEXT, to_status TEXT NOT NULL,
+    actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_project_events_project ON cs_project_events(project_id, created_at);
+
+CREATE TABLE IF NOT EXISTS cs_disputes (
+    id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL REFERENCES rh_invoices(id), project_id TEXT REFERENCES cs_projects(id),
+    client_id TEXT, reason TEXT NOT NULL, evidence_json TEXT NOT NULL, amount_disputed REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN', reviewer TEXT, resolution TEXT, refund_amount REAL NOT NULL DEFAULT 0,
+    commission_impact_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cs_disputes_status ON cs_disputes(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_cs_disputes_invoice ON cs_disputes(invoice_id);
+CREATE TABLE IF NOT EXISTS cs_dispute_events (
+    id TEXT PRIMARY KEY, dispute_id TEXT NOT NULL REFERENCES cs_disputes(id), from_status TEXT, to_status TEXT NOT NULL,
+    actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_dispute_events_dispute ON cs_dispute_events(dispute_id, created_at);
+
+CREATE TABLE IF NOT EXISTS cs_project_costs (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES cs_projects(id), cost_category TEXT NOT NULL,
+    amount REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', note TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_project_costs_project ON cs_project_costs(project_id, cost_category);
