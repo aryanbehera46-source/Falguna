@@ -362,7 +362,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         if path == "/":
             return self._html(INDEX_HTML)
         if path == "/assets/falguna-mark.png":
-            asset = Path(__file__).with_name("assets") / "falguna-mark.png"
+            asset = Path(__file__).with_name("site_static") / "brand" / "falguna-mark-small.png"
             data = asset.read_bytes()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "image/png")
@@ -2435,7 +2435,7 @@ def serve(root: Path, host="127.0.0.1", port=8765):
     if reconciled:
         print(f"Falguna: {len(reconciled)} browser session(s) were interrupted by restart "
               f"and marked FAILED: {', '.join(reconciled)}")
-    print(f"Falguna Engineering internal alpha: http://{host}:{server.server_port}")
+    print(f"Falguna: http://{host}:{server.server_port}")
     server.serve_forever()
 
 
@@ -2509,6 +2509,10 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .side-list .row-sub{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted-dim);font-size:11px;margin-top:1px}
 .side-empty{color:var(--muted-dim);padding:9px;font-size:12px}
 .boundary{flex:none;border-top:1px solid var(--line);padding:12px 9px 2px;color:var(--muted-dim);font-size:11px;background:var(--side);line-height:1.5}
+.account-wrap{position:relative;flex:none;margin-top:8px;padding-top:9px;border-top:1px solid var(--hairline)}
+.account-button{width:100%;display:flex;align-items:center;gap:10px;border:0;background:transparent;color:var(--ink);padding:8px;border-radius:10px;cursor:pointer;text-align:left}.account-button:hover,.account-button[aria-expanded="true"]{background:var(--surface)}
+.account-avatar{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:var(--ink);color:var(--canvas);font-weight:750;font-size:11px}.account-copy{min-width:0;flex:1}.account-copy b,.account-copy span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.account-copy b{font-size:12.5px}.account-copy span{font-size:10.5px;color:var(--ink-3)}
+.account-menu{position:absolute;left:0;right:0;bottom:50px;padding:6px;background:var(--surface-raised);border:1px solid var(--hairline);border-radius:13px;box-shadow:0 18px 55px #0007;z-index:20}.account-menu button{width:100%;border:0;background:transparent;color:var(--ink-2);padding:9px 10px;border-radius:8px;text-align:left;cursor:pointer;font-size:12.5px}.account-menu button:hover{background:var(--surface);color:var(--ink)}.account-menu .menu-note{padding:8px 10px;color:var(--ink-3);font-size:10.5px;line-height:1.45;border-top:1px solid var(--hairline);margin-top:4px}
 
 /* ---------- shell ---------- */
 .workspace{min-width:0;min-height:0;display:grid;grid-template-rows:54px minmax(0,1fr);overflow:hidden}
@@ -2972,18 +2976,31 @@ aside{background:var(--rail);padding:14px 12px;border-right:1px solid var(--hair
 .researching-label{display:inline-flex;align-items:center;gap:8px}.researching-label .brand-loader{width:24px;height:24px;border-radius:7px}.researching-label .brand-loader img{width:20px;height:20px}
 @keyframes falgunaDraw{0%,100%{transform:scale(.82);opacity:.72}45%{transform:scale(1);opacity:1}70%{transform:scale(.94);opacity:.9}}
 @keyframes falgunaOrbit{to{transform:rotate(360deg)}}
+
+/* ---------- Commercial experience V4: bright, calm, capability-first ---------- */
+:root{--canvas:#fbfaf7;--rail:#f4f2ec;--surface:#ffffff;--surface-raised:#f8f7f3;--hairline:#e4e1da;--ink:#17181b;--ink-2:#5e6168;--ink-3:#92949a;--brand:#ed7b2f;--brand-strong:#bd4b0d;--brand-wash:#fff0e4;--focus:#4f7de8}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--canvas:#111216;--rail:#17181d;--surface:#1d1f25;--surface-raised:#24272e;--hairline:#30333c;--ink:#f7f6f2;--ink-2:#b9bac0;--ink-3:#777b84;--brand:#ff984f;--brand-strong:#ffb477;--brand-wash:#352318;--focus:#82aaff}}
+:root[data-theme="dark"]{--canvas:#111216;--rail:#17181d;--surface:#1d1f25;--surface-raised:#24272e;--hairline:#30333c;--ink:#f7f6f2;--ink-2:#b9bac0;--ink-3:#777b84;--brand:#ff984f;--brand-strong:#ffb477;--brand-wash:#352318;--focus:#82aaff}
+body{background:radial-gradient(900px 540px at 70% -20%,color-mix(in srgb,var(--brand) 8%,transparent),transparent 70%),var(--canvas)}
+aside{background:color-mix(in srgb,var(--rail) 92%,transparent);backdrop-filter:blur(26px) saturate(125%)}.brand-mark{background:linear-gradient(150deg,#ff9d42,#e75f19);box-shadow:0 8px 22px #df681c25}.brand-word{letter-spacing:.035em;font-weight:600}.new-chat{border-radius:13px;box-shadow:0 8px 24px #00000010}.nav-item{border-radius:10px}.nav-item.active{box-shadow:none}.side-search input{background:color-mix(in srgb,var(--surface) 82%,transparent)}
+.workspace{grid-template-rows:64px minmax(0,1fr)}.topbar{border:0;background:transparent;padding:0 30px}.topbar-title strong{font-size:15px;font-weight:700;letter-spacing:-.015em}.topbar-right .privacy-pill,.topbar-right #modelPill{display:none!important}
+.chat-welcome{max-width:840px;margin-top:10vh;text-align:center}.chat-welcome .glow.brand-orbit{margin:0 auto 24px;width:56px;height:56px;border-radius:18px;box-shadow:0 18px 45px #e86b2235}.chat-welcome .glow.brand-orbit img{width:49px;height:49px}.chat-welcome h1{margin:0 auto 12px;font-size:clamp(38px,5vw,58px);line-height:1.06;letter-spacing:-.055em;max-width:760px}.chat-welcome p{margin:0 auto 32px;font-size:16px;max-width:680px;color:var(--ink-2)}.chip-row{grid-template-columns:repeat(3,1fr);gap:12px}.chip{min-height:92px;border-radius:18px;padding:17px;background:color-mix(in srgb,var(--surface) 90%,transparent);box-shadow:0 12px 38px #0000000b;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}.chip:hover{transform:translateY(-3px);box-shadow:0 18px 48px #00000012;border-color:color-mix(in srgb,var(--brand) 45%,var(--hairline))}
+.composer-wrap{padding-bottom:28px;background:linear-gradient(180deg,transparent,var(--canvas) 42%)}.composer{position:relative;border-radius:26px;padding:10px 12px 11px;border:1px solid color-mix(in srgb,var(--hairline) 85%,var(--brand) 8%);box-shadow:0 22px 70px #1d18200f,0 4px 18px #1d18200a}.composer:focus-within{box-shadow:0 25px 80px #1d182014,0 0 0 3px color-mix(in srgb,var(--focus) 12%,transparent)}.composer textarea{font-size:16px;padding:13px 11px 9px}.compose-row{gap:8px}.icon-btn.capability-button{width:38px;height:38px;border-radius:50%;background:var(--surface-raised);border:1px solid var(--hairline);color:var(--ink-2)}.icon-btn.capability-button:hover{background:var(--brand-wash);color:var(--brand-strong);border-color:color-mix(in srgb,var(--brand) 35%,var(--hairline))}.mode-chip{background:transparent;border:0;color:var(--ink-3);font-weight:600}.send-btn{width:38px;height:38px;border-radius:50%;background:var(--ink)}.compose-foot{color:var(--ink-3);font-size:10.5px;margin-top:10px}.compose-foot::after{display:none}
+.capability-menu{position:absolute;left:10px;bottom:58px;width:290px;padding:8px;background:color-mix(in srgb,var(--surface) 96%,transparent);border:1px solid var(--hairline);border-radius:18px;box-shadow:0 24px 70px #15171b25;backdrop-filter:blur(24px);z-index:30}.capability-label{padding:8px 10px 5px;color:var(--ink-3);font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.09em}.capability-item{width:100%;border:0;background:transparent;color:var(--ink);border-radius:11px;padding:10px;display:flex;align-items:center;gap:11px;text-align:left;cursor:pointer}.capability-item:hover{background:var(--surface-raised)}.capability-icon{width:30px;height:30px;border-radius:9px;background:var(--brand-wash);color:var(--brand-strong);display:grid;place-items:center;flex:none}.capability-copy{min-width:0}.capability-copy b,.capability-copy small{display:block}.capability-copy b{font-size:12.5px}.capability-copy small{color:var(--ink-3);font-size:10.5px;margin-top:1px}.capability-divider{height:1px;background:var(--hairline);margin:5px 6px}
+.plugin-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:13px;margin-top:20px}.plugin-card{background:var(--surface);border:1px solid var(--hairline);border-radius:18px;padding:18px;box-shadow:0 14px 45px #0000000a}.plugin-head{display:flex;align-items:center;gap:12px}.plugin-logo{width:42px;height:42px;border-radius:13px;background:var(--brand-wash);color:var(--brand-strong);display:grid;place-items:center}.plugin-title{font-size:14px;font-weight:700}.plugin-state{font-size:10px;color:var(--ink-3);margin-top:2px;text-transform:uppercase;letter-spacing:.07em}.plugin-card p{color:var(--ink-2);font-size:12.5px;line-height:1.55;margin:14px 0}.plugin-action{border:1px solid var(--hairline);background:var(--surface-raised);color:var(--ink);border-radius:10px;padding:7px 11px;font-size:11.5px;cursor:pointer}.plugin-action:hover{border-color:var(--brand);color:var(--brand-strong)}
+@media(max-width:850px){.topbar{padding:0 16px}.chat-welcome{margin-top:5vh;text-align:left}.chat-welcome .glow.brand-orbit{margin-left:0}.chat-welcome h1{font-size:38px}.chat-welcome p{font-size:14px}.chip-row{grid-template-columns:1fr}.chip{min-height:66px}.capability-menu{left:6px;right:6px;width:auto}.composer-wrap{padding-bottom:max(14px,env(safe-area-inset-bottom))}}
 @media(max-width:850px){.app{grid-template-columns:1fr}.chat-scroll,.composer-wrap{padding-left:14px;padding-right:14px}.chat-welcome{margin-top:5vh}.chip-row{grid-template-columns:1fr}.side-tools{margin-top:7px}.msg.user{margin-left:0}}
 @media(max-width:520px){.thread{padding-top:20px;gap:25px}.msg{grid-template-columns:27px minmax(0,1fr);column-gap:9px}.msg .avatar{width:26px;height:26px}.msg.user{grid-template-columns:minmax(0,1fr) 27px}.msg .bubble{font-size:14.5px}.composer-wrap{padding-bottom:max(10px,env(safe-area-inset-bottom))}.compose-foot::after{display:none}.topbar{padding:0 12px}}
 </style></head><body>
 <div class="app">
   <aside id="sidebar" aria-label="Falguna navigation">
-    <div class="brand"><span class="brand-mark"><img src="/assets/falguna-mark.png" alt=""></span><span class="brand-copy"><span class="brand-word">falguna</span><small>Private AI workspace</small></span></div>
+    <div class="brand"><span class="brand-mark"><img src="/assets/falguna-mark.png" alt=""></span><span class="brand-copy"><span class="brand-word">falguna</span></span></div>
     <button class="new-chat" id="newChatBtn"></button>
     <div class="side-tools"><label class="side-search" aria-label="Filter conversations"><span id="sideSearchIcon"></span><input id="sideSearchInput" type="search" placeholder="Find a conversation" autocomplete="off"></label><button class="side-shortcut" id="shortcutHelpBtn" type="button" title="Keyboard shortcuts">?</button></div>
     <nav class="nav" id="nav"></nav>
     <div class="side-title" id="sideListTitle">Recent chats</div>
     <div class="side-list" id="sideList"><div class="side-empty">Loading&hellip;</div></div>
-    <div class="boundary"><strong>Private workspace</strong><span>Local-only internal alpha · no automatic merge or deploy</span></div>
+    <div class="account-wrap"><button class="account-button" id="accountButton" type="button" aria-expanded="false"><span class="account-avatar">A</span><span class="account-copy"><b>Aryan</b><span>Personal workspace</span></span><span aria-hidden="true">⋯</span></button><div class="account-menu hidden" id="accountMenu"><button type="button" data-account-go="#/settings">Settings</button><button type="button" data-account-go="#/tools">Plugins</button><button type="button" data-account-go="#/help">Help</button><div class="menu-note">Team accounts, invites, and third-party installation require the future hosted account service.</div></div></div>
   </aside>
   <div class="scrim" id="scrim"></div>
   <main class="workspace">
@@ -3018,6 +3035,7 @@ let profiles={};
 let profileList=[];
 let homeDraftMessage='';
 let settingsModel='';
+let availableChatModels=[];
 
 /* ---------------------------------------------------------- misc helpers */
 function formatBytes(n){
@@ -3146,7 +3164,7 @@ $('sideSearchIcon').innerHTML=icon('search',14);
 $('menuButton').innerHTML=icon('menu',17);
 $('bellBtn').innerHTML=icon('bell',16)+'<span class="bell-dot hidden" id="bellDot"></span>';
 function navBtn([id,label]){return `<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`}
-$('nav').innerHTML=[['home','Home'],['chat','Chat'],['search','Search'],['projects','Projects']].map(navBtn).join('')
+$('nav').innerHTML=[['chat','Chat'],['search','Search'],['projects','Projects']].map(navBtn).join('')
   +`<details class="nav-adv" id="navAdvanced"><summary class="nav-adv-summary">Workspace<span class="nav-adv-chev" aria-hidden="true"></span></summary>`
   +[['work','Work'],['mission','Mission Control'],['memory','Memory'],['files','Files'],['history','History']].map(navBtn).join('')
   +`</details>`
@@ -3177,6 +3195,10 @@ function toggleSidebar(){const open=!$('sidebar').classList.contains('open');$('
 $('menuButton').onclick=toggleSidebar;$('scrim').onclick=closeSidebar;
 window.addEventListener('keydown',e=>{if(e.key==='Escape'){closeSidebar();stopBellPanel()}});
 $('newChatBtn').onclick=()=>{location.hash='#/chat';closeSidebar()};
+const accountButton=$('accountButton'),accountMenu=$('accountMenu');
+accountButton.onclick=e=>{e.stopPropagation();const open=accountMenu.classList.toggle('hidden')===false;accountButton.setAttribute('aria-expanded',String(open))};
+document.querySelectorAll('[data-account-go]').forEach(b=>b.onclick=()=>{accountMenu.classList.add('hidden');accountButton.setAttribute('aria-expanded','false');go(b.dataset.accountGo);closeSidebar()});
+document.addEventListener('click',e=>{if(!accountMenu.classList.contains('hidden')&&!accountMenu.contains(e.target)&&e.target!==accountButton){accountMenu.classList.add('hidden');accountButton.setAttribute('aria-expanded','false')}});
 
 /* --------------------------------------------------------------- theme */
 function currentThemeMode(){
@@ -3245,7 +3267,7 @@ async function pollLive(){
   const pill=$('indicatorPill');
   const running=s.running||0,needsYou=s.needs_you||0;
   if(running+needsYou>0){
-    pill.classList.remove('hidden');
+    pill.classList.toggle('hidden',currentRoute().view==='chat');
     pill.innerHTML=`<b>${running}</b> running`+(needsYou?` &middot; <span class="warn-count">${needsYou} needs you</span>`:'');
   }else{
     pill.classList.add('hidden');
@@ -3264,15 +3286,16 @@ function startLivePolling(){
 /* ---------------------------------------------------------------- router */
 
 function currentRoute(){
-  const raw=(location.hash||'#/home').replace(/^#\/?/,'');
+  const raw=(location.hash||'#/chat').replace(/^#\/?/,'');
   const parts=raw.split('/');
-  return {view:parts[0]||'home', id:parts[1]?decodeURIComponent(parts[1]):null};
+  return {view:parts[0]||'chat', id:parts[1]?decodeURIComponent(parts[1]):null};
 }
 function go(hash){location.hash=hash}
-const VIEW_TITLES={home:'Home',chat:'Chat',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings',activity:'Activity'};
+const VIEW_TITLES={chat:'Falguna',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings',activity:'Activity',help:'Help',tools:'Plugins'};
 function setActiveNav(view){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   $('viewTitle').textContent=VIEW_TITLES[view]||'Falguna';
+  if(view==='chat')$('indicatorPill').classList.add('hidden');
   const adv=$('navAdvanced');
   if(adv&&ADVANCED_VIEWS.has(view))adv.open=true;
 }
@@ -3286,7 +3309,7 @@ async function router(){
   stopBellPanel();
   const vp=$('viewport');
   try{
-    if(view==='home'){hideSideList();return renderHomeView()}
+    if(view==='home'){go('#/chat');return}
     if(view==='chat'){await renderSideChats();return renderChatView(id)}
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
     if(view==='search'){await renderSideResearch();return renderSearchView(id)}
@@ -3298,7 +3321,9 @@ async function router(){
     if(view==='history'){hideSideList();return renderHistoryView()}
     if(view==='settings'){hideSideList();return renderSettingsView(id)}
     if(view==='activity'){hideSideList();return renderActivityView()}
-    go('#/home');
+    if(view==='help'){hideSideList();return renderHelpView()}
+    if(view==='tools'){hideSideList();return renderToolsView()}
+    go('#/chat');
   }catch(err){
     vp.innerHTML=`<div class="page"><div class="empty-state error">${esc(err.message)}</div></div>`;
   }
@@ -3513,6 +3538,7 @@ async function loadProfiles(){
   const c=await api('/api/config');
   profileList=c.profiles;
   settingsModel=c.model;
+  availableChatModels=(c.provider_models||[]).filter(m=>!m.is_embedding_only);
   c.profiles.forEach(p=>profiles[p.id]=p);
   refreshModelPill().catch(()=>{});
   const pMode=c.privacy_mode;
@@ -3592,12 +3618,13 @@ function timeAgo(iso){
 /* --------------------------------------------------------------- Chat view */
 
 const STARTERS=[
-  ['spark','Help me think something through'],
-  ['chat','Summarize my recent Work missions'],
-  ['handoff','Turn an idea into a Work objective'],
+  ['spark','Explore an idea with me'],
+  ['search','Research something current'],
+  ['handoff','Plan and execute a real project'],
 ];
 
 let pendingAttachments=[];
+let draftConversationId=null;
 let currentConversationData=null,currentConversationId=null,editingMessageId=null;
 let chatPollGen=0;
 // Phase 2 Milestone 3: a separate generation counter for the inline
@@ -3615,13 +3642,15 @@ async function renderChatView(id){
       <div class="chat-view">
         <div class="chat-scroll"><div class="chat-welcome">
           <div class="glow brand-orbit"><img src="/assets/falguna-mark.png" alt="Falguna"></div>
-          <h1>How can I help?</h1>
-          <p>Ask a question, think something through, or describe what you're working on. Need current information from the web? Try <a href="#/search">Search</a>.</p>
+          <h1>What will we create today?</h1>
+          <p>Think, research, write, build, and turn ideas into finished work with one focused workspace.</p>
           <div class="chip-row">${STARTERS.map(([ic,label])=>`<button class="chip" data-starter="${esc(label)}">${icon(ic,13)}${esc(label)}</button>`).join('')}</div>
         </div></div>
         ${composerHtml('Start chat',false)}
       </div>`;
     wireComposerChrome(false);
+    wireAttachUpload(null);
+    renderPendingAttachRow();
     document.querySelectorAll('[data-starter]').forEach(b=>b.onclick=()=>{$('composerInput').value=b.dataset.starter;$('composerInput').focus()});
     if(homeDraftMessage){$('composerInput').value=homeDraftMessage;homeDraftMessage='';$('composerInput').focus();$('composerInput').dispatchEvent(new Event('input'))}
     $('composer').addEventListener('submit',async e=>{
@@ -3630,9 +3659,10 @@ async function renderChatView(id){
       if(!content)return;
       $('sendBtn').disabled=true;
       try{
-        const conv=await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:content.slice(0,60)})});
-        await api(`/api/conversations/${conv.id}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});
-        go('#/chat/'+conv.id);
+        const convId=draftConversationId||((await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:content.slice(0,60)})})).id);
+        await api(`/api/conversations/${convId}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,attachment_ids:pendingAttachments.map(a=>a.id)})});
+        draftConversationId=null;pendingAttachments=[];
+        go('#/chat/'+convId);
       }catch(err){$('sendBtn').disabled=false;showToast(err.message,{error:true})}
     });
     return;
@@ -3704,25 +3734,13 @@ async function renderChatToolbar(id,conversation){
       }).join('')
     : cfg.available_models.map(m=>`<option value="${esc(m)}" ${conversation.model_override===m?'selected':''}>${esc(m)}</option>`).join('');
   bar.innerHTML=`
-    <select class="tiny-select" id="convModel" title="Model for this chat">
-      <option value="">Auto (local-first, fallback-aware)</option>
-      ${modelOptions}
-    </select>
-    <select class="tiny-select" id="convWorkMode" title="Work mode for this chat">
-      ${cfg.work_modes.map(w=>`<option value="${esc(w)}" ${(conversation.work_mode||cfg.default_work_mode)===w?'selected':''}>${esc(w.charAt(0)+w.slice(1).toLowerCase())}</option>`).join('')}
-    </select>
+    <span class="mode-chip">${icon('spark',12)}Falguna</span>
     <div class="compose-spacer" style="flex:1"></div>
+    <button type="button" class="msg-action-btn" id="chatDetailsBtn">${icon('settings',12)}Details</button>
     <button type="button" class="msg-action-btn" id="archiveConvBtn">${icon('archive2',12)}Archive</button>
     <button type="button" class="msg-action-btn" id="deleteConvBtn">${icon('trash',12)}Delete</button>
   `;
-  $('convModel').onchange=async e=>{
-    try{await api(`/api/conversations/${id}/model`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:e.target.value||'auto'})})}
-    catch(err){showToast(err.message,{error:true})}
-  };
-  $('convWorkMode').onchange=async e=>{
-    try{await api(`/api/conversations/${id}/work-mode`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_mode:e.target.value})})}
-    catch(err){showToast(err.message,{error:true})}
-  };
+  $('chatDetailsBtn').onclick=()=>go('#/settings/models');
   $('archiveConvBtn').onclick=async()=>{
     if(!await confirmModal({title:'Archive this chat?',body:'You can still find it again through search afterward.',confirmLabel:'Archive'}))return;
     try{await api(`/api/conversations/${id}/archive`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderSideChats();go('#/chat')}
@@ -3737,25 +3755,32 @@ async function renderChatToolbar(id,conversation){
 
 function composerHtml(sendLabel,withExtras){
   return `<div class="composer-wrap">
-    ${withExtras?'<div class="composer-attach-row" id="pendingAttachRow"></div>':''}
+    <div class="composer-attach-row" id="pendingAttachRow"></div>
     <form class="composer" id="composer">
     <textarea id="composerInput" required placeholder="Message Falguna&hellip;" rows="1"></textarea>
+    <div class="capability-menu hidden" id="capabilityMenu">
+      <div class="capability-label">Add to this conversation</div>
+      <button type="button" class="capability-item" data-capability="files"><span class="capability-icon">${icon('clip',15)}</span><span class="capability-copy"><b>Files and folders</b><small>Documents, images, code, and project context</small></span></button>
+      <button type="button" class="capability-item" data-capability="research"><span class="capability-icon">${icon('search',15)}</span><span class="capability-copy"><b>Research the web</b><small>Current information with saved sources</small></span></button>
+      <button type="button" class="capability-item" data-capability="work"><span class="capability-icon">${icon('work',15)}</span><span class="capability-copy"><b>Create with Work</b><small>Plan, build, verify, and review a project</small></span></button>
+      <div class="capability-divider"></div>
+      <button type="button" class="capability-item" data-capability="plugins"><span class="capability-icon">${icon('projects',15)}</span><span class="capability-copy"><b>Plugins</b><small>Browse installed Falguna capabilities</small></span></button>
+    </div>
     <div class="compose-row">
-      <button type="button" class="icon-btn" id="attachBtn" title="${withExtras?'Attach a file':'Attachments are available once a chat exists'}">${icon('clip',16)}</button>
-      <span class="mode-chip">${icon('chat',12)}Chat</span>
+      <button type="button" class="icon-btn capability-button" id="attachBtn" title="Add files, tools, or capabilities" aria-label="Add files, tools, or capabilities" aria-expanded="false">${icon('plus',18)}</button>
+      <span class="mode-chip">${icon('spark',12)}Falguna</span>
       <div class="compose-spacer"></div>
       <button class="send-btn" id="sendBtn" type="submit" aria-label="${esc(sendLabel)}">${icon('send',14)}</button>
     </div>
-  </form>${withExtras?'<input type="file" id="fileInput" multiple hidden>':''}<div class="compose-foot">Falguna can be wrong. Hand off to Work for changes that need to be verified.</div></div>`;
+  </form><input type="file" id="fileInput" multiple hidden><div class="compose-foot">Falguna can make mistakes. Verify important work.</div></div>`;
 }
 function wireComposerChrome(withExtras){
   const ta=$('composerInput');
   ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,180)+'px'});
   ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit()}});
-  if(!withExtras){
-    const attach=$('attachBtn');
-    if(attach)attach.onclick=()=>showToast('Start the chat first, then attach a file to it.');
-  }
+  const add=$('attachBtn'),menu=$('capabilityMenu');
+  add.onclick=e=>{e.stopPropagation();const open=menu.classList.toggle('hidden')===false;add.setAttribute('aria-expanded',String(open))};
+  document.querySelectorAll('[data-capability]').forEach(b=>b.onclick=()=>{menu.classList.add('hidden');add.setAttribute('aria-expanded','false');const kind=b.dataset.capability;if(kind==='files')$('fileInput').click();if(kind==='research')go('#/search');if(kind==='work')go('#/work');if(kind==='plugins')go('#/tools')});
 }
 function renderPendingAttachRow(){
   const row=$('pendingAttachRow');
@@ -3766,13 +3791,16 @@ function renderPendingAttachRow(){
 function wireAttachUpload(conversationId){
   const input=$('fileInput'),btn=$('attachBtn');
   if(!input||!btn)return;
-  btn.onclick=()=>input.click();
   input.onchange=async()=>{
     const files=Array.from(input.files||[]);
     input.value='';
     for(const file of files){
       if(file.size>10*1024*1024){showToast(`${file.name} is larger than the 10MB attachment limit.`,{error:true});continue}
       try{
+        if(!conversationId){
+          if(!draftConversationId){const draft=await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'New conversation'})});draftConversationId=draft.id}
+          conversationId=draftConversationId;
+        }
         const dataUrl=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)});
         const base64=String(dataUrl).split(',')[1]||'';
         const rec=await api(`/api/conversations/${conversationId}/attachments`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,content_type:file.type||'application/octet-stream',data_base64:base64})});
@@ -4964,6 +4992,31 @@ async function renderMemorySuggestionsTab(body){
   await load();
 }
 
+/* ------------------------------------------------ Help and connected tools */
+function renderHelpView(){
+  $('viewport').innerHTML=`<div class="page"><h1>Help</h1><p class="lede">Quick guidance for the features available in this local release.</p>
+    <div class="settings-list"><div><b>Start a conversation</b><br>Choose New chat, select an available model if needed, then send a message.</div><div><b>Search and history</b><br>Use the sidebar search for recent conversations, or History for a complete activity view.</div><div><b>Work safely</b><br>Use Work for repository changes. Falguna keeps approval, review and merge boundaries visible.</div><div><b>Keyboard</b><br>Press ⌘K to navigate, ⌘⇧O for a new chat, and / to focus the composer.</div></div>
+    <div class="settings-note">Hosted support, account recovery and customer login do not exist in this local build yet. No support contact is fabricated.</div></div>`;
+}
+async function renderToolsView(){
+  const [cfg,browser]=await Promise.all([api('/api/config'),api('/api/browser/settings').catch(()=>null)]);
+  const models=(cfg.provider_models||[]).filter(m=>!m.is_embedding_only);
+  const browserState=browser&&browser.enabled?'Enabled':'Available',browserAction=browser&&browser.enabled?'Manage':'Set up';
+  const card=(iconName,title,state,desc,route,label)=>`<article class="plugin-card"><div class="plugin-head"><span class="plugin-logo">${icon(iconName,20)}</span><span><div class="plugin-title">${esc(title)}</div><div class="plugin-state">${esc(state)}</div></span></div><p>${esc(desc)}</p><button type="button" class="plugin-action" data-plugin-open="${esc(route)}">${esc(label)}</button></article>`;
+  $('viewport').innerHTML=`<div class="page" style="max-width:1040px"><h1>Plugins</h1><p class="lede">Built-in capabilities that are genuinely available in this Falguna installation.</p>
+    <div class="plugin-grid">
+      ${card('search','Web Research','Built in','Research current topics, preserve sources, and continue findings into a conversation.','#/search','Open research')}
+      ${card('work','Work','Built in','Turn a request into an isolated, reviewable project workflow with approval boundaries.','#/work','Start work')}
+      ${card('clip','Files','Built in','Attach documents, images, and code to conversations and keep generated artifacts together.','#/files','Browse files')}
+      ${card('memory','Memory','Built in','Search saved knowledge locally, with optional local semantic retrieval when configured.','#/memory','Open memory')}
+      ${card('projects','Projects','Built in','Keep approved repositories, conversations, files, and work organized by project.','#/projects','View projects')}
+      ${card('monitor','Browser',browserState,'Run local browser tasks with visible approval gates for sensitive actions.','#/settings/browser',browserAction)}
+    </div>
+    <div class="section-label">Model connections</div><div class="settings-list"><div>${models.length?`${models.length} configured model connection${models.length===1?'':'s'}. Technical provider controls live in Settings → Models.`:'No model connection is currently reachable. Configure one in Settings → Models.'}</div></div>
+    <div class="settings-note">Third-party app installation, OAuth permissions, team-shared plugins, and a public marketplace need the hosted account and connector service. They are intentionally not represented as installed today.</div></div>`;
+  document.querySelectorAll('[data-plugin-open]').forEach(b=>b.onclick=()=>go(b.dataset.pluginOpen));
+}
+
 /* ----------------------------------------------------------- Settings view */
 
 const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['browser','Browser'],['memory','Memory'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
@@ -4996,7 +5049,7 @@ async function renderSettingsView(tab){
   const [s,cfg]=await Promise.all([api('/api/settings'),api('/api/config')]);
   vp.innerHTML=`<div class="page">
     <h1>Settings</h1>
-    <p class="lede">Informational only in this release &mdash; nothing here can change Falguna's safety policy from the browser.</p>
+    <p class="lede">Personalize the parts of Falguna that are implemented in this release. Safety and approval boundaries remain enforced.</p>
     <div class="settings-nav" id="settingsNav">${SETTINGS_TABS.map(([id,label])=>`<button type="button" data-tab="${id}" class="${id===tab?'active':''}">${esc(label)}</button>`).join('')}</div>
     <div id="settingsBody"><div class="empty-state">Loading&hellip;</div></div>
   </div>`;
