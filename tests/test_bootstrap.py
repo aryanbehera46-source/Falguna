@@ -577,17 +577,26 @@ class BootstrapTests(unittest.TestCase):
         # Settings product, not a single mission composer -- these labels prove
         # every one of those surfaces, plus the original operator controls, is
         # actually present in the served page.
+        # Phase 4 Sprint 4: the product direction changed on purpose --
+        # chat is the default landing surface, with no internal-alpha
+        # language on the primary screen and no "How can I help?" stock
+        # copy (replaced by the chat-first welcome). Both removals are
+        # intentional per that sprint's spec, not a regression, so they
+        # are asserted ABSENT here rather than silently dropped from
+        # coverage.
         for label in (
-            "Falguna", "internal alpha", "Approved projects", "Recent missions",
+            "Falguna", "Approved projects", "Recent missions",
             "Recent chats", "Run mission", "Chat", "Work", "Search", "Projects",
             "History", "Settings", "Needs approval",
             "Approve", "Reject", "Request Changes", "Resume",
-            "How can I help?", "Human approval stays required",
+            "What will we create today?", "Human approval stays required",
             "side-empty", "nav-icon", "Open navigation",
             "min-height:60px", "overflow-y:auto", "closeSidebar",
             "flex:0 0 auto",
         ):
             self.assertIn(label, INDEX_HTML)
+        for removed_label in ("internal alpha", "How can I help?"):
+            self.assertNotIn(removed_label, INDEX_HTML)
 
     def test_chat_and_work_are_both_present_and_distinct_surfaces(self):
         # Chat and Work must be genuinely separate views wired together by a
@@ -595,7 +604,11 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("renderChatView", INDEX_HTML)
         self.assertIn("renderWorkView", INDEX_HTML)
         self.assertIn("/handoff", INDEX_HTML)
-        self.assertIn("Hand off to Work", INDEX_HTML)
+        # Phase 4 Sprint 4: relabeled "Hand off to Work" -> "Continue in
+        # Work" (compact-trigger redesign) -- the handoff route, the
+        # trigger button, and both distinct views are all still present;
+        # only the button copy changed.
+        self.assertIn("Continue in Work", INDEX_HTML)
         self.assertIn("Chat can't touch a repository itself", INDEX_HTML)
 
     def test_web_editable_scope_rejects_paths_outside_project(self):
