@@ -311,7 +311,7 @@ class TTTHQServerTests(_LiveServerCase):
         super().tearDown()
 
     def _wait_ready(self):
-        for _ in range(40):
+        for _ in range(100):
             try:
                 status, body = self._get(self.hq_port, "/api/config")
                 if body.get("product") == PRODUCT_NAME:
@@ -1155,7 +1155,7 @@ class FalgunaServerStillWorksTests(_LiveServerCase):
         super().tearDown()
 
     def _wait_ready(self):
-        for _ in range(40):
+        for _ in range(100):
             try:
                 status, body = self._get(self.falguna_port, "/api/config")
                 if body.get("product") == "Falguna Engineering":

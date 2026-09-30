@@ -87,11 +87,26 @@ class BillingStore:
         if not evidence:
             raise BillingError("payment cannot be recorded without evidence (manual confirmation or integration reference)")
         invoice = self._require(invoice_id)
+        history = json.loads(invoice["evidence_json"]) if invoice.get("evidence_json") else []
+        # Idempotency: the exact same payment observation (amount + evidence)
+        # reported again for this invoice is a no-op, not a second payment --
+        # e.g. a webhook retry, or the same bank-statement line re-imported
+        # by mistake. Checked BEFORE the terminal-status guard below, so a
+        # duplicate retry that arrives after the invoice already reached
+        # PAID from that same payment is still a harmless no-op rather than
+        # an error. A genuinely different payment (different amount and/or
+        # different evidence) is never matched by this and falls through to
+        # the normal checks.
+        for entry in history:
+            if entry.get("amount") == amount and entry.get("evidence") == evidence:
+                self.audit.append("RH_INVOICE_PAYMENT_DUPLICATE_IGNORED", {
+                    "invoice_id": invoice_id, "amount": amount, "actor": actor,
+                })
+                return self.store.get("rh_invoices", invoice_id)
         if invoice["status"] in _TERMINAL_INVOICE_STATUSES:
             raise BillingError(f"invoice is already {invoice['status']}, no further payment can be recorded")
         if amount is None or amount <= 0:
             raise BillingError("payment amount must be a positive number")
-        history = json.loads(invoice["evidence_json"]) if invoice.get("evidence_json") else []
         history.append({"amount": amount, "evidence": evidence, "actor": actor, "recorded_at": utcnow()})
         new_received = (invoice["amount_received"] or 0.0) + amount
         status = "PAID" if new_received >= invoice["amount"] else "PARTIALLY_PAID"

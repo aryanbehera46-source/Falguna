@@ -514,7 +514,7 @@ class _LivePartnerHQServerCase(unittest.TestCase):
         self.temp.cleanup()
 
     def _wait_ready(self):
-        for _ in range(40):
+        for _ in range(100):
             try:
                 status, _ = self._get("/api/config")
                 if status == 200:

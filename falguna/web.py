@@ -361,6 +361,16 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             return self._html(INDEX_HTML)
+        if path == "/favicon.ico":
+            asset = Path(__file__).with_name("site_static") / "brand" / "falguna-mark-small.png"
+            data = asset.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/assets/falguna-mark.png":
             asset = Path(__file__).with_name("site_static") / "brand" / "falguna-mark-small.png"
             data = asset.read_bytes()
@@ -409,7 +419,7 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             finally:
                 store.close()
             return self._json({
-                "product": "Falguna Engineering", "stage": "internal alpha", "profiles": profiles, "model": MODEL,
+                "product": "Falguna Engineering", "stage": "internal v1", "profiles": profiles, "model": MODEL,
                 "available_models": sorted(SUPPORTED_CODEX_MODELS), "codex_runtime_found": bool(shutil.which("codex")),
                 "provider_models": provider_models,
                 "work_modes": list(WORK_MODE_SETTINGS), "default_work_mode": DEFAULT_WORK_MODE,
@@ -2442,7 +2452,7 @@ def serve(root: Path, host="127.0.0.1", port=8765):
 INDEX_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <script>(function(){try{var t=localStorage.getItem('falguna-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}})();</script>
-<title>Falguna</title><style>
+<title>Falguna</title><link rel="icon" type="image/png" href="/assets/falguna-mark.png"><link rel="apple-touch-icon" href="/assets/falguna-mark.png"><style>
 /* ---------- theme (Sections 19-20): System follows the OS/browser
    preference; an explicit choice is persisted in localStorage and applied
    via [data-theme] on <html> before first paint by the inline script

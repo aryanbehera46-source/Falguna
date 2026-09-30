@@ -145,6 +145,38 @@ class RecordPaymentTests(BillingTestBase):
         with self.assertRaises(BillingError):
             self.billing.record_payment(invoice_id, 500, "Aryan", evidence="ref")
 
+    def test_repeated_identical_partial_payment_observation_is_idempotent(self):
+        # Phase 4 final acceptance -- financial integrity: a webhook retry
+        # or a re-imported bank-statement line reporting the *same*
+        # payment (same amount, same evidence) must never double-count.
+        invoice_id = self._sent_invoice(5000)
+        first = self.billing.record_payment(invoice_id, 2000, "Aryan", evidence="wire ref DUP-PARTIAL")
+        second = self.billing.record_payment(invoice_id, 2000, "Aryan", evidence="wire ref DUP-PARTIAL")
+        self.assertEqual(first["amount_received"], 2000)
+        self.assertEqual(second["amount_received"], 2000)
+        self.assertEqual(second["status"], "PARTIALLY_PAID")
+        history = __import__("json").loads(second["evidence_json"])
+        self.assertEqual(len(history), 1)
+
+    def test_repeated_identical_full_payment_after_paid_is_a_harmless_noop(self):
+        invoice_id = self._sent_invoice(1000)
+        first = self.billing.record_payment(invoice_id, 1000, "Aryan", evidence="wire ref DUP-FULL")
+        self.assertEqual(first["status"], "PAID")
+        # A retry of the exact same observation after the invoice is
+        # already terminal (PAID) must be a no-op, not a BillingError --
+        # a caller retrying a webhook should never see that as a failure.
+        second = self.billing.record_payment(invoice_id, 1000, "Aryan", evidence="wire ref DUP-FULL")
+        self.assertEqual(second["amount_received"], 1000)
+        self.assertEqual(second["status"], "PAID")
+
+    def test_a_genuinely_different_payment_after_a_duplicate_still_accumulates(self):
+        invoice_id = self._sent_invoice(5000)
+        self.billing.record_payment(invoice_id, 2000, "Aryan", evidence="wire ref DISTINCT-1")
+        self.billing.record_payment(invoice_id, 2000, "Aryan", evidence="wire ref DISTINCT-1")  # duplicate, ignored
+        result = self.billing.record_payment(invoice_id, 3000, "Aryan", evidence="wire ref DISTINCT-2")
+        self.assertEqual(result["amount_received"], 5000)
+        self.assertEqual(result["status"], "PAID")
+
 
 class OverdueCheckTests(BillingTestBase):
     def test_past_due_date_moves_sent_invoice_to_overdue(self):
