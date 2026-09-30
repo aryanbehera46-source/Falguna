@@ -107,6 +107,25 @@ class HTMLSeparationTests(unittest.TestCase):
         for label in ("Falguna", "Chat", "Work", "Approve", "Reject", "Request Changes"):
             self.assertIn(label, INDEX_HTML)
 
+    def test_falguna_defaults_to_chat_first_without_home_dashboard_chrome(self):
+        self.assertIn("location.hash||'#/chat'", INDEX_HTML)
+        self.assertIn("if(view==='home'){go('#/chat');return}", INDEX_HTML)
+        self.assertNotIn("[['home','Home'],['chat','Chat']", INDEX_HTML)
+        self.assertNotIn("Private AI workspace", INDEX_HTML)
+        self.assertNotIn("Local-only internal alpha", INDEX_HTML)
+
+    def test_falguna_account_menu_only_exposes_real_routes(self):
+        for route in ('data-account-go="#/settings"', 'data-account-go="#/help"', 'data-account-go="#/tools"'):
+            self.assertIn(route, INDEX_HTML)
+        self.assertIn("Login, team accounts, invites and a public plugin marketplace are planned", INDEX_HTML)
+        self.assertNotIn('data-account-go="#/login"', INDEX_HTML)
+        self.assertNotIn('data-account-go="#/invite"', INDEX_HTML)
+
+    def test_falguna_new_chat_model_control_is_wired(self):
+        self.assertIn('id="newChatModel"', INDEX_HTML)
+        self.assertIn("const selectedModel=$('newChatModel')?.value", INDEX_HTML)
+        self.assertIn("/model`,{method:'POST'", INDEX_HTML)
+
 
 class WorkforceAutoResumeClassificationTests(unittest.TestCase):
     """Phase 3 Milestone 3: closes the loop between the unit-level

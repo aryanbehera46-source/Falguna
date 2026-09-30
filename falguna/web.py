@@ -361,6 +361,16 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             return self._html(INDEX_HTML)
+        if path == "/assets/falguna-mark.png":
+            asset = Path(__file__).with_name("site_static") / "brand" / "falguna-mark-small.png"
+            data = asset.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/api/config":
             profiles = load_profiles(self.app_root)
             control, store = open_control_plane(self.app_root)
@@ -2425,7 +2435,7 @@ def serve(root: Path, host="127.0.0.1", port=8765):
     if reconciled:
         print(f"Falguna: {len(reconciled)} browser session(s) were interrupted by restart "
               f"and marked FAILED: {', '.join(reconciled)}")
-    print(f"Falguna Engineering internal alpha: http://{host}:{server.server_port}")
+    print(f"Falguna: http://{host}:{server.server_port}")
     server.serve_forever()
 
 
@@ -2499,6 +2509,10 @@ aside{background:var(--side);border-right:1px solid var(--line);padding:14px 10p
 .side-list .row-sub{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted-dim);font-size:11px;margin-top:1px}
 .side-empty{color:var(--muted-dim);padding:9px;font-size:12px}
 .boundary{flex:none;border-top:1px solid var(--line);padding:12px 9px 2px;color:var(--muted-dim);font-size:11px;background:var(--side);line-height:1.5}
+.account-wrap{position:relative;flex:none;margin-top:8px;padding-top:9px;border-top:1px solid var(--hairline)}
+.account-button{width:100%;display:flex;align-items:center;gap:10px;border:0;background:transparent;color:var(--ink);padding:8px;border-radius:10px;cursor:pointer;text-align:left}.account-button:hover,.account-button[aria-expanded="true"]{background:var(--surface)}
+.account-avatar{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:var(--ink);color:var(--canvas);font-weight:750;font-size:11px}.account-copy{min-width:0;flex:1}.account-copy b,.account-copy span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.account-copy b{font-size:12.5px}.account-copy span{font-size:10.5px;color:var(--ink-3)}
+.account-menu{position:absolute;left:0;right:0;bottom:50px;padding:6px;background:var(--surface-raised);border:1px solid var(--hairline);border-radius:13px;box-shadow:0 18px 55px #0007;z-index:20}.account-menu button{width:100%;border:0;background:transparent;color:var(--ink-2);padding:9px 10px;border-radius:8px;text-align:left;cursor:pointer;font-size:12.5px}.account-menu button:hover{background:var(--surface);color:var(--ink)}.account-menu .menu-note{padding:8px 10px;color:var(--ink-3);font-size:10.5px;line-height:1.45;border-top:1px solid var(--hairline);margin-top:4px}
 
 /* ---------- shell ---------- */
 .workspace{min-width:0;min-height:0;display:grid;grid-template-rows:54px minmax(0,1fr);overflow:hidden}
@@ -2946,18 +2960,19 @@ aside{background:var(--rail);padding:14px 12px;border-right:1px solid var(--hair
 .chat-welcome{max-width:760px;margin-top:8vh;text-align:left}.chat-welcome .glow{margin:0 0 24px;width:48px;height:48px;border-radius:14px;background:var(--ink);box-shadow:none}.chat-welcome .glow svg{color:var(--canvas)}.chat-welcome h1{font-size:clamp(30px,4vw,46px);max-width:620px}.chat-welcome p{max-width:620px;line-height:1.7}.chip-row{justify-content:flex-start;display:grid;grid-template-columns:repeat(3,1fr)}.chip{border-radius:13px;min-height:72px;align-items:flex-start;padding:13px;text-align:left;background:var(--surface);color:var(--ink-2)}
 .composer-wrap{padding:14px max(22px,calc((100vw - 292px - 780px)/2)) 20px;background:linear-gradient(180deg,transparent,var(--canvas) 24%)}.composer{max-width:780px;border-radius:18px;background:var(--surface);border-color:var(--hairline);box-shadow:0 18px 60px -42px #000}.composer:focus-within{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 14%,transparent),0 18px 60px -42px #000}.composer textarea{min-height:48px}.send-btn{background:var(--ink);color:var(--canvas)}.send-btn:hover{background:var(--brand);color:#211407}.compose-foot{display:flex;justify-content:center;gap:12px}.compose-foot::after{content:'Enter to send  ·  Shift+Enter for a new line';color:var(--ink-3)}
 .selector-row{position:sticky;top:0;z-index:3;padding:10px 0;background:color-mix(in srgb,var(--canvas) 90%,transparent);backdrop-filter:blur(14px)}
+.brand{gap:10px}.brand-mark,.brand-loader{display:grid;place-items:center;flex:none;background:linear-gradient(145deg,#ff8a00,#df6411);overflow:hidden}.brand-mark{width:32px;height:32px;border-radius:10px}.brand-mark img{width:27px;height:27px;object-fit:contain}.brand-word{font-family:"Avenir Next","Century Gothic",Futura,ui-sans-serif,sans-serif;font-size:19px;font-weight:500;letter-spacing:.055em;text-transform:lowercase;line-height:1}.brand-loader{width:30px;height:30px;border-radius:9px;position:relative}.brand-loader img{width:25px;height:25px;object-fit:contain;animation:falgunaPulse 1.55s ease-in-out infinite}.brand-thinking{display:flex;align-items:center;gap:10px!important}.chat-welcome .glow.brand-orbit{display:grid;place-items:center;background:linear-gradient(145deg,#ff8a00,#df6411);overflow:hidden}.chat-welcome .glow.brand-orbit img{width:42px;height:42px;object-fit:contain}@keyframes falgunaPulse{0%,100%{transform:scale(.84);opacity:.72}50%{transform:scale(1);opacity:1}}
 @media(max-width:850px){.app{grid-template-columns:1fr}.chat-scroll,.composer-wrap{padding-left:14px;padding-right:14px}.chat-welcome{margin-top:5vh}.chip-row{grid-template-columns:1fr}.side-tools{margin-top:7px}.msg.user{margin-left:0}}
 @media(max-width:520px){.thread{padding-top:20px;gap:25px}.msg{grid-template-columns:27px minmax(0,1fr);column-gap:9px}.msg .avatar{width:26px;height:26px}.msg.user{grid-template-columns:minmax(0,1fr) 27px}.msg .bubble{font-size:14.5px}.composer-wrap{padding-bottom:max(10px,env(safe-area-inset-bottom))}.compose-foot::after{display:none}.topbar{padding:0 12px}}
 </style></head><body>
 <div class="app">
   <aside id="sidebar" aria-label="Falguna navigation">
-    <div class="brand"><span class="mark">F</span><span class="brand-copy">Falguna<small>Private AI workspace</small></span></div>
+    <div class="brand"><span class="brand-mark"><img src="/assets/falguna-mark.png" alt=""></span><span class="brand-copy"><span class="brand-word">falguna</span></span></div>
     <button class="new-chat" id="newChatBtn"></button>
     <div class="side-tools"><label class="side-search" aria-label="Filter conversations"><span id="sideSearchIcon"></span><input id="sideSearchInput" type="search" placeholder="Find a conversation" autocomplete="off"></label><button class="side-shortcut" id="shortcutHelpBtn" type="button" title="Keyboard shortcuts">?</button></div>
     <nav class="nav" id="nav"></nav>
     <div class="side-title" id="sideListTitle">Recent chats</div>
     <div class="side-list" id="sideList"><div class="side-empty">Loading&hellip;</div></div>
-    <div class="boundary"><strong>Private workspace</strong><span>Local-only internal alpha · no automatic merge or deploy</span></div>
+    <div class="account-wrap"><button class="account-button" id="accountButton" type="button" aria-expanded="false"><span class="account-avatar">A</span><span class="account-copy"><b>Aryan</b><span>Local profile</span></span><span aria-hidden="true">⋯</span></button><div class="account-menu hidden" id="accountMenu"><button type="button" data-account-go="#/settings">Settings</button><button type="button" data-account-go="#/help">Help</button><button type="button" data-account-go="#/tools">Connected tools</button><div class="menu-note">Login, team accounts, invites and a public plugin marketplace are planned for the commercial account phases. They are not simulated here.</div></div></div>
   </aside>
   <div class="scrim" id="scrim"></div>
   <main class="workspace">
@@ -2992,6 +3007,7 @@ let profiles={};
 let profileList=[];
 let homeDraftMessage='';
 let settingsModel='';
+let availableChatModels=[];
 
 /* ---------------------------------------------------------- misc helpers */
 function formatBytes(n){
@@ -3120,7 +3136,7 @@ $('sideSearchIcon').innerHTML=icon('search',14);
 $('menuButton').innerHTML=icon('menu',17);
 $('bellBtn').innerHTML=icon('bell',16)+'<span class="bell-dot hidden" id="bellDot"></span>';
 function navBtn([id,label]){return `<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`}
-$('nav').innerHTML=[['home','Home'],['chat','Chat'],['search','Search'],['projects','Projects']].map(navBtn).join('')
+$('nav').innerHTML=[['chat','Chat'],['search','Search'],['projects','Projects']].map(navBtn).join('')
   +`<details class="nav-adv" id="navAdvanced"><summary class="nav-adv-summary">Workspace<span class="nav-adv-chev" aria-hidden="true"></span></summary>`
   +[['work','Work'],['mission','Mission Control'],['memory','Memory'],['files','Files'],['history','History']].map(navBtn).join('')
   +`</details>`
@@ -3151,6 +3167,10 @@ function toggleSidebar(){const open=!$('sidebar').classList.contains('open');$('
 $('menuButton').onclick=toggleSidebar;$('scrim').onclick=closeSidebar;
 window.addEventListener('keydown',e=>{if(e.key==='Escape'){closeSidebar();stopBellPanel()}});
 $('newChatBtn').onclick=()=>{location.hash='#/chat';closeSidebar()};
+const accountButton=$('accountButton'),accountMenu=$('accountMenu');
+accountButton.onclick=e=>{e.stopPropagation();const open=accountMenu.classList.toggle('hidden')===false;accountButton.setAttribute('aria-expanded',String(open))};
+document.querySelectorAll('[data-account-go]').forEach(b=>b.onclick=()=>{accountMenu.classList.add('hidden');accountButton.setAttribute('aria-expanded','false');go(b.dataset.accountGo);closeSidebar()});
+document.addEventListener('click',e=>{if(!accountMenu.classList.contains('hidden')&&!accountMenu.contains(e.target)&&e.target!==accountButton){accountMenu.classList.add('hidden');accountButton.setAttribute('aria-expanded','false')}});
 
 /* --------------------------------------------------------------- theme */
 function currentThemeMode(){
@@ -3219,7 +3239,7 @@ async function pollLive(){
   const pill=$('indicatorPill');
   const running=s.running||0,needsYou=s.needs_you||0;
   if(running+needsYou>0){
-    pill.classList.remove('hidden');
+    pill.classList.toggle('hidden',currentRoute().view==='chat');
     pill.innerHTML=`<b>${running}</b> running`+(needsYou?` &middot; <span class="warn-count">${needsYou} needs you</span>`:'');
   }else{
     pill.classList.add('hidden');
@@ -3238,15 +3258,16 @@ function startLivePolling(){
 /* ---------------------------------------------------------------- router */
 
 function currentRoute(){
-  const raw=(location.hash||'#/home').replace(/^#\/?/,'');
+  const raw=(location.hash||'#/chat').replace(/^#\/?/,'');
   const parts=raw.split('/');
-  return {view:parts[0]||'home', id:parts[1]?decodeURIComponent(parts[1]):null};
+  return {view:parts[0]||'chat', id:parts[1]?decodeURIComponent(parts[1]):null};
 }
 function go(hash){location.hash=hash}
-const VIEW_TITLES={home:'Home',chat:'Chat',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings',activity:'Activity'};
+const VIEW_TITLES={chat:'Falguna',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings',activity:'Activity',help:'Help',tools:'Connected tools'};
 function setActiveNav(view){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   $('viewTitle').textContent=VIEW_TITLES[view]||'Falguna';
+  if(view==='chat')$('indicatorPill').classList.add('hidden');
   const adv=$('navAdvanced');
   if(adv&&ADVANCED_VIEWS.has(view))adv.open=true;
 }
@@ -3260,7 +3281,7 @@ async function router(){
   stopBellPanel();
   const vp=$('viewport');
   try{
-    if(view==='home'){hideSideList();return renderHomeView()}
+    if(view==='home'){go('#/chat');return}
     if(view==='chat'){await renderSideChats();return renderChatView(id)}
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
     if(view==='search'){await renderSideResearch();return renderSearchView(id)}
@@ -3272,7 +3293,9 @@ async function router(){
     if(view==='history'){hideSideList();return renderHistoryView()}
     if(view==='settings'){hideSideList();return renderSettingsView(id)}
     if(view==='activity'){hideSideList();return renderActivityView()}
-    go('#/home');
+    if(view==='help'){hideSideList();return renderHelpView()}
+    if(view==='tools'){hideSideList();return renderToolsView()}
+    go('#/chat');
   }catch(err){
     vp.innerHTML=`<div class="page"><div class="empty-state error">${esc(err.message)}</div></div>`;
   }
@@ -3487,6 +3510,7 @@ async function loadProfiles(){
   const c=await api('/api/config');
   profileList=c.profiles;
   settingsModel=c.model;
+  availableChatModels=(c.provider_models||[]).filter(m=>!m.is_embedding_only);
   c.profiles.forEach(p=>profiles[p.id]=p);
   refreshModelPill().catch(()=>{});
   const pMode=c.privacy_mode;
@@ -3605,6 +3629,8 @@ async function renderChatView(id){
       $('sendBtn').disabled=true;
       try{
         const conv=await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:content.slice(0,60)})});
+        const selectedModel=$('newChatModel')?.value;
+        if(selectedModel)await api(`/api/conversations/${conv.id}/model`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:selectedModel})});
         await api(`/api/conversations/${conv.id}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});
         go('#/chat/'+conv.id);
       }catch(err){$('sendBtn').disabled=false;showToast(err.message,{error:true})}
@@ -3710,13 +3736,14 @@ async function renderChatToolbar(id,conversation){
 }
 
 function composerHtml(sendLabel,withExtras){
+  const modelControl=!withExtras&&availableChatModels.length?`<select class="tiny-select composer-model" id="newChatModel" title="Model for this chat"><option value="">Auto · local first</option>${availableChatModels.map(m=>`<option value="${esc(m.selector)}">${esc(m.display_name)} · ${m.is_local?'Local':'External'}</option>`).join('')}</select>`:'<span class="mode-chip">'+icon('chat',12)+'Chat</span>';
   return `<div class="composer-wrap">
     ${withExtras?'<div class="composer-attach-row" id="pendingAttachRow"></div>':''}
     <form class="composer" id="composer">
     <textarea id="composerInput" required placeholder="Message Falguna&hellip;" rows="1"></textarea>
     <div class="compose-row">
       <button type="button" class="icon-btn" id="attachBtn" title="${withExtras?'Attach a file':'Attachments are available once a chat exists'}">${icon('clip',16)}</button>
-      <span class="mode-chip">${icon('chat',12)}Chat</span>
+      ${modelControl}
       <div class="compose-spacer"></div>
       <button class="send-btn" id="sendBtn" type="submit" aria-label="${esc(sendLabel)}">${icon('send',14)}</button>
     </div>
@@ -4938,6 +4965,21 @@ async function renderMemorySuggestionsTab(body){
   await load();
 }
 
+/* ------------------------------------------------ Help and connected tools */
+function renderHelpView(){
+  $('viewport').innerHTML=`<div class="page"><h1>Help</h1><p class="lede">Quick guidance for the features available in this local release.</p>
+    <div class="settings-list"><div><b>Start a conversation</b><br>Choose New chat, select an available model if needed, then send a message.</div><div><b>Search and history</b><br>Use the sidebar search for recent conversations, or History for a complete activity view.</div><div><b>Work safely</b><br>Use Work for repository changes. Falguna keeps approval, review and merge boundaries visible.</div><div><b>Keyboard</b><br>Press ⌘K to navigate, ⌘⇧O for a new chat, and / to focus the composer.</div></div>
+    <div class="settings-note">Hosted support, account recovery and customer login do not exist in this local build yet. No support contact is fabricated.</div></div>`;
+}
+async function renderToolsView(){
+  const [cfg,browser]=await Promise.all([api('/api/config'),api('/api/browser/settings').catch(()=>null)]);
+  const models=(cfg.provider_models||[]).filter(m=>!m.is_embedding_only);
+  $('viewport').innerHTML=`<div class="page"><h1>Connected tools</h1><p class="lede">Only integrations this installation can actually detect or configure are shown.</p>
+    <div class="provider-cards">${models.length?models.map(m=>`<div class="provider-card"><div class="provider-card-head"><span class="provider-name">${esc(m.display_name)}</span><span class="health-pill ${m.is_local?'health-healthy':'health-degraded'}">${m.is_local?'Local model':'External model'}</span></div><div class="provider-detail">${esc(m.provider_display_name||m.provider_id||'Configured provider')}</div></div>`).join(''):'<div class="provider-card"><div class="provider-name">Models</div><div class="provider-detail">No chat model is reachable right now. Configure one in Settings → Models.</div></div>'}
+      <div class="provider-card"><div class="provider-card-head"><span class="provider-name">Browser tools</span><span class="health-pill ${browser&&browser.enabled?'health-healthy':'health-offline'}">${browser&&browser.enabled?'Enabled':'Off'}</span></div><div class="provider-detail">Local browser and computer-use controls are managed in Settings → Browser.</div></div></div>
+    <div class="settings-note">A public plugin marketplace and third-party installation flow are deferred to the commercial account and multi-tenant phases.</div></div>`;
+}
+
 /* ----------------------------------------------------------- Settings view */
 
 const SETTINGS_TABS=[['appearance','Appearance'],['models','Models'],['work','Work Mode'],['browser','Browser'],['memory','Memory'],['files','Files'],['notifications','Notifications'],['privacy','Privacy'],['usage','Usage & Cost'],['advanced','Advanced']];
@@ -4970,7 +5012,7 @@ async function renderSettingsView(tab){
   const [s,cfg]=await Promise.all([api('/api/settings'),api('/api/config')]);
   vp.innerHTML=`<div class="page">
     <h1>Settings</h1>
-    <p class="lede">Informational only in this release &mdash; nothing here can change Falguna's safety policy from the browser.</p>
+    <p class="lede">Personalize the parts of Falguna that are implemented in this release. Safety and approval boundaries remain enforced.</p>
     <div class="settings-nav" id="settingsNav">${SETTINGS_TABS.map(([id,label])=>`<button type="button" data-tab="${id}" class="${id===tab?'active':''}">${esc(label)}</button>`).join('')}</div>
     <div id="settingsBody"><div class="empty-state">Loading&hellip;</div></div>
   </div>`;
