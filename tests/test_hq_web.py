@@ -609,6 +609,13 @@ class WorkforceMediaHQServerTests(TTTHQServerTests):
         self.assertIn("source", snapshot["revenue"])
         self.assertIn("risk_signals", snapshot)
 
+        status, company_state = self._get(self.hq_port, "/api/company-state")
+        self.assertEqual(status, 200)
+        self.assertEqual(company_state["financials"]["quoted"], 0)  # no approved proposal exists
+        self.assertEqual(company_state["financials"]["invoiced"], 0)
+        self.assertEqual(company_state["financials"]["collected"], 0)
+        self.assertIn("delivery", company_state["sources"])
+
         code = self._get_raises(self.hq_port, "/api/cc/ceo-brief/latest")
         self.assertEqual(code, 404)
 

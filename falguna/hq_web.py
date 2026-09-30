@@ -48,6 +48,7 @@ from .analytics_growth import AnalyticsError, AnalyticsStore, GrowthAgent, Growt
 from .application_executor import ApplicationExecutor, ApplicationExecutorError
 from .billing import BillingError, BillingStore, CompletionError, CompletionService, RetentionError, RetentionStore
 from .command_center import CEOBriefStore, command_center_snapshot, kpi_snapshot
+from .company_state import CompanyStateService
 from .company_os import (
     CompanyMemoryStore, CompanyOSError, CompanyPolicyStore, CostEstimateStore, DecisionStore,
     DepartmentObjectiveStore, EventBus, ExecutionOrchestrator, FailureStore, ObjectiveStore, PlanStore,
@@ -566,6 +567,8 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 })
             if path == "/api/cc/snapshot":
                 return self._json(command_center_snapshot(store))
+            if path == "/api/company-state":
+                return self._json(CompanyStateService(store).snapshot())
             if path == "/api/cc/ceo-brief/latest":
                 brief = CEOBriefStore(store, control.audit).latest()
                 return self._json(brief or {"error": "no brief generated yet"}, HTTPStatus.OK if brief else HTTPStatus.NOT_FOUND)
@@ -2550,7 +2553,7 @@ main{padding:0 max(28px,calc((100vw - 264px - 1180px)/2))}.hqtopbar{min-height:5
 #view-commandCenter>.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}#view-commandCenter>.row>.section{margin:0;min-height:112px;display:flex;flex-direction:column;justify-content:flex-end;position:relative;overflow:hidden}#view-commandCenter>.row>.section h2{font-family:Georgia,"Times New Roman",serif;font-size:30px;font-weight:500;margin:0 0 8px}#view-commandCenter>.row>.section .sub{margin:0;text-transform:uppercase;letter-spacing:.07em}#view-commandCenter>.row>.section::after{content:'';position:absolute;right:-22px;top:-28px;width:88px;height:88px;border:1px solid color-mix(in srgb,var(--accent) 14%,transparent);border-radius:50%}
 .item{border-radius:9px;padding:13px;border-color:var(--line);background:color-mix(in srgb,var(--soft) 70%,transparent)}.item h3{font-size:13px;line-height:1.45}.meta span{background:var(--panel)}.hq-changed-item{padding:10px 2px}.hq-changed-time{font-variant-numeric:tabular-nums}
 .empty{border:1px dashed var(--line);border-radius:9px;padding:15px;text-align:center}.askf-fab{border-radius:10px}.askf-panel{width:min(500px,96vw)}
-@media(max-width:820px){.app{grid-template-columns:1fr}main{padding:0 14px;min-width:0}.col{width:100%!important;max-width:none;flex:1 1 0;min-width:0!important;overflow-x:hidden;padding-top:18px}.hqhero{align-items:flex-start}.hqhero-greeting{font-size:34px}.hqpulse-row,#view-commandCenter>.row{grid-template-columns:1fr}.hq-jumpbar{overflow-x:auto;flex-wrap:nowrap;padding-bottom:4px}.hq-jumpbar button{white-space:nowrap}.hqcore-label{display:none}.hqcore{padding:9px}.section{padding:15px}.hqtopbar-command{display:none}}
+@media(max-width:820px){.app{grid-template-columns:1fr}main{padding:0 14px;min-width:0}.col{width:100%!important;max-width:none;flex:1 1 0;min-width:0!important;overflow-x:hidden;padding-top:18px}.view{min-width:0;max-width:100%}.hqhero{align-items:flex-start}.hqhero-greeting{font-size:34px}.hqpulse-row,#view-commandCenter>.row{grid-template-columns:1fr}.hq-jumpbar{max-width:100%;overflow-x:auto;flex-wrap:nowrap;padding-bottom:4px}.hq-jumpbar button{white-space:nowrap}.hqcore-label{display:none}.hqcore{padding:9px}.section{padding:15px}.hqtopbar-command{display:none}}
 </style></head><body><div id="globalLoadingBar" aria-hidden="true"></div>
 <button type="button" id="askFalgunaFab" class="askf-fab">
 <span class="askf-fab-dot" id="askfFabDot" aria-hidden="true"></span>
@@ -2699,6 +2702,26 @@ Ask Falguna
 </div>
 <div class="pageintro">What the company is doing right now -- sourced live from Revenue Hunter, billing, Digital Workforce, and Media/Growth. No vanity metrics; every card below is a real, sourced read.</div>
 <div class="hq-jumpbar" aria-label="Command center shortcuts"><button type="button" data-hq-jump="needsAryan">Review decisions</button><button type="button" data-hq-jump="rhPipeline">Open revenue pipeline</button><button type="button" data-hq-jump="wfTasks">Inspect workforce</button><button type="button" data-hq-jump="ccCash">Cash &amp; runway</button><button type="button" data-hq-jump="ccRiskRegister">Risk register</button></div>
+<div class="section">
+<h2>Executive company state</h2>
+<div class="pageintro">One read-only view of persisted commercial, delivery, workforce, decision and partner records. Quoted, invoiced and collected are never blended.</div>
+<div class="row">
+<button class="section" style="flex:1;text-align:left" data-hq-jump="rhPipeline"><h2 id="eccQuoted">$0</h2><div class="sub">Quoted · approved proposals</div></button>
+<button class="section" style="flex:1;text-align:left" data-hq-jump="rhRevenue"><h2 id="eccInvoiced">$0</h2><div class="sub">Invoiced · non-cancelled</div></button>
+<button class="section" style="flex:1;text-align:left" data-hq-jump="rhRevenue"><h2 id="eccCollected">$0</h2><div class="sub">Collected · evidenced receipts</div></button>
+</div>
+<div class="row">
+<button class="section" style="flex:1;text-align:left" data-hq-jump="rhDeliveryEngine"><h2 id="eccProjects">0</h2><div class="sub">Active projects</div></button>
+<button class="section" style="flex:1;text-align:left" data-hq-jump="wfTasks"><h2 id="eccWorkforce">0</h2><div class="sub">Workforce needs attention</div></button>
+<button class="section" style="flex:1;text-align:left" data-hq-jump="needsAryan"><h2 id="eccDecisions">0</h2><div class="sub">Outstanding decisions</div></button>
+</div>
+<div class="row">
+<button class="section" style="flex:1;text-align:left" data-hq-jump="rhDeliveryEngine"><h2 id="eccHandovers">0</h2><div class="sub">Evidence-backed handovers</div></button>
+<button class="section" style="flex:1;text-align:left" data-hq-jump="pmReferrals"><h2 id="eccReferrals">0</h2><div class="sub">Attributed referrals</div></button>
+<button class="section" style="flex:1;text-align:left" data-hq-jump="pmCommissions"><h2 id="eccCommissions">$0</h2><div class="sub">Eligible commission</div></button>
+</div>
+<div class="sub" id="eccCurrencyNote"></div>
+</div>
 <div class="hqpulse-row">
 <div class="section hqpulse-card">
 <h2>Needs Your Attention</h2>
@@ -3623,6 +3646,22 @@ const g=active.closest('.navgroup');
 crumb.textContent=g?(g.querySelector('summary').textContent.trim()+' / '+active.textContent.trim()):'';
 })();
 const d=await api('/api/cc/snapshot');
+try{
+const s=await api('/api/company-state');
+$('eccQuoted').textContent='$'+s.financials.quoted;
+$('eccInvoiced').textContent='$'+s.financials.invoiced;
+$('eccCollected').textContent='$'+s.financials.collected;
+$('eccProjects').textContent=s.delivery.active_projects;
+$('eccWorkforce').textContent=s.delivery.workforce_attention;
+$('eccDecisions').textContent=s.decisions.pending;
+$('eccHandovers').textContent=s.delivery.handovers+' · '+s.delivery.qa_passed+' QA';
+$('eccReferrals').textContent=s.partners.referrals_by_status.ATTRIBUTED||0;
+$('eccCommissions').textContent='$'+s.partners.eligible;
+$('eccCurrencyNote').textContent=s.financials.currency_note;
+}catch(e){
+['eccQuoted','eccInvoiced','eccCollected','eccProjects','eccWorkforce','eccDecisions','eccHandovers','eccReferrals','eccCommissions'].forEach(id=>$(id).textContent='Unavailable');
+$('eccCurrencyNote').textContent='Company state could not be loaded. Existing operational views remain available.';
+}
 $('ccWonRevenue').textContent='$'+d.revenue.won_revenue_lifetime;
 $('ccCashIn').textContent='$'+d.cash.cash_in_to_date;
 $('ccOutstanding').textContent='$'+d.receivables.outstanding_total;
