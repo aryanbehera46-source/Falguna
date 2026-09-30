@@ -24,7 +24,13 @@ from unittest import mock
 
 from falguna.browser_runtime import BrowserRuntimeError, BrowserSessionStatus, BrowserSessionStore, playwright_available
 from falguna.runtime import open_control_plane
-from falguna.web import FalgunaHandler, reconcile_browser_sessions_at_startup, wait_for_background_tasks
+from falguna.web import (
+    FalgunaHandler,
+    _background_threads,
+    _background_threads_lock,
+    reconcile_browser_sessions_at_startup,
+    wait_for_background_tasks,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -156,6 +162,87 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         body = {"objective": objective, "steps": steps}
         body.update(extra)
         return self._post("/api/computer/sessions", body)
+
+
+class TrackedBackgroundThreadRegistrationTests(_LiveFalgunaServerCase):
+    """Reliability round regression test.
+
+    c37c09f ("Drain browser workers before HTTP test teardown") added the
+    tearDown() assertion above -- self.assertTrue(wait_for_background_tasks(...))
+    -- on the theory that browser-session workers were tracked in
+    falguna.web._background_threads. They were not: the production
+    browser-session launch path (and four sibling paths -- computer-use
+    sessions, their shared approve/resume path, engineering-mission resume,
+    and the main mission launcher) used a raw threading.Thread(...).start(),
+    which is invisible to that registry. wait_for_background_tasks() looks
+    up _background_threads[key]; for an unregistered thread that dict entry
+    never exists, so the wait returns True immediately regardless of
+    whether the worker had actually finished -- the assertion in
+    tearDown() was true by vacuous construction, not because draining ever
+    happened.
+
+    This test asserts on the registry directly rather than only on the
+    already-passing (but previously meaningless) wait_for_background_tasks()
+    return value, so it fails loudly if the production launch path
+    regresses back to an untracked thread. Before this round's fix (routing
+    the launch through start_tracked_background_thread in falguna/web.py),
+    the first assertion below failed every time, because
+    _background_threads.get(key) was always None/empty even while the
+    session was actively RUNNING.
+    """
+
+    def test_a_running_browser_session_is_registered_and_drains_from_the_tracked_registry(self):
+        key = str(Path(self.repo).resolve())
+
+        # Sanity check: nothing tracked for this repo before any session
+        # is created.
+        with _background_threads_lock:
+            self.assertNotIn(key, _background_threads)
+
+        session_id = self._create_explicit_session("tracked-thread-check", [
+            {"action": "open", "target": f"{self.fixture_base}/browser_fixture.html", "value": None, "description": "open"},
+            {"action": "wait", "target": None, "value": "800", "description": "brief wait"},
+        ])
+
+        # start_tracked_background_thread() registers the worker thread in
+        # _background_threads BEFORE calling thread.start(), and that
+        # registration happens synchronously inside the POST handler that
+        # just returned 202 above -- so this must already be true, with no
+        # polling or sleep required. That "registration precedes any
+        # response to the client" ordering is exactly what makes
+        # wait_for_background_tasks() meaningful when called from a test's
+        # tearDown() afterwards.
+        with _background_threads_lock:
+            workers = _background_threads.get(key)
+            self.assertTrue(
+                workers,
+                "browser-session worker was not registered in "
+                "_background_threads immediately after session creation -- "
+                "the production launch path is not using "
+                "start_tracked_background_thread",
+            )
+            live_threads = set(workers)
+
+        self.assertTrue(
+            any(t.is_alive() for t in live_threads),
+            "registered worker thread(s) were already dead immediately "
+            "after session creation; the wait step should still be running",
+        )
+
+        self._poll_until(session_id, {"COMPLETED", "FAILED"})
+
+        # Once the session has finished, wait_for_background_tasks() must
+        # actually drain the registry -- not just return True vacuously.
+        self.assertTrue(wait_for_background_tasks(self.repo, timeout=10))
+        with _background_threads_lock:
+            self.assertNotIn(
+                key, _background_threads,
+                "registry entry for this repository was not cleared after "
+                "the worker finished and wait_for_background_tasks() "
+                "returned True",
+            )
+        for t in live_threads:
+            self.assertFalse(t.is_alive(), "worker thread outlived wait_for_background_tasks()")
 
 
 class StartupReconciliationTests(unittest.TestCase):

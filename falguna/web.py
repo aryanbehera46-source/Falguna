@@ -1141,7 +1141,17 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             control.audit.append("browser_session_created", {"session_id": session_id, "objective": objective[:200], "steps": len(steps)})
         finally:
             store.close()
-        threading.Thread(target=_run_browser_session_background, args=(self.app_root, session_id), daemon=True).start()
+        # Reliability-round fix: this is the real, production browser-session
+        # launch path -- the exact one test_browser_web.py's teardown
+        # (c37c09f, "Drain browser workers before HTTP test teardown")
+        # believed it was already draining via wait_for_background_tasks().
+        # It wasn't: this call used a raw threading.Thread(), never
+        # registered in _background_threads, so that wait was silently a
+        # no-op for this path -- the assertion passed regardless of whether
+        # the worker had actually finished. Routing through
+        # start_tracked_background_thread is what actually makes drain-
+        # before-teardown real for a browser session.
+        start_tracked_background_thread(self.app_root, _run_browser_session_background, self.app_root, session_id)
         return self._json({"session_id": session_id, "status": BrowserSessionStatus.CREATED}, HTTPStatus.ACCEPTED)
 
     def _computer_status(self):
@@ -1209,7 +1219,10 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             control.audit.append("computer_session_created", {"session_id": session_id, "objective": objective[:200], "steps": len(steps)})
         finally:
             store.close()
-        threading.Thread(target=_run_computer_session_background, args=(self.app_root, session_id), daemon=True).start()
+        # Reliability-round fix: same untracked-thread gap as the browser
+        # session path above -- this is production's real computer-use
+        # session launch, now made drainable the same way.
+        start_tracked_background_thread(self.app_root, _run_computer_session_background, self.app_root, session_id)
         return self._json({"session_id": session_id, "status": BrowserSessionStatus.CREATED}, HTTPStatus.ACCEPTED)
 
     def _approve_browser_gate(self, session_id):
@@ -1237,10 +1250,13 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         finally:
             store.close()
         runner = _run_computer_session_background if is_computer else _run_browser_session_background
-        threading.Thread(
-            target=runner, args=(self.app_root, session_id),
-            kwargs={"resume_from_index": resume_index, "approve_gate_for_index": resume_index}, daemon=True,
-        ).start()
+        # Reliability-round fix: same untracked-thread gap -- this is the
+        # real resume-after-approval path for both browser and computer-use
+        # sessions.
+        start_tracked_background_thread(
+            self.app_root, runner, self.app_root, session_id,
+            resume_from_index=resume_index, approve_gate_for_index=resume_index,
+        )
         return self._json({"session_id": session_id, "status": "RESUMING"}, HTTPStatus.ACCEPTED)
 
     def _reject_browser_gate(self, session_id):
@@ -1441,7 +1457,9 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 token = secrets.token_urlsafe(16)
                 with _operations_lock:
                     _operations[token] = {"state": "STARTING", "run_id": run_id}
-                threading.Thread(target=_resume_mission, args=(self.app_root, token, run_id), daemon=True).start()
+                # Reliability-round fix: same untracked-thread gap -- this is
+                # the real engineering-mission resume path.
+                start_tracked_background_thread(self.app_root, _resume_mission, self.app_root, token, run_id)
                 return self._json({"operation": token, "state": "STARTING"}, HTTPStatus.ACCEPTED)
             if path.startswith("/api/runs/") and path.endswith(("/board-archive", "/board-unarchive")):
                 run_id = path.split("/")[3]
@@ -1590,13 +1608,17 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         discovery = {**plan.evidence(), "cache": cache, "duration_ms": discovery_ms}
         with _operations_lock:
             _operations[token]["discovery"] = discovery
-        thread = threading.Thread(
-            target=_run_mission,
-            args=(self.app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id, research_id,
-                  _model_choice(model), _work_mode(work_mode)),
-            daemon=True,
+        # Reliability-round fix: same untracked-thread gap -- this is the
+        # real Falguna Engineering mission launch path, the single most
+        # significant of the five untracked background-thread call sites
+        # this round found (browser session, computer-use session, their
+        # shared resume path, mission resume, and this one -- only the chat
+        # reply path was ever actually tracked before this fix).
+        start_tracked_background_thread(
+            self.app_root, _run_mission,
+            self.app_root, token, profile, objective, editable, commands, cap, discovery, conversation_id, research_id,
+            _model_choice(model), _work_mode(work_mode),
         )
-        thread.start()
         return token
 
     def _create_conversation(self, body):
