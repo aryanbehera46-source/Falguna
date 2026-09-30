@@ -809,3 +809,63 @@ CREATE TABLE IF NOT EXISTS tally_intake_events (
 );
 CREATE INDEX IF NOT EXISTS idx_tally_intake_events_submission ON tally_intake_events(tally_submission_id);
 CREATE INDEX IF NOT EXISTS idx_tally_intake_events_status ON tally_intake_events(status, created_at);
+
+
+-- Sales Partner Pilot V1 (falguna/partner_management.py). Internal pilot
+-- foundation only: no public signup, no payout execution, no payment
+-- provider integration. Partner/referral/commission bookkeeping sits
+-- alongside the existing Revenue & Delivery Engine (rh_opportunities,
+-- rh_invoices) rather than duplicating it -- a referral links to a real
+-- rh_opportunities row once attributed, and commission eligibility is
+-- computed by reading (never writing) the linked rh_invoices row.
+CREATE TABLE IF NOT EXISTS pm_partners (
+    id TEXT PRIMARY KEY, full_name TEXT NOT NULL, organization_name TEXT, email TEXT NOT NULL,
+    phone TEXT, region TEXT, country TEXT, service_categories_json TEXT, assigned_manager TEXT,
+    verification_status TEXT NOT NULL, agreement_accepted INTEGER NOT NULL DEFAULT 0,
+    agreement_accepted_at TEXT, agreement_reference TEXT, status TEXT NOT NULL,
+    approved_at TEXT, approved_by TEXT, suspended_at TEXT, suspended_by TEXT, suspension_reason TEXT,
+    terminated_at TEXT, terminated_by TEXT, termination_reason TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pm_partners_status ON pm_partners(status, created_at);
+CREATE TABLE IF NOT EXISTS pm_partner_status_events (
+    id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES pm_partners(id),
+    from_status TEXT, to_status TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pm_partner_status_events_partner ON pm_partner_status_events(partner_id, created_at);
+CREATE TABLE IF NOT EXISTS pm_referrals (
+    id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES pm_partners(id),
+    prospect_name TEXT NOT NULL, organization_name TEXT, contact_email TEXT, contact_phone TEXT,
+    region TEXT, requested_service TEXT NOT NULL, estimated_value REAL, referral_source TEXT, notes TEXT,
+    normalized_email TEXT, normalized_phone TEXT, normalized_domain TEXT, normalized_org TEXT,
+    attribution_status TEXT NOT NULL, attribution_start TEXT, attribution_expiry TEXT,
+    opportunity_id TEXT, duplicate_flag INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pm_referrals_partner ON pm_referrals(partner_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pm_referrals_attribution ON pm_referrals(attribution_status);
+CREATE INDEX IF NOT EXISTS idx_pm_referrals_email ON pm_referrals(normalized_email);
+CREATE INDEX IF NOT EXISTS idx_pm_referrals_phone ON pm_referrals(normalized_phone);
+CREATE INDEX IF NOT EXISTS idx_pm_referrals_domain ON pm_referrals(normalized_domain);
+CREATE INDEX IF NOT EXISTS idx_pm_referrals_org ON pm_referrals(normalized_org);
+CREATE TABLE IF NOT EXISTS pm_duplicate_reviews (
+    id TEXT PRIMARY KEY, referral_id TEXT NOT NULL REFERENCES pm_referrals(id),
+    competing_referral_ids_json TEXT NOT NULL, detected_reason TEXT, status TEXT NOT NULL,
+    reviewer TEXT, decision TEXT, awarded_referral_id TEXT, resolution_reason TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT, resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pm_duplicate_reviews_status ON pm_duplicate_reviews(status, created_at);
+CREATE TABLE IF NOT EXISTS pm_commissions (
+    id TEXT PRIMARY KEY, referral_id TEXT NOT NULL REFERENCES pm_referrals(id), partner_id TEXT NOT NULL REFERENCES pm_partners(id),
+    opportunity_id TEXT, invoice_id TEXT, rate REAL NOT NULL, status TEXT NOT NULL,
+    eligible_amount REAL NOT NULL DEFAULT 0, refunded_amount REAL NOT NULL DEFAULT 0, hold_reason TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pm_commissions_referral ON pm_commissions(referral_id);
+CREATE INDEX IF NOT EXISTS idx_pm_commissions_partner ON pm_commissions(partner_id, status);
+CREATE TABLE IF NOT EXISTS pm_commission_events (
+    id TEXT PRIMARY KEY, commission_id TEXT NOT NULL REFERENCES pm_commissions(id),
+    event_type TEXT NOT NULL, amount REAL, status_before TEXT, status_after TEXT, actor TEXT NOT NULL,
+    evidence_json TEXT, reason TEXT, event_ref TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pm_commission_events_commission ON pm_commission_events(commission_id, created_at);

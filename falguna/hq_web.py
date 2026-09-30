@@ -89,6 +89,9 @@ from .revenue_hunter import (
     QualificationStore, apply_decision_side_effect, extract_fields_from_text, extract_from_csv_rows,
 )
 from .revenue_delivery import RevenueDeliveryError, RevenueDeliveryService
+from .partner_management import (
+    CommissionError, CommissionStore, PartnerError, PartnerStore, ReferralError, ReferralStore,
+)
 from .runtime import open_control_plane
 from .sales_manager import SalesManagerService
 from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
@@ -729,6 +732,56 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 client_id = path.rsplit("/", 1)[-1]
                 client = ClientStore(store, control.audit).get(client_id)
                 return self._json(client or {"error": "client not found"}, HTTPStatus.OK if client else HTTPStatus.NOT_FOUND)
+
+            # -- Sales Partner Pilot V1 (internal pilot foundation; see
+            # falguna/partner_management.py) --
+            if path == "/api/partners":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": PartnerStore(store, control.audit).list(status)})
+            if path.startswith("/api/partners/") and path.endswith("/referrals"):
+                partner_id = path.split("/")[3]
+                return self._json({"items": ReferralStore(store, control.audit).list(partner_id=partner_id)})
+            if path.startswith("/api/partners/") and path.endswith("/commissions"):
+                partner_id = path.split("/")[3]
+                return self._json({"items": CommissionStore(store, control.audit).list(partner_id=partner_id)})
+            if path.startswith("/api/partners/"):
+                partner_id = path.rsplit("/", 1)[-1]
+                partner = PartnerStore(store, control.audit).get(partner_id)
+                return self._json(partner or {"error": "partner not found"}, HTTPStatus.OK if partner else HTTPStatus.NOT_FOUND)
+            if path == "/api/referrals":
+                query = parse_qs(urlparse(self.path).query)
+                attribution_status = (query.get("attribution_status") or [None])[0]
+                partner_id = (query.get("partner_id") or [None])[0]
+                return self._json({"items": ReferralStore(store, control.audit).list(partner_id=partner_id, attribution_status=attribution_status)})
+            if path == "/api/referrals/duplicate-reviews":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or ["OPEN"])[0]
+                return self._json({"items": ReferralStore(store, control.audit).list_duplicate_reviews(status or None)})
+            if path.startswith("/api/referrals/duplicate-reviews/"):
+                review_id = path.rsplit("/", 1)[-1]
+                review = ReferralStore(store, control.audit).get_duplicate_review(review_id)
+                return self._json(review or {"error": "duplicate review not found"}, HTTPStatus.OK if review else HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/referrals/") and path.endswith("/commission"):
+                referral_id = path.split("/")[3]
+                commission = CommissionStore(store, control.audit).get_for_referral(referral_id)
+                return self._json(commission or {"error": "no commission record yet"}, HTTPStatus.OK if commission else HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/referrals/"):
+                referral_id = path.rsplit("/", 1)[-1]
+                referral = ReferralStore(store, control.audit).get(referral_id)
+                return self._json(referral or {"error": "referral not found"}, HTTPStatus.OK if referral else HTTPStatus.NOT_FOUND)
+            if path == "/api/commissions":
+                query = parse_qs(urlparse(self.path).query)
+                partner_id = (query.get("partner_id") or [None])[0]
+                status = (query.get("status") or [None])[0]
+                return self._json({"items": CommissionStore(store, control.audit).list(partner_id=partner_id, status=status)})
+            if path.startswith("/api/commissions/") and path.endswith("/events"):
+                commission_id = path.split("/")[3]
+                return self._json({"items": CommissionStore(store, control.audit).events_for(commission_id)})
+            if path.startswith("/api/commissions/"):
+                commission_id = path.rsplit("/", 1)[-1]
+                commission = CommissionStore(store, control.audit).get(commission_id)
+                return self._json(commission or {"error": "commission not found"}, HTTPStatus.OK if commission else HTTPStatus.NOT_FOUND)
 
             # -- Digital Workforce (Section 20) --
             if path == "/api/wf/tasks":
@@ -1654,6 +1707,92 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     )
                     return self._json(result, HTTPStatus.CREATED)
 
+                # -- Sales Partner Pilot V1 (internal pilot foundation; see
+                # falguna/partner_management.py). Every consequential action
+                # here mirrors the rest of this file's convention: a human
+                # actor string, a *Error subclass of ValueError caught by
+                # this method's own outer except, and an audit trail entry
+                # for every state transition. Nothing in this section ever
+                # sends anything externally or executes a payout. --
+                if path == "/api/partners":
+                    partner_id = PartnerStore(store, control.audit).register(body, body.get("actor", "Aryan"))
+                    return self._json({"partner_id": partner_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/partners/") and path.endswith("/approve"):
+                    partner_id = path.split("/")[3]
+                    result = PartnerStore(store, control.audit).approve(partner_id, body.get("actor", "Aryan"), verification_status=body.get("verification_status", "VERIFIED"))
+                    return self._json(result)
+                if path.startswith("/api/partners/") and path.endswith("/suspend"):
+                    partner_id = path.split("/")[3]
+                    result = PartnerStore(store, control.audit).suspend(partner_id, body.get("actor", "Aryan"), body.get("reason", ""))
+                    return self._json(result)
+                if path.startswith("/api/partners/") and path.endswith("/reinstate"):
+                    partner_id = path.split("/")[3]
+                    result = PartnerStore(store, control.audit).reinstate(partner_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+                if path.startswith("/api/partners/") and path.endswith("/terminate"):
+                    partner_id = path.split("/")[3]
+                    result = PartnerStore(store, control.audit).terminate(partner_id, body.get("actor", "Aryan"), body.get("reason", ""))
+                    return self._json(result)
+
+                if path == "/api/referrals":
+                    partner_id = body.get("partner_id", "")
+                    referral_id = ReferralStore(store, control.audit).register(partner_id, body, body.get("actor", "Aryan"))
+                    return self._json({"referral_id": referral_id}, HTTPStatus.CREATED)
+                if path.startswith("/api/referrals/") and path.endswith("/attribute"):
+                    referral_id = path.split("/")[3]
+                    kwargs = {}
+                    if body.get("attribution_days") is not None:
+                        kwargs["attribution_days"] = int(body["attribution_days"])
+                    referral = ReferralStore(store, control.audit).attribute(referral_id, body.get("actor", "Aryan"), **kwargs)
+                    # Bootstrap the commission ledger row the instant a
+                    # referral is attributed, so it is visible (NOT_ELIGIBLE)
+                    # to the Commission ledger screen right away rather than
+                    # only appearing after the first sync.
+                    CommissionStore(store, control.audit).ensure_for_referral(referral_id, body.get("actor", "Aryan"))
+                    return self._json(referral)
+                if path.startswith("/api/referrals/") and path.endswith("/reject"):
+                    referral_id = path.split("/")[3]
+                    result = ReferralStore(store, control.audit).reject(referral_id, body.get("actor", "Aryan"), body.get("reason"))
+                    return self._json(result)
+                if path.startswith("/api/referrals/") and path.endswith("/check-expiry"):
+                    referral_id = path.split("/")[3]
+                    result = ReferralStore(store, control.audit).check_expiry(referral_id)
+                    return self._json(result)
+                if path.startswith("/api/referrals/") and path.endswith("/dispute/resolve"):
+                    referral_id = path.split("/")[3]
+                    result = ReferralStore(store, control.audit).resolve_dispute(referral_id, body.get("actor", "Aryan"), body.get("decision", ""), body.get("reason"))
+                    return self._json(result)
+                if path.startswith("/api/referrals/") and path.endswith("/dispute"):
+                    referral_id = path.split("/")[3]
+                    result = ReferralStore(store, control.audit).raise_dispute(referral_id, body.get("actor", "Aryan"), body.get("reason", ""))
+                    return self._json(result)
+                if path.startswith("/api/referrals/duplicate-reviews/") and path.endswith("/resolve"):
+                    review_id = path.split("/")[4]
+                    result = ReferralStore(store, control.audit).resolve_duplicate_review(
+                        review_id, body.get("actor", "Aryan"), body.get("decision", ""),
+                        reason=body.get("reason"), awarded_referral_id=body.get("awarded_referral_id"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/referrals/") and path.endswith("/commission/sync"):
+                    referral_id = path.split("/")[3]
+                    result = CommissionStore(store, control.audit).sync_from_invoice(referral_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+                if path.startswith("/api/referrals/") and path.endswith("/commission/hold"):
+                    referral_id = path.split("/")[3]
+                    result = CommissionStore(store, control.audit).hold(referral_id, body.get("actor", "Aryan"), body.get("reason", ""))
+                    return self._json(result)
+                if path.startswith("/api/referrals/") and path.endswith("/commission/release"):
+                    referral_id = path.split("/")[3]
+                    result = CommissionStore(store, control.audit).release_hold(referral_id, body.get("actor", "Aryan"))
+                    return self._json(result)
+                if path.startswith("/api/referrals/") and path.endswith("/commission/refund"):
+                    referral_id = path.split("/")[3]
+                    result = CommissionStore(store, control.audit).record_refund(
+                        referral_id, body.get("actor", "Aryan"), body.get("amount"), body.get("evidence"),
+                        body.get("reason", ""), event_ref=body.get("event_ref"),
+                    )
+                    return self._json(result)
+
                 # -- Digital Workforce (Section 20) --
                 needs_aryan_q = NeedsAryanQueue(store, control.audit, control)
                 if path == "/api/wf/tasks":
@@ -2501,6 +2640,17 @@ Ask Falguna
 <button class="navitem" data-view="rhRevenue">Revenue</button>
 <button class="navitem" data-view="rhSettings">Acquisition Settings</button>
 </details>
+<details class="navgroup" data-cat="partners">
+<summary class="navsec">Sales Partners (Pilot)<span class="chev" aria-hidden="true"></span></summary>
+<button class="navitem" data-view="pmPartners">Partners</button>
+<button class="navitem" data-view="pmPendingApprovals">Pending Approvals</button>
+<button class="navitem" data-view="pmSuspendedTerminated">Suspended / Terminated</button>
+<button class="navitem" data-view="pmReferrals">Referral Pipeline</button>
+<button class="navitem" data-view="pmDuplicateReview">Duplicate Lead Review</button>
+<button class="navitem" data-view="pmAttributionReview">Attribution Conflicts</button>
+<button class="navitem" data-view="pmCommissions">Commission Ledger</button>
+<button class="navitem" data-view="pmPerformance">Partner Performance</button>
+</details>
 <details class="navgroup" data-cat="growth">
 <summary class="navsec">Media<span class="chev" aria-hidden="true"></span></summary>
 <button class="navitem" data-view="mediaBrands">Brands</button>
@@ -3002,6 +3152,74 @@ Ask Falguna
 <div class="pageintro">Lightweight schedule definitions -- not an OS-level daemon. Each one creates a real Workforce Task when it's due; nothing here executes a task by itself.</div>
 <div class="list" id="wfWorkflowsList"></div>
 </div>
+<div class="view" id="view-pmPartners">
+<h1>Sales Partners</h1>
+<div class="pageintro">Internal pilot foundation only -- no public signup, no partner payouts. Every partner is created here by a TTT operator; approval, suspension, and termination are human-authorized actions with a full audit trail.</div>
+<div class="form">
+<input id="pmFullName" placeholder="Full name">
+<input id="pmOrgName" placeholder="Organization name (optional)">
+<input id="pmEmail" placeholder="Email" type="email">
+<input id="pmPhone" placeholder="Phone (optional)">
+<div class="row"><input id="pmRegion" placeholder="Region (optional)"><input id="pmCountry" placeholder="Country (optional)"></div>
+<input id="pmServiceCategories" placeholder="Allowed service categories (comma-separated)">
+<input id="pmManager" placeholder="Assigned TTT manager">
+<input id="pmAgreementRef" placeholder="Agreement / terms reference (optional)">
+<label style="display:flex;gap:8px;align-items:center"><input id="pmAgreementAccepted" type="checkbox"> Agreement / terms accepted</label>
+<div class="actions"><button id="pmCreate" type="button">Register partner (PENDING)</button></div>
+</div>
+<div class="list" id="pmPartnersList"></div>
+</div>
+<div class="view" id="view-pmPendingApprovals">
+<h1>Pending Partner Approvals</h1>
+<div class="pageintro">Only a human-authorized TTT role may approve or reject a partner application. Rejecting here terminates the application record with a reason -- no partner can approve itself.</div>
+<div class="list" id="pmPendingApprovalsList"></div>
+</div>
+<div class="view" id="view-pmSuspendedTerminated">
+<h1>Suspended &amp; Terminated Partners</h1>
+<div class="pageintro">A suspended partner is blocked from registering new referrals until reinstated. Termination is permanent in this pilot -- no reinstatement path.</div>
+<div class="section">
+<h2>Suspended</h2>
+<div class="list" id="pmSuspendedList"></div>
+</div>
+<div class="section">
+<h2>Terminated</h2>
+<div class="list" id="pmTerminatedList"></div>
+</div>
+</div>
+<div class="view" id="view-pmReferrals">
+<h1>Referral Pipeline</h1>
+<div class="pageintro">Leads registered by approved partners, integrated with the existing CRM / Revenue &amp; Delivery Engine -- attribution links a referral to a real opportunity, it never creates a parallel sales system.</div>
+<div class="row" style="margin:6px 0;flex-wrap:wrap">
+<select id="pmReferralFilter"><option value="">All attribution statuses</option><option value="PENDING_REVIEW">Pending review</option><option value="ATTRIBUTED">Attributed</option><option value="REJECTED">Rejected</option><option value="EXPIRED">Expired</option><option value="DISPUTED">Disputed</option></select>
+<button class="secondary" id="pmReferralFilterApply" type="button">Apply</button>
+</div>
+<div class="list" id="pmReferralsList"></div>
+</div>
+<div class="view" id="view-pmDuplicateReview">
+<h1>Duplicate Lead Review</h1>
+<div class="pageintro">Deterministic matches on email, phone, organization name, domain, or an existing customer never auto-award ownership -- every conflict is routed here for a human decision, with the decision, reviewer, and reason kept on the audit record.</div>
+<div class="row" style="margin:6px 0"><button class="secondary pmDupFilter active" data-status="OPEN">Open</button><button class="secondary pmDupFilter" data-status="RESOLVED">Resolved</button></div>
+<div class="list" id="pmDuplicateReviewList"></div>
+</div>
+<div class="view" id="view-pmAttributionReview">
+<h1>Attribution Conflict Review</h1>
+<div class="pageintro">A disputed attribution is never silently overwritten. Reinstating restores the original ATTRIBUTED referral; rejecting closes it out -- both require a human decision and reason.</div>
+<div class="list" id="pmAttributionReviewList"></div>
+</div>
+<div class="view" id="view-pmCommissions">
+<h1>Commission Ledger</h1>
+<div class="pageintro">Provisional commission accounting only. A quote is not revenue, an accepted project is not payment, and a DRAFT invoice is definitely not payment -- commission becomes ELIGIBLE only once a verified, cleared payment is observed on the linked invoice. No automated payout execution exists in this pilot.</div>
+<div class="row" style="margin:6px 0;flex-wrap:wrap">
+<select id="pmCommissionFilter"><option value="">All statuses</option><option value="NOT_ELIGIBLE">Not eligible</option><option value="PROVISIONAL">Provisional</option><option value="ELIGIBLE">Eligible</option><option value="HELD">Held</option><option value="REVERSED">Reversed</option></select>
+<button class="secondary" id="pmCommissionFilterApply" type="button">Apply</button>
+</div>
+<div class="list" id="pmCommissionsList"></div>
+</div>
+<div class="view" id="view-pmPerformance">
+<h1>Partner Performance Summary</h1>
+<div class="pageintro">Referral and commission totals per partner, computed from persisted state only.</div>
+<div class="list" id="pmPerformanceList"></div>
+</div>
 <div class="view" id="view-mediaBrands">
 <h1>Brands</h1>
 <div class="pageintro">Persistent voice/tone, audience, platforms, content pillars, visual guidelines, and approval policy -- one definition per brand, read by every piece of content and every Media agent.</div>
@@ -3254,7 +3472,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -3973,6 +4191,293 @@ function wfEvidence(t){try{return t.evidence_json?JSON.parse(t.evidence_json):nu
 function wfTaskCard(t){const label=WF_STATUS_LABEL[t.status]||esc(t.status);const needsAryan=t.status==='NEEDS_ARYAN'||t.needs_aryan_id;const blockers=wfBlockers(t);const evidence=wfEvidence(t);return `<div class="item"><h3>${esc(t.objective)}</h3><div class="meta"><span>${esc(label)}</span><span>${esc(t.task_type)}</span><span>${esc(t.department)}</span>${t.assigned_worker?`<span>${esc(t.assigned_worker)}</span>`:'<span>unassigned</span>'}${t.retries?`<span>${t.retries} retr${t.retries===1?'y':'ies'}</span>`:''}${needsAryan?'<span class="badge">waiting for Aryan</span>':''}${t.status==='COMPLETED'&&evidence?'<span class="badge">verified with evidence</span>':''}</div>${blockers?`<div class="contrib"><b>Blocked:</b> ${esc(typeof blockers==='string'?blockers:JSON.stringify(blockers))}</div>`:''}${t.error?`<div class="contrib"><b>Error:</b> ${esc(t.error)}</div>`:''}${evidence&&t.status!=='COMPLETED'?`<div class="contrib"><b>Evidence so far:</b> ${esc(typeof evidence==='string'?evidence:JSON.stringify(evidence))}</div>`:''}<div class="meta"><span>updated ${esc(t.updated_at||t.created_at)}</span></div></div>`}
 async function loadWfTasks(){const d=await api('/api/wf/tasks');$('wfTasksList').innerHTML=(d.items||[]).length?d.items.map(wfTaskCard).join(''):'<div class="empty">No workforce tasks yet -- once Digital Workforce or recurring workflows create real tasks, each will show who is assigned, current status (queued/planning/ready/in progress/blocked/waiting for Aryan/verifying/completed/failed/cancelled), any blocker, and completion evidence here.</div>'}
 async function loadWfWorkflows(){const d=await api('/api/wf/recurring-workflows');$('wfWorkflowsList').innerHTML=(d.items||[]).length?d.items.map(w=>`<div class="item"><h3>${esc(w.name)}</h3><div class="meta"><span>${esc(w.status)}</span><span>${esc(w.schedule_kind)}</span><span>${esc(w.department)}</span>${w.next_due_at?`<span>next due ${esc(w.next_due_at)}</span>`:''}</div></div>`).join(''):'<div class="empty">No recurring workflows yet.</div>'}
+// ---------- Sales Partner Pilot V1 (internal pilot foundation; see
+// falguna/partner_management.py). Every action below hits a real,
+// persisted, audited endpoint -- no inert buttons, no client-side-only
+// state. Consequential actions (approve/suspend/terminate, attribution,
+// duplicate resolution, commission hold/release/refund) always confirm
+// or require a typed reason, matching the rest of this HQ. ----------
+let pmOpenPartnerId=null;
+let pmOpenPartnerDetail=null;
+function pmPartnerBadge(p){
+if(p.status==='PENDING')return '<span class="badge">PENDING</span>';
+if(p.status==='SUSPENDED')return '<span class="stat-warn">SUSPENDED</span>';
+if(p.status==='TERMINATED')return '<span class="stat-bad">TERMINATED</span>';
+return '<span class="stat-good">APPROVED</span>';
+}
+async function loadPmPartners(){
+$('pmCreate').onclick=async()=>{
+const full_name=$('pmFullName').value.trim();
+const email=$('pmEmail').value.trim();
+if(!full_name||!email)return alert('Full name and email are required.');
+if(!$('pmAgreementAccepted').checked)return alert('Agreement/terms acceptance is required to register a partner.');
+try{
+await api('/api/partners',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+full_name, organization_name:$('pmOrgName').value.trim(), email, phone:$('pmPhone').value.trim(),
+region:$('pmRegion').value.trim(), country:$('pmCountry').value.trim(),
+service_categories:$('pmServiceCategories').value.split(',').map(s=>s.trim()).filter(Boolean),
+assigned_manager:$('pmManager').value.trim(), agreement_accepted:true, agreement_reference:$('pmAgreementRef').value.trim(),
+actor:'Aryan',
+})});
+['pmFullName','pmOrgName','pmEmail','pmPhone','pmRegion','pmCountry','pmServiceCategories','pmManager','pmAgreementRef'].forEach(id=>$(id).value='');
+$('pmAgreementAccepted').checked=false;
+await loadPmPartners();
+}catch(e){alert(e.message)}
+};
+try{
+const d=await api('/api/partners');
+renderPmPartners(d.items||[]);
+}catch(e){$('pmPartnersList').innerHTML=`<div class="empty">Unable to load partners: ${esc(e.message)}</div>`}
+}
+function renderPmPartners(items){
+$('pmPartnersList').innerHTML=items.length?items.map(p=>pmOpenPartnerId===p.id?pmPartnerDetailCard(pmOpenPartnerDetail&&pmOpenPartnerDetail.id===p.id?pmOpenPartnerDetail:p):pmPartnerCard(p)).join(''):'<div class="empty">No partners registered yet.</div>';
+wirePmPartnerList();
+}
+function pmPartnerCard(p){
+return `<div class="item"><h3>${esc(p.full_name)}${p.organization_name?' -- '+esc(p.organization_name):''}</h3><div class="meta">${pmPartnerBadge(p)}<span>${esc(p.email)}</span>${p.region?`<span>${esc(p.region)}</span>`:''}${p.assigned_manager?`<span>mgr: ${esc(p.assigned_manager)}</span>`:''}</div><div class="actions"><button class="secondary pmOpenPartner" data-id="${esc(p.id)}">Open</button></div></div>`;
+}
+function pmPartnerDetailCard(p){
+let categories='';try{categories=JSON.parse(p.service_categories_json||'[]').join(', ')}catch(e){}
+const history=(p.status_history||[]).slice().reverse().map(h=>`<div class="contrib"><b>${esc(h.from_status||'—')} &rarr; ${esc(h.to_status)}</b> by ${esc(h.actor)}${h.reason?': '+esc(h.reason):''}<div class="meta"><span>${esc(h.created_at)}</span></div></div>`).join('')||'<div class="empty">No status history.</div>';
+let actions='';
+if(p.status==='PENDING')actions=`<div class="actions"><button class="pmApprove" data-id="${esc(p.id)}">Approve</button><button class="danger pmReject" data-id="${esc(p.id)}">Reject</button></div>`;
+else if(p.status==='APPROVED')actions=`<div class="actions"><button class="danger pmSuspend" data-id="${esc(p.id)}">Suspend</button><button class="danger pmTerminate" data-id="${esc(p.id)}">Terminate</button></div>`;
+else if(p.status==='SUSPENDED')actions=`<div class="actions"><button class="pmReinstate" data-id="${esc(p.id)}">Reinstate</button><button class="danger pmTerminate" data-id="${esc(p.id)}">Terminate</button></div>`;
+const referralForm=p.status==='APPROVED'?`<div class="form">
+<div class="sub">Register a new referral for this partner</div>
+<input class="pmRefProspect" placeholder="Prospect / organization name">
+<input class="pmRefEmail" placeholder="Contact email (optional)">
+<input class="pmRefPhone" placeholder="Contact phone (optional)">
+<input class="pmRefRegion" placeholder="Region (optional)">
+<input class="pmRefService" placeholder="Requested service">
+<input class="pmRefValue" type="number" step="0.01" placeholder="Estimated value (optional)">
+<textarea class="pmRefNotes" placeholder="Notes (optional)"></textarea>
+<div class="actions"><button class="pmRegisterReferral" data-id="${esc(p.id)}">Register referral</button></div>
+</div>`:'<div class="empty">Only APPROVED partners can register referrals.</div>';
+return `<div class="item"><h3>${esc(p.full_name)}${p.organization_name?' -- '+esc(p.organization_name):''}</h3>
+<div class="meta">${pmPartnerBadge(p)}<span>${esc(p.email)}</span>${p.phone?`<span>${esc(p.phone)}</span>`:''}${p.region?`<span>${esc(p.region)}</span>`:''}${p.country?`<span>${esc(p.country)}</span>`:''}</div>
+<div class="meta"><span>verification: ${esc(p.verification_status)}</span><span>manager: ${esc(p.assigned_manager||'—')}</span>${categories?`<span>categories: ${esc(categories)}</span>`:''}</div>
+<div class="meta"><span>agreement accepted: ${p.agreement_accepted?'yes':'no'}</span>${p.agreement_reference?`<span>ref: ${esc(p.agreement_reference)}</span>`:''}</div>
+${p.suspension_reason?`<div class="contrib"><b>Suspension reason:</b> ${esc(p.suspension_reason)}</div>`:''}
+${p.termination_reason?`<div class="contrib"><b>Termination reason:</b> ${esc(p.termination_reason)}</div>`:''}
+${actions}
+${referralForm}
+<div class="sub" style="margin-top:12px">Status history</div>
+${history}
+<div class="actions"><button class="secondary pmClosePartner" data-id="${esc(p.id)}">Close</button></div>
+</div>`;
+}
+function wirePmPartnerList(){
+document.querySelectorAll('.pmOpenPartner').forEach(b=>b.onclick=async()=>{try{pmOpenPartnerDetail=await api('/api/partners/'+b.dataset.id);pmOpenPartnerId=b.dataset.id;await loadPmPartners()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmClosePartner').forEach(b=>b.onclick=async()=>{pmOpenPartnerId=null;pmOpenPartnerDetail=null;await loadPmPartners()});
+document.querySelectorAll('.pmApprove').forEach(b=>b.onclick=async()=>{if(!confirm('Approve this partner?'))return;try{await api(`/api/partners/${b.dataset.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});pmOpenPartnerDetail=await api('/api/partners/'+b.dataset.id);await loadPmPartners()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmReject').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for rejecting this partner application:');if(!reason)return;try{await api(`/api/partners/${b.dataset.id}/terminate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});pmOpenPartnerId=null;pmOpenPartnerDetail=null;await loadPmPartners()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmSuspend').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for suspending this partner:');if(!reason)return;try{await api(`/api/partners/${b.dataset.id}/suspend`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});pmOpenPartnerDetail=await api('/api/partners/'+b.dataset.id);await loadPmPartners()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmReinstate').forEach(b=>b.onclick=async()=>{if(!confirm('Reinstate this partner to APPROVED?'))return;try{await api(`/api/partners/${b.dataset.id}/reinstate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});pmOpenPartnerDetail=await api('/api/partners/'+b.dataset.id);await loadPmPartners()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmTerminate').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for terminating this partner (this is permanent in this pilot):');if(!reason)return;if(!confirm('Terminate this partner permanently?'))return;try{await api(`/api/partners/${b.dataset.id}/terminate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});pmOpenPartnerDetail=await api('/api/partners/'+b.dataset.id);await loadPmPartners()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmRegisterReferral').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const item=b.closest('.item');
+const prospect=item.querySelector('.pmRefProspect').value.trim();
+const service=item.querySelector('.pmRefService').value.trim();
+if(!prospect||!service)return alert('Prospect/organization name and requested service are required.');
+try{
+await api('/api/referrals',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+partner_id:id, prospect_name:prospect, organization_name:prospect,
+contact_email:item.querySelector('.pmRefEmail').value.trim(),
+contact_phone:item.querySelector('.pmRefPhone').value.trim(),
+region:item.querySelector('.pmRefRegion').value.trim(),
+requested_service:service,
+estimated_value:item.querySelector('.pmRefValue').value?Number(item.querySelector('.pmRefValue').value):null,
+notes:item.querySelector('.pmRefNotes').value.trim(),
+actor:'Aryan',
+})});
+alert('Referral registered.');
+pmOpenPartnerDetail=await api('/api/partners/'+id);
+await loadPmPartners();
+}catch(e){alert(e.message)}
+});
+}
+async function loadPmPendingApprovals(){
+try{
+const d=await api('/api/partners?status=PENDING');
+const items=d.items||[];
+$('pmPendingApprovalsList').innerHTML=items.length?items.map(p=>`<div class="item"><h3>${esc(p.full_name)}${p.organization_name?' -- '+esc(p.organization_name):''}</h3><div class="meta"><span class="badge">PENDING</span><span>${esc(p.email)}</span>${p.region?`<span>${esc(p.region)}</span>`:''}${p.assigned_manager?`<span>mgr: ${esc(p.assigned_manager)}</span>`:''}<span>applied ${esc(p.created_at)}</span></div><div class="actions"><button class="pmApprove2" data-id="${esc(p.id)}">Approve</button><button class="danger pmReject2" data-id="${esc(p.id)}">Reject</button></div></div>`).join(''):'<div class="empty">Nothing pending approval.</div>';
+document.querySelectorAll('.pmApprove2').forEach(b=>b.onclick=async()=>{if(!confirm('Approve this partner?'))return;try{await api(`/api/partners/${b.dataset.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadPmPendingApprovals()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmReject2').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for rejecting this partner application:');if(!reason)return;try{await api(`/api/partners/${b.dataset.id}/terminate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});await loadPmPendingApprovals()}catch(e){alert(e.message)}});
+}catch(e){$('pmPendingApprovalsList').innerHTML=`<div class="empty">Unable to load pending approvals: ${esc(e.message)}</div>`}
+}
+async function loadPmSuspendedTerminated(){
+try{
+const [susp,term]=await Promise.all([api('/api/partners?status=SUSPENDED'),api('/api/partners?status=TERMINATED')]);
+const suspItems=susp.items||[];
+$('pmSuspendedList').innerHTML=suspItems.length?suspItems.map(p=>`<div class="item"><h3>${esc(p.full_name)}${p.organization_name?' -- '+esc(p.organization_name):''}</h3><div class="meta"><span class="stat-warn">SUSPENDED</span><span>${esc(p.email)}</span><span>since ${esc(p.suspended_at||'')}</span><span>by ${esc(p.suspended_by||'')}</span></div>${p.suspension_reason?`<div class="contrib"><b>Reason:</b> ${esc(p.suspension_reason)}</div>`:''}<div class="actions"><button class="pmReinstate2" data-id="${esc(p.id)}">Reinstate</button><button class="danger pmTerminate2" data-id="${esc(p.id)}">Terminate</button></div></div>`).join(''):'<div class="empty">No suspended partners.</div>';
+const termItems=term.items||[];
+$('pmTerminatedList').innerHTML=termItems.length?termItems.map(p=>`<div class="item"><h3>${esc(p.full_name)}${p.organization_name?' -- '+esc(p.organization_name):''}</h3><div class="meta"><span class="stat-bad">TERMINATED</span><span>${esc(p.email)}</span><span>since ${esc(p.terminated_at||'')}</span><span>by ${esc(p.terminated_by||'')}</span></div>${p.termination_reason?`<div class="contrib"><b>Reason:</b> ${esc(p.termination_reason)}</div>`:''}</div>`).join(''):'<div class="empty">No terminated partners.</div>';
+document.querySelectorAll('.pmReinstate2').forEach(b=>b.onclick=async()=>{if(!confirm('Reinstate this partner to APPROVED?'))return;try{await api(`/api/partners/${b.dataset.id}/reinstate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadPmSuspendedTerminated()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmTerminate2').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for terminating this partner (permanent):');if(!reason)return;if(!confirm('Terminate this partner permanently?'))return;try{await api(`/api/partners/${b.dataset.id}/terminate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});await loadPmSuspendedTerminated()}catch(e){alert(e.message)}});
+}catch(e){$('pmSuspendedList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`;$('pmTerminatedList').innerHTML='';}
+}
+function pmAttrBadge(s){
+if(s==='ATTRIBUTED')return '<span class="stat-good">ATTRIBUTED</span>';
+if(s==='DISPUTED')return '<span class="stat-bad">DISPUTED</span>';
+if(s==='REJECTED'||s==='EXPIRED')return `<span class="stat-warn">${esc(s)}</span>`;
+return '<span class="badge">PENDING REVIEW</span>';
+}
+async function loadPmReferrals(){
+$('pmReferralFilterApply').onclick=()=>loadPmReferrals();
+try{
+const status=$('pmReferralFilter').value;
+const d=await api('/api/referrals'+(status?`?attribution_status=${encodeURIComponent(status)}`:''));
+const items=d.items||[];
+$('pmReferralsList').innerHTML=items.length?items.map(pmReferralCard).join(''):'<div class="empty">No referrals yet.</div>';
+wirePmReferralList();
+}catch(e){$('pmReferralsList').innerHTML=`<div class="empty">Unable to load referrals: ${esc(e.message)}</div>`}
+}
+function pmReferralCard(r){
+return `<div class="item"><h3>${esc(r.prospect_name)}${r.organization_name&&r.organization_name!==r.prospect_name?' -- '+esc(r.organization_name):''}</h3>
+<div class="meta">${pmAttrBadge(r.attribution_status)}${r.duplicate_flag?'<span class="badge">duplicate review open</span>':''}<span>partner ${esc(r.partner_id)}</span><span>${esc(r.requested_service)}</span>${r.estimated_value!=null?`<span>$${esc(String(r.estimated_value))}</span>`:''}${r.region?`<span>${esc(r.region)}</span>`:''}</div>
+<div class="meta">${r.attribution_expiry?`<span>expires ${esc(r.attribution_expiry)}</span>`:''}${r.opportunity_id?`<span>opportunity ${esc(r.opportunity_id)}</span>`:'<span>no linked opportunity yet</span>'}</div>
+<div class="actions">
+${r.attribution_status==='PENDING_REVIEW'&&!r.duplicate_flag?`<button class="pmAttribute" data-id="${esc(r.id)}">Attribute</button>`:''}
+${r.attribution_status==='PENDING_REVIEW'&&r.duplicate_flag?'<span class="meta">Open duplicate review must be resolved first</span>':''}
+${(r.attribution_status==='PENDING_REVIEW'||r.attribution_status==='DISPUTED')?`<button class="danger pmRejectReferral" data-id="${esc(r.id)}">Reject</button>`:''}
+${r.attribution_status==='ATTRIBUTED'?`<button class="secondary pmCheckExpiry" data-id="${esc(r.id)}">Check expiry</button><button class="danger pmRaiseDispute" data-id="${esc(r.id)}">Raise dispute</button>`:''}
+</div>
+</div>`;
+}
+function wirePmReferralList(){
+document.querySelectorAll('.pmAttribute').forEach(b=>b.onclick=async()=>{if(!confirm('Attribute this referral? This links it to (or creates) a CRM opportunity.'))return;try{await api(`/api/referrals/${b.dataset.id}/attribute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadPmReferrals()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmRejectReferral').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for rejecting this referral (optional):')||'';try{await api(`/api/referrals/${b.dataset.id}/reject`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});await loadPmReferrals()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmCheckExpiry').forEach(b=>b.onclick=async()=>{try{await api(`/api/referrals/${b.dataset.id}/check-expiry`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});await loadPmReferrals()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmRaiseDispute').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for disputing this attribution:');if(!reason)return;try{await api(`/api/referrals/${b.dataset.id}/dispute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});await loadPmReferrals()}catch(e){alert(e.message)}});
+}
+let pmDupFilterStatus='OPEN';
+async function loadPmDuplicateReview(){
+document.querySelectorAll('.pmDupFilter').forEach(b=>b.onclick=()=>{pmDupFilterStatus=b.dataset.status;document.querySelectorAll('.pmDupFilter').forEach(x=>x.classList.remove('active'));b.classList.add('active');loadPmDuplicateReview()});
+try{
+const d=await api('/api/referrals/duplicate-reviews?status='+encodeURIComponent(pmDupFilterStatus));
+const items=d.items||[];
+$('pmDuplicateReviewList').innerHTML=items.length?items.map(pmDupCard).join(''):'<div class="empty">No duplicate reviews in this state.</div>';
+wirePmDupList();
+}catch(e){$('pmDuplicateReviewList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`}
+}
+function pmDupCard(rv){
+let competing=[];try{competing=JSON.parse(rv.competing_referral_ids_json||'[]')}catch(e){}
+const resolved=rv.status==='RESOLVED';
+return `<div class="item"><h3>Duplicate review -- referral ${esc(rv.referral_id)}</h3>
+<div class="meta">${resolved?'<span class="stat-good">RESOLVED</span>':'<span class="badge">OPEN</span>'}<span>reason: ${esc(rv.detected_reason||'')}</span></div>
+<div class="contrib"><b>Competing:</b> ${competing.length?competing.map(c=>esc(c)).join(', '):'none'}</div>
+${resolved?`<div class="contrib"><b>Decision:</b> ${esc(rv.decision)} by ${esc(rv.reviewer)}${rv.awarded_referral_id?', awarded '+esc(rv.awarded_referral_id):''}${rv.resolution_reason?' -- '+esc(rv.resolution_reason):''}</div>`:
+`<div class="form">
+<select class="pmDupDecision" data-id="${esc(rv.id)}"><option value="NO_CONFLICT">No conflict -- clear both</option><option value="AWARD">Award to one referral</option><option value="REJECT_ALL">Reject all candidates</option></select>
+<input class="pmDupAwardId" data-id="${esc(rv.id)}" placeholder="Awarded referral ID (required for Award)">
+<input class="pmDupReason" data-id="${esc(rv.id)}" placeholder="Reason">
+<div class="actions"><button class="pmResolveDup" data-id="${esc(rv.id)}">Resolve</button></div>
+</div>`}
+</div>`;
+}
+function wirePmDupList(){
+document.querySelectorAll('.pmResolveDup').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const item=b.closest('.item');
+const decision=item.querySelector('.pmDupDecision').value;
+const awarded=item.querySelector('.pmDupAwardId').value.trim();
+const reason=item.querySelector('.pmDupReason').value.trim();
+if(decision==='AWARD'&&!awarded)return alert('awarded_referral_id is required for an AWARD decision.');
+if(!confirm('Resolve this duplicate review as '+decision+'?'))return;
+try{
+await api(`/api/referrals/duplicate-reviews/${id}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',decision,awarded_referral_id:awarded||null,reason})});
+await loadPmDuplicateReview();
+}catch(e){alert(e.message)}
+});
+}
+async function loadPmAttributionReview(){
+try{
+const d=await api('/api/referrals?attribution_status=DISPUTED');
+const items=d.items||[];
+$('pmAttributionReviewList').innerHTML=items.length?items.map(r=>`<div class="item"><h3>${esc(r.prospect_name)}</h3>
+<div class="meta"><span class="stat-bad">DISPUTED</span><span>partner ${esc(r.partner_id)}</span><span>${esc(r.requested_service)}</span>${r.opportunity_id?`<span>opportunity ${esc(r.opportunity_id)}</span>`:''}</div>
+<div class="form">
+<input class="pmDisputeReason" data-id="${esc(r.id)}" placeholder="Resolution reason (optional)">
+<div class="actions"><button class="pmDisputeReinstate" data-id="${esc(r.id)}">Reinstate attribution</button><button class="danger pmDisputeReject" data-id="${esc(r.id)}">Reject referral</button></div>
+</div>
+</div>`).join(''):'<div class="empty">No attribution disputes open.</div>';
+document.querySelectorAll('.pmDisputeReinstate').forEach(b=>b.onclick=async()=>{const item=b.closest('.item');const reason=item.querySelector('.pmDisputeReason').value.trim();try{await api(`/api/referrals/${b.dataset.id}/dispute/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',decision:'REINSTATE',reason})});await loadPmAttributionReview()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmDisputeReject').forEach(b=>b.onclick=async()=>{const item=b.closest('.item');const reason=item.querySelector('.pmDisputeReason').value.trim();if(!confirm('Reject this referral?'))return;try{await api(`/api/referrals/${b.dataset.id}/dispute/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',decision:'REJECT',reason})});await loadPmAttributionReview()}catch(e){alert(e.message)}});
+}catch(e){$('pmAttributionReviewList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`}
+}
+function pmCommissionBadge(s){
+if(s==='ELIGIBLE')return '<span class="stat-good">ELIGIBLE</span>';
+if(s==='PROVISIONAL')return '<span class="badge">PROVISIONAL</span>';
+if(s==='HELD')return '<span class="stat-warn">HELD</span>';
+if(s==='REVERSED')return '<span class="stat-bad">REVERSED</span>';
+return '<span class="meta">NOT ELIGIBLE</span>';
+}
+async function loadPmCommissions(){
+$('pmCommissionFilterApply').onclick=()=>loadPmCommissions();
+try{
+const status=$('pmCommissionFilter').value;
+const d=await api('/api/commissions'+(status?`?status=${encodeURIComponent(status)}`:''));
+const items=d.items||[];
+$('pmCommissionsList').innerHTML=items.length?items.map(pmCommissionCard).join(''):'<div class="empty">No commission records yet.</div>';
+wirePmCommissionList();
+}catch(e){$('pmCommissionsList').innerHTML=`<div class="empty">Unable to load: ${esc(e.message)}</div>`}
+}
+function pmCommissionCard(c){
+return `<div class="item"><h3>Commission for referral ${esc(c.referral_id)}</h3>
+<div class="meta">${pmCommissionBadge(c.status)}<span>partner ${esc(c.partner_id)}</span><span>rate ${(c.rate*100).toFixed(0)}%</span><span>eligible $${esc(String(c.eligible_amount))}</span>${c.refunded_amount?`<span>refunded $${esc(String(c.refunded_amount))}</span>`:''}${c.invoice_id?`<span>invoice ${esc(c.invoice_id)}</span>`:'<span>no linked invoice yet</span>'}</div>
+${c.hold_reason?`<div class="contrib"><b>Hold reason:</b> ${esc(c.hold_reason)}</div>`:''}
+<div class="actions">
+<button class="secondary pmSyncCommission" data-referral="${esc(c.referral_id)}">Sync from invoice</button>
+${(c.status==='PROVISIONAL'||c.status==='ELIGIBLE')?`<button class="danger pmHoldCommission" data-referral="${esc(c.referral_id)}">Hold</button>`:''}
+${c.status==='HELD'?`<button class="pmReleaseCommission" data-referral="${esc(c.referral_id)}">Release hold</button>`:''}
+${(c.status==='ELIGIBLE'||c.status==='PROVISIONAL'||c.status==='HELD')?`<button class="danger pmRefundCommission" data-referral="${esc(c.referral_id)}">Record refund</button>`:''}
+<button class="secondary pmCommissionEvents" data-id="${esc(c.id)}">Events</button>
+</div>
+<div class="list" id="pmCommissionEvents-${esc(c.id)}"></div>
+</div>`;
+}
+function wirePmCommissionList(){
+document.querySelectorAll('.pmSyncCommission').forEach(b=>b.onclick=async()=>{try{await api(`/api/referrals/${b.dataset.referral}/commission/sync`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadPmCommissions()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmHoldCommission').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for holding this commission:');if(!reason)return;try{await api(`/api/referrals/${b.dataset.referral}/commission/hold`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',reason})});await loadPmCommissions()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmReleaseCommission').forEach(b=>b.onclick=async()=>{if(!confirm('Release this hold?'))return;try{await api(`/api/referrals/${b.dataset.referral}/commission/release`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadPmCommissions()}catch(e){alert(e.message)}});
+document.querySelectorAll('.pmRefundCommission').forEach(b=>b.onclick=async()=>{
+const amount=prompt('Refund amount:');if(!amount)return;
+const evidence=prompt('Evidence (required -- e.g. refund transaction reference):');if(!evidence)return;
+const reason=prompt('Reason:')||'';
+try{await api(`/api/referrals/${b.dataset.referral}/commission/refund`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',amount:Number(amount),evidence:{note:evidence},reason})});await loadPmCommissions()}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.pmCommissionEvents').forEach(b=>b.onclick=async()=>{
+try{
+const d=await api(`/api/commissions/${b.dataset.id}/events`);
+const items=d.items||[];
+$('pmCommissionEvents-'+b.dataset.id).innerHTML=items.length?items.map(ev=>`<div class="contrib"><b>${esc(ev.event_type)}</b> ${esc(ev.status_before||'—')} &rarr; ${esc(ev.status_after||'—')} by ${esc(ev.actor)}${ev.amount!=null?', $'+esc(String(ev.amount)):''}${ev.reason?' -- '+esc(ev.reason):''}<div class="meta"><span>${esc(ev.created_at)}</span></div></div>`).join(''):'<div class="empty">No events.</div>';
+}catch(e){alert(e.message)}
+});
+}
+async function loadPmPerformance(){
+try{
+const partners=(await api('/api/partners')).items||[];
+if(!partners.length){$('pmPerformanceList').innerHTML='<div class="empty">No partners yet.</div>';return}
+const rows=await Promise.all(partners.map(async p=>{
+const [refs,comms]=await Promise.all([api(`/api/partners/${p.id}/referrals`),api(`/api/partners/${p.id}/commissions`)]);
+const referrals=refs.items||[];
+const commissions=comms.items||[];
+const attributed=referrals.filter(r=>r.attribution_status==='ATTRIBUTED').length;
+const disputed=referrals.filter(r=>r.attribution_status==='DISPUTED').length;
+const eligibleTotal=commissions.filter(c=>c.status==='ELIGIBLE').reduce((s,c)=>s+(c.eligible_amount||0),0);
+const provisionalTotal=commissions.filter(c=>c.status==='PROVISIONAL').reduce((s,c)=>s+(c.eligible_amount||0),0);
+const heldCount=commissions.filter(c=>c.status==='HELD').length;
+const reversedCount=commissions.filter(c=>c.status==='REVERSED').length;
+return {p,referralsCount:referrals.length,attributed,disputed,eligibleTotal,provisionalTotal,heldCount,reversedCount};
+}));
+$('pmPerformanceList').innerHTML=rows.map(r=>`<div class="item"><h3>${esc(r.p.full_name)}${r.p.organization_name?' -- '+esc(r.p.organization_name):''}</h3>
+<div class="meta">${pmPartnerBadge(r.p)}<span>${r.referralsCount} referral${r.referralsCount===1?'':'s'}</span><span>${r.attributed} attributed</span>${r.disputed?`<span>${r.disputed} disputed</span>`:''}</div>
+<div class="meta"><span>eligible commission: $${r.eligibleTotal.toFixed(2)}</span><span>provisional: $${r.provisionalTotal.toFixed(2)}</span>${r.heldCount?`<span>${r.heldCount} held</span>`:''}${r.reversedCount?`<span>${r.reversedCount} reversed</span>`:''}</div>
+</div>`).join('');
+}catch(e){$('pmPerformanceList').innerHTML=`<div class="empty">Unable to load performance summary: ${esc(e.message)}</div>`}
+}
 // ---------- Media / Growth ----------
 async function loadMediaBrands(){const d=await api('/api/media/brands');$('mediaBrandsList').innerHTML=(d.items||[]).length?d.items.map(b=>`<div class="item"><h3>${esc(b.name)}</h3><div class="meta">${b.voice_tone?`<span>${esc(b.voice_tone)}</span>`:''}${b.audience?`<span>${esc(b.audience)}</span>`:''}</div></div>`).join(''):'<div class="empty">No brands yet.</div>'}
 async function loadMediaContent(){const d=await api('/api/media/content');$('mediaContentList').innerHTML=(d.items||[]).length?d.items.map(c=>`<div class="item"><h3>${esc(c.title)}</h3><div class="meta"><span>${esc(c.content_state)}</span><span>${esc(c.format)}</span>${c.platform?`<span>${esc(c.platform)}</span>`:''}${c.planned_publish_date?`<span>due ${esc(c.planned_publish_date)}</span>`:''}</div></div>`).join(''):'<div class="empty">No content items yet.</div>'}

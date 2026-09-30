@@ -312,7 +312,10 @@ class StateStore:
             # TTT Communications V2 (falguna/risk_engine.py)
             "comm_risk_events",
             # Twenty Two Technologies -- Live Enquiry Activation V1 (falguna/tally_intake.py)
-            "tally_intake_events"}
+            "tally_intake_events",
+            # Sales Partner Pilot V1 (falguna/partner_management.py)
+            "pm_partners", "pm_partner_status_events", "pm_referrals", "pm_duplicate_reviews",
+            "pm_commissions", "pm_commission_events"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())
