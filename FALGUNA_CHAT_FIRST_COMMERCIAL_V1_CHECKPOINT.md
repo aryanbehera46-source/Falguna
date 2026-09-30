@@ -12,6 +12,15 @@ Date: 2026-09-30
 - Login, team accounts, invites, and a public plugin marketplace remain explicitly deferred; no fake actions were added.
 - Existing Falguna mark is reused for the product identity; source brand assets were not changed.
 
+## Commercial experience V4 refinement
+
+- Replaced exposed provider/routing jargon on the main product surface with one clear `Falguna` experience; technical provider and privacy controls remain in Settings.
+- Rebuilt the light visual system with brighter neutral surfaces, higher-contrast typography, warm brand depth, elevated cards, and a larger editorial landing hierarchy.
+- Rebuilt the composer around a real `+` capability menu for Files and folders, Web Research, Work, and Plugins.
+- New-chat file attachment now creates a real draft conversation only when a file is selected, uploads into the synthetic conversation store, and associates the attachment with the first message.
+- Added a real Plugins screen for the built-in capabilities actually available: Web Research, Work, Files, Memory, Projects, and Browser.
+- Third-party OAuth installation, public marketplace, shared plugins, and team accounts remain explicitly deferred rather than shown as installed.
+
 ## Isolation and data boundary
 
 - Branch: `work/chat-first-commercial-v1`
@@ -23,9 +32,11 @@ Date: 2026-09-30
 ## Verification
 
 - Python compile passed.
-- Focused regression: 20 tests passed (`HTMLSeparationTests`, `ConversationStoreTests`, `ChatResponderTests`).
+- Focused regression: 21 tests passed (`HTMLSeparationTests`, `ConversationStoreTests`, `ChatResponderTests`).
+- Extracted browser JavaScript passed `node --check`.
 - Desktop browser QA: 1440x960, chat landing, account menu, Help, Settings, no console warnings/errors.
-- Responsive browser QA: 780x1688 CSS viewport (mobile breakpoint active), no horizontal overflow, no console warnings/errors.
+- Desktop browser QA additionally covered the expanded capability menu and Plugins screen.
+- Responsive browser QA: 780x1688 CSS viewport (mobile breakpoint active), no horizontal overflow, no new console errors.
 - A broader combined web run was not counted as passing: it reproduced the known SQLite disk-I/O / server teardown instability and was interrupted rather than overstated.
 
 ## Deferred commercial phases

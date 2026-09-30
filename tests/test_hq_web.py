@@ -117,14 +117,20 @@ class HTMLSeparationTests(unittest.TestCase):
     def test_falguna_account_menu_only_exposes_real_routes(self):
         for route in ('data-account-go="#/settings"', 'data-account-go="#/help"', 'data-account-go="#/tools"'):
             self.assertIn(route, INDEX_HTML)
-        self.assertIn("Login, team accounts, invites and a public plugin marketplace are planned", INDEX_HTML)
+        self.assertIn("Team accounts, invites, and third-party installation require", INDEX_HTML)
         self.assertNotIn('data-account-go="#/login"', INDEX_HTML)
         self.assertNotIn('data-account-go="#/invite"', INDEX_HTML)
 
-    def test_falguna_new_chat_model_control_is_wired(self):
-        self.assertIn('id="newChatModel"', INDEX_HTML)
-        self.assertIn("const selectedModel=$('newChatModel')?.value", INDEX_HTML)
-        self.assertIn("/model`,{method:'POST'", INDEX_HTML)
+    def test_falguna_composer_exposes_real_capabilities_not_provider_jargon(self):
+        self.assertIn('id="capabilityMenu"', INDEX_HTML)
+        for capability in ('data-capability="files"', 'data-capability="research"', 'data-capability="work"', 'data-capability="plugins"'):
+            self.assertIn(capability, INDEX_HTML)
+        self.assertNotIn('id="newChatModel"', INDEX_HTML)
+        self.assertNotIn('Auto · local first', INDEX_HTML)
+
+    def test_falguna_new_chat_attachment_creates_a_real_draft_conversation(self):
+        self.assertIn("if(!draftConversationId){const draft=await api('/api/conversations'", INDEX_HTML)
+        self.assertIn("attachment_ids:pendingAttachments.map", INDEX_HTML)
 
 
 class WorkforceAutoResumeClassificationTests(unittest.TestCase):
