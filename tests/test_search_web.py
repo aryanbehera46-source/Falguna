@@ -293,7 +293,17 @@ class ResearchResponderTests(unittest.TestCase):
 class _LiveFalgunaServerCase(unittest.TestCase):
     """Boots a real repo + a real FalgunaHandler HTTP server on a scratch
     port -- same pattern as test_chat_web.py's _LiveFalgunaServerCase, kept
-    as a local copy here so this file has no cross-test-file import."""
+    as a local copy here so this file has no cross-test-file import.
+
+    Sprint 3 fix: this used to bind the fixed literal port 8798 directly,
+    the exact same hardcoded number test_hq_web.py's FalgunaServerStillWorksTests
+    also bound -- confirmed as one of the two root causes of the Sprint 2
+    full-suite collisions (15 errors / 1 failure, all "Address already in
+    use" during setUp). Fixed the same way as test_hq_web.py: bind to port 0
+    and read the real OS-assigned ephemeral port back from
+    server_address[1]. The class attribute below is no longer read for
+    binding -- setUp() overwrites it as an instance attribute with the real
+    bound port."""
 
     port = 8798
 
@@ -308,7 +318,8 @@ class _LiveFalgunaServerCase(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "seed"], check=True, capture_output=True)
         self.control, self.store = open_control_plane(self.repo)
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), FalgunaHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FalgunaHandler)
+        self.port = self.server.server_address[1]
         self.server.app_root = self.repo
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

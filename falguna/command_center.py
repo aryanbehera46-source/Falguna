@@ -240,7 +240,19 @@ class CEOBriefStore:
     def get(self, brief_id: str) -> Optional[Dict[str, Any]]:
         return self.store.get("cc_ceo_briefs", brief_id)
 
-    def generate(self, actor: str = "system", period_start: Optional[str] = None) -> Dict[str, Any]:
+    def generate(self, actor: str = "system", period_start: Optional[str] = None,
+                 narrator: Optional[Any] = None) -> Dict[str, Any]:
+        """`narrator` (Phase 4 Sprint 3, Section 6) is optional and purely
+        additive: when given, it must implement `.narrate(confirmed_facts,
+        estimates, recommendations, risks) -> str` and set
+        `.last_source_label` (e.g. "model:openai/gpt-4o-mini") as a side
+        effect of that call. It is used only to render the already-computed,
+        deterministic content below as readable prose -- it is never
+        consulted for the facts, estimates, recommendations or priorities
+        themselves, and a raised exception (model unavailable, malformed
+        reply, anything) falls back to a deterministic narrative built from
+        those same facts, exactly the same fallback philosophy every other
+        deterministic computation in this class already uses."""
         now = datetime.now(timezone.utc)
         period_end = now.isoformat()
         if period_start is None:
@@ -251,10 +263,13 @@ class CEOBriefStore:
                 period_start = (now - timedelta(hours=CEO_BRIEF_DEFAULT_LOOKBACK_HOURS)).isoformat()
 
         confirmed_facts = self._confirmed_facts(period_start, period_end)
+        confirmed_facts.update(self._partner_commission_facts(period_start, period_end))
         snapshot = command_center_snapshot(self.store)
         estimates = self._estimates(snapshot)
         recommendations = self._recommendations(snapshot)
         top_priorities = self._top_priorities(snapshot)
+
+        narrative, narrative_source = self._narrative(narrator, confirmed_facts, estimates, recommendations, snapshot["risk_signals"])
 
         brief_id = self.store.create("cc_ceo_briefs", {
             "period_start": period_start, "period_end": period_end,
@@ -263,10 +278,71 @@ class CEOBriefStore:
             "recommendations_json": json.dumps(recommendations),
             "top_priorities_json": json.dumps(top_priorities),
             "risks_json": json.dumps(snapshot["risk_signals"]),
+            "narrative": narrative, "narrative_source": narrative_source,
             "actor": actor, "created_at": now.isoformat(),
         })
-        self.audit.append("CEO_BRIEF_GENERATED", {"brief_id": brief_id, "period_start": period_start, "period_end": period_end, "actor": actor})
+        self.audit.append("CEO_BRIEF_GENERATED", {"brief_id": brief_id, "period_start": period_start, "period_end": period_end, "actor": actor, "narrative_source": narrative_source})
         return self.store.get("cc_ceo_briefs", brief_id)
+
+    def _partner_commission_facts(self, period_start: str, period_end: str) -> Dict[str, Any]:
+        """Sales Partner Pilot V1 facts (Section 6: "partner/referral issues"
+        and "commission liabilities"), added without touching
+        command_center_snapshot or duplicating partner_management.py's own
+        arithmetic -- these are the two current-state numbers a founder
+        brief needs that neither confirmed_facts nor command_center_snapshot
+        currently surfaces."""
+        referrals = self.store.list("pm_referrals")
+        new_referrals_since = [r for r in referrals if period_start <= r["created_at"] < period_end]
+        open_conflicts = self.store.list("pm_duplicate_reviews", "status=?", ("OPEN",))
+        commissions = self.store.list("pm_commissions")
+        # COMMISSION_STATUSES (partner_management.py) = NOT_ELIGIBLE,
+        # PROVISIONAL, ELIGIBLE, HELD, REVERSED, PAID. Both ELIGIBLE (earned,
+        # awaiting payout) and HELD (earned but explicitly blocked) are real
+        # money the company owes a partner and has not yet paid -- the
+        # liability this brief needs. PROVISIONAL is not yet confirmed,
+        # REVERSED/PAID/NOT_ELIGIBLE owe nothing further.
+        held_commissions = [c for c in commissions if c["status"] in ("HELD", "ELIGIBLE")]
+        held_total = round(sum((c["eligible_amount"] or 0.0) - (c["refunded_amount"] or 0.0) for c in held_commissions), 2)
+        return {
+            "new_referrals": len(new_referrals_since),
+            "open_partner_conflicts": len(open_conflicts),
+            "held_commission_liability_total": held_total,
+            "held_commission_count": len(held_commissions),
+        }
+
+    def _narrative(self, narrator: Optional[Any], confirmed_facts: Dict[str, Any], estimates: List[str],
+                    recommendations: List[str], risks: List[Dict[str, Any]]) -> tuple:
+        if narrator is not None:
+            try:
+                text = narrator.narrate(confirmed_facts, estimates, recommendations, risks)
+                if text and isinstance(text, str) and text.strip():
+                    return text.strip(), getattr(narrator, "last_source_label", "model")
+            except Exception:
+                pass  # fall through to the deterministic narrative below -- never a hard failure
+        return self._deterministic_narrative(confirmed_facts, estimates, recommendations, risks), "deterministic"
+
+    @staticmethod
+    def _deterministic_narrative(confirmed_facts: Dict[str, Any], estimates: List[str],
+                                  recommendations: List[str], risks: List[Dict[str, Any]]) -> str:
+        parts = []
+        if confirmed_facts.get("deals_won") or confirmed_facts.get("new_opportunities"):
+            parts.append(
+                f"Since the last brief: {confirmed_facts.get('deals_won', 0)} deal(s) won, "
+                f"{confirmed_facts.get('new_opportunities', 0)} new opportunit(y/ies), "
+                f"{confirmed_facts.get('payments_received_count', 0)} payment(s) received "
+                f"totaling {confirmed_facts.get('payments_received_total', 0)}."
+            )
+        else:
+            parts.append("No new deals, opportunities, or payments recorded since the last brief.")
+        if confirmed_facts.get("open_partner_conflicts"):
+            parts.append(f"{confirmed_facts['open_partner_conflicts']} partner attribution conflict(s) remain open.")
+        if confirmed_facts.get("held_commission_count"):
+            parts.append(f"{confirmed_facts['held_commission_count']} commission(s) held, totaling {confirmed_facts['held_commission_liability_total']}.")
+        if risks:
+            parts.append(f"{len(risks)} risk signal(s) flagged.")
+        if recommendations:
+            parts.append(recommendations[0])
+        return " ".join(parts)
 
     def _confirmed_facts(self, period_start: str, period_end: str) -> Dict[str, Any]:
         stage_events = self.store.list("rh_stage_history")

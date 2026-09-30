@@ -204,6 +204,28 @@ CREATE TABLE IF NOT EXISTS cc_risks (id TEXT PRIMARY KEY, title TEXT NOT NULL, c
 CREATE INDEX IF NOT EXISTS idx_cc_budgets_department ON cc_budgets(department, status);
 CREATE INDEX IF NOT EXISTS idx_cc_risks_status ON cc_risks(status, severity);
 
+-- Phase 4 Sprint 3: FALGUNA Executive Coordinator V1 -- structured, auditable
+-- recommendations (Section 4). A recommendation is a first-class advisory
+-- record with its own lifecycle (PENDING -> AUTHORIZED/DECLINED -> EXECUTED),
+-- distinct from a Needs-Aryan item (the human decision point it links to via
+-- needs_aryan_id) and distinct from an alert (an alert is stateless/derived;
+-- a recommendation is a persisted, model-or-rule-generated suggestion with
+-- its own outcome). id is a stable hash of (category, ref_type, ref_id) so
+-- re-running generation never creates a duplicate PENDING recommendation for
+-- the same underlying situation.
+CREATE TABLE IF NOT EXISTS co_recommendations (
+    id TEXT PRIMARY KEY, category TEXT NOT NULL, department TEXT,
+    ref_type TEXT, ref_id TEXT, recommended_action TEXT NOT NULL,
+    evidence_json TEXT NOT NULL, explanation TEXT NOT NULL, priority TEXT NOT NULL,
+    confidence TEXT, financial_impact REAL, financial_impact_currency TEXT,
+    model_provider TEXT, model_id TEXT, needs_aryan_id TEXT,
+    status TEXT NOT NULL, decided_by TEXT, decision TEXT, decision_at TEXT,
+    outcome TEXT, outcome_ref_type TEXT, outcome_ref_id TEXT, outcome_at TEXT,
+    actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_co_recommendations_status ON co_recommendations(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_co_recommendations_category ON co_recommendations(category, ref_type, ref_id);
+
 -- TTT Trading Lab v1 (Sections 1-27). PAPER/RESEARCH ONLY -- no table here
 -- ever represents a real brokerage/exchange order or real money movement.
 -- `tl_` prefix, additive-only CREATE TABLE IF NOT EXISTS, same convention

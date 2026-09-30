@@ -238,6 +238,15 @@ class StateStore:
         # like every other additive column here; PlanStore.create() and
         # route_plan() both treat that the same as an explicit empty list.
         "co_plans": [("workforce_assignments_json", "TEXT")],
+        # Phase 4 Sprint 3 (Executive Brief V1): an optional model-generated
+        # narrative paragraph layered on top of the brief's already-computed,
+        # deterministic confirmed_facts/estimates/recommendations -- never a
+        # replacement for them. NULL for every brief generated before this
+        # column existed, and for any brief generated while no model was
+        # reachable (CEOBriefStore.generate() falls back to a deterministic
+        # narrative in that case and still sets narrative_source="deterministic"
+        # so the UI never confuses "no model" with "no brief").
+        "cc_ceo_briefs": [("narrative", "TEXT"), ("narrative_source", "TEXT")],
     }
 
     def migrate(self) -> None:
@@ -279,6 +288,7 @@ class StateStore:
             "media_brands", "media_campaigns", "media_content_items", "media_content_events", "media_scripts",
             "media_assets", "media_publications", "media_analytics", "media_experiments", "media_lead_attributions",
             "cc_ceo_briefs", "cc_goals", "cc_goal_progress_events", "cc_ledger_entries", "cc_budgets", "cc_risks",
+            "co_recommendations",
             "tl_markets", "tl_instruments", "tl_data_sources", "tl_datasets", "tl_ohlcv_bars", "tl_data_quality_reports",
             "tl_strategies", "tl_strategy_versions", "tl_strategy_status_events", "tl_backtests", "tl_stress_tests",
             "tl_risk_limits", "tl_risk_breach_events", "tl_paper_accounts", "tl_paper_orders", "tl_paper_positions",

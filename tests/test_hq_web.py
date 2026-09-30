@@ -148,7 +148,25 @@ class WorkforceAutoResumeClassificationTests(unittest.TestCase):
 
 
 class _LiveServerCase(unittest.TestCase):
-    """Base class that boots a real repo + real HTTP server on a scratch port."""
+    """Base class that boots a real repo + real HTTP server on a scratch port.
+
+    Sprint 3 fix: hq_port/falguna_port used to be fixed literals (8799/8798)
+    bound directly in each subclass's setUp(). Many distinct _LiveServerCase
+    subclasses (including test_search_web.py's independent SearchHttpLayerTests,
+    which keeps its own local copy of the same literal 8798) bind a server per
+    test method reusing those same hardcoded numbers, so an OS-level
+    TIME_WAIT/socket-release race between one test's tearDown() and the next
+    bind() on the identical port intermittently raised "OSError: [Errno 48]
+    Address already in use" under a large combined run -- confirmed real in the
+    Sprint 2 full-suite run (17 failures / 15 errors, the large majority of
+    which were exactly this collision). Not a defect in the server or any
+    test's assertions -- pure test-infrastructure fragility. Fixed by binding
+    to port 0 and reading the real, OS-assigned ephemeral port back from
+    server_address[1] instead. The class attributes below are no longer read
+    for binding -- each setUp() overwrites them as instance attributes with
+    the real bound port -- kept only as documented defaults for anything that
+    inspects the class before a server exists.
+    """
 
     hq_port = 8799
     falguna_port = 8798
@@ -253,7 +271,8 @@ class WorkforceRestartReconciliationTests(_LiveServerCase):
 class TTTHQServerTests(_LiveServerCase):
     def setUp(self):
         super().setUp()
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.hq_port), TTTHQHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), TTTHQHandler)
+        self.hq_port = self.server.server_address[1]
         self.server.app_root = self.repo
         self.server.falguna_url = "http://127.0.0.1:8765"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -619,8 +638,11 @@ class WorkforceMediaHQServerTests(TTTHQServerTests):
         self.assertEqual(company_state["financials"]["collected"], 0)
         self.assertIn("delivery", company_state["sources"])
 
-        code = self._get_raises(self.hq_port, "/api/cc/ceo-brief/latest")
-        self.assertEqual(code, 404)
+        # Phase 4 Sprint 3, Section 6: no brief yet is a normal empty
+        # state, not an HTTP error.
+        status, empty = self._get(self.hq_port, "/api/cc/ceo-brief/latest")
+        self.assertEqual(status, 200)
+        self.assertIsNone(empty.get("brief"))
 
         status, brief = self._post(self.hq_port, "/api/cc/ceo-brief/generate", {"actor": "Aryan"})
         self.assertEqual(status, 201)
@@ -633,6 +655,64 @@ class WorkforceMediaHQServerTests(TTTHQServerTests):
         status, listing = self._get(self.hq_port, "/api/cc/ceo-brief")
         self.assertEqual(status, 200)
         self.assertTrue(any(b["id"] == brief["id"] for b in listing["items"]))
+
+    def test_executive_coordinator_full_loop_over_http(self):
+        # Phase 4 Sprint 3: the complete, real synthetic sequence Section 14
+        # requires -- a genuinely stale opportunity -> FALGUNA assessment ->
+        # an evidence-backed recommendation -> human review through the
+        # *existing* Needs Aryan decision route -> one bounded, real
+        # internal wf_tasks -> a recorded outcome -- end to end, entirely
+        # through the real HTTP layer (no direct store access except to
+        # simulate the passage of time, since there is no HTTP route for
+        # backdating history and there should not be one).
+        status, opp_out = self._post(self.hq_port, "/api/rh/opportunities", {
+            "title": "Stale HTTP Deal", "client_name": "HTTP Client",
+        })
+        self.assertEqual(status, 201)
+        opportunity_id = opp_out["opportunity_id"]
+        status, _ = self._post(self.hq_port, f"/api/rh/opportunities/{opportunity_id}/stage", {
+            "to_stage": "Qualified", "actor": "Aryan",
+        })
+        self.assertEqual(status, 200)
+        old = "2020-01-01T00:00:00+00:00"
+        for h in self.store.list("rh_stage_history", "opportunity_id=?", (opportunity_id,)):
+            self.store.db.execute("UPDATE rh_stage_history SET created_at=? WHERE id=?", (old, h["id"]))
+        self.store.db.commit()
+
+        status, assessment = self._get(self.hq_port, "/api/executive/assessment")
+        self.assertEqual(status, 200)
+        self.assertIn("workflows", assessment)
+        self.assertIn("company_state", assessment)
+
+        status, synced = self._post(self.hq_port, "/api/executive/sync", {"actor": "FALGUNA"})
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(synced["created_count"], 1)
+        rec = next(r for r in synced["recommendations"] if r["category"] == "followup_inactive_opportunity" and r["ref_id"] == opportunity_id)
+        self.assertEqual(rec["status"], "PENDING")
+        self.assertIsNotNone(rec["needs_aryan_id"])
+
+        status, listed = self._get(self.hq_port, "/api/executive/recommendations?status=PENDING")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(r["id"] == rec["id"] for r in listed["items"]))
+
+        # The human review step: the exact same, already-tested Needs Aryan
+        # decision route Sprint 2's Unified Decision Queue already uses --
+        # never a second, parallel approval endpoint.
+        status, decision = self._post(self.hq_port, f"/api/needs-aryan/{rec['needs_aryan_id']}/decision", {
+            "action": "approve", "actor": "Aryan",
+        })
+        self.assertEqual(status, 200)
+
+        status, after = self._get(self.hq_port, "/api/executive/recommendations")
+        self.assertEqual(status, 200)
+        final = next(r for r in after["items"] if r["id"] == rec["id"])
+        self.assertEqual(final["status"], "EXECUTED")
+        self.assertIsNotNone(final["outcome_ref_id"])
+
+        status, task = self._get(self.hq_port, f"/api/wf/tasks/{final['outcome_ref_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(task["source"], f"co_recommendation:{rec['id']}")
+        self.assertEqual(task["department"], "sales")
 
     def test_goals_and_kpis_over_http(self):
         status, out = self._post(self.hq_port, "/api/cc/goals", {
@@ -1036,7 +1116,8 @@ class FalgunaServerStillWorksTests(_LiveServerCase):
 
     def setUp(self):
         super().setUp()
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.falguna_port), FalgunaHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FalgunaHandler)
+        self.falguna_port = self.server.server_address[1]
         self.server.app_root = self.repo
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

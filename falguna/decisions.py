@@ -34,12 +34,15 @@ DEPARTMENT_BY_REF_TYPE = {
     "rh_proposal": "Revenue Hunter", "rh_closing_package": "Revenue Hunter",
     "comm_conversation": "Communications", "cc_reserve_policy": "Finance & Capital",
     "run": "Falguna Engineering", "co_decisions": "Company OS",
+    # Phase 4 Sprint 3: FALGUNA Executive Coordinator recommendation reviews.
+    "co_recommendation": "Executive Coordinator",
 }
 
 VIEW_BY_REF_TYPE = {
     "rh_proposal": "rhPipeline", "rh_closing_package": "rhDeliveryEngine",
     "comm_conversation": "communications", "cc_reserve_policy": "ccCapital",
     "co_decisions": "coDecisions",
+    "co_recommendation": "coordinatorRecommendations",
 }
 
 

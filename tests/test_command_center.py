@@ -193,5 +193,41 @@ class CEOBriefTests(CommandCenterBase):
         self.store = reopened_store  # let tearDown close this live handle
 
 
+class _FakeNarratorSuccess:
+    def __init__(self):
+        self.last_source_label = "model:test-provider/test-model"
+
+    def narrate(self, confirmed_facts, estimates, recommendations, risks):
+        return "Model-written CEO brief narrative."
+
+
+class _FakeNarratorFailure:
+    last_source_label = "model:test-provider/test-model"
+
+    def narrate(self, confirmed_facts, estimates, recommendations, risks):
+        raise RuntimeError("simulated model transport failure")
+
+
+class CEOBriefNarratorTests(CommandCenterBase):
+    """Phase 4 Sprint 3, Section 6: narrator is optional and purely additive
+    -- a brief must always be generated, with or without a reachable model,
+    and the deterministic narrative must never be silently skipped."""
+
+    def test_no_narrator_uses_deterministic_narrative(self):
+        brief = CEOBriefStore(self.store, self.audit).generate("Aryan")
+        self.assertEqual(brief["narrative_source"], "deterministic")
+        self.assertTrue(brief["narrative"])
+
+    def test_narrator_success_is_used_and_labeled(self):
+        brief = CEOBriefStore(self.store, self.audit).generate("Aryan", narrator=_FakeNarratorSuccess())
+        self.assertEqual(brief["narrative"], "Model-written CEO brief narrative.")
+        self.assertEqual(brief["narrative_source"], "model:test-provider/test-model")
+
+    def test_narrator_failure_falls_back_to_deterministic(self):
+        brief = CEOBriefStore(self.store, self.audit).generate("Aryan", narrator=_FakeNarratorFailure())
+        self.assertEqual(brief["narrative_source"], "deterministic")
+        self.assertTrue(brief["narrative"])
+
+
 if __name__ == "__main__":
     unittest.main()

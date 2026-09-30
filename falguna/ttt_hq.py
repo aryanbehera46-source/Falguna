@@ -84,6 +84,17 @@ NEEDS_ARYAN_KINDS = {
     # already does -- this kind is for the broader approval surface above
     # and beyond that one narrow case.
     "communications_approval",
+    # Added for FALGUNA Executive Coordinator V1 (Phase 4 Sprint 3): a
+    # structured, evidence-backed recommendation FALGUNA generated from real
+    # persisted company state (see falguna/executive_coordinator.py) that
+    # needs an owner decision before any internal task is created from it.
+    # This is deliberately a review of FALGUNA's *suggestion*, distinct from
+    # every business-originated kind above -- approving one never itself
+    # approves a proposal/closing/invoice/etc.; it only authorizes FALGUNA
+    # to route a bounded, non-financial internal task (see
+    # executive_coordinator.py's _INTERNAL_TASK_CATEGORIES) through the
+    # existing, already-authorized Workforce task-creation mechanism.
+    "executive_recommendation_review",
 }
 NEEDS_ARYAN_ACTIONS = {"approve": "APPROVED", "reject": "REJECTED", "defer": "DEFERRED", "request-changes": "CHANGES_REQUESTED"}
 # A run in one of these statuses cannot become actionable again through

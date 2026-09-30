@@ -52,6 +52,7 @@ from .company_state import CompanyStateService
 from .decisions import unified_decision_queue
 from .alerts import AlertAckStore, alerts_snapshot
 from .orchestration import workflow_monitor_snapshot
+from .executive_coordinator import ExecutiveCoordinator, ModelNarrator
 from .company_os import (
     CompanyMemoryStore, CompanyOSError, CompanyPolicyStore, CostEstimateStore, DecisionStore,
     DepartmentObjectiveStore, EventBus, ExecutionOrchestrator, FailureStore, ObjectiveStore, PlanStore,
@@ -297,6 +298,23 @@ _askf_operations = {}
 _askf_operations_lock = threading.Lock()
 _askf_cancel_events = {}
 _askf_cancel_events_lock = threading.Lock()
+
+
+def _build_executive_narrator(store):
+    """Builds a real ModelNarrator through the exact same provider-neutral
+    gateway/router pair `_run_askf_reply` already uses (Phase 4 Sprint 3,
+    Section 3/6). Any construction failure (no model configured, registry
+    error, anything) is swallowed here and None is returned -- the caller
+    always gets a working ExecutiveCoordinator either way, just without a
+    narrator when this fails, and every recommendation still gets its full
+    deterministic explanation. This mirrors the same fallback philosophy
+    CEOBriefStore.generate()'s narrator argument already uses."""
+    try:
+        gateway = OpenAICompatibleGateway(None, "http://127.0.0.1:1/v1", "")
+        transport = ModelRouter.from_registry(ModelRegistry(store), codex_use_fallback=True)
+        return ModelNarrator(gateway, transport, None, timeout_seconds=45)
+    except Exception:
+        return None
 
 
 def _run_askf_reply(app_root, token, clean_history, cancel_event):
@@ -584,9 +602,25 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 ))
             if path == "/api/alerts":
                 return self._json(alerts_snapshot(store, control.audit))
+            if path == "/api/executive/assessment":
+                # Section 3: "understand the current operational situation" --
+                # pure composition of the existing read models, nothing new
+                # computed about business state itself.
+                return self._json(ExecutiveCoordinator(store, control.audit).assess())
+            if path == "/api/executive/recommendations":
+                query = parse_qs(urlparse(self.path).query)
+                status = (query.get("status") or [None])[0]
+                items = ExecutiveCoordinator(store, control.audit).recommendations.list(status=status)
+                return self._json({"items": items})
             if path == "/api/cc/ceo-brief/latest":
+                # Phase 4 Sprint 3, Section 6: a fresh install with no brief
+                # yet is a normal, expected state -- not an error. This
+                # always returns 200: the brief dict directly once one
+                # exists (unchanged shape for existing callers), or
+                # {"brief": null} until then, so the HQ UI's initial load
+                # never produces a spurious 404 in the browser console.
                 brief = CEOBriefStore(store, control.audit).latest()
-                return self._json(brief or {"error": "no brief generated yet"}, HTTPStatus.OK if brief else HTTPStatus.NOT_FOUND)
+                return self._json(brief if brief else {"brief": None})
             if path == "/api/cc/ceo-brief":
                 return self._json({"items": CEOBriefStore(store, control.audit).list()})
             if path == "/api/cc/kpis":
@@ -1235,6 +1269,16 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     topic_id = path.split("/")[3]
                     topic = BoardroomStore(store, control.audit).set_follow_up(topic_id, body.get("follow_up", ""), body.get("actor", "Aryan"))
                     return self._json(topic)
+                if path.startswith("/api/boardroom/") and path.endswith("/prepare-memo"):
+                    # Section 7: writes a real, evidence-backed brief into
+                    # the topic's existing discussion_summary field --
+                    # extends the existing Boardroom mechanism, no new one.
+                    topic_id = path.split("/")[3]
+                    try:
+                        topic = ExecutiveCoordinator(store, control.audit).prepare_board_memo(topic_id, body.get("actor", "Aryan"))
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return self._json(topic)
                 if path == "/api/backlog":
                     item_id = BacklogStore(store, control.audit).create_item(
                         body.get("title", ""), body.get("actor", "Aryan"), category=body.get("category"),
@@ -1378,6 +1422,17 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     return self._json({"alert_id": alert_id, "acknowledged": True})
                 if path == "/api/orchestration/sync":
                     return self._json({"workflows": workflow_monitor_snapshot(store, control.audit)["workflows"]})
+                if path == "/api/executive/sync":
+                    # Section 3/4: generate any new deterministic
+                    # recommendations (each linked to a real NeedsAryanQueue
+                    # item -- the single existing human decision point) and
+                    # sweep outcomes for previously-approved ones. The model
+                    # narrator is best-effort: a construction failure (no
+                    # model configured, registry error) never blocks this --
+                    # every recommendation still carries its full
+                    # deterministic explanation either way.
+                    coordinator = ExecutiveCoordinator(store, control.audit, narrator=_build_executive_narrator(store))
+                    return self._json(coordinator.sync(actor=body.get("actor", "FALGUNA")))
                 if path == "/api/needs-aryan":
                     item_id = NeedsAryanQueue(store, control.audit, control).create_item(
                         body.get("kind", ""), body.get("title", ""), body.get("what_is_needed", ""),
@@ -1417,6 +1472,16 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                             # actually written -- the exact same pattern as
                             # the rh_closing_package hook right above.
                             ReservePolicyStore(store, control.audit).apply_pending_change(item_id, body.get("actor", "Aryan"))
+                        if before.get("ref_type") == "co_recommendation":
+                            # Phase 4 Sprint 3, Section 5: this decision IS
+                            # the human review step in recommend -> review ->
+                            # (bounded internal task) -> outcome. Sweeping
+                            # outcomes right here means an approval creates
+                            # its one allowed internal task immediately,
+                            # instead of waiting on a later poll of
+                            # /api/executive/sync. sync_outcomes() is
+                            # idempotent -- safe even if a poll also runs.
+                            ExecutiveCoordinator(store, control.audit).sync_outcomes(actor=body.get("actor", "Aryan"))
                     return self._json(result)
 
                 if path == "/api/rh/opportunities":
@@ -2616,6 +2681,7 @@ Ask Falguna
 <button class="navitem" data-view="orchWorkflows">Workflow Monitor</button>
 <button class="navitem" data-view="orchDecisions">Unified Decisions</button>
 <button class="navitem" data-view="orchAlerts">Operational Alerts</button>
+<button class="navitem" data-view="coordinatorRecommendations">Executive Coordinator</button>
 <details class="navexec" data-exec="briefing" open>
 <summary class="navsec navsec-exec">Briefing<span class="chev" aria-hidden="true"></span></summary>
 <button class="navitem" data-view="coCeoV2">CEO Brief</button>
@@ -3024,6 +3090,18 @@ Ask Falguna
 <div class="section" style="flex:1"><h2 id="alertLow">0</h2><div class="sub">Low severity</div></div>
 </div>
 <div class="list" id="orchAlertsList"></div>
+</div>
+<div class="view" id="view-coordinatorRecommendations">
+<h1>Executive Coordinator</h1>
+<div class="pageintro">FALGUNA turns the existing company read models (workflows, unified decisions, operational alerts, revenue &amp; delivery, workforce) into structured, evidence-backed recommendations. Every core field -- category, linked record, evidence, priority, financial impact -- is computed by deterministic rules first; a model, when reachable, only rewrites the explanation text. Nothing here executes on its own: every recommendation is reviewed through the same Needs Aryan queue as everything else, and an approval only ever triggers one narrow, non-financial internal task for a small named set of categories -- every other approval's outcome is simply the decision itself.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="coordPending">0</h2><div class="sub">Pending review</div></div>
+<div class="section" style="flex:1"><h2 id="coordAuthorized">0</h2><div class="sub">Authorized</div></div>
+<div class="section" style="flex:1"><h2 id="coordExecuted">0</h2><div class="sub">Executed</div></div>
+<div class="section" style="flex:1"><h2 id="coordDeclined">0</h2><div class="sub">Declined</div></div>
+</div>
+<div class="actions"><button id="coordSyncBtn" type="button">Sync now</button></div>
+<div class="list" id="coordRecommendationsList"></div>
 </div>
 <div class="view" id="view-communications">
 <h1>Communications</h1>
@@ -3555,7 +3633,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -3740,7 +3818,7 @@ $('ccMediaFailures').classList.toggle('stat-bad',Number(d.media.publishing_failu
 $('ccRisks').innerHTML=(d.risk_signals||[]).length?d.risk_signals.map(r=>`<div class="item"><h3>${esc(r.summary)}</h3><div class="meta"><span>${esc(r.category)}</span><span class="stat-warn">${esc(r.severity)}</span></div></div>`).join(''):'<div class="empty stat-good">No active risk signals.</div>';
 $('ccUpcoming').innerHTML=(d.upcoming_obligations||[]).length?d.upcoming_obligations.map(o=>`<div class="item"><h3>${esc(o.kind)}</h3><div class="meta"><span>due ${esc(o.due_date||'')}</span></div></div>`).join(''):'<div class="empty">Nothing due soon.</div>';
 $('ccKeyOpps').innerHTML=(d.pipeline.key_opportunities||[]).length?d.pipeline.key_opportunities.map(o=>`<div class="item"><h3>${esc(o.title)}</h3><div class="meta"><span>${esc(o.stage)}</span><span>${esc(o.client_name||'')}</span></div></div>`).join(''):'<div class="empty">No active opportunities.</div>';
-try{const b=await api('/api/cc/ceo-brief/latest');if(!b.error){renderCeoBrief(b)}}catch(e){}
+try{const b=await api('/api/cc/ceo-brief/latest');if(b&&b.period_start){renderCeoBrief(b)}}catch(e){}
 }
 function renderCeoBrief(b){
 $('ccBriefMeta').textContent=`Covers ${b.period_start} to ${b.period_end}`;
@@ -3946,13 +4024,15 @@ ${t.status==='OPEN'?`<div class="form">
 <div class="actions">
 <button class="secondary brsummary" data-topic="${esc(t.id)}">Set discussion summary</button>
 <button class="secondary brfollowup" data-topic="${esc(t.id)}">Set follow-up</button>
+<button class="secondary brmemo" data-topic="${esc(t.id)}">Prepare evidence-backed memo</button>
 </div>
 </div>`).join(''):'<div class="empty">No Boardroom topics yet.</div>';
 topics.forEach(t=>loadTopicHistory(t.id));
 document.querySelectorAll('.addc').forEach(b=>b.onclick=async()=>{const item=b.closest('.item');const perspective=item.querySelector('.pv').value;const content=item.querySelector('.ct').value.trim();if(!perspective||!content)return alert('Pick a perspective and write something first.');await api(`/api/boardroom/${b.dataset.topic}/contribution`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({perspective,content})});await loadBoardroom()});
 document.querySelectorAll('.dec[data-topic]').forEach(b=>b.onclick=async()=>{const note=prompt('Note for this decision (optional):')||'';await api(`/api/boardroom/${b.dataset.topic}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadBoardroom();await loadBacklog()});
 document.querySelectorAll('.brsummary').forEach(b=>b.onclick=async()=>{const v=prompt('Discussion summary:');if(!v)return;await api(`/api/boardroom/${b.dataset.topic}/discussion-summary`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({discussion_summary:v,actor:'Aryan'})});await loadBoardroom()});
-document.querySelectorAll('.brfollowup').forEach(b=>b.onclick=async()=>{const v=prompt('Follow-up:');if(!v)return;await api(`/api/boardroom/${b.dataset.topic}/follow-up`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({follow_up:v,actor:'Aryan'})});await loadBoardroom()})}
+document.querySelectorAll('.brfollowup').forEach(b=>b.onclick=async()=>{const v=prompt('Follow-up:');if(!v)return;await api(`/api/boardroom/${b.dataset.topic}/follow-up`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({follow_up:v,actor:'Aryan'})});await loadBoardroom()});
+document.querySelectorAll('.brmemo').forEach(b=>b.onclick=async()=>{b.disabled=true;const original=b.textContent;b.textContent='Preparing…';try{await api(`/api/boardroom/${b.dataset.topic}/prepare-memo`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadBoardroom()}catch(e){alert(e.message)}finally{b.disabled=false;b.textContent=original}})}
 async function loadTopicHistory(id){try{const t=await api('/api/boardroom/'+id);const el=$('contribs-'+id);if(!el)return;el.innerHTML=(t.contributions||[]).map(c=>`<div class="contrib"><b>${esc(c.perspective)}:</b> ${esc(c.content)}</div>`).join('')+(t.decisions||[]).map(d=>`<div class="contrib"><b>${esc(d.action)}</b> by ${esc(d.decided_by)}${d.note?': '+esc(d.note):''}</div>`).join('')}catch(e){}}
 $('brCreate').onclick=async()=>{const title=$('brTitle').value.trim();const summary=$('brSummary').value.trim();if(!title||!summary)return alert('Title and summary are required.');await api('/api/boardroom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,summary,actor:'Aryan',proposed_category:$('brCategory').value||null,proposed_priority:$('brPriority').value||null,linked_objective_id:$('brLinkedObjective').value.trim()||null,linked_venture_id:$('brLinkedVenture').value.trim()||null})});$('brTitle').value='';$('brSummary').value='';$('brLinkedObjective').value='';$('brLinkedVenture').value='';await loadBoardroom()};
 $('ccGenerateBrief').onclick=async()=>{const b=await api('/api/cc/ceo-brief/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});renderCeoBrief(b)};
@@ -4015,6 +4095,26 @@ ${i.source_link.view?`<button class="secondary orchJump" data-view="${esc(i.sour
 document.querySelectorAll('.orchDec2').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadOrchDecisions()}catch(e){alert(e.message)}});
 document.querySelectorAll('.orchJump').forEach(b=>b.onclick=()=>{const btn=document.querySelector(`.navitem[data-view="${b.dataset.view}"]`);if(btn)btn.click()})}
 async function loadOrchAlerts(){const d=await api('/api/alerts');renderOrchAlerts(d)}
+async function loadCoordinatorRecommendations(){const d=await api('/api/executive/recommendations');renderCoordinatorRecommendations(d)}
+function renderCoordinatorRecommendations(d){
+const items=d.items||[];
+const counts={PENDING:0,AUTHORIZED:0,EXECUTED:0,DECLINED:0};
+items.forEach(r=>{if(counts[r.status]!==undefined)counts[r.status]++});
+$('coordPending').textContent=counts.PENDING;$('coordAuthorized').textContent=counts.AUTHORIZED;$('coordExecuted').textContent=counts.EXECUTED;$('coordDeclined').textContent=counts.DECLINED;
+$('coordRecommendationsList').innerHTML=items.length?items.map(r=>`<div class="item">
+<h3>${esc(r.recommended_action)}</h3>
+<div class="meta"><span>${esc(r.department||'')}</span><span>${esc(r.category)}</span><span class="${r.priority==='HIGH'?'badge':''}">${esc(r.priority)}</span><span>${esc(r.status)}</span>${r.model_provider?`<span>model: ${esc(r.model_provider)}</span>`:'<span>deterministic</span>'}</div>
+<div>${esc(r.explanation||'')}</div>
+${r.financial_impact?`<div class="contrib"><b>Financial impact:</b> ${esc(r.financial_impact)} ${esc(r.financial_impact_currency||'')}</div>`:''}
+${r.outcome?`<div class="contrib"><b>Outcome:</b> ${esc(r.outcome)}</div>`:''}
+${r.status==='PENDING'&&r.needs_aryan_id?`<div class="actions">
+<button class="secondary coordDecide" data-id="${esc(r.needs_aryan_id)}" data-action="approve">Approve</button>
+<button class="danger coordDecide" data-id="${esc(r.needs_aryan_id)}" data-action="reject">Reject</button>
+<button class="secondary coordDecide" data-id="${esc(r.needs_aryan_id)}" data-action="defer">Defer</button>
+</div>`:''}
+</div>`).join(''):'<div class="empty">No recommendations right now. Click Sync now to have FALGUNA assess the current company state.</div>';
+document.querySelectorAll('.coordDecide').forEach(b=>b.onclick=async()=>{const note=prompt('Note (optional):')||'';try{await api(`/api/needs-aryan/${encodeURIComponent(b.dataset.id)}/decision`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.action,note,actor:'Aryan'})});await loadCoordinatorRecommendations()}catch(e){alert(e.message)}})}
+$('coordSyncBtn').onclick=async()=>{$('coordSyncBtn').disabled=true;$('coordSyncBtn').textContent='Syncing…';try{await api('/api/executive/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCoordinatorRecommendations()}catch(e){alert(e.message)}finally{$('coordSyncBtn').disabled=false;$('coordSyncBtn').textContent='Sync now'}};
 function renderOrchAlerts(d){
 $('alertActive').textContent=d.active_count;$('alertHigh').textContent=d.by_severity.HIGH;$('alertMedium').textContent=d.by_severity.MEDIUM;$('alertLow').textContent=d.by_severity.LOW;
 $('orchAlertsList').innerHTML=d.alerts.length?d.alerts.map(a=>`<div class="item">
