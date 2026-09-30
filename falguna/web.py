@@ -361,6 +361,16 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             return self._html(INDEX_HTML)
+        if path == "/assets/falguna-mark.png":
+            asset = Path(__file__).with_name("assets") / "falguna-mark.png"
+            data = asset.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/api/config":
             profiles = load_profiles(self.app_root)
             control, store = open_control_plane(self.app_root)
@@ -2946,12 +2956,28 @@ aside{background:var(--rail);padding:14px 12px;border-right:1px solid var(--hair
 .chat-welcome{max-width:760px;margin-top:8vh;text-align:left}.chat-welcome .glow{margin:0 0 24px;width:48px;height:48px;border-radius:14px;background:var(--ink);box-shadow:none}.chat-welcome .glow svg{color:var(--canvas)}.chat-welcome h1{font-size:clamp(30px,4vw,46px);max-width:620px}.chat-welcome p{max-width:620px;line-height:1.7}.chip-row{justify-content:flex-start;display:grid;grid-template-columns:repeat(3,1fr)}.chip{border-radius:13px;min-height:72px;align-items:flex-start;padding:13px;text-align:left;background:var(--surface);color:var(--ink-2)}
 .composer-wrap{padding:14px max(22px,calc((100vw - 292px - 780px)/2)) 20px;background:linear-gradient(180deg,transparent,var(--canvas) 24%)}.composer{max-width:780px;border-radius:18px;background:var(--surface);border-color:var(--hairline);box-shadow:0 18px 60px -42px #000}.composer:focus-within{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 14%,transparent),0 18px 60px -42px #000}.composer textarea{min-height:48px}.send-btn{background:var(--ink);color:var(--canvas)}.send-btn:hover{background:var(--brand);color:#211407}.compose-foot{display:flex;justify-content:center;gap:12px}.compose-foot::after{content:'Enter to send  ·  Shift+Enter for a new line';color:var(--ink-3)}
 .selector-row{position:sticky;top:0;z-index:3;padding:10px 0;background:color-mix(in srgb,var(--canvas) 90%,transparent);backdrop-filter:blur(14px)}
+
+/* ---------- Falguna brand system ---------- */
+.brand{gap:10px}.brand-mark,.brand-loader{display:grid;place-items:center;flex:none;background:linear-gradient(145deg,#ff8a00,#df6411);overflow:hidden}
+.brand-mark{width:32px;height:32px;border-radius:10px;box-shadow:0 10px 26px -16px #ff7900}
+.brand-mark img{width:27px;height:27px;object-fit:contain}
+.brand-word{font-family:"Avenir Next","Century Gothic",Futura,ui-sans-serif,sans-serif;font-size:19px;font-weight:500;letter-spacing:.055em;text-transform:lowercase;line-height:1}
+.brand-copy small{margin-top:6px;letter-spacing:.08em;text-transform:uppercase;font-size:8.5px}
+.brand-loader{width:34px;height:34px;border-radius:11px;position:relative;box-shadow:0 12px 32px -17px #ff7900}
+.brand-loader img{width:29px;height:29px;object-fit:contain;animation:falgunaDraw 1.55s cubic-bezier(.45,0,.2,1) infinite}
+.brand-loader::after{content:'';position:absolute;inset:-35%;border-radius:50%;border:1px solid transparent;border-top-color:#fff9;animation:falgunaOrbit 1.05s linear infinite}
+.brand-thinking{display:flex;align-items:center;gap:10px;font-style:normal}.brand-thinking .brand-loader{width:30px;height:30px;border-radius:9px}.brand-thinking .brand-loader img{width:25px;height:25px}
+.chat-welcome .glow.brand-orbit{display:grid;place-items:center;background:linear-gradient(145deg,#ff8a00,#df6411);overflow:visible}
+.chat-welcome .glow.brand-orbit img{width:42px;height:42px;object-fit:contain}
+.researching-label{display:inline-flex;align-items:center;gap:8px}.researching-label .brand-loader{width:24px;height:24px;border-radius:7px}.researching-label .brand-loader img{width:20px;height:20px}
+@keyframes falgunaDraw{0%,100%{transform:scale(.82);opacity:.72}45%{transform:scale(1);opacity:1}70%{transform:scale(.94);opacity:.9}}
+@keyframes falgunaOrbit{to{transform:rotate(360deg)}}
 @media(max-width:850px){.app{grid-template-columns:1fr}.chat-scroll,.composer-wrap{padding-left:14px;padding-right:14px}.chat-welcome{margin-top:5vh}.chip-row{grid-template-columns:1fr}.side-tools{margin-top:7px}.msg.user{margin-left:0}}
 @media(max-width:520px){.thread{padding-top:20px;gap:25px}.msg{grid-template-columns:27px minmax(0,1fr);column-gap:9px}.msg .avatar{width:26px;height:26px}.msg.user{grid-template-columns:minmax(0,1fr) 27px}.msg .bubble{font-size:14.5px}.composer-wrap{padding-bottom:max(10px,env(safe-area-inset-bottom))}.compose-foot::after{display:none}.topbar{padding:0 12px}}
 </style></head><body>
 <div class="app">
   <aside id="sidebar" aria-label="Falguna navigation">
-    <div class="brand"><span class="mark">F</span><span class="brand-copy">Falguna<small>Private AI workspace</small></span></div>
+    <div class="brand"><span class="brand-mark"><img src="/assets/falguna-mark.png" alt=""></span><span class="brand-copy"><span class="brand-word">falguna</span><small>Private AI workspace</small></span></div>
     <button class="new-chat" id="newChatBtn"></button>
     <div class="side-tools"><label class="side-search" aria-label="Filter conversations"><span id="sideSearchIcon"></span><input id="sideSearchInput" type="search" placeholder="Find a conversation" autocomplete="off"></label><button class="side-shortcut" id="shortcutHelpBtn" type="button" title="Keyboard shortcuts">?</button></div>
     <nav class="nav" id="nav"></nav>
@@ -3588,7 +3614,7 @@ async function renderChatView(id){
     vp.innerHTML=`
       <div class="chat-view">
         <div class="chat-scroll"><div class="chat-welcome">
-          <div class="glow">${icon('spark',24)}</div>
+          <div class="glow brand-orbit"><img src="/assets/falguna-mark.png" alt="Falguna"></div>
           <h1>How can I help?</h1>
           <p>Ask a question, think something through, or describe what you're working on. Need current information from the web? Try <a href="#/search">Search</a>.</p>
           <div class="chip-row">${STARTERS.map(([ic,label])=>`<button class="chip" data-starter="${esc(label)}">${icon(ic,13)}${esc(label)}</button>`).join('')}</div>
@@ -3760,7 +3786,7 @@ function appendOptimisticUserBubble(content,attachments){
   const t=$('thread');
   if(t.querySelector('.empty-state'))t.innerHTML='';
   const chips=(attachments||[]).length?`<div class="attach-chip-row">${attachments.map(a=>`<span class="attach-chip">${icon('clip',11)}${esc(a.filename)}</span>`).join('')}</div>`:'';
-  t.insertAdjacentHTML('beforeend',`<div class="msg user" data-optimistic="1"><div class="avatar">Y</div><div class="bubble">${nl2br(content)}${chips}</div></div><div class="msg assistant" id="thinkingRow"><div class="avatar">F</div><div class="bubble thinking"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></div></div>`);
+  t.insertAdjacentHTML('beforeend',`<div class="msg user" data-optimistic="1"><div class="avatar">Y</div><div class="bubble">${nl2br(content)}${chips}</div></div><div class="msg assistant" id="thinkingRow"><div class="avatar">F</div><div class="bubble brand-thinking"><span class="brand-loader"><img src="/assets/falguna-mark.png" alt=""></span><span>Thinking&hellip;</span></div></div>`);
   t.closest('.chat-scroll').scrollTop=9e6;
 }
 
@@ -3825,7 +3851,7 @@ function renderMessageRow(m,attachments,isLast){
           <button type="button" class="msg-action-btn" data-stop-id="${esc(m.id)}">${icon('stop',11)}Stop</button>
         </div></div>`;
     }
-    return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble thinking"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></div>
+    return `<div class="msg assistant"><div class="avatar">F</div><div class="bubble brand-thinking"><span class="brand-loader"><img src="/assets/falguna-mark.png" alt=""></span><span>${status==='PENDING'?'Queued':'Thinking'}&hellip;</span></div>
       <div class="status-note">${status==='PENDING'?'Queued':'Thinking'}&hellip; <span data-since="${esc(m.created_at)}">0s</span>
         <button type="button" class="msg-action-btn" data-stop-id="${esc(m.id)}">${icon('stop',11)}Stop</button>
       </div></div>`;
@@ -4253,7 +4279,7 @@ async function renderSearchView(id){
   if(!id){
     vp.innerHTML=`<div class="page" style="max-width:680px">
       <div class="chat-welcome" style="margin-top:6vh">
-        <div class="glow">${icon('search',22)}</div>
+        <div class="glow brand-orbit"><img src="/assets/falguna-mark.png" alt="Falguna"></div>
         <h1>Research anything</h1>
         <p>Falguna searches the web, keeps citations, and lets you continue the findings into Chat or hand them to Work.</p>
       </div>
@@ -4274,7 +4300,7 @@ async function renderSearchView(id){
       e.preventDefault();
       const query=$('researchQuery').value.trim();
       if(query.length<3)return;
-      $('researchGo').disabled=true;$('researchGo').textContent='Researching…';
+      $('researchGo').disabled=true;$('researchGo').innerHTML='<span class="researching-label"><span class="brand-loader"><img src="/assets/falguna-mark.png" alt=""></span>Researching&hellip;</span>';
       try{
         const out=await api('/api/research',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,project_id:$('researchProject').value||undefined})});
         go('#/search/'+out.research.id);
