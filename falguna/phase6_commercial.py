@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
@@ -125,12 +126,22 @@ class PaymentOrchestrator:
         prior = self.store.list("p6_payment_events", "payment_intent_id=? AND idempotency_key=?", (payment_id, key))
         if prior:
             return prior[-1]
-        event_id = self.store.create("p6_payment_events", {
-            "payment_intent_id": payment_id, "organization_id": organization_id, "event_type": event_type,
-            "status_before": before, "status_after": after, "amount": amount, "currency": currency,
-            "evidence_json": _json(evidence), "provider_event_ref": provider_event_ref,
-            "idempotency_key": key, "actor": actor, "created_at": utcnow(),
-        })
+        # Race-matrix fix: see FinanceAccounts.record_event -- same
+        # check-then-act shape, same UNIQUE(payment_intent_id,
+        # idempotency_key) backstop, same graceful fallback to the row the
+        # winning connection actually persisted.
+        try:
+            event_id = self.store.create("p6_payment_events", {
+                "payment_intent_id": payment_id, "organization_id": organization_id, "event_type": event_type,
+                "status_before": before, "status_after": after, "amount": amount, "currency": currency,
+                "evidence_json": _json(evidence), "provider_event_ref": provider_event_ref,
+                "idempotency_key": key, "actor": actor, "created_at": utcnow(),
+            })
+        except sqlite3.IntegrityError:
+            prior = self.store.list("p6_payment_events", "payment_intent_id=? AND idempotency_key=?", (payment_id, key))
+            if not prior:
+                raise
+            return prior[-1]
         return self.store.get("p6_payment_events", event_id)
 
     def apply_verified_event(self, context: AccessContext, payment_id: str, new_status: str, amount: float,
@@ -227,8 +238,16 @@ class ApprovalWorkflow:
         row = self._scoped(context, request_id, "approvals:verify")
         if row["status"] != "PENDING_VERIFICATION" or row["maker_identity_id"] == context.identity_id:
             raise CommercialSecurityError("independent verifier required")
-        self.store.update("p6_approval_requests", request_id, status="PENDING_ARYAN_APPROVAL",
-                          verifier_identity_id=context.identity_id, verified_at=utcnow())
+        # Race-matrix fix: a plain update() here would let a concurrent
+        # reject() (or another verify()) on the same stale read silently
+        # overwrite this one. compare_and_set re-checks status=PENDING_
+        # VERIFICATION atomically at write time, so only the first of two
+        # racing decisions on this request can ever land.
+        won = self.store.compare_and_set("p6_approval_requests", request_id,
+            {"status": "PENDING_VERIFICATION"}, status="PENDING_ARYAN_APPROVAL",
+            verifier_identity_id=context.identity_id, verified_at=utcnow())
+        if not won:
+            raise CommercialSecurityError("approval request changed concurrently; reload before verifying")
         updated = self.store.get("p6_approval_requests", request_id)
         self._event(updated, "VERIFIED", row["status"], updated["status"], context.identity_id)
         return updated
@@ -240,8 +259,16 @@ class ApprovalWorkflow:
             raise CommercialSecurityError("Aryan owner identity is the required final approver")
         if row["status"] != "PENDING_ARYAN_APPROVAL" or row["verifier_identity_id"] == context.identity_id:
             raise CommercialSecurityError("verified request and independent final approver required")
-        self.store.update("p6_approval_requests", request_id, status="APPROVED_PENDING_EXECUTION",
-                          final_approver_identity_id=context.identity_id, approved_at=utcnow())
+        # Race-matrix fix: expected includes verifier_identity_id, not just
+        # status, so a concurrent amend() (material beneficiary/amount
+        # change) that resets verifier_identity_id to None between the read
+        # above and this write makes the CAS fail -- the old verification
+        # can never authorize the changed request, even under a race.
+        won = self.store.compare_and_set("p6_approval_requests", request_id,
+            {"status": "PENDING_ARYAN_APPROVAL", "verifier_identity_id": row["verifier_identity_id"]},
+            status="APPROVED_PENDING_EXECUTION", final_approver_identity_id=context.identity_id, approved_at=utcnow())
+        if not won:
+            raise CommercialSecurityError("approval request changed concurrently; reload before approving")
         updated = self.store.get("p6_approval_requests", request_id)
         self._event(updated, "ARYAN_APPROVED", row["status"], updated["status"], context.identity_id)
         return updated
@@ -255,10 +282,17 @@ class ApprovalWorkflow:
         if row["status"] not in {"PENDING_VERIFICATION", "PENDING_ARYAN_APPROVAL"}:
             raise CommercialSecurityError("only a pending request may be amended")
         before = row["status"]
-        self.store.update("p6_approval_requests", request_id, payload_json=_json(payload), amount=amount,
-                          currency=currency, beneficiary_ref=beneficiary_ref,
-                          status="PENDING_VERIFICATION", verifier_identity_id=None, verified_at=None,
-                          final_approver_identity_id=None, approved_at=None)
+        # Race-matrix fix: CAS on the exact status just read. If an
+        # approve_by_aryan() or reject() committed first (beneficiary
+        # change arriving mid-approval), this amend loses the race and
+        # fails closed instead of silently re-opening an already-decided
+        # request behind that decision's back.
+        won = self.store.compare_and_set("p6_approval_requests", request_id, {"status": before},
+            payload_json=_json(payload), amount=amount, currency=currency, beneficiary_ref=beneficiary_ref,
+            status="PENDING_VERIFICATION", verifier_identity_id=None, verified_at=None,
+            final_approver_identity_id=None, approved_at=None)
+        if not won:
+            raise CommercialSecurityError("approval request changed concurrently; reload before amending")
         updated = self.store.get("p6_approval_requests", request_id)
         self._event(updated, "MATERIAL_CHANGE_REQUIRES_REVERIFICATION", before, updated["status"],
                     context.identity_id, {"prior_verification_invalidated": before == "PENDING_ARYAN_APPROVAL"})
@@ -270,7 +304,14 @@ class ApprovalWorkflow:
             raise CommercialSecurityError("rejection reason is required")
         if row["status"] not in {"PENDING_VERIFICATION", "PENDING_ARYAN_APPROVAL"}:
             raise CommercialSecurityError("only a pending request may be rejected")
-        self.store.update("p6_approval_requests", request_id, status="REJECTED", rejection_reason=reason)
+        # Race-matrix fix: CAS on the exact status just read, so a
+        # concurrent approve_by_aryan()/verify()/amend() that already moved
+        # this request off that status makes the reject lose cleanly rather
+        # than overwrite a decision that already landed.
+        won = self.store.compare_and_set("p6_approval_requests", request_id, {"status": row["status"]},
+            status="REJECTED", rejection_reason=reason)
+        if not won:
+            raise CommercialSecurityError("approval request changed concurrently; reload before rejecting")
         updated = self.store.get("p6_approval_requests", request_id)
         self._event(updated, "REJECTED", row["status"], "REJECTED", context.identity_id, {"reason": reason})
         return updated
@@ -307,13 +348,31 @@ class FinanceAccounts:
         existing = self.store.list("p6_financial_events", "organization_id=? AND idempotency_key=?", (context.organization_id, idempotency_key))
         if existing:
             return existing[-1]
-        event_id = self.store.create("p6_financial_events", {
-            "organization_id": context.organization_id, "event_type": event_type, "account_bucket": bucket,
-            "direction": direction, "amount": round(float(amount), 2), "currency": currency.upper(),
-            "source_type": source_type, "source_id": source_id, "evidence_json": _json(evidence),
-            "idempotency_key": idempotency_key, "actor": context.identity_id,
-            "reverses_event_id": reverses_event_id, "created_at": utcnow(),
-        })
+        # Race-matrix fix: the list-then-create above is check-then-act --
+        # two connections can both see "no existing event" and both reach
+        # this insert (e.g. two concurrent settlement reconciliations, or a
+        # commission release racing another release attempt on the same
+        # idempotency key). The UNIQUE(organization_id, idempotency_key)
+        # constraint in schema_sqlite.sql is what actually prevents a
+        # second financial consequence from ever being persisted; this
+        # catches the resulting IntegrityError from the loser and returns
+        # the winner's row instead of raising, so cash is credited/debited
+        # exactly once and the caller still gets a normal idempotent result
+        # rather than an unhandled database exception.
+        try:
+            event_id = self.store.create("p6_financial_events", {
+                "organization_id": context.organization_id, "event_type": event_type, "account_bucket": bucket,
+                "direction": direction, "amount": round(float(amount), 2), "currency": currency.upper(),
+                "source_type": source_type, "source_id": source_id, "evidence_json": _json(evidence),
+                "idempotency_key": idempotency_key, "actor": context.identity_id,
+                "reverses_event_id": reverses_event_id, "created_at": utcnow(),
+            })
+        except sqlite3.IntegrityError:
+            existing = self.store.list("p6_financial_events", "organization_id=? AND idempotency_key=?",
+                                       (context.organization_id, idempotency_key))
+            if not existing:
+                raise
+            return existing[-1]
         return self.store.get("p6_financial_events", event_id)
 
     def set_reserve_policy(self, context: AccessContext, currency: str, essential_monthly_burn: float,
@@ -408,51 +467,78 @@ class CommercialOperations:
         if not payment:
             raise CommercialSecurityError("payment intent not found")
         self.identities.authorize(context, "finance:read", payment["organization_id"])
-        existing = self.store.list("p6_reconciliations", "organization_id=? AND idempotency_key=?",
-                                   (payment["organization_id"], idempotency_key))
-        if existing:
-            return existing[-1]
         invoice = self.billing.get(payment.get("invoice_id")) if payment.get("invoice_id") else None
-        findings = []
-        status = "MATCHED"
-        if payment["status"] != "SETTLED":
-            findings.append("PAYMENT_NOT_SETTLED")
-            status = "REVIEW_REQUIRED"
-        if not invoice:
-            findings.append("PAYMENT_WITHOUT_VALID_INVOICE")
-            status = "UNMATCHED"
-        elif self._invoice_organization(invoice) != payment["organization_id"]:
-            findings.append("INVOICE_ORGANIZATION_MISMATCH")
-            status = "MISMATCH"
-        if settled_currency.upper() != payment["currency"]:
-            findings.append("CURRENCY_MISMATCH")
-            status = "MISMATCH"
-        if round(float(settled_amount), 2) != round(float(payment["amount"]), 2):
-            findings.append("AMOUNT_MISMATCH")
-            status = "MISMATCH"
-        if not settlement_ref:
-            findings.append("MISSING_SETTLEMENT_REFERENCE")
-            status = "REVIEW_REQUIRED"
-        duplicates = self.store.list("p6_reconciliations", "organization_id=? AND settlement_ref=?",
-                                     (payment["organization_id"], settlement_ref)) if settlement_ref else []
-        if duplicates:
-            findings.append("DUPLICATE_SETTLEMENT")
-            status = "REVIEW_REQUIRED"
-        if invoice and status == "MATCHED":
-            remaining = round(float(invoice["amount"]) - float(invoice.get("amount_received") or 0), 2)
-            if settled_amount < remaining:
-                status = "PARTIAL"
-                findings.append("PARTIAL_COLLECTION")
-        now = utcnow()
-        reconciliation_id = self.store.create("p6_reconciliations", {
-            "organization_id": payment["organization_id"], "invoice_id": payment.get("invoice_id"),
-            "payment_intent_id": payment_id, "provider_transaction_ref": payment.get("provider_transaction_ref"),
-            "settlement_ref": settlement_ref, "expected_amount": payment["amount"], "settled_amount": settled_amount,
-            "expected_currency": payment["currency"], "settled_currency": settled_currency.upper(),
-            "status": status, "findings_json": _json(findings), "evidence_json": _json(evidence),
-            "reviewed_by_identity_id": context.identity_id, "idempotency_key": idempotency_key,
-            "created_at": now, "updated_at": now,
-        })
+        # Race-matrix fix (settlement vs settlement): the idempotency-key
+        # replay check and the settlement_ref duplicate-detection check
+        # below were both plain check-then-act reads followed by a separate
+        # create() call, with no lock held across the gap. Two genuinely
+        # concurrent reconcile_settlement() calls for the very same
+        # settlement could race this two different ways: (a) an identical
+        # idempotency_key replay -- both see "no existing row" and both
+        # reach create(), and the loser would previously crash on the
+        # UNIQUE(organization_id, idempotency_key) constraint with a raw,
+        # uncaught sqlite3.IntegrityError instead of getting back the
+        # winner's row; (b) a genuine double-submission with *different*
+        # idempotency_keys for the same settlement_ref -- both could see
+        # "no duplicate settlement_ref" and both commit a MATCHED/PARTIAL
+        # reconciliation (and, further down, both create a receipt), which
+        # is exactly the duplicate-settlement finding this code is supposed
+        # to catch. BEGIN IMMEDIATE forces this whole
+        # read-both-checks -> decide -> insert sequence to serialize
+        # against every other reconcile_settlement() call on this
+        # organization, so no concurrent caller can ever act on a stale
+        # "nothing exists yet" snapshot.
+        with self.store.transaction_immediate() as db:
+            existing_rows = db.execute(
+                "SELECT id FROM p6_reconciliations WHERE organization_id=? AND idempotency_key=?",
+                (payment["organization_id"], idempotency_key),
+            ).fetchall()
+            if existing_rows:
+                return self.store.get("p6_reconciliations", existing_rows[-1]["id"])
+            findings = []
+            status = "MATCHED"
+            if payment["status"] != "SETTLED":
+                findings.append("PAYMENT_NOT_SETTLED")
+                status = "REVIEW_REQUIRED"
+            if not invoice:
+                findings.append("PAYMENT_WITHOUT_VALID_INVOICE")
+                status = "UNMATCHED"
+            elif self._invoice_organization(invoice) != payment["organization_id"]:
+                findings.append("INVOICE_ORGANIZATION_MISMATCH")
+                status = "MISMATCH"
+            if settled_currency.upper() != payment["currency"]:
+                findings.append("CURRENCY_MISMATCH")
+                status = "MISMATCH"
+            if round(float(settled_amount), 2) != round(float(payment["amount"]), 2):
+                findings.append("AMOUNT_MISMATCH")
+                status = "MISMATCH"
+            if not settlement_ref:
+                findings.append("MISSING_SETTLEMENT_REFERENCE")
+                status = "REVIEW_REQUIRED"
+            duplicate_rows = db.execute(
+                "SELECT id FROM p6_reconciliations WHERE organization_id=? AND settlement_ref=?",
+                (payment["organization_id"], settlement_ref),
+            ).fetchall() if settlement_ref else []
+            if duplicate_rows:
+                findings.append("DUPLICATE_SETTLEMENT")
+                status = "REVIEW_REQUIRED"
+            if invoice and status == "MATCHED":
+                remaining = round(float(invoice["amount"]) - float(invoice.get("amount_received") or 0), 2)
+                if settled_amount < remaining:
+                    status = "PARTIAL"
+                    findings.append("PARTIAL_COLLECTION")
+            now = utcnow()
+            reconciliation_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO p6_reconciliations (id,organization_id,invoice_id,payment_intent_id,"
+                "provider_transaction_ref,settlement_ref,expected_amount,settled_amount,expected_currency,"
+                "settled_currency,status,findings_json,evidence_json,reviewed_by_identity_id,idempotency_key,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (reconciliation_id, payment["organization_id"], payment.get("invoice_id"), payment_id,
+                 payment.get("provider_transaction_ref"), settlement_ref, payment["amount"], settled_amount,
+                 payment["currency"], settled_currency.upper(), status, _json(findings), _json(evidence),
+                 context.identity_id, idempotency_key, now, now),
+            )
         if status in {"MATCHED", "PARTIAL"}:
             payment_evidence = {"type": "VERIFIED_PROVIDER_SETTLEMENT", "settlement_ref": settlement_ref,
                                 "payment_intent_id": payment_id, "reconciliation_id": reconciliation_id}

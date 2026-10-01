@@ -318,6 +318,38 @@ class StateStore:
             self.db.rollback()
             raise
 
+    @contextmanager
+    def transaction_immediate(self):
+        """Like `transaction()`, but takes SQLite's write lock up front
+        (`BEGIN IMMEDIATE`) instead of lazily on the connection's first DML
+        statement. `compare_and_set` is enough when an invariant lives on a
+        single row (one status column), but some Phase 6 invariants span
+        MULTIPLE rows -- e.g. "the sum of every CONFIRMED refund against
+        this payment, including the one about to be confirmed, must never
+        exceed the settled amount." Two different refund rows have no
+        shared primary key for compare_and_set to key off, so without this,
+        two connections could each read the pre-race sum, each see
+        themselves as within bounds, and each commit -- an over-refund that
+        no single-row CAS would catch.
+
+        `BEGIN IMMEDIATE` forces this connection to acquire SQLite's
+        RESERVED write lock before the first SELECT inside the block runs
+        (not just before the first write, as plain deferred transactions
+        do), so a second connection's own `BEGIN IMMEDIATE` blocks (up to
+        PRAGMA busy_timeout) until this one commits or rolls back. The
+        read-sum -> decide -> write sequence inside the block is therefore
+        serialized against every other writer using this same method, the
+        same way a real row-level lock would serialize it in a
+        production database.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield self.db
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
     def create(self, table: str, values: Dict[str, Any], record_id: Optional[str] = None) -> str:
         allowed = {"missions", "requirements", "tasks", "task_steps", "runs", "checkpoints", "approvals", "model_calls", "cost_events", "artifacts", "run_controls", "project_cache", "mission_timings", "supervisor_states", "boardroom_topics", "boardroom_contributions", "boardroom_decisions", "backlog_items", "backlog_history", "needs_aryan_items", "conversations", "chat_messages", "conversation_handoffs", "research_queries", "research_sources", "research_citations", "research_handoffs", "rh_opportunities", "rh_stage_history", "rh_qualifications", "rh_proposals", "rh_followups", "rh_active_jobs", "rh_discovery_runs", "rh_discovered_sources", "rh_opportunity_research", "rh_settings", "rh_lifecycle_events", "rh_application_attempts", "clients", "rh_closing_records", "rh_negotiation_terms", "rh_conversation_messages", "rh_onboarding_items", "rh_invoices", "rh_completion_records", "rh_retention_items", "rh_outbound_leads", "rh_outreach_drafts",
             "wf_tasks", "wf_task_events", "wf_recurring_workflows", "wf_recurring_runs", "wf_documents", "wf_email_messages",
@@ -404,6 +436,42 @@ class StateStore:
         assignments = ",".join(f"{key}=?" for key in values)
         with self.transaction() as db:
             db.execute(f"UPDATE {table} SET {assignments} WHERE id=?", [*values.values(), record_id])
+
+    def compare_and_set(self, table: str, record_id: str, expected: Dict[str, Any], **values: Any) -> bool:
+        """Atomic conditional update: WHERE id=? AND <every expected column
+        still matches>. Phase 6 race-matrix fix (2026-10-02): a plain
+        read-then-update (`get()` followed by `update()`) is two separate
+        statements with no lock held between them, so two genuinely separate
+        database connections can both read the same prior state, both pass
+        an application-level "is this still pending?" check, and both then
+        write -- the second write silently overwrites the first's decision
+        (a classic lost update). That is exactly how a reject() could
+        silently un-happen because an approve() on a stale read committed
+        after it, or how a material beneficiary/amount change could be
+        approved against the pre-change snapshot.
+
+        This method folds the check into the write itself: the UPDATE's own
+        WHERE clause re-verifies `expected` at the instant SQLite takes the
+        write lock, not at some earlier SELECT. SQLite's single-writer
+        serialization (WAL mode, PRAGMA busy_timeout above) means that when
+        two connections race here, one update's WHERE clause is evaluated
+        against the row as the OTHER one already committed it, not a stale
+        in-memory copy -- so at most one caller ever sees rowcount == 1.
+        The loser gets `False` back (no exception, no partial write) and
+        must re-read current state and decide whether to retry or fail
+        closed; callers in this module choose to fail closed, since a lost
+        race on an approval/financial transition means the precondition the
+        caller believed held is no longer true.
+        """
+        values["updated_at"] = utcnow()
+        assignments = ",".join(f"{key}=?" for key in values)
+        conditions = " AND ".join(f"{key}=?" for key in expected)
+        with self.transaction() as db:
+            cursor = db.execute(
+                f"UPDATE {table} SET {assignments} WHERE id=? AND {conditions}",
+                [*values.values(), record_id, *expected.values()],
+            )
+            return cursor.rowcount == 1
 
     def list(self, table: str, where: str = "1=1", params: Iterable[Any] = ()):
         return [dict(row) for row in self.db.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY created_at", tuple(params))]

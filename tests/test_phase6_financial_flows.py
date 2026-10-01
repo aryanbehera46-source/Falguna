@@ -77,6 +77,20 @@ class CommissionReleaseFlowTests(FinancialFlowsCase):
         b = service.prepare(self.maker, self.commission_id, "INR", 0, "same")
         self.assertEqual(a["id"], b["id"])
 
+    def test_cross_organization_commission_release_is_denied(self):
+        """Tenant-isolation adversarial test: pm_commissions/pm_referrals/
+        rh_invoices predate Phase 6's organization layer and carry no
+        organization_id of their own. A commercial identity from a
+        DIFFERENT organization than the one that actually owns this
+        commission (via its invoice's linked client in comm_organizations)
+        must never be able to prepare a release against it."""
+        other_identity_id = self.identities.create("acme", "STAFF", "maker", "Acme Maker", "FINANCE_OPERATOR", "test")
+        from falguna.phase6_commercial import AccessContext
+        other = AccessContext(other_identity_id, "acme")
+        service = CommissionReleaseService(self.store, self.audit, self.identities)
+        with self.assertRaisesRegex(CommercialSecurityError, "does not belong to this organization"):
+            service.prepare(other, self.commission_id, "INR", 0, "cross-tenant-attempt")
+
     def test_open_risk_blocks_release(self):
         now = utcnow()
         self.store.create("p6_risk_events", {"organization_id": "ttt", "event_type": "BRAND_MISUSE", "severity": "HIGH",
@@ -129,6 +143,20 @@ class RefundFlowTests(FinancialFlowsCase):
 
 
 class SubscriptionAndPayableTests(FinancialFlowsCase):
+    def test_cross_organization_subscription_creation_is_denied(self):
+        """Tenant-isolation adversarial test: `clients` predates Phase 6's
+        organization layer and carries no organization_id of its own. A
+        commercial identity from a DIFFERENT organization than the one that
+        actually owns this client (via comm_organizations) must never be
+        able to create a recurring subscription against it."""
+        other_identity_id = self.identities.create("acme", "STAFF", "maker", "Acme Maker", "FINANCE_OPERATOR", "test")
+        from falguna.phase6_commercial import AccessContext
+        other = AccessContext(other_identity_id, "acme")
+        service = SubscriptionService(self.store, self.audit, self.identities)
+        with self.assertRaisesRegex(CommercialSecurityError, "does not belong to this organization"):
+            service.create(other, self.client_id, "Hijacked Plan", 500, "INR", "MONTHLY",
+                           "2026-11-01", "token", "mandate")
+
     def test_recurring_invoice_is_idempotent_for_due_cycle(self):
         service = SubscriptionService(self.store, self.audit, self.identities)
         sub = service.create(self.maker, self.client_id, "Monthly maintenance", 100, "INR", "MONTHLY",

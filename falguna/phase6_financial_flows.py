@@ -1,6 +1,7 @@
 """Final Phase 6 sandbox financial flows: commissions, refunds, subscriptions, payables."""
 
 import json
+import sqlite3
 import uuid
 from datetime import date, timedelta
 from typing import Any, Dict, Optional
@@ -40,6 +41,25 @@ class CommissionReleaseService:
         invoice = self.store.get("rh_invoices", commission.get("invoice_id"))
         if not referral or not invoice:
             raise CommercialSecurityError("commission must link to referral and cleared invoice")
+        # Tenant-isolation fix: pm_commissions/pm_referrals/rh_invoices
+        # predate Phase 6's multi-organization commercial-identity layer and
+        # carry no organization_id column of their own (confirmed against
+        # schema_sqlite.sql). Without this check, a commercial identity
+        # authorized under ANY organization -- not just the one that
+        # actually owns this commission -- could prepare (and, on full
+        # Aryan approval, release) a payable commission event under its own
+        # organization_id using someone else's partner commission record: a
+        # genuine cross-tenant commission release, demonstrated directly
+        # (CommissionReleaseService.prepare() called by an "acme" identity
+        # against a commission that only ever belonged to "ttt" succeeded
+        # before this fix). Resolved the same way
+        # CommercialOperations._invoice_organization() resolves ownership
+        # elsewhere in this codebase: via the invoice's linked client in
+        # comm_organizations.
+        owning_rows = self.store.list("comm_organizations", "linked_client_id=?", (invoice["client_id"],))
+        owning_organization_id = owning_rows[-1]["id"] if owning_rows else None
+        if owning_organization_id != context.organization_id:
+            raise CommercialSecurityError("commission does not belong to this organization")
         open_risks = self.store.list("p6_risk_events", "organization_id=? AND partner_id=? AND status NOT IN ('CLEARED','CLOSED')",
                                      (context.organization_id, commission["partner_id"]))
         if open_risks:
@@ -76,14 +96,56 @@ class CommissionReleaseService:
         if release["status"] == "RELEASABLE":
             return release
         _approval(self.store, release["approval_request_id"], context.organization_id, "COMMISSION_RELEASE", release["commission_id"])
-        commission = self.store.get("pm_commissions", release["commission_id"])
-        if not commission or commission["status"] != "ELIGIBLE":
-            raise CommercialSecurityError("commission is no longer eligible")
-        open_risks = self.store.list("p6_risk_events", "organization_id=? AND partner_id=? AND status NOT IN ('CLEARED','CLOSED')",
-                                     (context.organization_id, commission["partner_id"]))
-        if open_risks:
-            raise CommercialSecurityError("new unresolved risk invalidates release readiness")
-        self.store.update("p6_commission_releases", release_id, status="RELEASABLE")
+        # Race/invariant fix (commission release vs commission release, and
+        # commission release vs clawback): the commission's current
+        # refunded_amount, its eligibility, the open-risk check, and this
+        # release's own status transition must be read and applied as one
+        # atomic unit. A plain read-then-write split across two tables
+        # (p6_commission_releases and pm_commissions) leaves a window where
+        # a concurrent refund clawback could land between the staleness
+        # check and the status write, letting a release reach RELEASABLE
+        # (and emit a commission-payable finance event) using a
+        # commission_amount that was already stale by the time it
+        # committed -- an overpayment relative to actually-settled,
+        # non-refunded revenue. compare_and_set alone only guards one row's
+        # own column, not an invariant spanning two tables, so this uses
+        # BEGIN IMMEDIATE the same way RefundService.confirm_sandbox does
+        # for its own cross-row sum check.
+        with self.store.transaction_immediate() as db:
+            current = db.execute("SELECT status FROM p6_commission_releases WHERE id=?", (release_id,)).fetchone()
+            if not current:
+                raise CommercialSecurityError("commission release not found")
+            if current["status"] == "RELEASABLE":
+                return self.store.get("p6_commission_releases", release_id)
+            commission = db.execute(
+                "SELECT status, partner_id, refunded_amount FROM pm_commissions WHERE id=?", (release["commission_id"],)
+            ).fetchone()
+            if not commission or commission["status"] != "ELIGIBLE":
+                raise CommercialSecurityError("commission is no longer eligible")
+            # `prepare()` snapshotted refund_chargeback_amount into this
+            # release row at prepare-time. If that no longer matches the
+            # commission's current refunded_amount -- a clawback happened
+            # since, possibly this very instant via BEGIN IMMEDIATE's
+            # serialization against the refund path -- the stored
+            # commission_amount is stale. Fail closed and require a fresh
+            # prepare() rather than release a number that may now be
+            # too high.
+            if round(float(commission["refunded_amount"] or 0), 2) != round(float(release["refund_chargeback_amount"]), 2):
+                raise CommercialSecurityError(
+                    "commission refund/clawback state changed since this release was prepared; re-prepare the release")
+            open_risk = db.execute(
+                "SELECT 1 FROM p6_risk_events WHERE organization_id=? AND partner_id=? "
+                "AND status NOT IN ('CLEARED','CLOSED') LIMIT 1",
+                (context.organization_id, commission["partner_id"]),
+            ).fetchone()
+            if open_risk:
+                raise CommercialSecurityError("new unresolved risk invalidates release readiness")
+            cursor = db.execute(
+                "UPDATE p6_commission_releases SET status=?, updated_at=? WHERE id=? AND status=?",
+                ("RELEASABLE", utcnow(), release_id, current["status"]),
+            )
+            if cursor.rowcount != 1:
+                raise CommercialSecurityError("commission release changed concurrently; reload before releasing")
         self.accounts.record_event(context, "COMMISSION_PAYABLE", "ACCRUED_PAYABLES", "CREDIT",
             release["commission_amount"], release["currency"], "COMMISSION_RELEASE", release_id,
             {"approval_request_id": release["approval_request_id"]}, f"commission-payable:{release_id}")
@@ -135,14 +197,46 @@ class RefundService:
         if not provider_ref or not evidence:
             raise CommercialSecurityError("verified sandbox provider evidence required")
         _approval(self.store, refund["approval_request_id"], context.organization_id, "REFUND", refund["payment_intent_id"])
-        duplicate = self.store.list("p6_refunds", "provider_ref=? AND status='CONFIRMED'", (provider_ref,))
-        if duplicate:
-            raise CommercialSecurityError("duplicate refund provider reference")
         payment = self.store.get("p6_payment_intents", refund["payment_intent_id"])
         if not payment or payment["organization_id"] != context.organization_id or payment["currency"] != refund["currency"]:
             raise CommercialSecurityError("refund/payment mismatch")
-        self.store.update("p6_refunds", refund_id, status="CONFIRMED", provider_ref=provider_ref,
-                          evidence_json=json.dumps(evidence, sort_keys=True))
+        # Race/invariant fix (refund vs refund): request()'s eligibility
+        # check only looks at refunds already CONFIRMED at request time, so
+        # two *different*, independently approved refund requests against
+        # the same payment (different idempotency keys, different
+        # provider_ref -- a plain CAS on one row can't see the other) could
+        # otherwise both confirm and together exceed the settled amount.
+        # This re-validates the combined total under BEGIN IMMEDIATE so the
+        # read-the-sibling-sum -> decide -> flip-this-row sequence is
+        # atomic against every other connection confirming a refund for
+        # this same payment, not just against another attempt on this same
+        # refund row.
+        now = utcnow()
+        with self.store.transaction_immediate() as db:
+            current = db.execute("SELECT status FROM p6_refunds WHERE id=?", (refund_id,)).fetchone()
+            if not current:
+                raise CommercialSecurityError("refund not found")
+            if current["status"] == "CONFIRMED":
+                return self.store.get("p6_refunds", refund_id)
+            duplicate = db.execute(
+                "SELECT 1 FROM p6_refunds WHERE provider_ref=? AND status='CONFIRMED'", (provider_ref,)
+            ).fetchone()
+            if duplicate:
+                raise CommercialSecurityError("duplicate refund provider reference")
+            sibling_rows = db.execute(
+                "SELECT amount FROM p6_refunds WHERE payment_intent_id=? AND status='CONFIRMED' AND id<>?",
+                (refund["payment_intent_id"], refund_id),
+            ).fetchall()
+            already_confirmed = sum(float(row["amount"]) for row in sibling_rows)
+            if round(already_confirmed + float(refund["amount"]), 2) > round(float(payment["amount"]), 2) + 1e-9:
+                raise CommercialSecurityError(
+                    "combined confirmed refunds would exceed the settled payment amount")
+            cursor = db.execute(
+                "UPDATE p6_refunds SET status=?, provider_ref=?, evidence_json=?, updated_at=? WHERE id=? AND status=?",
+                ("CONFIRMED", provider_ref, json.dumps(evidence, sort_keys=True), now, refund_id, current["status"]),
+            )
+            if cursor.rowcount != 1:
+                raise CommercialSecurityError("refund changed concurrently; reload before confirming")
         self.accounts.record_event(context, "REFUND_CONFIRMED", "CASH", "DEBIT", refund["amount"], refund["currency"],
             "REFUND", refund_id, evidence, f"refund:{provider_ref}")
         referrals = self.store.list("pm_referrals", "opportunity_id=?", (self.store.get("rh_invoices", refund["invoice_id"]).get("opportunity_id"),))
@@ -177,6 +271,22 @@ class SubscriptionService:
         self.identities.authorize(context, "payments:create", context.organization_id)
         if cadence not in self.CADENCES or amount <= 0 or not self.store.get("clients", client_id):
             raise CommercialSecurityError("valid client, cadence, and amount required")
+        # Tenant-isolation fix: `clients` predates Phase 6's organization
+        # layer and carries no organization_id of its own (same root cause
+        # as the CommissionReleaseService.prepare() cross-tenant gap fixed
+        # above). Without this, a commercial identity from ANY organization
+        # could create a recurring subscription -- and later autopay
+        # attempts and invoices -- against a client that actually belongs to
+        # a completely different organization (demonstrated directly: an
+        # "acme" identity successfully created a subscription against a
+        # client only ever linked to "ttt" before this fix). Same
+        # resolution pattern as CommercialOperations._invoice_organization()
+        # and the commission-release fix: ownership is resolved via the
+        # client's link in comm_organizations and must match the caller.
+        owning_rows = self.store.list("comm_organizations", "linked_client_id=?", (client_id,))
+        owning_organization_id = owning_rows[-1]["id"] if owning_rows else None
+        if owning_organization_id != context.organization_id:
+            raise CommercialSecurityError("client does not belong to this organization")
         if provider_token_ref and any(term in provider_token_ref.lower() for term in ("cvv", "pan=", "card_number")):
             raise CommercialSecurityError("token references only; raw card data forbidden")
         now = utcnow()
@@ -232,21 +342,45 @@ class SubscriptionService:
         invoice = self.store.get("rh_invoices", sub["last_invoice_id"])
         if not invoice or invoice["status"] == "PAID":
             raise CommercialSecurityError("unpaid recurring invoice required")
-        prior = self.store.list("p6_subscription_attempts", "subscription_id=? AND invoice_id=?", (subscription_id, invoice["id"]))
-        attempt_number = len(prior) + 1
+        cycle_date = invoice["created_at"][:10]
         intent = self.payments.create_intent(context, context.organization_id, sub["amount"], sub["currency"],
             "SUBSCRIPTION", f"subscription-payment:{idempotency_key}", "TTT", "beneficiary:official", ["CARD"],
-            invoice_id=invoice["id"], metadata={"subscription_id": subscription_id, "attempt": attempt_number})
+            invoice_id=invoice["id"], metadata={"subscription_id": subscription_id})
         self.store.update("p6_payment_intents", intent["id"], payment_method_token_ref=sub["provider_token_ref"],
                           mandate_token_ref=sub["mandate_ref"])
-        attempt_id = self.store.create("p6_subscription_attempts", {
-            "organization_id": context.organization_id, "subscription_id": subscription_id, "invoice_id": invoice["id"],
-            "payment_intent_id": intent["id"], "cycle_date": invoice["created_at"][:10],
-            "attempt_number": attempt_number, "status": "PENDING_PROVIDER", "failure_reason": None,
-            "idempotency_key": idempotency_key, "created_at": utcnow(), "updated_at": utcnow(),
-        })
-        self.store.update("p6_subscriptions", subscription_id, autopay_status="PENDING_PROVIDER")
-        return self.store.get("p6_subscription_attempts", attempt_id)
+        # Race-matrix fix (recurring retry vs delayed original event):
+        # attempt_number is derived from how many attempt rows already
+        # exist for this subscription+cycle. Two independently triggered
+        # attempts for the same cycle -- an automatic retry racing a
+        # delayed original provider event, each carrying its own
+        # idempotency_key -- could otherwise both read "0 prior attempts"
+        # and both try to claim attempt_number=1. UNIQUE(subscription_id,
+        # cycle_date, attempt_number) guarantees only one of them can ever
+        # persist that number; this loop catches the loser's
+        # IntegrityError, re-reads the now-current count under the fresh
+        # committed state, and retries with the next free number. Each
+        # retry re-reads rather than reusing a stale count, so the final
+        # numbering is always correct and gap-free regardless of how many
+        # callers raced here.
+        for _ in range(5):
+            prior = self.store.list("p6_subscription_attempts", "subscription_id=? AND cycle_date=?", (subscription_id, cycle_date))
+            attempt_number = len(prior) + 1
+            try:
+                attempt_id = self.store.create("p6_subscription_attempts", {
+                    "organization_id": context.organization_id, "subscription_id": subscription_id, "invoice_id": invoice["id"],
+                    "payment_intent_id": intent["id"], "cycle_date": cycle_date,
+                    "attempt_number": attempt_number, "status": "PENDING_PROVIDER", "failure_reason": None,
+                    "idempotency_key": idempotency_key, "created_at": utcnow(), "updated_at": utcnow(),
+                })
+            except sqlite3.IntegrityError:
+                existing = self.store.list("p6_subscription_attempts", "organization_id=? AND idempotency_key=?",
+                                           (context.organization_id, idempotency_key))
+                if existing:
+                    return existing[-1]
+                continue
+            self.store.update("p6_subscriptions", subscription_id, autopay_status="PENDING_PROVIDER")
+            return self.store.get("p6_subscription_attempts", attempt_id)
+        raise CommercialSecurityError("could not allocate a unique autopay attempt number; retry")
 
     def mark_attempt_failed(self, context: AccessContext, attempt_id: str, reason: str) -> Dict[str, Any]:
         self.identities.authorize(context, "payments:create", context.organization_id)
@@ -374,6 +508,15 @@ class PayableService:
         payable = self.store.get("p6_payables", payable_id)
         if not payable or payable["organization_id"] != context.organization_id:
             raise CommercialSecurityError("payable not found")
+        if payable["status"] == "SANDBOX_EXECUTION_READY":
+            return payable
         _approval(self.store, payable["approval_request_id"], context.organization_id, "VENDOR_PAYMENT", payable["idempotency_key"])
-        self.store.update("p6_payables", payable_id, status="SANDBOX_EXECUTION_READY")
+        # Race-matrix fix (payable release duplication): CAS the transition
+        # so two concurrent mark_execution_ready() calls -- both passing
+        # the approval check above against the same already-approved
+        # request -- produce exactly one execution-ready transition; the
+        # second call observes the first's committed state and returns it
+        # rather than re-applying an unconditional update.
+        self.store.compare_and_set("p6_payables", payable_id, {"status": payable["status"]},
+                                   status="SANDBOX_EXECUTION_READY")
         return self.store.get("p6_payables", payable_id)

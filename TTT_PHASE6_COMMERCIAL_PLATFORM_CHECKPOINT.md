@@ -193,3 +193,61 @@ Remaining acceptance blockers:
 3. Re-run the full suite in an environment with ffmpeg/ffprobe/flite and controlled network/model-provider availability if a completely green repository-wide result is required. The recorded failures are not Phase 6 correctness failures, but they prevent a green full-suite claim.
 
 No push, merge, deploy, provider activation, real customer/partner data, external communication, spending, bank connection, real refund, payout, or money movement occurred.
+
+
+## 2026-10-02 independent adversarial closure attempt — STILL NOT FINAL ACCEPTANCE
+
+This pass acted as an independent, skeptical reviewer against the two blockers left open above, with an explicit mandate to also attack the design for money-state corruption, authorization bypass, and UI/API divergence rather than only confirm prior work.
+
+### Blocker 1 (race matrix) — RESOLVED
+
+Added `tests/test_phase6_race_matrix.py`: all 10 mandated items as genuine multi-connection races (each worker opens its own `StateStore` / own `sqlite3.connect()`, on its own thread, synchronized with `threading.Barrier`) — duplicate capture/settlement/refund/commission-release, refund-vs-settlement, clawback-vs-release, approval-vs-rejection, beneficiary mutation during approval, retry-vs-webhook, payable-readiness duplication, and reconciliation-vs-refund. **11/11 passed, 28.60s**, rerun clean.
+
+Fixing these races required one real code change: `CommercialOperations.reconcile_settlement()` had a check-then-act gap between the idempotency replay check, the duplicate-settlement check, and the `p6_reconciliations` insert. Rewritten to do all three inside one `StateStore.transaction_immediate()` block. Verified by the new `SettlementRaceTests` / `ReconciliationVsRefundTests` cases.
+
+### Blocker 2 (authenticated browser acceptance) — PARTIALLY RESOLVED
+
+Using this session's own device-automation tools (not available in the prior attempt), the real HQ server was launched on the user's Mac via the actual `launcher/Twenty Two Technologies.app`, and the in-app browser successfully navigated to `http://127.0.0.1:8766/api/config` and got a genuine response. This resolves the specific prior blocker ("the available in-app browser blocked navigation to the separate local login port / cannot set cookies") — the browser can reach a real local server.
+
+What this did **not** complete: a full authenticated walkthrough of Finance Overview, Invoice/Payment, Approval Queue, Partner Commission, Refund, Subscription, Payables, Partner/Payment-Instruction Verification, Isolation, and UI health. The only account-creation/login surface in this codebase (`falguna/site_web.py`'s `/login`, port 8767) has no CLI subcommand (`falguna/__main__.py` wires only `init`, `web`, `hq`, `create-mission`, `run`, `status`, `summary`, `decide`), so there is no supported way to reach it from a cold launch without adding one. This was not attempted, since it would be scope growth on an auth surface, not a Phase 6 fix. The server was stopped again via `Stop Twenty Two Technologies.app` after verification; confirmed stopped (a follow-up navigation to the same URL failed).
+
+### Adversarial review — two new cross-tenant isolation defects found and fixed
+
+Legacy pre-Phase-6 tables (`clients`, `rh_invoices`, `pm_referrals`, `pm_commissions`) carry no `organization_id` of their own. Two Phase 6 service methods operated on them without resolving true ownership via `comm_organizations.linked_client_id`, and were exploitable cross-tenant:
+
+- `CommissionReleaseService.prepare()` — an identity from one organization could prepare/release a commission belonging to another organization's referral. Fixed: ownership resolved and compared to `context.organization_id` before proceeding; `CommercialSecurityError` otherwise.
+- `SubscriptionService.create()` — an identity from one organization could create a subscription against another organization's client. Same fix pattern.
+
+Both demonstrated exploitable with standalone probes before the fix and blocked after. Regression tests added (`test_cross_organization_commission_release_is_denied`, `test_cross_organization_subscription_creation_is_denied`).
+
+Also reviewed and found sound (no defect): every mutating `/api/p6/*` route requires authenticated session + CSRF + organization-header match + per-call `identities.authorize()`; `FinanceAccounts.record_event`'s write-equivalent `finance:read` gate is never reachable directly over HTTP; webhook replay/idempotency keys and UNIQUE constraints behave correctly under the new race-matrix load.
+
+### NEW, UNRESOLVED CRITICAL FINDING: real staff logins can never complete final Aryan approval
+
+`ApprovalWorkflow.approve_by_aryan()` (`falguna/phase6_commercial.py:258`) requires `identity["subject_ref"].strip().lower() == "aryan"`. Every real HTTP session resolves its commercial identity through `TTTHQHandler._commercial_context()` as `subject_type="STAFF_USER", subject_ref=<site_staff_users.id>`, and `StaffAuthService.create_user()` always assigns a fresh UUID as that id — there is no way, through the actual application, to ever provision a staff identity whose `subject_ref` literally equals `"aryan"`. Every existing passing test bypasses this by constructing `AccessContext` directly against a hand-made `subject_type="STAFF", subject_ref="aryan"` identity that the real login flow can never create.
+
+Proven against a real `ThreadingHTTPServer(TTTHQHandler)` with three real staff logins (maker, independent verifier, and an "Aryan Behera" owner account created the only way the codebase allows):
+
+```
+1) maker creates approval: 201
+2) real independent verifier verifies: 200 PENDING_ARYAN_APPROVAL
+3) real 'Aryan' owner login approves via the actual HTTP route: 403 {'error': 'Aryan owner identity is the required final approver'}
+```
+
+This means: as shipped, **no real person can ever complete the final owner-approval step** for a refund, commission release, vendor payment, or beneficiary change through the real web application — the exact outgoing-financial-action gate this phase exists to enforce is unreachable in practice, even though every automated test of it passes (because the tests don't go through real login).
+
+A fix was drafted (also match the first word of the identity's `display_name`, lowercased, so a real `display_name="Aryan Behera"` login can pass, while every existing test fixture — which already sets `display_name="Aryan"` alongside its synthetic `subject_ref="aryan"` — keeps passing unchanged). This edit was **not applied**: the environment's own safety classifier flagged it as a security-weakening change to a financial-authorization check and blocked it, with instructions not to attempt it through any other path and instead bring it to the user. `falguna/phase6_commercial.py` is confirmed unmodified at that line. This is squarely the kind of decision reserved for a human owner, not something to route around.
+
+### Fresh verification this pass
+
+- `tests/test_phase6_race_matrix.py`: 11 passed, 28.60s.
+- `tests/test_phase6_commercial.py` + `tests/test_phase6_financial_flows.py`: 46 passed, 112.00s.
+- `tests/test_phase6_partner.py` + `tests/test_phase6_hq.py` + `tests/test_phase6_concurrency.py`: 23 passed, 68.37s.
+- Related regression — `test_billing.py` (30), `test_finance_ledger.py` (13), `test_partner_management.py` (44), `test_commercial.py` (48), `test_customer_portal.py` (8): all passed, 0 failures.
+- Total this pass: **223 passed, 0 failed** across every suite touched directly or transitively by this session's changes.
+- A repository-wide full-suite re-run (as opposed to these directly-affected suites) was **not** repeated this pass: the prior 2026-10-02 attempt already ran it in full (2,209 passed / 18 failed, every failure independently classified as a pre-existing environment limitation — missing ffmpeg/flite, a fixed-timeout HTTP test, a trading-data provider check — none touching Phase 6 code), and this session's diff is confined to `falguna/phase6_commercial.py`, `falguna/phase6_financial_flows.py`, and Phase 6 test files, none of which intersect those failing modules. Re-running the full multi-thousand-test suite again was judged not to change that conclusion; this is stated as a judgment call, not a completed re-run.
+- Also fixed in passing (not a Phase 6 code issue): a stale, empty `.git/index.lock` left behind by an earlier interrupted git invocation was blocking all `git add`/`git commit` in this repo. Removed with the user's explicit delete-permission grant for this folder; `git add --dry-run` now succeeds.
+
+### Final decision: PHASE 6 CHECKPOINT — NOT FINAL ACCEPTANCE
+
+The status line at the top of this report stands. The remaining blocker is not tooling or test coverage — it is the live finding above: final Aryan approval is unreachable for any real person through the real application. Final acceptance should not be declared while the platform's own last-line financial control cannot be exercised by its intended approver. No push, merge, deploy, provider activation, real customer/partner data, external communication, spending, bank connection, real refund, payout, or money movement occurred this pass.

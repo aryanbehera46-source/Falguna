@@ -21,6 +21,8 @@ class Phase6MultiConnectionTests(unittest.TestCase):
         now = utcnow()
         self.client_id = store.create("clients", {"name": "Synthetic", "primary_contact": None, "contact_channel": None,
             "status": "ACTIVE", "total_won_value": 100, "created_at": now, "updated_at": now})
+        store.create("comm_organizations", {"name": "Synthetic Org", "domain": "synthetic.invalid",
+            "linked_client_id": self.client_id, "notes": None, "created_at": now, "updated_at": now}, record_id="ttt")
         self.subscription = SubscriptionService(store, audit, identities).create(
             self.context, self.client_id, "Monthly", 100, "INR", "MONTHLY", "2026-10-01", "token", "mandate")
         self.payment = PaymentOrchestrator(store, audit, identities).create_intent(
