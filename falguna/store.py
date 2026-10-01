@@ -205,6 +205,18 @@ class StateStore:
         # Keep added_at intact for rolled-back code and add the current name
         # used by CommsStore/StateStore.list().
         "comm_participants": [("created_at", "TEXT")],
+        # Phase 5 Final Client Experience, Section 8 (Customer Communication
+        # Profile): a persisted, independently-settable preference overlay
+        # on an existing contact -- NULL (unknown/not yet set) for every
+        # contact created before this column existed, exactly the additive
+        # convention every other column in this table already follows. See
+        # falguna/comms.py's set_contact_preferences().
+        "comm_contacts": [
+            ("preferred_language", "TEXT"), ("preferred_channel", "TEXT"), ("tone", "TEXT"),
+            ("detail_level", "TEXT"), ("technical_level", "TEXT"), ("update_cadence", "TEXT"),
+            ("timezone", "TEXT"), ("call_preference", "TEXT"), ("communication_restrictions", "TEXT"),
+            ("preferences_set_by", "TEXT"), ("preferences_updated_at", "TEXT"),
+        ],
         "comm_messages": [
             ("provider_message_id", "TEXT"),
             # Phase 1, Requirement 3 (real, opt-in email send): real-send
@@ -347,7 +359,13 @@ class StateStore:
             # Phase 5 Continuation, Section 14: Capability Registry V1
             "cs_capabilities",
             # Phase 5 Continuation, Section 22: Learning from Outcomes V1
-            "cs_outcome_records"}
+            "cs_outcome_records",
+            # Phase 5 Final Client Experience, Section 3/4/6/7: Customer
+            # Language Understanding V1 (falguna/language.py)
+            "comm_message_interpretations",
+            # Phase 5 Final Client Experience, Section 20: payment
+            # communication bridge (falguna/payment_comms.py)
+            "comm_payment_drafts"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

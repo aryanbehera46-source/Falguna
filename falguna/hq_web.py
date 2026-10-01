@@ -104,6 +104,15 @@ from .commercial import (
 from .capability_registry import CapabilityRegistryError, CapabilityRegistryStore, can_deliver
 from .capacity import capacity_snapshot
 from .outcomes import OutcomeStore
+# Phase 5 Final Client Experience -- language understanding, minimum-
+# interruption clarification, the payment communication bridge, the
+# customer portal data foundation, and the WhatsApp channel provider.
+from .language import LanguageInterpretationStore, LanguageUnderstandingService
+from .clarification_coordinator import ClarificationCoordinator
+from .payment_comms import PaymentCommsBridge
+from .customer_portal import CustomerPortalService
+from .customer_context import CustomerContextService
+from .whatsapp_admin import resolve_configured_whatsapp_provider
 from .runtime import open_control_plane
 from .sales_manager import SalesManagerService
 from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
@@ -599,6 +608,14 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     priority=(query.get("priority") or [None])[0], limit=50,
                 )
                 return self._json({"items": items})
+            if path.startswith("/api/comms/conversations/") and path.endswith("/clarification-assessment"):
+                conv_id = path.split("/")[4]
+                interpretations = LanguageInterpretationStore(store, control.audit)
+                coordinator = ClarificationCoordinator(store, control.audit, interpretations=interpretations)
+                try:
+                    return self._json(coordinator.assess_conversation(conv_id))
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             if path.startswith("/api/comms/conversations/"):
                 conv_id = path.rsplit("/", 1)[-1]
                 needs_aryan = NeedsAryanQueue(store, control.audit, control)
@@ -970,6 +987,25 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 dispute_id = path.rsplit("/", 1)[-1]
                 dispute = DisputeStore(store, control.audit).get(dispute_id)
                 return self._json(dispute or {"error": "dispute not found"}, HTTPStatus.OK if dispute else HTTPStatus.NOT_FOUND)
+
+            # -- Phase 5 Final Client Experience (Sections 8, 5, 16, 17) --
+            if path.startswith("/api/comms/contacts/") and not path.endswith("/preferences"):
+                contact_id = path.rsplit("/", 1)[-1]
+                contact = CommsStore(store, control.audit).get_contact(contact_id)
+                return self._json(contact or {"error": "contact not found"}, HTTPStatus.OK if contact else HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/payment-comms/invoices/"):
+                invoice_id = path.rsplit("/", 1)[-1]
+                return self._json({"items": PaymentCommsBridge(store, control.audit).list_for_invoice(invoice_id)})
+            if path.startswith("/api/payment-comms/disputes/"):
+                dispute_id = path.rsplit("/", 1)[-1]
+                return self._json({"items": PaymentCommsBridge(store, control.audit).list_for_dispute(dispute_id)})
+            if path.startswith("/api/customer-portal/"):
+                organization_id = path.rsplit("/", 1)[-1]
+                try:
+                    bundle = CustomerPortalService(store, control.audit).get_portal_bundle(organization_id)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+                return self._json(bundle)
 
             # -- Digital Workforce (Section 20) --
             if path == "/api/wf/tasks":
@@ -1549,6 +1585,54 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     comms_send = CommsStore(store, control.audit, needs_aryan, provider=resolve_configured_email_provider())
                     message = comms_send.send_message_via_provider(message_id, body.get("actor", "Aryan"))
                     return self._json(message)
+                if path.startswith("/api/comms/messages/") and path.endswith("/send-whatsapp"):
+                    message_id = path.split("/")[4]
+                    needs_aryan = NeedsAryanQueue(store, control.audit, control)
+                    comms_wa = CommsStore(store, control.audit, needs_aryan, whatsapp_provider=resolve_configured_whatsapp_provider())
+                    message = comms_wa.send_message_via_whatsapp_provider(message_id, body.get("actor", "Aryan"))
+                    return self._json(message)
+                if path.startswith("/api/comms/contacts/") and path.endswith("/preferences"):
+                    contact_id = path.split("/")[4]
+                    try:
+                        contact = CommsStore(store, control.audit).set_contact_preferences(
+                            contact_id, body.get("actor", "Aryan"),
+                            preferred_language=body.get("preferred_language"), preferred_channel=body.get("preferred_channel"),
+                            tone=body.get("tone"), detail_level=body.get("detail_level"), technical_level=body.get("technical_level"),
+                            update_cadence=body.get("update_cadence"), timezone=body.get("timezone"),
+                            call_preference=body.get("call_preference"), communication_restrictions=body.get("communication_restrictions"),
+                        )
+                    except CommsError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return self._json(contact)
+                if path.startswith("/api/comms/conversations/") and path.endswith("/clarify"):
+                    conv_id = path.split("/")[4]
+                    interpretations = LanguageInterpretationStore(store, control.audit)
+                    coordinator = ClarificationCoordinator(store, control.audit, interpretations=interpretations)
+                    try:
+                        draft = coordinator.draft_consolidated_clarification(conv_id, actor=body.get("actor", "system"))
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+                    return self._json(draft or {"action": "NO_ACTION_NEEDED"})
+                if path.startswith("/api/payment-comms/invoices/") and path.endswith("/ready-notice"):
+                    invoice_id = path.split("/")[4]
+                    draft = PaymentCommsBridge(store, control.audit).draft_invoice_ready_notice(invoice_id, actor=body.get("actor", "system"))
+                    return self._json(draft or {"action": "NO_DRAFT_PRODUCED"})
+                if path.startswith("/api/payment-comms/invoices/") and path.endswith("/payment-notice"):
+                    invoice_id = path.split("/")[4]
+                    draft = PaymentCommsBridge(store, control.audit).draft_payment_received_notice(invoice_id, actor=body.get("actor", "system"))
+                    return self._json(draft or {"action": "NO_DRAFT_PRODUCED"})
+                if path.startswith("/api/payment-comms/invoices/") and path.endswith("/overdue-notice"):
+                    invoice_id = path.split("/")[4]
+                    draft = PaymentCommsBridge(store, control.audit).draft_overdue_reminder(invoice_id, actor=body.get("actor", "system"))
+                    return self._json(draft or {"action": "NO_DRAFT_PRODUCED"})
+                if path.startswith("/api/payment-comms/disputes/") and path.endswith("/ack-notice"):
+                    dispute_id = path.split("/")[4]
+                    draft = PaymentCommsBridge(store, control.audit).draft_dispute_acknowledgement(dispute_id, actor=body.get("actor", "system"))
+                    return self._json(draft or {"action": "NO_DRAFT_PRODUCED"})
+                if path.startswith("/api/payment-comms/disputes/") and path.endswith("/resolution-notice"):
+                    dispute_id = path.split("/")[4]
+                    draft = PaymentCommsBridge(store, control.audit).draft_dispute_resolution_notice(dispute_id, actor=body.get("actor", "system"))
+                    return self._json(draft or {"action": "NO_DRAFT_PRODUCED"})
                 if path.startswith("/api/alerts/") and path.endswith("/acknowledge"):
                     alert_id = unquote(path.split("/")[3])
                     try:
@@ -4628,15 +4712,23 @@ $('commsRecentlyResolvedList').innerHTML=(ov.recently_resolved||[]).length?(ov.r
 
 document.querySelectorAll('.commsRunAgent').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const r=await api(`/api/comms/conversations/${b.dataset.id}/run-agent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});alert(r.actions&&r.actions.length?'Agent actions:\n'+r.actions.join('\n'):(r.note||'No action taken.'));await loadCommunications()}catch(e){alert(e.message)}finally{b.disabled=false}});
 document.querySelectorAll('.commsResolve').forEach(b=>b.onclick=async()=>{await api(`/api/comms/conversations/${b.dataset.id}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'resolved',actor:'Aryan'})});await loadCommunications()});
-document.querySelectorAll('.commsExpand').forEach(b=>b.onclick=async()=>{const el=$('commsmsgs-'+b.dataset.id);if(el.dataset.loaded==='1'){el.innerHTML='';el.dataset.loaded='0';return}const conv=await api('/api/comms/conversations/'+b.dataset.id);el.dataset.loaded='1';
+document.querySelectorAll('.commsExpand').forEach(b=>b.onclick=async()=>{const el=$('commsmsgs-'+b.dataset.id);if(el.dataset.loaded==='1'){el.innerHTML='';el.dataset.loaded='0';return}const [conv,clarification]=await Promise.all([api('/api/comms/conversations/'+b.dataset.id),api('/api/comms/conversations/'+b.dataset.id+'/clarification-assessment').catch(()=>null)]);el.dataset.loaded='1';
 const msgsHtml=(conv.messages||[]).map(m=>`<div class="contrib"><b>${esc(m.direction)}${m.is_internal_note?' note':''} (${esc(m.status)})${m.sender_agent?' -- '+esc(m.sender_agent):''}:</b> ${esc(m.body)}${m.direction==='OUTBOUND'&&m.status==='DRAFT'&&!m.is_internal_note?` <button class="secondary commsMarkSent" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}">Approve & mark sent</button> <button class="secondary commsSendViaEmail" data-mid="${esc(m.id)}" data-cid="${esc(b.dataset.id)}" title="Attempts a real send through the currently configured email provider (Null by default -- refuses until real credentials are opted in). Requires any HIGH-risk approval on this message to already be APPROVED.">Send via email</button>`:''}${m.failure_reason?` <span class="meta" style="color:#b91c1c">Last attempt failed (${esc(m.send_method||'')}, ${m.send_attempts||0} attempt${(m.send_attempts||0)===1?'':'s'}): ${esc(m.failure_reason)}</span>`:''}</div>`).join('')||'<div class="empty">No messages yet.</div>';
 // Milestone 8 drill-down: risk classification + approval/audit history
 // alongside the thread, so a full review never requires leaving this card.
 const riskHtml=(conv.risk_events||[]).length?`<div class="contrib"><b>Risk classification:</b> ${(conv.risk_events||[]).map(r=>`${esc(r.risk)}`).join(', ')}</div>`:'';
 const historyHtml=(conv.history||[]).length?`<div class="contrib"><b>Audit history:</b> ${(conv.history||[]).map(h=>`${esc(h.field)}: ${esc(h.old_value||'--')} -> ${esc(h.new_value)} (${esc(h.actor)})`).join('; ')}</div>`:'';
-el.innerHTML=msgsHtml+riskHtml+historyHtml;
+// Phase 5 Final Client Experience: this contact's communication
+// preferences (Section 8) and the minimum-interruption clarification
+// coordinator's current read on this conversation (Section 5) --
+// surfaced read-only plus one action, never auto-sent.
+const contactPrefs=conv.primary_contact||null;
+const prefsHtml=contactPrefs&&(contactPrefs.preferred_language||contactPrefs.tone||contactPrefs.preferred_channel||contactPrefs.technical_level)?`<div class="contrib"><b>Communication preferences:</b> ${[contactPrefs.preferred_language&&`language: ${esc(contactPrefs.preferred_language)}`,contactPrefs.preferred_channel&&`channel: ${esc(contactPrefs.preferred_channel)}`,contactPrefs.tone&&esc(contactPrefs.tone),contactPrefs.technical_level&&esc(contactPrefs.technical_level),contactPrefs.update_cadence&&`cadence: ${esc(contactPrefs.update_cadence)}`].filter(Boolean).join(', ')}</div>`:'';
+const clarificationHtml=clarification&&clarification.action==='SEND_CONSOLIDATED_CLARIFICATION'?`<div class="contrib"><b>Clarification needed (${clarification.consolidated_questions.length}):</b> ${clarification.consolidated_questions.map(esc).join(' / ')} <button class="secondary commsDraftClarify" data-cid="${esc(b.dataset.id)}">Draft consolidated clarification</button></div>`:(clarification?`<div class="contrib"><b>Clarification:</b> everything on file is already covered -- no action needed from the customer right now.</div>`:'');
+el.innerHTML=msgsHtml+riskHtml+historyHtml+prefsHtml+clarificationHtml;
 el.querySelectorAll('.commsMarkSent').forEach(mb=>mb.onclick=async()=>{if(!confirm('Confirm you have actually sent this message through the real channel, and mark it sent?'))return;await api(`/api/comms/messages/${mb.dataset.mid}/mark-sent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCommunications()})});
 el.querySelectorAll('.commsSendViaEmail').forEach(sb=>sb.onclick=async()=>{if(!confirm('Attempt a REAL send through the configured email provider now? (Refuses safely if no real provider is configured, if this message needs an approval that has not been granted yet, or if it is not an outbound draft.)'))return;sb.disabled=true;try{const r=await api(`/api/comms/messages/${sb.dataset.mid}/send`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});if(r.status==='SENT'){alert('Sent via '+(r.provider_name||'provider')+'.');}else{alert('Send did not complete: '+(r.failure_reason||r.status||'unknown'));}}catch(e){alert('Send failed: '+e.message)}finally{sb.disabled=false;await loadCommunications()}});
+el.querySelectorAll('.commsDraftClarify').forEach(cb=>cb.onclick=async()=>{cb.disabled=true;try{await api(`/api/comms/conversations/${cb.dataset.cid}/clarify`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});el.dataset.loaded='0';b.click()}catch(e){alert('Could not draft clarification: '+e.message)}finally{cb.disabled=false}});
 }
 $('commsRunWorkforce').onclick=async()=>{$('commsRunWorkforce').disabled=true;$('commsWorkforceRunStatus').innerHTML='<div class="empty">Running AI Workforce across open conversations...</div>';try{const r=await api('/api/comms/workforce/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});$('commsWorkforceRunStatus').innerHTML=`<div class="item"><div class="meta"><span>checked ${r.conversations_checked}</span><span>acted on ${r.conversations_acted_on}</span></div></div>`;await loadCommunications()}catch(e){$('commsWorkforceRunStatus').innerHTML=`<div class="empty">Run failed: ${esc(e.message)}</div>`}finally{$('commsRunWorkforce').disabled=false}};
 

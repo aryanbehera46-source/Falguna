@@ -82,6 +82,66 @@ class OrganizationAndContactTests(_CommsTestCase):
         self.assertEqual(self.store.get("comm_contacts", c1)["organization_id"], org)
 
 
+class ContactCommunicationPreferenceTests(_CommsTestCase):
+    """Phase 5 Final Client Experience, Section 8 -- Customer Communication
+    Profile. Every field independently settable, None leaves the field
+    untouched, invalid values rejected against the closed enums, and
+    nothing here infers anything the test didn't explicitly state."""
+
+    def test_preferences_start_unset(self):
+        c = self.comms.find_or_create_contact("new@acme.com", "New Contact")
+        contact = self.comms.get_contact(c)
+        for field in ("preferred_language", "preferred_channel", "tone", "detail_level",
+                      "technical_level", "update_cadence", "timezone", "call_preference",
+                      "communication_restrictions"):
+            self.assertIsNone(contact[field])
+
+    def test_set_contact_preferences_persists_only_given_fields(self):
+        c = self.comms.find_or_create_contact("pref@acme.com", "Pref Contact")
+        updated = self.comms.set_contact_preferences(
+            c, "Aryan", preferred_language="es", tone="CONVERSATIONAL", detail_level="CONCISE",
+        )
+        self.assertEqual(updated["preferred_language"], "es")
+        self.assertEqual(updated["tone"], "CONVERSATIONAL")
+        self.assertEqual(updated["detail_level"], "CONCISE")
+        self.assertIsNone(updated["technical_level"])
+        self.assertEqual(updated["preferences_set_by"], "Aryan")
+        self.assertIsNotNone(updated["preferences_updated_at"])
+
+    def test_set_contact_preferences_is_additive_across_calls(self):
+        c = self.comms.find_or_create_contact("pref2@acme.com", "Pref Two")
+        self.comms.set_contact_preferences(c, "Aryan", preferred_language="fr")
+        second = self.comms.set_contact_preferences(c, "Aryan", technical_level="NON_TECHNICAL")
+        self.assertEqual(second["preferred_language"], "fr")
+        self.assertEqual(second["technical_level"], "NON_TECHNICAL")
+
+    def test_set_contact_preferences_rejects_invalid_values(self):
+        c = self.comms.find_or_create_contact("pref3@acme.com", "Pref Three")
+        with self.assertRaises(CommsError):
+            self.comms.set_contact_preferences(c, "Aryan", tone="SARCASTIC")
+        with self.assertRaises(CommsError):
+            self.comms.set_contact_preferences(c, "Aryan", detail_level="VERBOSE")
+        with self.assertRaises(CommsError):
+            self.comms.set_contact_preferences(c, "Aryan", technical_level="EXPERT")
+        with self.assertRaises(CommsError):
+            self.comms.set_contact_preferences(c, "Aryan", update_cadence="HOURLY")
+        with self.assertRaises(CommsError):
+            self.comms.set_contact_preferences(c, "Aryan", call_preference="ALWAYS_CALL")
+        with self.assertRaises(CommsError):
+            self.comms.set_contact_preferences(c, "Aryan", preferred_channel="CARRIER_PIGEON")
+
+    def test_set_contact_preferences_rejects_unknown_contact(self):
+        with self.assertRaises(CommsError):
+            self.comms.set_contact_preferences("not-a-real-id", "Aryan", tone="FORMAL")
+
+    def test_set_contact_preferences_with_no_fields_is_a_no_op(self):
+        c = self.comms.find_or_create_contact("pref4@acme.com", "Pref Four")
+        before = self.comms.get_contact(c)
+        after = self.comms.set_contact_preferences(c, "Aryan")
+        self.assertEqual(before, after)
+        self.assertIsNone(after["preferences_set_by"])
+
+
 class ConversationLifecycleTests(_CommsTestCase):
     def test_open_conversation_rejects_invalid_channel_department_priority(self):
         with self.assertRaises(CommsError):

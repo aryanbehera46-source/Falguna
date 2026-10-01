@@ -35,8 +35,9 @@ from .audit import AuditLog
 from .email_admin import EmailError, EmailProvider, NullEmailProvider
 from .store import StateStore, utcnow
 from .ttt_hq import NeedsAryanQueue
+from .whatsapp_admin import NullWhatsAppProvider, WhatsAppError, WhatsAppProvider
 
-CHANNELS = {"EMAIL", "WEBSITE", "SUPPORT", "CAREERS", "PROJECT", "INTERNAL"}
+CHANNELS = {"EMAIL", "WEBSITE", "SUPPORT", "CAREERS", "PROJECT", "INTERNAL", "WHATSAPP"}
 DEPARTMENTS = {"general", "sales", "support", "projects", "billing", "careers", "media"}
 STATUSES = {"new", "open", "pending_customer", "pending_approval", "escalated", "resolved", "closed"}
 PRIORITIES = {"low", "normal", "high", "urgent"}
@@ -64,6 +65,19 @@ TICKET_STATUSES = {"NEW", "TRIAGED", "IN_PROGRESS", "WAITING_CUSTOMER", "WAITING
 # box" posture (see e.g. ConversationStore's confidence labels).
 _SLA_HOURS_BY_PRIORITY = {"urgent": 1, "high": 4, "normal": 24, "low": 72}
 
+# Phase 5 Final Client Experience, Section 8 -- Customer Communication
+# Profile. Small, closed, code-level enums (the same convention CHANNELS/
+# DEPARTMENTS/PRIORITIES above already use), never a free-text guess and
+# never an inferred sensitive trait: every value here is something a
+# contact can be directly, explicitly observed or told to prefer. A field
+# left unset stays None/unknown forever until someone sets it -- there is
+# no default any of these silently fall back to.
+COMM_TONES = {"FORMAL", "CONVERSATIONAL"}
+COMM_DETAIL_LEVELS = {"CONCISE", "DETAILED"}
+COMM_TECHNICAL_LEVELS = {"NON_TECHNICAL", "TECHNICAL"}
+COMM_UPDATE_CADENCES = {"AS_NEEDED", "DAILY", "WEEKLY", "MILESTONE_ONLY"}
+COMM_CALL_PREFERENCES = {"PREFERS_CALLS", "PREFERS_ASYNC", "NO_PREFERENCE"}
+
 
 class CommsError(ValueError):
     pass
@@ -84,6 +98,7 @@ class CommsStore:
     def __init__(
         self, store: StateStore, audit: AuditLog, needs_aryan: Optional[NeedsAryanQueue] = None,
         provider: Optional[EmailProvider] = None,
+        whatsapp_provider: Optional[WhatsAppProvider] = None,
     ):
         self.store = store
         self.audit = audit
@@ -95,6 +110,12 @@ class CommsStore:
         # cleanly until a caller explicitly passes a real, configured
         # provider (see hq_web.py's resolve_configured_email_provider()).
         self.provider = provider or NullEmailProvider()
+        # Phase 5 Final Client Experience, Section 14: same opt-in
+        # convention for WhatsApp. NullWhatsAppProvider structurally
+        # cannot send, so send_message_via_whatsapp_provider() always
+        # refuses cleanly -- no call site in this assignment passes a
+        # real, configured provider.
+        self.whatsapp_provider = whatsapp_provider or NullWhatsAppProvider()
 
     def _participant_timestamps(self, timestamp: str) -> Dict[str, str]:
         """Write the timestamp names supported by this database.
@@ -149,6 +170,77 @@ class CommsStore:
             "organization_id": organization_id, "name": name, "email": email, "phone": phone,
             "role_title": None, "notes": None, "created_at": now, "updated_at": now,
         })
+
+    def get_contact(self, contact_id: str) -> Optional[Dict[str, Any]]:
+        return self.store.get("comm_contacts", contact_id)
+
+    def set_contact_preferences(
+        self, contact_id: str, actor: str, *,
+        preferred_language: Optional[str] = None,
+        preferred_channel: Optional[str] = None,
+        tone: Optional[str] = None,
+        detail_level: Optional[str] = None,
+        technical_level: Optional[str] = None,
+        update_cadence: Optional[str] = None,
+        timezone: Optional[str] = None,
+        call_preference: Optional[str] = None,
+        communication_restrictions: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Phase 5 Final Client Experience, Section 8. Every field is
+        independently settable and `None` means "leave as-is", not "clear
+        this field" -- the same convention
+        CapabilityRegistryStore.set_profile() already established. Only
+        directly-stated/observed preferences belong here: this never
+        infers a sensitive personal characteristic, only records what a
+        contact asked for or was told to prefer (e.g. "reply in Spanish",
+        "keep it brief", "call me instead of emailing").
+        """
+        contact = self.store.get("comm_contacts", contact_id)
+        if not contact:
+            raise CommsError("contact not found")
+        if preferred_channel is not None and preferred_channel not in CHANNELS:
+            raise CommsError(f"preferred_channel must be one of {sorted(CHANNELS)}")
+        if tone is not None and tone not in COMM_TONES:
+            raise CommsError(f"tone must be one of {sorted(COMM_TONES)}")
+        if detail_level is not None and detail_level not in COMM_DETAIL_LEVELS:
+            raise CommsError(f"detail_level must be one of {sorted(COMM_DETAIL_LEVELS)}")
+        if technical_level is not None and technical_level not in COMM_TECHNICAL_LEVELS:
+            raise CommsError(f"technical_level must be one of {sorted(COMM_TECHNICAL_LEVELS)}")
+        if update_cadence is not None and update_cadence not in COMM_UPDATE_CADENCES:
+            raise CommsError(f"update_cadence must be one of {sorted(COMM_UPDATE_CADENCES)}")
+        if call_preference is not None and call_preference not in COMM_CALL_PREFERENCES:
+            raise CommsError(f"call_preference must be one of {sorted(COMM_CALL_PREFERENCES)}")
+        updates: Dict[str, Any] = {}
+        if preferred_language is not None:
+            updates["preferred_language"] = preferred_language
+        if preferred_channel is not None:
+            updates["preferred_channel"] = preferred_channel
+        if tone is not None:
+            updates["tone"] = tone
+        if detail_level is not None:
+            updates["detail_level"] = detail_level
+        if technical_level is not None:
+            updates["technical_level"] = technical_level
+        if update_cadence is not None:
+            updates["update_cadence"] = update_cadence
+        if timezone is not None:
+            updates["timezone"] = timezone
+        if call_preference is not None:
+            updates["call_preference"] = call_preference
+        if communication_restrictions is not None:
+            updates["communication_restrictions"] = communication_restrictions
+        if not updates:
+            return contact
+        now = utcnow()
+        updates["preferences_set_by"] = actor
+        updates["preferences_updated_at"] = now
+        updates["updated_at"] = now
+        self.store.update("comm_contacts", contact_id, **updates)
+        self.audit.append(
+            "COMM_CONTACT_PREFERENCES_SET",
+            {"contact_id": contact_id, "fields": sorted(k for k in updates if k not in ("updated_at", "preferences_set_by", "preferences_updated_at")), "actor": actor},
+        )
+        return self.store.get("comm_contacts", contact_id)
 
     # -- conversations ----------------------------------------------------
 
@@ -436,6 +528,88 @@ class CommsStore:
                 })
                 return sent_message
             except EmailError as exc:
+                last_error = str(exc)
+
+        now = utcnow()
+        self.store.update(
+            "comm_messages", message_id, status="FAILED", updated_at=now,
+            send_method="provider", provider_name=provider_name, send_attempts=attempts,
+            failure_reason=last_error or "provider send failed for an unknown reason",
+        )
+        self.audit.append("COMM_MESSAGE_SEND_FAILED", {
+            "message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor,
+            "provider": provider_name, "attempts": attempts, "reason": last_error,
+        })
+        return self.store.get("comm_messages", message_id)
+
+    def send_message_via_whatsapp_provider(self, message_id: str, actor: str, max_attempts: int = 3) -> Dict[str, Any]:
+        """Phase 5 Final Client Experience, Section 14 -- the WhatsApp
+        counterpart to send_message_via_provider(), same preconditions and
+        same HIGH-risk-approval gate, reusing the contact's phone number
+        instead of an email address. With NullWhatsAppProvider (the only
+        provider ever wired in by this assignment) this always refuses
+        before attempting anything."""
+        if not self.whatsapp_provider.is_configured():
+            raise CommsError(
+                "no real WhatsApp provider is configured -- nothing was sent. "
+                "This assignment does not authorize activating a real WhatsApp Business account; "
+                "use mark_message_sent to record that you sent this yourself."
+            )
+        message = self.store.get("comm_messages", message_id)
+        if not message:
+            raise CommsError("message not found")
+        if message["direction"] != "OUTBOUND" or message["is_internal_note"]:
+            raise CommsError("only an outbound, non-internal-note message can be sent")
+        if message["status"] != "DRAFT":
+            raise CommsError(f"message is already {message['status']}, not DRAFT")
+
+        from .risk_engine import RiskClassificationStore
+        risk_events = RiskClassificationStore(self.store, self.audit, self.needs_aryan).list_for_subject("comm_message", message_id)
+        for event in risk_events:
+            if event["risk"] != "HIGH":
+                continue
+            item = self.store.get("needs_aryan_items", event["needs_aryan_id"]) if event.get("needs_aryan_id") else None
+            if not item or item["status"] != "APPROVED":
+                raise CommsError(
+                    "this message was classified HIGH risk and its approval is not yet APPROVED -- "
+                    "it cannot be sent (manually or via a provider) until that is resolved."
+                )
+
+        conv = self.store.get("comm_conversations", message["conversation_id"])
+        contact = self.store.get("comm_contacts", conv["primary_contact_id"]) if conv and conv.get("primary_contact_id") else None
+        to_phone = (contact or {}).get("phone")
+        if not to_phone:
+            raise CommsError("this conversation has no contact phone number on file -- cannot send via a WhatsApp provider")
+
+        prior_inbound = [
+            m for m in self.store.list("comm_messages", "conversation_id=? AND direction=?", (message["conversation_id"], "INBOUND"))
+            if m.get("provider_message_id")
+        ]
+        in_reply_to = prior_inbound[-1]["provider_message_id"] if prior_inbound else None
+        provider_name = self.whatsapp_provider.provider_name()
+
+        last_error: Optional[str] = None
+        attempts = 0
+        max_attempts = max(1, int(max_attempts))
+        for attempts in range(1, max_attempts + 1):
+            try:
+                result = self.whatsapp_provider.send(
+                    to_phone, message["body"],
+                    thread_id=conv.get("external_thread_id"), in_reply_to_message_id=in_reply_to,
+                )
+                self.store.update(
+                    "comm_messages", message_id,
+                    provider_message_id=result.get("provider_message_id"), send_attempts=attempts,
+                )
+                sent_message = self._finalize_sent(dict(message), actor, send_method="provider", provider_name=provider_name)
+                self.audit.append("COMM_MESSAGE_SENT_VIA_WHATSAPP_PROVIDER", {
+                    "message_id": message_id, "conversation_id": message["conversation_id"], "actor": actor,
+                    "provider": provider_name, "attempts": attempts,
+                    "provider_message_id": result.get("provider_message_id"),
+                    "note": "provider accepted the message for delivery; not a confirmation it reached the recipient's device",
+                })
+                return sent_message
+            except WhatsAppError as exc:
                 last_error = str(exc)
 
         now = utcnow()

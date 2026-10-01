@@ -707,6 +707,20 @@ CREATE TABLE IF NOT EXISTS comm_contacts (
     phone TEXT,
     role_title TEXT,
     notes TEXT,
+    -- Phase 5 Final Client Experience, Section 8 (Customer Communication
+    -- Profile): NULL means "unknown/not yet set", never a guessed default.
+    -- See falguna/comms.py's set_contact_preferences() / COMM_PREFERENCE_*.
+    preferred_language TEXT,
+    preferred_channel TEXT,
+    tone TEXT,
+    detail_level TEXT,
+    technical_level TEXT,
+    update_cadence TEXT,
+    timezone TEXT,
+    call_preference TEXT,
+    communication_restrictions TEXT,
+    preferences_set_by TEXT,
+    preferences_updated_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -1007,3 +1021,52 @@ CREATE TABLE IF NOT EXISTS cs_project_costs (
     amount REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', note TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cs_project_costs_project ON cs_project_costs(project_id, cost_category);
+
+-- ============================================================
+-- Phase 5 Final Client Experience, Section 3/4/6/7: Customer
+-- Language Understanding V1 (falguna/language.py). One durable record
+-- per inbound customer message actually run through the interpreter --
+-- never fabricated, never recomputed silently in place (a re-interpret
+-- is a new row, so the original interpretation a human may have already
+-- acted on is never rewritten out from under them).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS comm_message_interpretations (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL REFERENCES comm_messages(id),
+    raw_text TEXT NOT NULL,
+    detected_languages_json TEXT NOT NULL,
+    normalized_english_summary TEXT,
+    ambiguity_flags_json TEXT NOT NULL,
+    unresolved_questions_json TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    inferred_requirement_candidates_json TEXT NOT NULL,
+    clarification_needed INTEGER NOT NULL,
+    unavailable INTEGER NOT NULL DEFAULT 0,
+    unavailable_reason TEXT,
+    model_provider TEXT,
+    model_name TEXT,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_message_interpretations_message ON comm_message_interpretations(message_id);
+
+-- ============================================================
+-- Phase 5 Final Client Experience, Section 20: Payment Communication
+-- Bridge (falguna/payment_comms.py). A DRAFT-only customer-facing message
+-- generated from a real, already-persisted BillingStore/DisputeStore
+-- state transition -- never sent automatically, never claiming a status
+-- (e.g. "payment received") the linked invoice/dispute row does not
+-- itself actually show.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS comm_payment_drafts (
+    id TEXT PRIMARY KEY,
+    invoice_id TEXT REFERENCES rh_invoices(id),
+    dispute_id TEXT REFERENCES cs_disputes(id),
+    event_type TEXT NOT NULL,
+    comm_message_id TEXT REFERENCES comm_messages(id),
+    evidence_json TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comm_payment_drafts_invoice ON comm_payment_drafts(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_comm_payment_drafts_dispute ON comm_payment_drafts(dispute_id);

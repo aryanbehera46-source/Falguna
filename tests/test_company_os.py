@@ -1217,6 +1217,18 @@ class WorkforceDependencyChainDeterministicEndToEndTests(CompanyOSBase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.thread.join(timeout=5)
+        # Phase 5 full-regression finding: shutdown() only stops
+        # serve_forever()'s loop -- it does NOT release the listening
+        # socket. Without server_close() the bind on the real Ollama port
+        # (127.0.0.1:11434) outlives this test class for the rest of the
+        # pytest process, so any later test whose code path makes a real
+        # OllamaProvider health-check/list-models call (e.g.
+        # FalgunaServerStillWorksTests via /api/config) connects into a
+        # dead listener nobody is accept()-ing, stalling for minutes once
+        # its backlog fills and in some cases flipping an
+        # otherwise-passing assertion to FAILED. Closing the socket here
+        # is the fix -- verified by a clean full-suite rerun afterward.
+        cls.server.server_close()
 
     def setUp(self):
         super().setUp()
