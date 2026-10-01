@@ -1,6 +1,7 @@
 """Final Phase 6 sandbox financial flows: commissions, refunds, subscriptions, payables."""
 
 import json
+import uuid
 from datetime import date, timedelta
 from typing import Any, Dict, Optional
 
@@ -9,6 +10,7 @@ from .billing import BillingStore
 from .partner_management import CommissionStore
 from .phase6_commercial import (
     AccessContext, ApprovalWorkflow, CommercialIdentityStore, CommercialSecurityError, FinanceAccounts,
+    PaymentOrchestrator,
 )
 from .store import StateStore, utcnow
 
@@ -150,6 +152,15 @@ class RefundService:
                 clawback = round(float(refund["amount"]) * float(commission["rate"]), 2)
                 CommissionStore(self.store, self.audit).record_refund(referrals[-1]["id"], context.identity_id,
                     clawback, evidence, "confirmed customer refund", event_ref=refund_id)
+        reconciliation_id = self.store.create("p6_refund_reconciliations", {
+            "organization_id": context.organization_id, "refund_id": refund_id,
+            "payment_intent_id": refund["payment_intent_id"], "invoice_id": refund["invoice_id"],
+            "provider_ref": provider_ref, "amount": refund["amount"], "currency": refund["currency"],
+            "status": "MATCHED", "evidence_json": json.dumps(evidence, sort_keys=True),
+            "created_at": utcnow(), "updated_at": utcnow(),
+        })
+        self.audit.append("P6_REFUND_RECONCILED", {"refund_id": refund_id, "reconciliation_id": reconciliation_id,
+                          "provider_ref": provider_ref, "actor": context.identity_id})
         return self.store.get("p6_refunds", refund_id)
 
 
@@ -158,6 +169,7 @@ class SubscriptionService:
 
     def __init__(self, store: StateStore, audit: AuditLog, identities: CommercialIdentityStore):
         self.store, self.audit, self.identities = store, audit, identities
+        self.payments = PaymentOrchestrator(store, audit, identities)
 
     def create(self, context: AccessContext, client_id: str, plan_name: str, amount: float, currency: str,
                cadence: str, next_billing_date: str, provider_token_ref: Optional[str], mandate_ref: Optional[str],
@@ -184,16 +196,152 @@ class SubscriptionService:
         as_of = as_of or date.today().isoformat()
         if sub["next_billing_date"] > as_of:
             raise CommercialSecurityError("subscription is not due")
-        if sub.get("last_invoice_id"):
-            prior = self.store.get("rh_invoices", sub["last_invoice_id"])
-            if prior and prior["created_at"][:10] == sub["next_billing_date"]:
-                return prior
+        cycle_date = sub["next_billing_date"]
+        now = utcnow()
+        with self.store.transaction() as db:
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO p6_subscription_cycles "
+                "(id,subscription_id,cycle_date,invoice_id,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), subscription_id, cycle_date, None, "GENERATING", now, now),
+            )
+        cycles = self.store.list("p6_subscription_cycles", "subscription_id=? AND cycle_date=?", (subscription_id, cycle_date))
+        cycle = cycles[-1]
+        if cursor.rowcount == 0:
+            if cycle.get("invoice_id"):
+                return self.store.get("rh_invoices", cycle["invoice_id"])
+            raise CommercialSecurityError("recurring invoice generation is already in progress")
         invoice_id = BillingStore(self.store, self.audit).create_invoice(sub["client_id"], context.identity_id,
             sub["amount"], sub["currency"], opportunity_id=sub.get("opportunity_id"), milestone=sub["plan_name"])
-        next_date = (date.fromisoformat(sub["next_billing_date"]) + timedelta(days=self.CADENCES[sub["cadence"]])).isoformat()
+        self.store.update("p6_subscription_cycles", cycle["id"], invoice_id=invoice_id, status="INVOICED")
+        next_date = (date.fromisoformat(cycle_date) + timedelta(days=self.CADENCES[sub["cadence"]])).isoformat()
         self.store.update("p6_subscriptions", subscription_id, last_invoice_id=invoice_id, next_billing_date=next_date,
                           autopay_status="INVOICE_CREATED")
         return self.store.get("rh_invoices", invoice_id)
+
+    def create_autopay_attempt(self, context: AccessContext, subscription_id: str, idempotency_key: str) -> Dict[str, Any]:
+        self.identities.authorize(context, "payments:create", context.organization_id)
+        sub = self.store.get("p6_subscriptions", subscription_id)
+        if not sub or sub["organization_id"] != context.organization_id or sub["status"] != "ACTIVE":
+            raise CommercialSecurityError("active organization-scoped subscription required")
+        if not sub.get("last_invoice_id") or not sub.get("mandate_ref") or not sub.get("provider_token_ref"):
+            raise CommercialSecurityError("due invoice and provider token/mandate references required")
+        existing = self.store.list("p6_subscription_attempts", "organization_id=? AND idempotency_key=?",
+                                   (context.organization_id, idempotency_key))
+        if existing:
+            return existing[-1]
+        invoice = self.store.get("rh_invoices", sub["last_invoice_id"])
+        if not invoice or invoice["status"] == "PAID":
+            raise CommercialSecurityError("unpaid recurring invoice required")
+        prior = self.store.list("p6_subscription_attempts", "subscription_id=? AND invoice_id=?", (subscription_id, invoice["id"]))
+        attempt_number = len(prior) + 1
+        intent = self.payments.create_intent(context, context.organization_id, sub["amount"], sub["currency"],
+            "SUBSCRIPTION", f"subscription-payment:{idempotency_key}", "TTT", "beneficiary:official", ["CARD"],
+            invoice_id=invoice["id"], metadata={"subscription_id": subscription_id, "attempt": attempt_number})
+        self.store.update("p6_payment_intents", intent["id"], payment_method_token_ref=sub["provider_token_ref"],
+                          mandate_token_ref=sub["mandate_ref"])
+        attempt_id = self.store.create("p6_subscription_attempts", {
+            "organization_id": context.organization_id, "subscription_id": subscription_id, "invoice_id": invoice["id"],
+            "payment_intent_id": intent["id"], "cycle_date": invoice["created_at"][:10],
+            "attempt_number": attempt_number, "status": "PENDING_PROVIDER", "failure_reason": None,
+            "idempotency_key": idempotency_key, "created_at": utcnow(), "updated_at": utcnow(),
+        })
+        self.store.update("p6_subscriptions", subscription_id, autopay_status="PENDING_PROVIDER")
+        return self.store.get("p6_subscription_attempts", attempt_id)
+
+    def mark_attempt_failed(self, context: AccessContext, attempt_id: str, reason: str) -> Dict[str, Any]:
+        self.identities.authorize(context, "payments:create", context.organization_id)
+        attempt = self.store.get("p6_subscription_attempts", attempt_id)
+        if not attempt or attempt["organization_id"] != context.organization_id or not reason.strip():
+            raise CommercialSecurityError("organization-scoped attempt and failure reason required")
+        if attempt["status"] == "FAILED":
+            return attempt
+        if attempt["status"] != "PENDING_PROVIDER":
+            raise CommercialSecurityError("only pending autopay attempt may fail")
+        self.store.update("p6_subscription_attempts", attempt_id, status="FAILED", failure_reason=reason)
+        sub = self.store.get("p6_subscriptions", attempt["subscription_id"])
+        self.store.update("p6_subscriptions", sub["id"], autopay_status="RETRY_REQUIRED", retry_count=int(sub["retry_count"])+1)
+        return self.store.get("p6_subscription_attempts", attempt_id)
+
+    def sync_collected(self, context: AccessContext, attempt_id: str) -> Dict[str, Any]:
+        self.identities.authorize(context, "finance:read", context.organization_id)
+        attempt = self.store.get("p6_subscription_attempts", attempt_id)
+        if not attempt or attempt["organization_id"] != context.organization_id:
+            raise CommercialSecurityError("autopay attempt not found")
+        if attempt["status"] == "COLLECTED":
+            return attempt
+        payment = self.store.get("p6_payment_intents", attempt["payment_intent_id"])
+        reconciliations = self.store.list("p6_reconciliations", "payment_intent_id=? AND status IN ('MATCHED','PARTIAL')", (payment["id"],))
+        if payment["status"] != "SETTLED" or not reconciliations:
+            raise CommercialSecurityError("verified settled and reconciled recurring payment required")
+        self.store.update("p6_subscription_attempts", attempt_id, status="COLLECTED")
+        self.store.update("p6_subscriptions", attempt["subscription_id"], autopay_status="COLLECTED", retry_count=0)
+        return self.store.get("p6_subscription_attempts", attempt_id)
+
+    def set_status(self, context: AccessContext, subscription_id: str, status: str) -> Dict[str, Any]:
+        self.identities.authorize(context, "payments:create", context.organization_id)
+        sub = self.store.get("p6_subscriptions", subscription_id)
+        if not sub or sub["organization_id"] != context.organization_id or status not in {"ACTIVE", "PAUSED", "CANCELLED", "EXPIRED"}:
+            raise CommercialSecurityError("valid organization-scoped subscription status required")
+        if sub["status"] in {"CANCELLED", "EXPIRED"} and status == "ACTIVE":
+            raise CommercialSecurityError("terminal subscription cannot resume")
+        self.store.update("p6_subscriptions", subscription_id, status=status,
+                          autopay_status="READY" if status == "ACTIVE" else status)
+        return self.store.get("p6_subscriptions", subscription_id)
+
+
+class CommercialEconomicsService:
+    CHANNELS = {"WEBSITE_INBOUND", "REFERRAL_PARTNER", "MARKETPLACE", "AGENCY_WHITE_LABEL",
+                "CUSTOMER_EXPANSION", "RFP_TENDER", "PERMITTED_OUTBOUND", "PRODUCTIZED_PAGE", "SELF_SERVICE"}
+
+    def __init__(self, store: StateStore, audit: AuditLog, identities: CommercialIdentityStore):
+        self.store, self.audit, self.identities = store, audit, identities
+
+    def record(self, context: AccessContext, opportunity_id: str, source_channel: str, source_metadata: Dict[str, Any],
+               origin_partner_id: Optional[str] = None, quoted_value: Optional[float] = None,
+               contracted_value: Optional[float] = None, estimated_delivery_cost: Optional[float] = None,
+               known_delivery_cost: Optional[float] = None, cost_evidence: Optional[Any] = None,
+               gateway_fee: float = 0, service_tier: Optional[str] = None) -> Dict[str, Any]:
+        self.identities.authorize(context, "finance:read", context.organization_id)
+        if source_channel not in self.CHANNELS or not self.store.get("rh_opportunities", opportunity_id):
+            raise CommercialSecurityError("valid opportunity and source channel required")
+        if known_delivery_cost is not None and not cost_evidence:
+            raise CommercialSecurityError("known delivery cost requires evidence")
+        values = {"source_channel": source_channel, "source_metadata_json": json.dumps(source_metadata, sort_keys=True),
+                  "origin_partner_id": origin_partner_id, "quoted_value": quoted_value, "contracted_value": contracted_value,
+                  "estimated_delivery_cost": estimated_delivery_cost, "known_delivery_cost": known_delivery_cost,
+                  "cost_evidence_json": json.dumps(cost_evidence, sort_keys=True) if cost_evidence else None,
+                  "gateway_fee": gateway_fee, "service_tier": service_tier, "actor": context.identity_id}
+        rows = self.store.list("p6_opportunity_economics", "organization_id=? AND opportunity_id=?", (context.organization_id, opportunity_id))
+        if rows:
+            self.store.update("p6_opportunity_economics", rows[-1]["id"], **values)
+            return self.store.get("p6_opportunity_economics", rows[-1]["id"])
+        values.update({"organization_id": context.organization_id, "opportunity_id": opportunity_id,
+                       "created_at": utcnow(), "updated_at": utcnow()})
+        eid = self.store.create("p6_opportunity_economics", values)
+        return self.store.get("p6_opportunity_economics", eid)
+
+    def analytics(self, context: AccessContext) -> Dict[str, Any]:
+        self.identities.authorize(context, "finance:read", context.organization_id)
+        rows = self.store.list("p6_opportunity_economics", "organization_id=?", (context.organization_id,))
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            channel = result.setdefault(row["source_channel"], {"opportunities": 0, "won": 0, "settled_revenue": 0.0,
+                "refunds": 0.0, "known_contribution": None})
+            channel["opportunities"] += 1
+            opportunity = self.store.get("rh_opportunities", row["opportunity_id"])
+            if opportunity and str(opportunity.get("stage", "")).lower() == "won": channel["won"] += 1
+            invoices = self.store.list("rh_invoices", "opportunity_id=?", (row["opportunity_id"],))
+            invoice_ids = [i["id"] for i in invoices]
+            collected = sum(float(i.get("amount_received") or 0) for i in invoices)
+            refunds = sum(float(r["amount"]) for iid in invoice_ids for r in self.store.list("p6_refunds", "invoice_id=? AND status='CONFIRMED'", (iid,)))
+            channel["settled_revenue"] += collected
+            channel["refunds"] += refunds
+            cost = row.get("known_delivery_cost")
+            if cost is not None:
+                contribution = collected - refunds - float(cost) - float(row.get("gateway_fee") or 0)
+                channel["known_contribution"] = round((channel["known_contribution"] or 0) + contribution, 2)
+        return {"organization_id": context.organization_id, "channels": result,
+                "note": "Contribution is null unless known delivery cost evidence exists; CAC and margin are not inferred."}
 
 
 class PayableService:

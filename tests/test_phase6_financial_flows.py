@@ -3,8 +3,10 @@ import unittest
 from pathlib import Path
 
 from falguna.audit import AuditLog
-from falguna.phase6_commercial import AccessContext, ApprovalWorkflow, CommercialIdentityStore, CommercialSecurityError
-from falguna.phase6_financial_flows import CommissionReleaseService, PayableService, RefundService, SubscriptionService
+from falguna.phase6_commercial import (AccessContext, ApprovalWorkflow, CommercialIdentityStore,
+                                       CommercialOperations, CommercialSecurityError, PaymentOrchestrator)
+from falguna.phase6_financial_flows import (CommissionReleaseService, CommercialEconomicsService,
+                                            PayableService, RefundService, SubscriptionService)
 from falguna.store import StateStore, utcnow
 
 
@@ -20,6 +22,8 @@ class FinancialFlowsCase(unittest.TestCase):
         now = utcnow()
         self.client_id = self.store.create("clients", {"name": "Synthetic", "primary_contact": None, "contact_channel": None,
             "status": "ACTIVE", "total_won_value": 1000, "created_at": now, "updated_at": now})
+        self.store.create("comm_organizations", {"name": "Synthetic Org", "domain": "synthetic.invalid",
+            "linked_client_id": self.client_id, "notes": None, "created_at": now, "updated_at": now}, record_id="ttt")
         self.opp_id = self.store.create("rh_opportunities", {"source": "partner_referral", "source_url": None,
             "client_name": "Synthetic", "title": "Synthetic", "description": None, "budget_rate": None,
             "required_skills": None, "deadline": None, "contract_type": None, "location_timezone": None,
@@ -113,6 +117,8 @@ class RefundFlowTests(FinancialFlowsCase):
         service.confirm_sandbox(self.maker, refund["id"], "provider-1", {"verified": True})
         self.assertEqual(len(self.store.list("p6_financial_events", "event_type='REFUND_CONFIRMED'")), 1)
         self.assertEqual(self.store.get("pm_commissions", self.commission_id)["refunded_amount"], 10)
+        recon = self.store.list("p6_refund_reconciliations", "refund_id=?", (refund["id"],))
+        self.assertEqual(recon[0]["status"], "MATCHED")
 
     def test_wrong_currency_and_over_refund_fail(self):
         service = RefundService(self.store, self.audit, self.identities)
@@ -132,6 +138,43 @@ class SubscriptionAndPayableTests(FinancialFlowsCase):
             service.create_due_invoice(self.maker, sub["id"], "2026-10-01")
         self.assertEqual(first["status"], "DRAFT")
 
+    def test_successful_monthly_recurring_collection_end_to_end(self):
+        service = SubscriptionService(self.store, self.audit, self.identities)
+        sub = service.create(self.maker, self.client_id, "Monthly maintenance", 100, "INR", "MONTHLY",
+                             "2026-10-01", "token_ref_1", "mandate_ref_1", self.opp_id)
+        invoice = service.create_due_invoice(self.maker, sub["id"], "2026-10-01")
+        attempt = service.create_autopay_attempt(self.maker, sub["id"], "cycle-1")
+        payment = PaymentOrchestrator(self.store, self.audit, self.identities)
+        payment.apply_verified_event(self.maker, attempt["payment_intent_id"], "CAPTURED", 100, "INR",
+                                     {"verified": True}, "capture-1", "provider-capture-1")
+        payment.apply_verified_event(self.maker, attempt["payment_intent_id"], "SETTLED", 100, "INR",
+                                     {"verified": True}, "settled-1", "provider-settled-1")
+        CommercialOperations(self.store, self.audit, self.identities).reconcile_settlement(
+            self.maker, attempt["payment_intent_id"], "settlement-1", 100, "INR", {"verified": True}, "recon-1")
+        collected = service.sync_collected(self.maker, attempt["id"])
+        self.assertEqual(collected["status"], "COLLECTED")
+        self.assertEqual(self.store.get("rh_invoices", invoice["id"])["status"], "PAID")
+        self.assertEqual(len(self.store.list("p6_receipts", "invoice_id=?", (invoice["id"],))), 1)
+        self.assertEqual(len(self.store.list("p6_financial_events", "event_type='SETTLED_COLLECTION'")), 1)
+
+    def test_failed_retry_pause_resume_and_cancel_are_honest(self):
+        service = SubscriptionService(self.store, self.audit, self.identities)
+        sub = service.create(self.maker, self.client_id, "Monthly", 100, "INR", "MONTHLY",
+                             "2026-10-01", "token", "mandate", self.opp_id)
+        service.create_due_invoice(self.maker, sub["id"], "2026-10-01")
+        first = service.create_autopay_attempt(self.maker, sub["id"], "try-1")
+        service.mark_attempt_failed(self.maker, first["id"], "synthetic decline")
+        retry = service.create_autopay_attempt(self.maker, sub["id"], "try-2")
+        self.assertEqual(retry["attempt_number"], 2)
+        service.set_status(self.maker, sub["id"], "PAUSED")
+        with self.assertRaisesRegex(CommercialSecurityError, "active"):
+            service.create_autopay_attempt(self.maker, sub["id"], "blocked")
+        service.set_status(self.maker, sub["id"], "ACTIVE")
+        self.assertEqual(service.create_autopay_attempt(self.maker, sub["id"], "try-2")["id"], retry["id"])
+        service.set_status(self.maker, sub["id"], "CANCELLED")
+        with self.assertRaisesRegex(CommercialSecurityError, "terminal"):
+            service.set_status(self.maker, sub["id"], "ACTIVE")
+
     def test_payable_requires_full_approval_and_never_executes(self):
         service = PayableService(self.store, self.audit, self.identities)
         payable = service.create(self.maker, "VENDOR", "vendor:synthetic", 300, "INR", {"expense": "hosting"}, "payable-1")
@@ -142,6 +185,26 @@ class SubscriptionAndPayableTests(FinancialFlowsCase):
         ready = service.mark_execution_ready(self.maker, payable["id"])
         self.assertEqual(ready["status"], "SANDBOX_EXECUTION_READY")
         self.assertEqual(self.store.list("p6_financial_events", "source_type='PAYABLE'"), [])
+
+
+class CommercialEconomicsTests(FinancialFlowsCase):
+    def test_channel_analytics_only_computes_contribution_with_cost_evidence(self):
+        service = CommercialEconomicsService(self.store, self.audit, self.identities)
+        service.record(self.maker, self.opp_id, "REFERRAL_PARTNER", {"campaign": "synthetic"},
+                       self.partner_id, quoted_value=1000, contracted_value=1000)
+        channel = service.analytics(self.maker)["channels"]["REFERRAL_PARTNER"]
+        self.assertEqual(channel["settled_revenue"], 1000)
+        self.assertIsNone(channel["known_contribution"])
+        service.record(self.maker, self.opp_id, "REFERRAL_PARTNER", {"campaign": "synthetic"},
+                       self.partner_id, quoted_value=1000, contracted_value=1000,
+                       known_delivery_cost=400, cost_evidence={"synthetic": True}, gateway_fee=20)
+        channel = service.analytics(self.maker)["channels"]["REFERRAL_PARTNER"]
+        self.assertEqual(channel["known_contribution"], 580)
+
+    def test_known_cost_without_evidence_is_rejected(self):
+        with self.assertRaisesRegex(CommercialSecurityError, "evidence"):
+            CommercialEconomicsService(self.store, self.audit, self.identities).record(
+                self.maker, self.opp_id, "WEBSITE_INBOUND", {}, known_delivery_cost=1)
 
 
 if __name__ == "__main__":

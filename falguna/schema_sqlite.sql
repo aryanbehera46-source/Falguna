@@ -1216,6 +1216,36 @@ CREATE TABLE IF NOT EXISTS p6_subscriptions (
     actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_p6_subscriptions_due ON p6_subscriptions(status, next_billing_date);
+CREATE TABLE IF NOT EXISTS p6_subscription_cycles (
+    id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, cycle_date TEXT NOT NULL,
+    invoice_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(subscription_id, cycle_date)
+);
+CREATE TABLE IF NOT EXISTS p6_subscription_attempts (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, subscription_id TEXT NOT NULL,
+    invoice_id TEXT NOT NULL, payment_intent_id TEXT, cycle_date TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL, status TEXT NOT NULL, failure_reason TEXT,
+    idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, idempotency_key),
+    UNIQUE(subscription_id, cycle_date, attempt_number)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_subscription_attempt ON p6_subscription_attempts(subscription_id, cycle_date, status);
+CREATE TABLE IF NOT EXISTS p6_refund_reconciliations (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, refund_id TEXT NOT NULL UNIQUE,
+    payment_intent_id TEXT NOT NULL, invoice_id TEXT NOT NULL, provider_ref TEXT NOT NULL UNIQUE,
+    amount REAL NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL,
+    evidence_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p6_refund_recon_org ON p6_refund_reconciliations(organization_id, invoice_id, status);
+CREATE TABLE IF NOT EXISTS p6_opportunity_economics (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
+    source_channel TEXT NOT NULL, source_metadata_json TEXT NOT NULL, origin_partner_id TEXT,
+    quoted_value REAL, contracted_value REAL, estimated_delivery_cost REAL,
+    known_delivery_cost REAL, cost_evidence_json TEXT, gateway_fee REAL NOT NULL DEFAULT 0,
+    service_tier TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, opportunity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_economics_source ON p6_opportunity_economics(organization_id, source_channel);
 CREATE TABLE IF NOT EXISTS p6_payables (
     id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, payable_type TEXT NOT NULL,
     beneficiary_ref TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL,

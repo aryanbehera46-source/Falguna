@@ -116,7 +116,8 @@ from .phase6_commercial import (
     CommercialSecurityError, FinanceAccounts, PaymentOrchestrator,
 )
 from .phase6_partner import CommercialRiskService, CustomerVerificationService
-from .phase6_financial_flows import CommissionReleaseService, PayableService, RefundService, SubscriptionService
+from .phase6_financial_flows import (CommissionReleaseService, CommercialEconomicsService, PayableService,
+                                     RefundService, SubscriptionService)
 from .site_auth import StaffAuthService
 from .customer_portal import CustomerPortalService
 from .customer_context import CustomerContextService
@@ -658,7 +659,10 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         scoped = lambda table: list(reversed(store.list(table, "organization_id=?", (context.organization_id,))))
                         return self._json({"organization_id": context.organization_id,
                             "commission_releases": scoped("p6_commission_releases"), "refunds": scoped("p6_refunds"),
-                            "subscriptions": scoped("p6_subscriptions"), "payables": scoped("p6_payables")})
+                            "subscriptions": scoped("p6_subscriptions"), "subscription_attempts": scoped("p6_subscription_attempts"),
+                            "payables": scoped("p6_payables")})
+                    if path == "/api/p6/economics":
+                        return self._json(CommercialEconomicsService(store, control.audit, identities).analytics(context))
                 except CommercialSecurityError as exc:
                     return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             if path == "/api/hq/what-changed":
@@ -1535,6 +1539,28 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                             subscription_id = path.split("/")[4]
                             return self._json(SubscriptionService(store, control.audit, identities).create_due_invoice(
                                 context, subscription_id, body.get("as_of")), HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/subscriptions/") and path.endswith("/attempt"):
+                            subscription_id = path.split("/")[4]
+                            return self._json(SubscriptionService(store, control.audit, identities).create_autopay_attempt(
+                                context, subscription_id, body.get("idempotency_key", "")), HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/subscription-attempts/") and path.endswith("/fail"):
+                            attempt_id = path.split("/")[4]
+                            return self._json(SubscriptionService(store, control.audit, identities).mark_attempt_failed(
+                                context, attempt_id, body.get("reason", "")))
+                        if path.startswith("/api/p6/subscription-attempts/") and path.endswith("/sync"):
+                            attempt_id = path.split("/")[4]
+                            return self._json(SubscriptionService(store, control.audit, identities).sync_collected(context, attempt_id))
+                        if path.startswith("/api/p6/subscriptions/") and path.endswith("/status"):
+                            subscription_id = path.split("/")[4]
+                            return self._json(SubscriptionService(store, control.audit, identities).set_status(
+                                context, subscription_id, body.get("status", "")))
+                        if path == "/api/p6/economics":
+                            return self._json(CommercialEconomicsService(store, control.audit, identities).record(
+                                context, body.get("opportunity_id", ""), body.get("source_channel", ""),
+                                body.get("source_metadata") or {}, body.get("origin_partner_id"), body.get("quoted_value"),
+                                body.get("contracted_value"), body.get("estimated_delivery_cost"),
+                                body.get("known_delivery_cost"), body.get("cost_evidence"),
+                                float(body.get("gateway_fee") or 0), body.get("service_tier")), HTTPStatus.CREATED)
                         if path == "/api/p6/payables":
                             return self._json(PayableService(store, control.audit, identities).create(
                                 context, body.get("payable_type", ""), body.get("beneficiary_ref", ""),

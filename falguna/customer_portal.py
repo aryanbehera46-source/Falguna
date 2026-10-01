@@ -84,6 +84,15 @@ class CustomerPortalService:
             "created_at": project["created_at"], "updated_at": project["updated_at"],
         }
 
+    @staticmethod
+    def _customer_safe_refund(refund: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": refund["id"], "invoice_id": refund["invoice_id"], "payment_intent_id": refund["payment_intent_id"],
+            "amount": refund["amount"], "currency": refund["currency"], "reason": refund["reason"],
+            "status": refund["status"], "provider_ref": refund.get("provider_ref") if refund["status"] == "CONFIRMED" else None,
+            "created_at": refund["created_at"],
+        }
+
 
     def get_portal_bundle(
         self, organization_id: str, actor: str = "system",
@@ -109,8 +118,10 @@ class CustomerPortalService:
             invoices += [self._customer_safe_invoice(i) for i in self.billing.list_for_client(client_id)]
 
         disputes: List[Dict[str, Any]] = []
+        refunds: List[Dict[str, Any]] = []
         for invoice in invoices:
             disputes += [self._customer_safe_dispute(d) for d in self.disputes.list(invoice_id=invoice["id"])]
+            refunds += [self._customer_safe_refund(r) for r in self.store.list("p6_refunds", "invoice_id=?", (invoice["id"],))]
 
         projects: List[Dict[str, Any]] = []
         for client_id in client_ids:
@@ -120,5 +131,5 @@ class CustomerPortalService:
             "organization": ctx["organization"], "contacts": ctx["contacts"], "clients": ctx["clients"],
             "projects": projects, "conversations": ctx["conversations"],
             "open_support_issues": ctx["open_support_issues"],
-            "invoices": invoices, "disputes": disputes,
+            "invoices": invoices, "disputes": disputes, "refunds": refunds,
         }

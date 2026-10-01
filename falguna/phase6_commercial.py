@@ -7,6 +7,7 @@ or execute money movement, beneficiary changes, refunds, or commissions.
 import hashlib
 import hmac
 import json
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
@@ -167,12 +168,18 @@ class PaymentOrchestrator:
         if not payment or payment["organization_id"] != organization_id:
             raise CommercialSecurityError("webhook payment organization mismatch")
         now = utcnow()
-        event_id = self.store.create("p6_webhook_events", {
-            "provider": provider, "provider_event_ref": provider_event_ref, "payment_intent_id": payment_id,
-            "organization_id": organization_id, "signature_verified": 1, "payload_hash": digest,
-            "processing_status": "VERIFIED_PENDING_APPLICATION", "failure_reason": None,
-            "received_at": now, "created_at": now,
-        })
+        try:
+            event_id = self.store.create("p6_webhook_events", {
+                "provider": provider, "provider_event_ref": provider_event_ref, "payment_intent_id": payment_id,
+                "organization_id": organization_id, "signature_verified": 1, "payload_hash": digest,
+                "processing_status": "VERIFIED_PENDING_APPLICATION", "failure_reason": None,
+                "received_at": now, "created_at": now,
+            })
+        except sqlite3.IntegrityError:
+            replay = self.store.list("p6_webhook_events", "provider=? AND provider_event_ref=?", (provider, provider_event_ref))
+            if not replay or replay[-1]["payload_hash"] != digest:
+                raise CommercialSecurityError("webhook replay conflict")
+            return replay[-1]
         return self.store.get("p6_webhook_events", event_id)
 
 

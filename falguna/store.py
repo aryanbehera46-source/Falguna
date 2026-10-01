@@ -19,6 +19,8 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path))
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
 
     # Additive-only column migrations for tables that already existed in a
@@ -380,7 +382,9 @@ class StateStore:
             "p6_webhook_events", "p6_approval_requests", "p6_financial_events",
             "p6_reserve_policies", "p6_reconciliations", "p6_receipts", "p6_approval_events",
             "p6_commission_plans", "p6_partner_contributions", "p6_risk_events", "p6_risk_event_actions"}
-        allowed.update({"p6_commission_releases", "p6_refunds", "p6_subscriptions", "p6_payables"})
+        allowed.update({"p6_commission_releases", "p6_refunds", "p6_subscriptions", "p6_payables",
+                        "p6_subscription_cycles", "p6_subscription_attempts", "p6_refund_reconciliations",
+                        "p6_opportunity_economics"})
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

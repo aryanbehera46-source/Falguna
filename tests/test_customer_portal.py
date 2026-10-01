@@ -17,6 +17,7 @@ from falguna.customer_portal import CustomerPortalService
 from falguna.revenue_hunter import OpportunityStore
 from falguna.sales_ops import ClientStore
 from falguna.store import StateStore
+from falguna.store import utcnow
 
 
 class _TwoCustomerPortalCase(unittest.TestCase):
@@ -98,6 +99,20 @@ class PortalDisputeVisibilityTests(_TwoCustomerPortalCase):
         self.assertEqual(dispute["status"], "OPEN")
         self.assertNotIn("evidence_json", dispute)
         self.assertNotIn("commission_impact_json", dispute)
+
+    def test_refund_status_is_customer_visible_only_after_verified_confirmation(self):
+        now = utcnow()
+        base = {"organization_id": self.org_a, "payment_intent_id": "synthetic-payment",
+                "invoice_id": self.invoice_a, "approval_request_id": "synthetic-approval", "amount": 25,
+                "currency": "USD", "eligibility_basis_json": "{}", "reason": "synthetic test",
+                "evidence_json": None, "created_at": now, "updated_at": now}
+        pending_id = self.store.create("p6_refunds", {**base, "status": "PENDING_APPROVAL", "provider_ref": None,
+            "idempotency_key": "pending-refund"})
+        confirmed_id = self.store.create("p6_refunds", {**base, "status": "CONFIRMED", "provider_ref": "sandbox-ref",
+            "evidence_json": '{"verified":true}', "idempotency_key": "confirmed-refund"})
+        refunds = {r["id"]: r for r in self.portal.get_portal_bundle(self.org_a)["refunds"]}
+        self.assertIsNone(refunds[pending_id]["provider_ref"])
+        self.assertEqual(refunds[confirmed_id]["provider_ref"], "sandbox-ref")
 
 
 
