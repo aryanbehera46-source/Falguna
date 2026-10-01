@@ -49,6 +49,10 @@ from .audit import AuditLog
 from .store import StateStore, utcnow
 
 SERVICE_APPROVAL_STATUSES = {"DRAFT", "APPROVED", "RETIRED"}
+# Phase 5 Continuation, Section 4 (International Services V1).
+SERVICE_RISK_LEVELS = {"LOW", "MEDIUM", "HIGH"}
+SERVICE_COMPLEXITY_LEVELS = {"SIMPLE", "MODERATE", "COMPLEX"}
+REGIONAL_PRICING_STATUSES = {"PROPOSED", "APPROVED", "RETIRED"}
 FOUNDATION_MATURITIES = {"PRODUCTION_READY", "PROTOTYPE", "INTERNAL", "NEEDS_HARDENING"}
 INTAKE_QUALIFICATION_STATUSES = {"NEW", "QUALIFYING", "QUALIFIED", "DISQUALIFIED", "CONVERTED"}
 DELIVERY_ROUTES = {"USE_FOUNDATION", "CUSTOMIZE", "CUSTOM_BUILD", "ESCALATE", "DECLINE"}
@@ -128,6 +132,167 @@ class ServiceCatalogStore:
             where += " AND category=?"
             params.append(category)
         return list(reversed(self.store.list("cs_services", where, params)))
+
+    # -- International Services V1 (Phase 5 Continuation, Section 4) --
+    #
+    # Extends a service with the delivery-shape metadata needed before it
+    # can responsibly be offered across regions: delivery languages, a
+    # risk level, a regulated/sensitive flag (with notes), a baseline
+    # complexity and delivery window, standard assumptions/exclusions, and
+    # service-specific QA requirements. Every field is independently
+    # settable and nullable -- unknown stays unknown, exactly like
+    # economics_for_project's cost fields; nothing here defaults to a
+    # value that would imply an assessment was made when it wasn't.
+    #
+    # Regional pricing is handled separately (propose_regional_pricing /
+    # approve_regional_pricing) because the instruction is explicit that
+    # FALGUNA may recommend an indicative band but must never fabricate a
+    # binding quote: a PROPOSED entry is advisory only, and only a human
+    # calling approve_regional_pricing makes one authoritative.
+
+    def set_international_profile(
+        self, service_id: str, actor: str, *,
+        supported_languages: Optional[List[str]] = None,
+        risk_level: Optional[str] = None,
+        regulated: Optional[bool] = None,
+        regulated_notes: Optional[str] = None,
+        baseline_complexity: Optional[str] = None,
+        standard_delivery_days: Optional[int] = None,
+        standard_assumptions: Optional[str] = None,
+        qa_requirements: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        service = self.store.get("cs_services", service_id)
+        if not service:
+            raise CommercialError("service not found")
+        if risk_level is not None and risk_level not in SERVICE_RISK_LEVELS:
+            raise CommercialError(f"unknown risk_level: {risk_level!r} (expected one of {sorted(SERVICE_RISK_LEVELS)})")
+        if baseline_complexity is not None and baseline_complexity not in SERVICE_COMPLEXITY_LEVELS:
+            raise CommercialError(
+                f"unknown baseline_complexity: {baseline_complexity!r} "
+                f"(expected one of {sorted(SERVICE_COMPLEXITY_LEVELS)})"
+            )
+        if standard_delivery_days is not None and standard_delivery_days <= 0:
+            raise CommercialError("standard_delivery_days must be a positive number of days")
+        effective_regulated = service.get("regulated") if regulated is None else (1 if regulated else 0)
+        if regulated_notes and not effective_regulated:
+            raise CommercialError(
+                "regulated_notes requires regulated=True -- do not record regulatory notes "
+                "for a service that is not flagged as regulated/sensitive"
+            )
+        updates: Dict[str, Any] = {}
+        if supported_languages is not None:
+            updates["supported_languages_json"] = json.dumps(supported_languages)
+        if risk_level is not None:
+            updates["risk_level"] = risk_level
+        if regulated is not None:
+            updates["regulated"] = 1 if regulated else 0
+        if regulated_notes is not None:
+            updates["regulated_notes"] = regulated_notes
+        if baseline_complexity is not None:
+            updates["baseline_complexity"] = baseline_complexity
+        if standard_delivery_days is not None:
+            updates["standard_delivery_days"] = standard_delivery_days
+        if standard_assumptions is not None:
+            updates["standard_assumptions"] = standard_assumptions
+        if qa_requirements is not None:
+            updates["qa_requirements"] = qa_requirements
+        if not updates:
+            return service
+        self.store.update("cs_services", service_id, **updates)
+        self.audit.append(
+            "CS_SERVICE_INTERNATIONAL_PROFILE_SET",
+            {"service_id": service_id, "fields": sorted(updates), "actor": actor},
+        )
+        return self.store.get("cs_services", service_id)
+
+    def propose_regional_pricing(
+        self, service_id: str, actor: str, region: str, currency: str,
+        price_min: Optional[float] = None, price_max: Optional[float] = None,
+        rationale: Optional[str] = None, country: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """FALGUNA (or a human) may propose an indicative regional price
+        band. This is advisory only: it is never the band
+        regional_pricing_for() returns, and must never be treated as a
+        binding quote, until a human calls approve_regional_pricing.
+        Replaces any existing PROPOSED entry for the same region (a fresh
+        recommendation supersedes a stale one); leaves an already-APPROVED
+        entry for that region untouched until the new proposal is itself
+        approved.
+        """
+        service = self.store.get("cs_services", service_id)
+        if not service:
+            raise CommercialError("service not found")
+        region = (region or "").strip()
+        if not region:
+            raise CommercialError("region is required")
+        if not (currency or "").strip():
+            raise CommercialError("currency is required")
+        if price_min is not None and price_max is not None and price_min > price_max:
+            raise CommercialError("price_min cannot exceed price_max")
+        entries = json.loads(service.get("regional_pricing_json") or "[]")
+        entries = [e for e in entries if not (e["region"] == region and e["status"] == "PROPOSED")]
+        now = utcnow()
+        entries.append({
+            "region": region, "country": country, "currency": currency,
+            "price_min": price_min, "price_max": price_max, "rationale": rationale,
+            "status": "PROPOSED", "proposed_by": actor, "proposed_at": now,
+            "approved_by": None, "approved_at": None,
+        })
+        self.store.update("cs_services", service_id, regional_pricing_json=json.dumps(entries))
+        self.audit.append(
+            "CS_SERVICE_REGIONAL_PRICING_PROPOSED",
+            {"service_id": service_id, "region": region, "currency": currency, "actor": actor},
+        )
+        return self.store.get("cs_services", service_id)
+
+    def approve_regional_pricing(self, service_id: str, actor: str, region: str) -> Dict[str, Any]:
+        """The one human-authorization gate for international pricing: the
+        most recent PROPOSED band for `region` becomes APPROVED (and the
+        single source of truth regional_pricing_for() will return), and
+        any previously-APPROVED band for the same region is retired so at
+        most one APPROVED entry per region ever exists. Refuses if there
+        is no PROPOSED entry for that region to approve.
+        """
+        service = self.store.get("cs_services", service_id)
+        if not service:
+            raise CommercialError("service not found")
+        region = (region or "").strip()
+        entries = json.loads(service.get("regional_pricing_json") or "[]")
+        now = utcnow()
+        found = False
+        for entry in entries:
+            if entry["region"] != region:
+                continue
+            if entry["status"] == "APPROVED":
+                entry["status"] = "RETIRED"
+            elif entry["status"] == "PROPOSED":
+                entry["status"] = "APPROVED"
+                entry["approved_by"] = actor
+                entry["approved_at"] = now
+                found = True
+        if not found:
+            raise CommercialError(f"no proposed regional pricing found for region {region!r}")
+        self.store.update("cs_services", service_id, regional_pricing_json=json.dumps(entries))
+        self.audit.append(
+            "CS_SERVICE_REGIONAL_PRICING_APPROVED",
+            {"service_id": service_id, "region": region, "actor": actor},
+        )
+        return self.store.get("cs_services", service_id)
+
+    def regional_pricing_for(self, service_id: str, region: str) -> Optional[Dict[str, Any]]:
+        """Returns the APPROVED regional price band for `region`, or None
+        -- never a PROPOSED (unapproved) one, however recent, so a caller
+        can never mistake an un-authorized FALGUNA recommendation for a
+        real, quotable price.
+        """
+        service = self.store.get("cs_services", service_id)
+        if not service:
+            return None
+        entries = json.loads(service.get("regional_pricing_json") or "[]")
+        for entry in entries:
+            if entry["region"] == region and entry["status"] == "APPROVED":
+                return entry
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -380,12 +545,10 @@ class IntakeStore:
             },
             actor=actor, source="phase5_intake",
         )
-        now = utcnow()
-        project_id = self.store.create("cs_projects", {
-            "intake_id": intake_id, "service_id": intake.get("service_id"), "opportunity_id": opportunity_id,
-            "foundation_id": foundation_id, "client_id": client_id, "delivery_route": delivery_route,
-            "status": "SCOPED", "mission_id": None, "actor": actor, "created_at": now, "updated_at": now,
-        })
+        project_id = ProjectStore(self.store, self.audit).create_for_opportunity(
+            opportunity_id, client_id, actor, delivery_route,
+            service_id=intake.get("service_id"), foundation_id=foundation_id, intake_id=intake_id,
+        )
         self.store.update("cs_intakes", intake_id, qualification_status="CONVERTED", opportunity_id=opportunity_id)
         self._record_event(intake_id, intake["qualification_status"], "CONVERTED", actor, f"converted to project {project_id}")
         self.audit.append("CS_INTAKE_CONVERTED", {"intake_id": intake_id, "project_id": project_id, "opportunity_id": opportunity_id, "actor": actor})
@@ -424,6 +587,47 @@ class ProjectStore:
         self.store = store
         self.audit = audit
 
+    def create_for_opportunity(
+        self, opportunity_id: str, client_id: str, actor: str, delivery_route: str, *,
+        service_id: Optional[str] = None, foundation_id: Optional[str] = None,
+        intake_id: Optional[str] = None, mission_id: Optional[str] = None,
+    ) -> str:
+        """The single canonical way a `cs_projects` row comes into being,
+        regardless of entry point. `IntakeStore.convert_to_project` (a
+        customer-initiated direct intake) and `ClosingService._execute_close`
+        (falguna/sales_ops.py -- a FALGUNA-discovered/pursued opportunity
+        won through the native Revenue & Delivery Engine pipeline) both
+        call this, so a dispute, an economics rollup, or a delivery-route
+        decision exists for every won deal -- never only for the ones that
+        happened to start as a direct customer intake. This is the fix for
+        a real architecture gap found while planning the Phase 5
+        continuation: before this method existed, `cs_projects` rows were
+        only ever created inline inside `convert_to_project`, so an
+        opportunity won through manual/paste/url/csv intake or discovery
+        (falguna/opportunity_agent.py) never got a delivery-project record
+        at all, and silently bypassed Phase 5 Sprint 1's dispute/economics
+        machinery. Idempotent: a second call for an opportunity that
+        already has a cs_projects row returns that row's id unchanged
+        rather than creating a duplicate delivery-project record."""
+        if delivery_route not in DELIVERY_ROUTES:
+            raise CommercialError(f"unknown delivery_route: {delivery_route!r}")
+        existing = self.store.list("cs_projects", "opportunity_id=?", (opportunity_id,))
+        if existing:
+            return existing[-1]["id"]
+        if foundation_id and not self.store.get("cs_foundations", foundation_id):
+            raise CommercialError("foundation not found")
+        now = utcnow()
+        project_id = self.store.create("cs_projects", {
+            "intake_id": intake_id, "service_id": service_id, "opportunity_id": opportunity_id,
+            "foundation_id": foundation_id, "client_id": client_id, "delivery_route": delivery_route,
+            "status": "SCOPED", "mission_id": mission_id, "actor": actor, "created_at": now, "updated_at": now,
+        })
+        self.audit.append("CS_PROJECT_CREATED", {
+            "project_id": project_id, "opportunity_id": opportunity_id, "intake_id": intake_id,
+            "delivery_route": delivery_route, "actor": actor,
+        })
+        return project_id
+
     def _record_event(self, project_id: str, from_status, to_status: str, actor: str, reason: Optional[str] = None) -> None:
         self.store.create("cs_project_events", {
             "project_id": project_id, "from_status": from_status, "to_status": to_status,
@@ -444,7 +648,24 @@ class ProjectStore:
         self.store.update("cs_projects", project_id, status=to_status, mission_id=project.get("mission_id"))
         self._record_event(project_id, project["status"], to_status, actor, reason)
         self.audit.append("CS_PROJECT_STATUS_CHANGED", {"project_id": project_id, "to_status": to_status, "actor": actor})
+        if to_status == "CLOSED":
+            self._record_outcome(project_id, actor)
         return self.store.get("cs_projects", project_id)
+
+    def _record_outcome(self, project_id: str, actor: str) -> None:
+        """Phase 5 Continuation, Section 22 (Learning from Outcomes V1):
+        capture the one durable outcome record the moment a project
+        reaches CLOSED. Lazy import (rather than a module-level one) to
+        avoid a circular import -- falguna/outcomes.py itself imports
+        `economics_for_project` from this module. Wrapped in try/except:
+        a learning-record failure must never block an already-legitimate
+        project close, exactly like ClosingService._link_commercial_project
+        above in falguna/sales_ops.py."""
+        try:
+            from .outcomes import OutcomeStore
+            OutcomeStore(self.store, self.audit).record_for_project(project_id, actor=actor)
+        except Exception as exc:
+            print(f"ProjectStore: outcome recording skipped for project {project_id} ({exc})")
 
     def link_mission(self, project_id: str, actor: str, mission_id: str) -> Dict[str, Any]:
         if not self.store.get("cs_projects", project_id):
@@ -465,6 +686,39 @@ class ProjectStore:
 
     def history(self, project_id: str) -> List[Dict[str, Any]]:
         return self.store.list("cs_project_events", "project_id=?", (project_id,))
+
+
+def backfill_projects_for_closed_opportunities(store: StateStore, audit: AuditLog, actor: str = "system") -> List[str]:
+    """Phase 5 continuation: `ProjectStore.create_for_opportunity` only
+    started being called from `ClosingService._execute_close`
+    (falguna/sales_ops.py) once that fix landed. Any deal that was already
+    won and closed before that -- including ones already sitting in a
+    real database -- would otherwise have no `cs_projects` row and
+    silently sit outside the dispute/economics/delivery-route system
+    forever. This walks every existing `rh_closing_records` row and
+    creates the matching `cs_projects` row for any that doesn't already
+    have one. `create_for_opportunity` is itself idempotent on
+    `opportunity_id`, so this is always safe to re-run -- it only ever
+    adds a missing row, never duplicates or touches an existing one.
+    Returns the list of project ids created (empty if nothing needed
+    backfilling). Never raises: a single bad closing record is skipped
+    and logged rather than blocking every other one or the server startup
+    that calls this (same defensive posture as
+    hq_web.reconcile_workforce_tasks_at_startup)."""
+    created = []
+    for record in store.list("rh_closing_records", "1=1"):
+        try:
+            opportunity_id = record["opportunity_id"]
+            if store.list("cs_projects", "opportunity_id=?", (opportunity_id,)):
+                continue
+            route = recommend_route(store, None, None)["route"]
+            project_id = ProjectStore(store, audit).create_for_opportunity(
+                opportunity_id, record["client_id"], actor, route,
+            )
+            created.append(project_id)
+        except Exception as exc:
+            print(f"backfill_projects_for_closed_opportunities: skipped closing record {record.get('id')} ({exc})")
+    return created
 
 
 # ---------------------------------------------------------------------------

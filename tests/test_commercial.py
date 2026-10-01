@@ -92,6 +92,133 @@ class CommercialTestCase(unittest.TestCase):
         self.services.set_approval(sid, "Aryan", "RETIRED")
         self.assertEqual(self.services.list(active_only=True), [])
 
+    # -- 1b. International Services V1 (Phase 5 Continuation, Section 4) --
+
+    def test_international_profile_unset_fields_stay_unknown(self):
+        sid = self._approved_service()
+        service = self.services.get(sid)
+        self.assertIsNone(service["risk_level"])
+        self.assertIsNone(service["baseline_complexity"])
+        self.assertIsNone(service["standard_delivery_days"])
+        self.assertIsNone(service["regulated"])
+
+    def test_international_profile_set_and_persist(self):
+        sid = self._approved_service()
+        updated = self.services.set_international_profile(
+            sid, "Aryan", supported_languages=["en", "hi"], risk_level="MEDIUM",
+            baseline_complexity="MODERATE", standard_delivery_days=14,
+            standard_assumptions="Client supplies content and brand assets.",
+            qa_requirements="Cross-browser check + mobile responsiveness pass.",
+        )
+        self.assertEqual(updated["risk_level"], "MEDIUM")
+        self.assertEqual(updated["baseline_complexity"], "MODERATE")
+        self.assertEqual(updated["standard_delivery_days"], 14)
+        import json as _json
+        self.assertEqual(_json.loads(updated["supported_languages_json"]), ["en", "hi"])
+
+    def test_international_profile_rejects_unknown_risk_level(self):
+        sid = self._approved_service()
+        with self.assertRaises(CommercialError):
+            self.services.set_international_profile(sid, "Aryan", risk_level="EXTREME")
+
+    def test_international_profile_rejects_unknown_complexity(self):
+        sid = self._approved_service()
+        with self.assertRaises(CommercialError):
+            self.services.set_international_profile(sid, "Aryan", baseline_complexity="TRIVIAL")
+
+    def test_international_profile_rejects_non_positive_delivery_days(self):
+        sid = self._approved_service()
+        with self.assertRaises(CommercialError):
+            self.services.set_international_profile(sid, "Aryan", standard_delivery_days=0)
+
+    def test_international_profile_regulated_notes_require_regulated_flag(self):
+        sid = self._approved_service()
+        with self.assertRaises(CommercialError):
+            self.services.set_international_profile(sid, "Aryan", regulated_notes="Needs GDPR review.")
+        # Setting regulated=True first, then notes, is fine.
+        self.services.set_international_profile(sid, "Aryan", regulated=True)
+        updated = self.services.set_international_profile(sid, "Aryan", regulated_notes="Needs GDPR review.")
+        self.assertEqual(updated["regulated_notes"], "Needs GDPR review.")
+
+    def test_international_profile_unknown_service_rejected(self):
+        with self.assertRaises(CommercialError):
+            self.services.set_international_profile("does-not-exist", "Aryan", risk_level="LOW")
+
+    def test_regional_pricing_proposed_is_not_authoritative_until_approved(self):
+        sid = self._approved_service()
+        self.services.propose_regional_pricing(
+            sid, "Falguna", region="EU", currency="EUR", price_min=800, price_max=1200,
+            rationale="Indicative band based on comparable EU engagements.",
+        )
+        # A PROPOSED band must never be returned as authoritative.
+        self.assertIsNone(self.services.regional_pricing_for(sid, "EU"))
+        service = self.services.get(sid)
+        import json as _json
+        entries = _json.loads(service["regional_pricing_json"])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["status"], "PROPOSED")
+        self.assertIsNone(entries[0]["approved_by"])
+
+    def test_regional_pricing_approve_makes_it_authoritative(self):
+        sid = self._approved_service()
+        self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="EUR", price_min=800, price_max=1200)
+        self.services.approve_regional_pricing(sid, "Aryan", "EU")
+        band = self.services.regional_pricing_for(sid, "EU")
+        self.assertIsNotNone(band)
+        self.assertEqual(band["status"], "APPROVED")
+        self.assertEqual(band["approved_by"], "Aryan")
+
+    def test_regional_pricing_approve_without_proposal_rejected(self):
+        sid = self._approved_service()
+        with self.assertRaises(CommercialError):
+            self.services.approve_regional_pricing(sid, "Aryan", "EU")
+
+    def test_regional_pricing_new_proposal_supersedes_old_proposal_not_approved(self):
+        sid = self._approved_service()
+        self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="EUR", price_min=800, price_max=1200)
+        self.services.approve_regional_pricing(sid, "Aryan", "EU")
+        # A fresh proposal for the same region must not disturb the
+        # existing approved band until it is itself approved.
+        self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="EUR", price_min=900, price_max=1300)
+        band = self.services.regional_pricing_for(sid, "EU")
+        self.assertEqual(band["price_min"], 800)
+
+    def test_regional_pricing_approving_new_proposal_retires_old_approved_band(self):
+        sid = self._approved_service()
+        self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="EUR", price_min=800, price_max=1200)
+        self.services.approve_regional_pricing(sid, "Aryan", "EU")
+        self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="EUR", price_min=900, price_max=1300)
+        self.services.approve_regional_pricing(sid, "Aryan", "EU")
+        service = self.services.get(sid)
+        import json as _json
+        entries = _json.loads(service["regional_pricing_json"])
+        approved = [e for e in entries if e["status"] == "APPROVED"]
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(approved[0]["price_min"], 900)
+        retired = [e for e in entries if e["status"] == "RETIRED"]
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0]["price_min"], 800)
+
+    def test_regional_pricing_independent_regions_do_not_interfere(self):
+        sid = self._approved_service()
+        self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="EUR", price_min=800, price_max=1200)
+        self.services.propose_regional_pricing(sid, "Falguna", region="APAC", currency="USD", price_min=600, price_max=900)
+        self.services.approve_regional_pricing(sid, "Aryan", "EU")
+        self.assertIsNotNone(self.services.regional_pricing_for(sid, "EU"))
+        self.assertIsNone(self.services.regional_pricing_for(sid, "APAC"))
+
+    def test_regional_pricing_requires_region_and_currency(self):
+        sid = self._approved_service()
+        with self.assertRaises(CommercialError):
+            self.services.propose_regional_pricing(sid, "Falguna", region="", currency="EUR")
+        with self.assertRaises(CommercialError):
+            self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="")
+
+    def test_regional_pricing_rejects_min_above_max(self):
+        sid = self._approved_service()
+        with self.assertRaises(CommercialError):
+            self.services.propose_regional_pricing(sid, "Falguna", region="EU", currency="EUR", price_min=1500, price_max=1000)
+
     # -- 2. Customer Intake & Qualification -------------------------------
 
     def test_intake_requires_customer_name_and_outcome(self):

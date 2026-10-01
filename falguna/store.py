@@ -247,6 +247,20 @@ class StateStore:
         # narrative in that case and still sets narrative_source="deterministic"
         # so the UI never confuses "no model" with "no brief").
         "cc_ceo_briefs": [("narrative", "TEXT"), ("narrative_source", "TEXT")],
+        # Phase 5 Continuation, Section 4 (International Services V1): a
+        # service created before this column set existed has every one of
+        # these as NULL, meaning "not yet assessed for international
+        # delivery" -- identical to how an unset risk_level/complexity/
+        # delivery-window is treated for a service created afterwards.
+        # Additive only; nothing here changes the meaning of any existing
+        # cs_services column.
+        "cs_services": [
+            ("supported_languages_json", "TEXT"), ("risk_level", "TEXT"),
+            ("regulated", "INTEGER"), ("regulated_notes", "TEXT"),
+            ("baseline_complexity", "TEXT"), ("standard_delivery_days", "INTEGER"),
+            ("standard_assumptions", "TEXT"), ("qa_requirements", "TEXT"),
+            ("regional_pricing_json", "TEXT"),
+        ],
     }
 
     def migrate(self) -> None:
@@ -329,7 +343,11 @@ class StateStore:
             # Phase 5 Sprint 1: Commercial Operating Foundation (falguna/commercial.py)
             "cs_services", "cs_foundations", "cs_intakes", "cs_intake_events",
             "cs_projects", "cs_project_events", "cs_disputes", "cs_dispute_events",
-            "cs_project_costs"}
+            "cs_project_costs",
+            # Phase 5 Continuation, Section 14: Capability Registry V1
+            "cs_capabilities",
+            # Phase 5 Continuation, Section 22: Learning from Outcomes V1
+            "cs_outcome_records"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

@@ -257,6 +257,43 @@ class ClosingServiceTests(SalesOpsTestBase):
         self.assertIsNotNone(job)
         self.assertEqual(job["opportunity_id"], opp_id)
 
+    def test_close_also_creates_a_canonical_commercial_project(self):
+        """Phase 5 continuation architecture fix: a deal won through the
+        native Revenue & Delivery Engine pipeline (this test's path) must
+        get the same kind of cs_projects delivery record a direct customer
+        intake gets via IntakeStore.convert_to_project -- otherwise
+        disputes/economics/delivery-routing silently never apply to it."""
+        from falguna.commercial import ProjectStore
+        opp_id = self._opportunity()
+        result = self._configured_service().close(opp_id, "Aryan", client_name="Acme Corp", final_price=2000)
+        projects = ProjectStore(self.store, self.audit).list()
+        matching = [p for p in projects if p["opportunity_id"] == opp_id]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["client_id"], result["client_id"])
+        self.assertEqual(matching[0]["delivery_route"], "ESCALATE")  # no catalogue service known at this entry point
+        self.assertEqual(matching[0]["status"], "SCOPED")
+
+    def test_close_called_twice_does_not_duplicate_the_commercial_project(self):
+        from falguna.commercial import ProjectStore
+        opp_id = self._opportunity()
+        service = self._configured_service()
+        service.close(opp_id, "Aryan", client_name="Acme Corp", final_price=2000)
+        service.close(opp_id, "Aryan", client_name="Acme Corp", final_price=2000)
+        projects = [p for p in ProjectStore(self.store, self.audit).list() if p["opportunity_id"] == opp_id]
+        self.assertEqual(len(projects), 1)
+
+    def test_close_still_succeeds_even_if_commercial_project_link_fails(self):
+        """A bookkeeping-link failure must never block an already-approved
+        real commercial close -- money and the client record matter more
+        than this cross-reference."""
+        from unittest.mock import patch
+        opp_id = self._opportunity()
+        with patch("falguna.commercial.ProjectStore.create_for_opportunity", side_effect=RuntimeError("boom")):
+            result = self._configured_service().close(opp_id, "Aryan", client_name="Acme Corp", final_price=2000)
+        self.assertEqual(result["status"], "CLOSED")
+        opp = self.store.get("rh_opportunities", opp_id)
+        self.assertEqual(opp["stage"], "Won")
+
     def test_close_persists_the_structured_closing_record(self):
         opp_id = self._opportunity()
         result = self._configured_service().close(
@@ -312,6 +349,80 @@ class ClosingServiceTests(SalesOpsTestBase):
         result = self._configured_service().close(opp_id, "Aryan", client_name="Acme Corp")
         client = self.clients.get(result["client_id"])
         self.assertEqual(client["total_won_value"], 0.0)
+
+
+class CommercialProjectBackfillTests(SalesOpsTestBase):
+    """falguna.commercial.backfill_projects_for_closed_opportunities --
+    catches up any deal that was won/closed before the architecture fix
+    above existed, so historical closing records aren't left permanently
+    outside the dispute/economics system."""
+
+    def _closed_opportunity_without_project(self):
+        SalesPolicyStore(self.store).save({})
+        opp_id = self.opportunities.create({"title": "Legacy deal"}, actor="Aryan")
+        # Simulate a close from before ProjectStore.create_for_opportunity
+        # was wired in: create the closing record and client directly,
+        # without touching cs_projects at all.
+        client_id = self.clients.upsert("Legacy Co", "Aryan")
+        self.opportunities.mark_won(opp_id, "Aryan", final_price=500, note="legacy close")
+        self.store.create("rh_closing_records", {
+            "opportunity_id": opp_id, "client_id": client_id, "final_scope": None, "final_price": 500,
+            "currency": "USD", "payment_terms": None, "milestones_json": None, "deadline": None,
+            "deliverables": None, "acceptance_criteria": None, "communication_channel": None,
+            "actor": "Aryan", "created_at": "2025-01-01T00:00:00Z",
+        })
+        return opp_id
+
+    def test_backfill_creates_a_project_for_a_legacy_closing_record(self):
+        from falguna.commercial import backfill_projects_for_closed_opportunities, ProjectStore
+        opp_id = self._closed_opportunity_without_project()
+        created = backfill_projects_for_closed_opportunities(self.store, self.audit)
+        self.assertEqual(len(created), 1)
+        projects = [p for p in ProjectStore(self.store, self.audit).list() if p["opportunity_id"] == opp_id]
+        self.assertEqual(len(projects), 1)
+
+    def test_backfill_is_idempotent(self):
+        from falguna.commercial import backfill_projects_for_closed_opportunities
+        self._closed_opportunity_without_project()
+        first = backfill_projects_for_closed_opportunities(self.store, self.audit)
+        second = backfill_projects_for_closed_opportunities(self.store, self.audit)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 0)
+
+    def test_backfill_skips_one_bad_record_without_blocking_the_rest(self):
+        """rh_closing_records enforces real foreign keys, so a genuinely
+        dangling record can never exist to backfill in the first place --
+        the realistic failure this guards against is create_for_opportunity
+        itself raising for one record (a transient/unexpected error). That
+        must not stop every other legitimate closing record from still
+        being backfilled, and must never propagate out of this function."""
+        from unittest.mock import patch
+        from falguna.commercial import backfill_projects_for_closed_opportunities, ProjectStore
+        bad_opp_id = self._closed_opportunity_without_project()
+        good_opp_id = self.opportunities.create({"title": "A second legacy deal"}, actor="Aryan")
+        client_id = self.clients.upsert("Second Legacy Co", "Aryan")
+        self.opportunities.mark_won(good_opp_id, "Aryan", final_price=750, note="legacy close")
+        self.store.create("rh_closing_records", {
+            "opportunity_id": good_opp_id, "client_id": client_id, "final_scope": None, "final_price": 750,
+            "currency": "USD", "payment_terms": None, "milestones_json": None, "deadline": None,
+            "deliverables": None, "acceptance_criteria": None, "communication_channel": None,
+            "actor": "Aryan", "created_at": "2025-01-01T00:00:00Z",
+        })
+
+        real_create = ProjectStore.create_for_opportunity
+        def flaky_create(self, opportunity_id, *args, **kwargs):
+            if opportunity_id == bad_opp_id:
+                raise RuntimeError("simulated transient failure")
+            return real_create(self, opportunity_id, *args, **kwargs)
+
+        with patch.object(ProjectStore, "create_for_opportunity", flaky_create):
+            created = backfill_projects_for_closed_opportunities(self.store, self.audit)  # must not raise
+
+        self.assertEqual(len(created), 1)
+        good_projects = [p for p in ProjectStore(self.store, self.audit).list() if p["opportunity_id"] == good_opp_id]
+        bad_projects = [p for p in ProjectStore(self.store, self.audit).list() if p["opportunity_id"] == bad_opp_id]
+        self.assertEqual(len(good_projects), 1)
+        self.assertEqual(len(bad_projects), 0)
 
 
 class ClosingServiceCommercialSafetyDefaultTests(SalesOpsTestBase):

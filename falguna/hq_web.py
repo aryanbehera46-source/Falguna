@@ -101,6 +101,9 @@ from .commercial import (
     CommercialError, CostEntryStore, DisputeStore, FoundationStore, IntakeStore,
     ProjectStore, ServiceCatalogStore, economics_for_project, recommend_route,
 )
+from .capability_registry import CapabilityRegistryError, CapabilityRegistryStore, can_deliver
+from .capacity import capacity_snapshot
+from .outcomes import OutcomeStore
 from .runtime import open_control_plane
 from .sales_manager import SalesManagerService
 from .sales_ops import ClientStore, ClosingError, ClosingService, NegotiationGuardrails, SalesPolicyStore
@@ -880,6 +883,34 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 service_id = path.rsplit("/", 1)[-1]
                 service = ServiceCatalogStore(store, control.audit).get(service_id)
                 return self._json(service or {"error": "service not found"}, HTTPStatus.OK if service else HTTPStatus.NOT_FOUND)
+            # -- Delivery Capacity & Scheduling V1 (Phase 5 Continuation, Section 16) --
+            if path == "/api/cs/capacity":
+                return self._json(capacity_snapshot(store))
+            # -- Learning from Outcomes V1 (Phase 5 Continuation, Section 22).
+            # Advisory read-only: never wired into qualification scoring,
+            # foundation maturity, or recommend_route in this round --
+            # see falguna/outcomes.py's module docstring for the boundary. --
+            if path == "/api/cs/outcomes":
+                query = parse_qs(urlparse(self.path).query)
+                service_id = (query.get("service_id") or [None])[0]
+                acceptance = (query.get("acceptance") or [None])[0]
+                return self._json({"items": OutcomeStore(store, control.audit).list(service_id=service_id, acceptance=acceptance)})
+            if path.startswith("/api/cs/projects/") and path.endswith("/outcome"):
+                project_id = path.split("/")[4]
+                outcome = OutcomeStore(store, control.audit).get_by_project(project_id)
+                return self._json(outcome or {"error": "no outcome recorded for this project"}, HTTPStatus.OK if outcome else HTTPStatus.NOT_FOUND)
+            # -- Capability Registry V1 (Phase 5 Continuation, Section 14) --
+            if path == "/api/cs/capabilities":
+                return self._json({"items": CapabilityRegistryStore(store, control.audit).list()})
+            if path == "/api/cs/capabilities/can-deliver":
+                query = parse_qs(urlparse(self.path).query)
+                task_type = (query.get("task_type") or [""])[0]
+                if not task_type:
+                    return self._json({"error": "task_type is required"}, HTTPStatus.BAD_REQUEST)
+                needs_aryan_q = NeedsAryanQueue(store, control.audit, control)
+                orch = _build_workforce_orchestrator(self.app_root, store, control.audit, needs_aryan_q, control=control)
+                registry = CapabilityRegistryStore(store, control.audit)
+                return self._json(can_deliver(registry, orch, task_type))
             if path == "/api/cs/foundations":
                 query = parse_qs(urlparse(self.path).query)
                 category = (query.get("category") or [None])[0]
@@ -2013,6 +2044,60 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         service_id, body.get("actor", "Aryan"), body.get("approval_status", ""),
                     )
                     return self._json(result)
+                # -- International Services V1 (Phase 5 Continuation, Section 4).
+                # Regional pricing is a two-step propose/approve flow so a
+                # FALGUNA-drafted band is never mistaken for a binding quote. --
+                if path.startswith("/api/cs/services/") and path.endswith("/international-profile"):
+                    service_id = path.split("/")[4]
+                    result = ServiceCatalogStore(store, control.audit).set_international_profile(
+                        service_id, body.get("actor", "Aryan"),
+                        supported_languages=body.get("supported_languages"),
+                        risk_level=body.get("risk_level"),
+                        regulated=body.get("regulated"),
+                        regulated_notes=body.get("regulated_notes"),
+                        baseline_complexity=body.get("baseline_complexity"),
+                        standard_delivery_days=body.get("standard_delivery_days"),
+                        standard_assumptions=body.get("standard_assumptions"),
+                        qa_requirements=body.get("qa_requirements"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/cs/services/") and path.endswith("/regional-pricing/propose"):
+                    service_id = path.split("/")[4]
+                    result = ServiceCatalogStore(store, control.audit).propose_regional_pricing(
+                        service_id, body.get("actor", "Aryan"), body.get("region", ""),
+                        body.get("currency", ""), price_min=body.get("price_min"),
+                        price_max=body.get("price_max"), rationale=body.get("rationale"),
+                        country=body.get("country"),
+                    )
+                    return self._json(result)
+                if path.startswith("/api/cs/services/") and path.endswith("/regional-pricing/approve"):
+                    service_id = path.split("/")[4]
+                    result = ServiceCatalogStore(store, control.audit).approve_regional_pricing(
+                        service_id, body.get("actor", "Aryan"), body.get("region", ""),
+                    )
+                    return self._json(result)
+                # -- Capability Registry V1 (Phase 5 Continuation, Section 14).
+                # sync is read-only against the live worker roster (never
+                # mutates a worker or executes a task); profile is the one
+                # human-maintained overlay (availability/specialist/
+                # limitations/dependencies/cost driver). --
+                if path == "/api/cs/capabilities/sync":
+                    needs_aryan_q = NeedsAryanQueue(store, control.audit, control)
+                    orch = _build_workforce_orchestrator(self.app_root, store, control.audit, needs_aryan_q, control=control)
+                    registry = CapabilityRegistryStore(store, control.audit)
+                    registry.sync_from_workforce(orch, actor=body.get("actor", "system"))
+                    return self._json({"items": registry.list()})
+                if path.startswith("/api/cs/capabilities/") and path.endswith("/profile"):
+                    capability_id = path.split("/")[4]
+                    result = CapabilityRegistryStore(store, control.audit).set_profile(
+                        capability_id, body.get("actor", "Aryan"),
+                        model_tool_dependencies=body.get("model_tool_dependencies"),
+                        requires_specialist=body.get("requires_specialist"),
+                        known_limitations=body.get("known_limitations"),
+                        availability=body.get("availability"),
+                        cost_driver=body.get("cost_driver"),
+                    )
+                    return self._json(result)
                 if path == "/api/cs/foundations":
                     foundation_id = FoundationStore(store, control.audit).register(
                         body.get("name", ""), body.get("category"), body.get("maturity", ""),
@@ -2810,6 +2895,57 @@ def reconcile_workforce_tasks_at_startup(app_root: Path):
         return []
 
 
+def backfill_commercial_projects_at_startup(app_root) -> list:
+    """Call once, before TTT HQ starts accepting requests. Phase 5
+    continuation fixed a real architecture gap: `ClosingService._execute_close`
+    (falguna/sales_ops.py) did not used to create a `cs_projects` delivery
+    record for a deal won through the native Revenue & Delivery Engine
+    pipeline -- only a direct customer intake (`IntakeStore.convert_to_project`)
+    did. `falguna.commercial.backfill_projects_for_closed_opportunities`
+    closes that gap for every deal that was already won before the fix
+    landed. It is idempotent (skips any opportunity that already has a
+    `cs_projects` row), so running it on every startup is safe and cheap
+    once the backlog is caught up. Never raises, so a database problem
+    here can't block the server from starting. Returns the project ids
+    created (empty if nothing needed backfilling, or if it failed)."""
+    try:
+        from .commercial import backfill_projects_for_closed_opportunities
+        control, store = open_control_plane(app_root)
+        try:
+            return backfill_projects_for_closed_opportunities(store, control.audit, actor="system")
+        finally:
+            store.close()
+    except Exception as exc:
+        print(f"TTT HQ: commercial-project backfill skipped ({exc})")
+        return []
+
+
+def sync_capability_registry_at_startup(app_root) -> list:
+    """Call once, before TTT HQ starts accepting requests. Phase 5
+    Continuation, Section 14 (Capability Registry V1): keeps
+    `cs_capabilities` in step with whatever `_build_workforce_orchestrator`
+    actually registers, so the registry is never stale relative to a code
+    change that added, removed, or renamed a worker -- a human never has
+    to remember to click "Sync" after a deploy. `CapabilityRegistryStore.
+    sync_from_workforce` only ever refreshes introspected facts and never
+    touches a human-set profile field, so this is safe to run on every
+    startup. Never raises, so a database problem here can't block the
+    server from starting. Returns the capability ids touched (empty if
+    none, or if it failed)."""
+    try:
+        control, store = open_control_plane(app_root)
+        try:
+            needs_aryan_q = NeedsAryanQueue(store, control.audit, control)
+            orch = _build_workforce_orchestrator(app_root, store, control.audit, needs_aryan_q, control=control)
+            registry = CapabilityRegistryStore(store, control.audit)
+            return registry.sync_from_workforce(orch, actor="system")
+        finally:
+            store.close()
+    except Exception as exc:
+        print(f"TTT HQ: capability registry sync skipped ({exc})")
+        return []
+
+
 def serve_hq(root, host: str = "127.0.0.1", port: int = 8766, falguna_url: str = "http://127.0.0.1:8765") -> None:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("TTT HQ is local-only")
@@ -2821,6 +2957,13 @@ def serve_hq(root, host: str = "127.0.0.1", port: int = 8766, falguna_url: str =
     if reconciled:
         print(f"TTT HQ: {len(reconciled)} workforce task(s) were interrupted by restart "
               f"and marked BLOCKED (escalated to Needs Aryan): {', '.join(reconciled)}")
+    backfilled_projects = backfill_commercial_projects_at_startup(server.app_root)
+    if backfilled_projects:
+        print(f"TTT HQ: {len(backfilled_projects)} previously-won deal(s) were backfilled with a "
+              f"commercial delivery-project record: {', '.join(backfilled_projects)}")
+    synced_capabilities = sync_capability_registry_at_startup(server.app_root)
+    if synced_capabilities:
+        print(f"TTT HQ: capability registry synced ({len(synced_capabilities)} worker capabilities).")
     print(f"Twenty Two Technologies HQ (internal v1): http://{host}:{server.server_port}")
     server.serve_forever()
 
@@ -2977,6 +3120,9 @@ Ask Falguna
 <button class="navitem" data-view="csIntakes">Customer Intakes</button>
 <button class="navitem" data-view="csProjects">Delivery Projects</button>
 <button class="navitem" data-view="csDisputes">Disputes &amp; Refunds</button>
+<button class="navitem" data-view="csCapabilities">Capability Registry</button>
+<button class="navitem" data-view="csCapacity">Delivery Capacity</button>
+<button class="navitem" data-view="csOutcomes">Learning from Outcomes</button>
 </details>
 <details class="navgroup" data-cat="growth">
 <summary class="navsec">Media<span class="chev" aria-hidden="true"></span></summary>
@@ -3669,6 +3815,27 @@ Ask Falguna
 <div class="pageintro">State-management only -- no dispute or refund here ever executes an external financial transfer. Resolving with a refund amount records it on the dispute and, where a partner referral exists, reverses the proportional commission through the existing commission ledger; it never edits an invoice's own record of cash actually received.</div>
 <div class="list" id="csDisputesList"></div>
 </div>
+<div class="view" id="view-csCapabilities">
+<h1>Capability Registry</h1>
+<div class="pageintro">What FALGUNA can actually deliver right now, read from the real, registered Workforce roster -- not a hand-maintained guess. "Sync" refreshes the worker list and its supported task types from the live code; availability, specialist requirement, dependencies, and known limitations are set here by a human and are never inferred.</div>
+<div class="actions"><button id="csCapSync" type="button">Sync from live worker roster</button></div>
+<div class="list" id="csCapabilitiesList"></div>
+</div>
+<div class="view" id="view-csCapacity">
+<h1>Delivery Capacity</h1>
+<div class="pageintro">A real, evidence-based read of current delivery load -- counted from persisted project/task/approval-queue rows, never an invented utilization percentage. The recommendation below is one of a small set of named categories with a documented threshold behind it.</div>
+<div class="list" id="csCapacityOut">Loading...</div>
+</div>
+<div class="view" id="view-csOutcomes">
+<h1>Learning from Outcomes</h1>
+<div class="pageintro">One durable record per project the moment it reaches CLOSED -- delivery time, QA-rework cycles, disputes, and economics, all derived from real persisted evidence, never a self-report. Advisory and read-only: this does not yet feed qualification scoring, foundation maturity, or route recommendations (see Section 22's documented boundary).</div>
+<div class="actions">
+<select id="csOutcomesServiceFilter"><option value="">All services</option></select>
+<select id="csOutcomesAcceptanceFilter"><option value="">All acceptance states</option><option value="ACCEPTED_CLEAN">Accepted clean</option><option value="ACCEPTED_WITH_REWORK">Accepted with rework</option><option value="DISPUTED">Disputed</option></select>
+<button id="csOutcomesFilterBtn" type="button">Filter</button>
+</div>
+<div class="list" id="csOutcomesList">Loading...</div>
+</div>
 <div class="view" id="view-mediaBrands">
 <h1>Brands</h1>
 <div class="pageintro">Persistent voice/tone, audience, platforms, content pillars, visual guidelines, and approval policy -- one definition per brand, read by every piece of content and every Media agent.</div>
@@ -3921,7 +4088,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,csServices:loadCsServices,csFoundations:loadCsFoundations,csIntakes:loadCsIntakes,csProjects:loadCsProjects,csDisputes:loadCsDisputes,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,csServices:loadCsServices,csFoundations:loadCsFoundations,csIntakes:loadCsIntakes,csProjects:loadCsProjects,csDisputes:loadCsDisputes,csCapabilities:loadCsCapabilities,csCapacity:loadCsCapacity,csOutcomes:loadCsOutcomes,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -5054,18 +5221,113 @@ if(s==='APPROVED')return '<span class="stat-good">APPROVED</span>';
 if(s==='RETIRED')return '<span class="stat-bad">RETIRED</span>';
 return '<span class="badge">DRAFT</span>';
 }
+// -- International Services V1 (Phase 5 Continuation, Section 4) --
+let csOpenServiceId=null;
+function csRiskBadge(r){
+if(r==='HIGH')return '<span class="stat-bad">HIGH RISK</span>';
+if(r==='MEDIUM')return '<span class="stat-warn">MEDIUM RISK</span>';
+if(r==='LOW')return '<span class="stat-good">LOW RISK</span>';
+return '';
+}
+function csServiceIntlSummary(s){
+const bits=[];
+if(s.risk_level)bits.push(csRiskBadge(s.risk_level));
+if(s.baseline_complexity)bits.push(`<span class="badge">${esc(s.baseline_complexity)}</span>`);
+if(s.standard_delivery_days!=null)bits.push(`<span>~${s.standard_delivery_days}d delivery</span>`);
+if(s.regulated)bits.push('<span class="stat-warn">regulated/sensitive</span>');
+try{const langs=JSON.parse(s.supported_languages_json||'[]');if(langs.length)bits.push(`<span>${langs.map(esc).join(', ')}</span>`)}catch(e){}
+return bits.length?`<div class="meta">${bits.join('')}</div>`:'';
+}
+function csRegionalPricingRows(s){
+let entries=[];try{entries=JSON.parse(s.regional_pricing_json||'[]')}catch(e){}
+if(!entries.length)return '<div class="empty">No regional pricing proposed yet.</div>';
+return entries.slice().reverse().map(e=>`<div class="contrib">
+<b>${esc(e.region)}${e.country?' / '+esc(e.country):''}</b>: ${e.price_min??'?'}-${e.price_max??'?'} ${esc(e.currency)}
+${e.status==='APPROVED'?'<span class="stat-good">APPROVED</span>':e.status==='PROPOSED'?'<span class="badge">PROPOSED (not binding)</span>':'<span class="sub">RETIRED</span>'}
+${e.rationale?` -- ${esc(e.rationale)}`:''}
+${e.status==='PROPOSED'?`<button class="secondary csRegPriceApprove" data-id="${esc(s.id)}" data-region="${esc(e.region)}">Approve</button>`:''}
+</div>`).join('');
+}
+function csServiceIntlPanel(s){
+const id=esc(s.id);
+let langs=[];try{langs=JSON.parse(s.supported_languages_json||'[]')}catch(e){}
+return `<div class="section">
+<h2>International delivery profile</h2>
+<div class="pageintro">Unknown stays unknown here -- nothing below is assumed until it is explicitly set by a human.</div>
+<div class="row"><select id="csIntlRisk_${id}"><option value="">Risk level (unset)</option><option value="LOW" ${s.risk_level==='LOW'?'selected':''}>Low</option><option value="MEDIUM" ${s.risk_level==='MEDIUM'?'selected':''}>Medium</option><option value="HIGH" ${s.risk_level==='HIGH'?'selected':''}>High</option></select>
+<select id="csIntlComplexity_${id}"><option value="">Baseline complexity (unset)</option><option value="SIMPLE" ${s.baseline_complexity==='SIMPLE'?'selected':''}>Simple</option><option value="MODERATE" ${s.baseline_complexity==='MODERATE'?'selected':''}>Moderate</option><option value="COMPLEX" ${s.baseline_complexity==='COMPLEX'?'selected':''}>Complex</option></select>
+<input id="csIntlDeliveryDays_${id}" type="number" min="1" placeholder="Standard delivery (days)" value="${s.standard_delivery_days??''}"></div>
+<input id="csIntlLanguages_${id}" placeholder="Delivery languages, comma-separated" value="${esc(langs.join(', '))}">
+<label style="display:flex;gap:8px;align-items:center"><input id="csIntlRegulated_${id}" type="checkbox" ${s.regulated?'checked':''}> Regulated / sensitive (e.g. finance, health, legal)</label>
+<input id="csIntlRegulatedNotes_${id}" placeholder="Regulatory notes (requires regulated checked)" value="${esc(s.regulated_notes||'')}">
+<textarea id="csIntlAssumptions_${id}" placeholder="Standard assumptions / exclusions">${esc(s.standard_assumptions||'')}</textarea>
+<input id="csIntlQa_${id}" placeholder="Service-specific QA requirements" value="${esc(s.qa_requirements||'')}">
+<div class="actions"><button class="csSvcSaveIntl" data-id="${id}">Save international profile</button></div>
+<h2>Regional pricing</h2>
+<div class="pageintro">FALGUNA may propose an indicative band; it is never binding until a human approves it here.</div>
+<div id="csRegPriceRows_${id}">${csRegionalPricingRows(s)}</div>
+<div class="row"><input id="csRegPriceRegion_${id}" placeholder="Region (e.g. EU, APAC)"><input id="csRegPriceCountry_${id}" placeholder="Country (optional)"><input id="csRegPriceCurrency_${id}" placeholder="Currency" value="${esc(s.currency||'USD')}"></div>
+<div class="row"><input id="csRegPriceMin_${id}" type="number" step="0.01" placeholder="Indicative min"><input id="csRegPriceMax_${id}" type="number" step="0.01" placeholder="Indicative max"></div>
+<input id="csRegPriceRationale_${id}" placeholder="Rationale (optional)">
+<div class="actions"><button class="secondary csRegPricePropose" data-id="${id}">Propose regional band</button></div>
+</div>`;
+}
 function renderCsServices(items){
 $('csServicesList').innerHTML=items.length?items.map(s=>`<div class="item"><h3>${esc(s.title)} <span class="sub">(${esc(s.service_key)})</span></h3>
 <div class="meta">${csApprovalBadge(s.approval_status)}<span>${esc(s.category)}</span><span>${esc(s.pricing_model)}</span><span>${esc(s.delivery_mode)}</span>${s.price_min!=null||s.price_max!=null?`<span>${s.price_min??'?'}-${s.price_max??'?'} ${esc(s.currency)}</span>`:''}${s.automation_eligible?'<span class="badge">automation-eligible</span>':''}</div>
+${csServiceIntlSummary(s)}
 <div class="contrib">${esc(s.customer_description)}</div>
 ${s.scope_boundaries?`<div class="contrib"><b>Not included:</b> ${esc(s.scope_boundaries)}</div>`:''}
 <div class="actions">
 ${s.approval_status!=='APPROVED'?`<button class="csSvcApprove" data-id="${esc(s.id)}">Approve</button>`:''}
 ${s.approval_status!=='RETIRED'?`<button class="secondary csSvcRetire" data-id="${esc(s.id)}">Retire</button>`:''}
+<button class="secondary csSvcToggleIntl" data-id="${esc(s.id)}">${csOpenServiceId===s.id?'Hide international profile':'International / Regional pricing'}</button>
 </div>
+${csOpenServiceId===s.id?csServiceIntlPanel(s):''}
 </div>`).join(''):'<div class="empty">No services in the catalogue yet.</div>';
 document.querySelectorAll('.csSvcApprove').forEach(b=>b.onclick=async()=>{try{await api(`/api/cs/services/${b.dataset.id}/approval`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',approval_status:'APPROVED'})});await loadCsServices()}catch(e){alert(e.message)}});
 document.querySelectorAll('.csSvcRetire').forEach(b=>b.onclick=async()=>{if(!confirm('Retire this service? It will no longer be offered as an active catalogue entry.'))return;try{await api(`/api/cs/services/${b.dataset.id}/approval`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',approval_status:'RETIRED'})});await loadCsServices()}catch(e){alert(e.message)}});
+document.querySelectorAll('.csSvcToggleIntl').forEach(b=>b.onclick=()=>{csOpenServiceId=(csOpenServiceId===b.dataset.id)?null:b.dataset.id;loadCsServices()});
+document.querySelectorAll('.csSvcSaveIntl').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const risk_level=$(`csIntlRisk_${id}`).value||null;
+const baseline_complexity=$(`csIntlComplexity_${id}`).value||null;
+const deliveryDaysRaw=$(`csIntlDeliveryDays_${id}`).value;
+const supported_languages=$(`csIntlLanguages_${id}`).value.split(',').map(s=>s.trim()).filter(Boolean);
+const regulated=$(`csIntlRegulated_${id}`).checked;
+const regulated_notes=$(`csIntlRegulatedNotes_${id}`).value.trim()||null;
+const standard_assumptions=$(`csIntlAssumptions_${id}`).value.trim()||null;
+const qa_requirements=$(`csIntlQa_${id}`).value.trim()||null;
+try{
+await api(`/api/cs/services/${id}/international-profile`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+actor:'Aryan',risk_level,baseline_complexity,standard_delivery_days:deliveryDaysRaw?Number(deliveryDaysRaw):null,
+supported_languages,regulated,regulated_notes,standard_assumptions,qa_requirements,
+})});
+await loadCsServices();
+}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csRegPricePropose').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+const region=$(`csRegPriceRegion_${id}`).value.trim();
+const currency=$(`csRegPriceCurrency_${id}`).value.trim()||'USD';
+if(!region)return alert('Region is required.');
+try{
+await api(`/api/cs/services/${id}/regional-pricing/propose`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+actor:'Aryan',region,country:$(`csRegPriceCountry_${id}`).value.trim()||null,currency,
+price_min:$(`csRegPriceMin_${id}`).value?Number($(`csRegPriceMin_${id}`).value):null,
+price_max:$(`csRegPriceMax_${id}`).value?Number($(`csRegPriceMax_${id}`).value):null,
+rationale:$(`csRegPriceRationale_${id}`).value.trim()||null,
+})});
+await loadCsServices();
+}catch(e){alert(e.message)}
+});
+document.querySelectorAll('.csRegPriceApprove').forEach(b=>b.onclick=async()=>{
+if(!confirm(`Approve this indicative band for ${b.dataset.region}? It becomes the authoritative regional price until superseded.`))return;
+try{
+await api(`/api/cs/services/${b.dataset.id}/regional-pricing/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan',region:b.dataset.region})});
+await loadCsServices();
+}catch(e){alert(e.message)}
+});
 }
 async function loadCsFoundations(){
 $('csFndCreate').onclick=async()=>{
@@ -5285,6 +5547,121 @@ return `<div class="item"><h3>Project ${id.slice(0,8)}</h3>
 </div>`;
 }
 function csFmtMoney(v){return v==null?'<i>unknown</i>':('$'+Number(v).toFixed(2))}
+// -- Capability Registry V1 (Phase 5 Continuation, Section 14) --
+async function loadCsCapabilities(){
+$('csCapSync').onclick=async()=>{
+try{await api('/api/cs/capabilities/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'Aryan'})});await loadCsCapabilities()}catch(e){alert(e.message)}
+};
+try{const d=await api('/api/cs/capabilities');renderCsCapabilities(d.items||[])}
+catch(e){$('csCapabilitiesList').innerHTML=`<div class="empty">Unable to load capabilities: ${esc(e.message)}</div>`}
+}
+function csCapAvailabilityBadge(a){
+if(a==='AVAILABLE')return '<span class="stat-good">AVAILABLE</span>';
+if(a==='LIMITED')return '<span class="stat-warn">LIMITED</span>';
+if(a==='UNAVAILABLE')return '<span class="stat-bad">UNAVAILABLE</span>';
+return '<span class="badge">not yet assessed</span>';
+}
+function renderCsCapabilities(items){
+if(!items.length){$('csCapabilitiesList').innerHTML='<div class="empty">No capabilities synced yet -- click "Sync from live worker roster" above.</div>';return}
+$('csCapabilitiesList').innerHTML=items.map(c=>{
+let taskTypes=[];try{taskTypes=JSON.parse(c.supported_task_types_json||'[]')}catch(e){}
+let deps=[];try{deps=JSON.parse(c.model_tool_dependencies_json||'[]')}catch(e){}
+const id=esc(c.id);
+return `<div class="item"><h3>${esc(c.worker_name)}</h3>
+<div class="meta">${csCapAvailabilityBadge(c.availability)}${c.requires_specialist?'<span class="stat-warn">requires specialist</span>':''}${c.auto_resumable_after_restart?'<span class="badge">auto-resumable</span>':''}</div>
+<div class="sub">${esc(c.worker_class)}</div>
+${c.description?`<div class="contrib">${esc(c.description)}</div>`:''}
+<div class="contrib"><b>Supported task types:</b> ${taskTypes.length?taskTypes.map(esc).join(', '):'<i>none introspected</i>'}</div>
+${deps.length?`<div class="contrib"><b>Model/tool dependencies:</b> ${deps.map(esc).join(', ')}</div>`:''}
+${c.known_limitations?`<div class="contrib"><b>Known limitations:</b> ${esc(c.known_limitations)}</div>`:''}
+<div class="form" style="margin-top:8px">
+<div class="row"><select id="csCapAvail_${id}"><option value="">Availability (unset)</option><option value="AVAILABLE" ${c.availability==='AVAILABLE'?'selected':''}>Available</option><option value="LIMITED" ${c.availability==='LIMITED'?'selected':''}>Limited</option><option value="UNAVAILABLE" ${c.availability==='UNAVAILABLE'?'selected':''}>Unavailable</option></select>
+<select id="csCapCost_${id}"><option value="">Cost driver (unset)</option><option value="MODEL_API" ${c.cost_driver==='MODEL_API'?'selected':''}>Model/API</option><option value="INFRASTRUCTURE" ${c.cost_driver==='INFRASTRUCTURE'?'selected':''}>Infrastructure</option><option value="HUMAN_EXPERT" ${c.cost_driver==='HUMAN_EXPERT'?'selected':''}>Human/expert</option><option value="OTHER_DIRECT" ${c.cost_driver==='OTHER_DIRECT'?'selected':''}>Other direct</option></select></div>
+<label style="display:flex;gap:8px;align-items:center"><input id="csCapSpecialist_${id}" type="checkbox" ${c.requires_specialist?'checked':''}> Requires a human specialist</label>
+<input id="csCapDeps_${id}" placeholder="Model/tool dependencies, comma-separated" value="${esc(deps.join(', '))}">
+<textarea id="csCapLimits_${id}" placeholder="Known limitations">${esc(c.known_limitations||'')}</textarea>
+<div class="actions"><button class="csCapSaveProfile" data-id="${id}">Save profile</button></div>
+</div>
+</div>`;
+}).join('');
+document.querySelectorAll('.csCapSaveProfile').forEach(b=>b.onclick=async()=>{
+const id=b.dataset.id;
+try{
+await api(`/api/cs/capabilities/${id}/profile`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+actor:'Aryan',availability:$(`csCapAvail_${id}`).value||null,cost_driver:$(`csCapCost_${id}`).value||null,
+requires_specialist:$(`csCapSpecialist_${id}`).checked,
+model_tool_dependencies:$(`csCapDeps_${id}`).value.split(',').map(s=>s.trim()).filter(Boolean),
+known_limitations:$(`csCapLimits_${id}`).value.trim()||null,
+})});
+await loadCsCapabilities();
+}catch(e){alert(e.message)}
+});
+}
+// -- Delivery Capacity & Scheduling V1 (Phase 5 Continuation, Section 16) --
+function csCapacityBadge(r){
+if(r==='AVAILABLE')return '<span class="stat-good">AVAILABLE</span>';
+if(r==='CONSTRAINED')return '<span class="stat-warn">CONSTRAINED</span>';
+if(r==='EXECUTION_BOTTLENECK')return '<span class="stat-bad">EXECUTION BOTTLENECK</span>';
+if(r==='SPECIALIST_CONSTRAINED')return '<span class="stat-bad">SPECIALIST CONSTRAINED</span>';
+if(r==='APPROVAL_BOTTLENECK')return '<span class="stat-bad">APPROVAL BOTTLENECK</span>';
+return esc(r);
+}
+async function loadCsCapacity(){
+try{
+const c=await api('/api/cs/capacity');
+const statusRows=Object.entries(c.wf_tasks_by_status||{}).map(([s,n])=>`<span>${esc(s)}: ${n}</span>`).join('');
+const projRows=Object.entries(c.projects_by_status||{}).map(([s,n])=>`<span>${esc(s)}: ${n}</span>`).join('');
+$('csCapacityOut').innerHTML=`<div class="item">
+<h3>${csCapacityBadge(c.recommendation)}</h3>
+<div class="contrib">${esc(c.recommendation_reason)}</div>
+<div class="section"><h2>Workforce tasks</h2><div class="meta">${statusRows||'<span>none</span>'}</div><div class="contrib">In flight: ${c.wf_tasks_in_flight} -- Stuck (blocked/needs-aryan/failed): ${c.wf_tasks_stuck}</div></div>
+<div class="section"><h2>Delivery projects</h2><div class="meta">${projRows||'<span>none</span>'}</div><div class="contrib">Active (non-closed): ${c.active_projects}</div></div>
+<div class="section"><h2>Approval queue</h2><div class="contrib">Pending: ${c.needs_aryan_pending}${c.needs_aryan_oldest_pending_hours!=null?` -- oldest waiting ${c.needs_aryan_oldest_pending_hours}h`:''}</div></div>
+<div class="sub">Generated ${esc(c.generated_at)}. Thresholds: ${Object.entries(c.thresholds||{}).map(([k,v])=>`${esc(k)}=${v}`).join(', ')}</div>
+</div>`;
+}catch(e){$('csCapacityOut').innerHTML=`<div class="empty">Unable to load capacity: ${esc(e.message)}</div>`}
+}
+// -- Learning from Outcomes V1 (Phase 5 Continuation, Section 22) --
+function csOutcomeBadge(a){
+if(a==='ACCEPTED_CLEAN')return '<span class="stat-good">ACCEPTED CLEAN</span>';
+if(a==='ACCEPTED_WITH_REWORK')return '<span class="stat-warn">ACCEPTED WITH REWORK</span>';
+if(a==='DISPUTED')return '<span class="stat-bad">DISPUTED</span>';
+return esc(a);
+}
+async function csPopulateOutcomesServiceFilter(){
+const sel=$('csOutcomesServiceFilter');
+if(sel.dataset.loaded)return;
+try{
+const s=await api('/api/cs/services');
+sel.insertAdjacentHTML('beforeend',(s.items||[]).map(x=>`<option value="${esc(x.id)}">${esc(x.title)}</option>`).join(''));
+sel.dataset.loaded='1';
+}catch(e){/* non-fatal -- filter dropdown just stays with "All services" */}
+}
+async function loadCsOutcomes(){
+await csPopulateOutcomesServiceFilter();
+try{
+const serviceId=$('csOutcomesServiceFilter').value;
+const acceptance=$('csOutcomesAcceptanceFilter').value;
+const params=new URLSearchParams();
+if(serviceId)params.set('service_id',serviceId);
+if(acceptance)params.set('acceptance',acceptance);
+const qs=params.toString();
+const r=await api('/api/cs/outcomes'+(qs?`?${qs}`:''));
+const items=r.items||[];
+if(!items.length){$('csOutcomesList').innerHTML='<div class="empty">No outcome records yet -- one is captured automatically the moment a delivery project reaches CLOSED.</div>';return}
+$('csOutcomesList').innerHTML=items.map(o=>`<div class="item">
+<h3>${csOutcomeBadge(o.acceptance)} <span class="sub">project ${esc(o.project_id)}</span></h3>
+<div class="meta"><span>Route: ${esc(o.delivery_route)}</span><span>QA cycles: ${o.qa_cycle_count}</span><span>Disputes: ${o.dispute_count}</span></div>
+<div class="contrib">Estimated delivery: ${o.estimated_delivery_days!=null?o.estimated_delivery_days+'d':'<i>unknown</i>'} -- Actual: ${o.actual_delivery_days!=null?o.actual_delivery_days+'d':'<i>unknown</i>'}</div>
+<div class="contrib">Quoted: ${csFmtMoney(o.quoted_value)} -- Net collected: ${csFmtMoney(o.net_collected)} -- Direct cost: ${csFmtMoney(o.total_known_direct_cost)} -- Gross contribution: ${csFmtMoney(o.gross_contribution)}</div>
+<div class="sub">Recorded ${esc(o.created_at)}</div>
+</div>`).join('');
+}catch(e){$('csOutcomesList').innerHTML=`<div class="empty">Unable to load outcomes: ${esc(e.message)}</div>`}
+}
+document.addEventListener('DOMContentLoaded',()=>{
+const btn=document.getElementById('csOutcomesFilterBtn');
+if(btn)btn.addEventListener('click',loadCsOutcomes);
+});
 async function csLoadProjectExtras(projectId){
 const econOut=$('csEconOut_'+projectId);
 const invOut=$('csInvoicesOut_'+projectId);

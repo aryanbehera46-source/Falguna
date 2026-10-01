@@ -906,10 +906,48 @@ CREATE TABLE IF NOT EXISTS cs_services (
     pricing_model TEXT NOT NULL, price_min REAL, price_max REAL, currency TEXT NOT NULL DEFAULT 'USD',
     delivery_mode TEXT NOT NULL, required_specialists_json TEXT, automation_eligible INTEGER NOT NULL DEFAULT 0,
     foundation_id TEXT REFERENCES cs_foundations(id), approval_status TEXT NOT NULL DEFAULT 'DRAFT',
-    active INTEGER NOT NULL DEFAULT 0, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    active INTEGER NOT NULL DEFAULT 0, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    -- International Services V1 (Phase 5 Continuation, Section 4). All
+    -- nullable: unknown/unassessed stays unknown, never a misleading
+    -- default. regional_pricing_json is a JSON list of per-region bands,
+    -- each PROPOSED (advisory, FALGUNA may suggest) or APPROVED (the one
+    -- human-authorization gate; see ServiceCatalogStore.approve_regional_pricing).
+    supported_languages_json TEXT, risk_level TEXT, regulated INTEGER, regulated_notes TEXT,
+    baseline_complexity TEXT, standard_delivery_days INTEGER, standard_assumptions TEXT,
+    qa_requirements TEXT, regional_pricing_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cs_services_status ON cs_services(approval_status, active);
 CREATE INDEX IF NOT EXISTS idx_cs_services_category ON cs_services(category);
+
+-- Phase 5 Continuation, Section 14: Capability Registry V1
+-- (falguna/capability_registry.py). One row per registered Workforce
+-- worker, synced from the live orchestrator (introspected facts) plus a
+-- small human-maintained profile overlay. Nullable overlay fields mean
+-- "not yet assessed", never a false default.
+CREATE TABLE IF NOT EXISTS cs_capabilities (
+    id TEXT PRIMARY KEY, worker_name TEXT NOT NULL UNIQUE, worker_class TEXT NOT NULL,
+    supported_task_types_json TEXT NOT NULL, auto_resumable_after_restart INTEGER NOT NULL DEFAULT 0,
+    description TEXT, model_tool_dependencies_json TEXT, requires_specialist INTEGER,
+    known_limitations TEXT, availability TEXT, cost_driver TEXT,
+    actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_capabilities_worker ON cs_capabilities(worker_name);
+
+-- Phase 5 Continuation, Section 22: Learning from Outcomes V1
+-- (falguna/outcomes.py). One row per CLOSED cs_projects row, captured
+-- automatically by ProjectStore.transition. Every field is derived from
+-- that project's own history/economics -- nullable where no real
+-- evidence exists (e.g. a service with no standard_delivery_days set).
+CREATE TABLE IF NOT EXISTS cs_outcome_records (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL UNIQUE REFERENCES cs_projects(id),
+    service_id TEXT REFERENCES cs_services(id), foundation_id TEXT REFERENCES cs_foundations(id),
+    delivery_route TEXT NOT NULL, estimated_delivery_days INTEGER, actual_delivery_days REAL,
+    qa_cycle_count INTEGER NOT NULL DEFAULT 0, dispute_count INTEGER NOT NULL DEFAULT 0,
+    acceptance TEXT NOT NULL, quoted_value REAL, net_collected REAL,
+    total_known_direct_cost REAL, gross_contribution REAL,
+    actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_outcome_records_service ON cs_outcome_records(service_id, acceptance);
 
 CREATE TABLE IF NOT EXISTS cs_foundations (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT, description TEXT, repository_ref TEXT,

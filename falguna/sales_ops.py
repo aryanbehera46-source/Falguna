@@ -401,8 +401,37 @@ class ClosingService:
 
         active_job_id = self.active_jobs.create_from_won_opportunity(opportunity_id, actor)
         self.orchestrator.try_transition(opportunity_id, "ONBOARDING", actor=actor, reason="active job created, onboarding started")
+        self._link_commercial_project(opportunity_id, client_id, actor)
 
         return {
             "closing_record_id": closing_record_id, "client_id": client_id, "active_job_id": active_job_id,
             "already_closed": False, "status": "CLOSED",
         }
+
+    def _link_commercial_project(self, opportunity_id: str, client_id: str, actor: str) -> None:
+        """Phase 5 continuation: give every closed deal a canonical
+        `cs_projects` delivery record (falguna/commercial.py) -- the same
+        kind of record a direct customer intake gets via
+        `IntakeStore.convert_to_project` -- so disputes, unit economics
+        and delivery-route tracking exist for every won deal regardless
+        of how it entered the pipeline (manual/paste/url/csv intake,
+        future discovery sources), not only the ones that happened to
+        start as a direct customer intake. `ProjectStore.create_for_opportunity`
+        is itself idempotent on `opportunity_id`, so calling `close()`
+        again never creates a duplicate. No catalogue service is known
+        from this entry point, so `recommend_route` evaluates with
+        `service=None` and always returns ESCALATE -- an honest "a human
+        must scope delivery manually" rather than guessing a route.
+        Wrapped in try/except: a bookkeeping-link failure must never
+        block an already-approved, real commercial close -- the money
+        and client record matter more than this cross-reference, the
+        same defensive posture `reconcile_workforce_tasks_at_startup`
+        already uses in hq_web.py for a non-critical startup step."""
+        try:
+            from .commercial import ProjectStore, recommend_route
+            route = recommend_route(self.store, None, None)["route"]
+            ProjectStore(self.store, self.audit).create_for_opportunity(
+                opportunity_id, client_id, actor, route,
+            )
+        except Exception as exc:
+            print(f"ClosingService: commercial project link skipped ({exc})")

@@ -207,5 +207,58 @@ class CommercialFoundationHTTPTests(_LiveCommercialHQServerCase):
         self.assertIn("exceeds", body["error"])
 
 
+class InternationalServicesHTTPTests(_LiveCommercialHQServerCase):
+    """Phase 5 Continuation, Section 4: proves the international-profile
+    fields and the propose/approve regional-pricing gate are reachable and
+    enforced at the HTTP layer, not only inside ServiceCatalogStore
+    directly."""
+
+    def test_international_profile_set_over_http(self):
+        service_id = self._approved_service()
+        status, body = self._post(f"/api/cs/services/{service_id}/international-profile", {
+            "actor": "Aryan", "risk_level": "LOW", "baseline_complexity": "SIMPLE",
+            "standard_delivery_days": 7, "supported_languages": ["en"],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(body["risk_level"], "LOW")
+        self.assertEqual(body["baseline_complexity"], "SIMPLE")
+        self.assertEqual(body["standard_delivery_days"], 7)
+
+    def test_international_profile_rejects_invalid_risk_level_over_http(self):
+        service_id = self._approved_service()
+        status, body = self._post(f"/api/cs/services/{service_id}/international-profile", {
+            "actor": "Aryan", "risk_level": "CATASTROPHIC",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("risk_level", body["error"])
+
+    def test_regional_pricing_propose_then_approve_over_http(self):
+        service_id = self._approved_service()
+        status, body = self._post(f"/api/cs/services/{service_id}/regional-pricing/propose", {
+            "actor": "Falguna", "region": "EU", "currency": "EUR", "price_min": 800, "price_max": 1200,
+        })
+        self.assertEqual(status, 200)
+        status, service = self._get(f"/api/cs/services/{service_id}")
+        self.assertEqual(status, 200)
+        entries = json.loads(service["regional_pricing_json"])
+        self.assertEqual(entries[0]["status"], "PROPOSED")
+
+        status, body = self._post(f"/api/cs/services/{service_id}/regional-pricing/approve", {
+            "actor": "Aryan", "region": "EU",
+        })
+        self.assertEqual(status, 200)
+        entries = json.loads(body["regional_pricing_json"])
+        approved = [e for e in entries if e["status"] == "APPROVED"]
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(approved[0]["approved_by"], "Aryan")
+
+    def test_regional_pricing_approve_without_proposal_rejected_over_http(self):
+        service_id = self._approved_service()
+        status, body = self._post(f"/api/cs/services/{service_id}/regional-pricing/approve", {
+            "actor": "Aryan", "region": "EU",
+        })
+        self.assertEqual(status, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
