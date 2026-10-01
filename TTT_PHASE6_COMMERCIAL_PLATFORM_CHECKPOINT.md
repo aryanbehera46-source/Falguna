@@ -1,10 +1,12 @@
 # TTT / FALGUNA Phase 6 Commercial Platform Checkpoint
 
-**Status:** CHECKPOINT — Phase 6 is not complete and this is not final acceptance.  
+**Status:** **PHASE 6 CHECKPOINT — NOT FINAL ACCEPTANCE**
 **Date:** 2026-10-01  
 **Branch:** `phase6/commercial-platform-foundation-v1`  
 **Accepted baseline:** `b42067f` — Phase 5 Final Client Experience  
 **Implementation checkpoint:** `a49834d`  
+**Continuation starting commit:** `a836b79`
+**Authenticated integration/reconciliation commit:** `7f5dac0`
 **External actions:** None. No push, merge, deploy, customer contact, provider activation, account creation, spending, or money movement.
 
 ## Files changed
@@ -14,6 +16,20 @@
 - `falguna/store.py` — explicit allow-list entries for the new tables.
 - `tests/test_phase6_commercial.py` — 22 synthetic security, idempotency, authorization, webhook, approval, and reserve-policy tests.
 - This checkpoint report.
+
+## 2026-10-01 continuation outcome
+
+This continuation turned the original data-model foundation into a guarded operational backend slice:
+
+- Every new `/api/p6/*` HQ route requires a valid server-side TTT staff session, an active commercial identity mapped to that staff user, an exact organization header match, the required commercial role permission, and (for mutations) the session CSRF token.
+- Added authenticated APIs for invoice checkout creation, verified provider-event application, settlement reconciliation, reconciliation/receipt views, approval request/verify/amend/reject/final-approve, and finance cash position.
+- Added invoice-linked checkout validation. A checkout cannot cross organizations, use a terminal invoice, or exceed the real amount due. Partial/milestone checkout remains explicit.
+- Added separate capture and settlement truth. Only a `SETTLED` payment can reconcile into an invoice collection.
+- Added reconciliation records with `MATCHED`, `PARTIAL`, `MISMATCH`, `UNMATCHED`, and `REVIEW_REQUIRED` states, plus amount/currency, missing settlement, duplicate settlement, invalid invoice, and organization mismatch findings.
+- Only matched or partial verified settlements update the existing invoice ledger, create a receipt, append a finance cash event, and affect cash. Mismatch/review rows do none of those things.
+- Added append-only approval events with a hash of amount/currency/beneficiary/action/payload/risk fields at every decision point.
+- Material approval changes reset the request to `PENDING_VERIFICATION`, clear prior verifier/final-approver state, and append an invalidation event. Rejection requires a reason and is also append-only.
+- Corrected a partial-write hazard found during testing: settlement evidence is now validated before a reconciliation row can be created.
 
 ## Architecture decisions
 
@@ -42,15 +58,18 @@
 - Automatic high-risk flags for beneficiary changes and configured high-value actions.
 - Append-only finance-event foundation and dynamic protected/free-cash calculation.
 - Direct FALGUNA/AI maker attempts fail.
+- Authenticated, CSRF-protected, organization-scoped HQ APIs for the Phase 6 operational slice.
+- Invoice -> checkout -> capture -> settlement -> reconciliation -> receipt -> existing billing ledger -> finance cash event.
+- Honest partial/milestone collection path and mismatch/review path.
+- Append-only approval audit history, rejection, and re-verification after material change.
 
 ## Deferred requirements
 
 The following remain Phase 6 work and must not be represented as complete:
 
-- Authenticated HQ HTTP endpoints and UI. Existing local HQ authentication/identity integration must be designed before exposing these records; no insecure route was added merely to show progress.
-- Concrete provider adapters, checkout/session creation, tokenized saved-method/mandate handling, subscription schedules, provider settlement ingestion, receipts, or real webhook application.
-- Invoice-to-payment orchestration and reconciliation against the existing `rh_invoices`/billing evidence ledger.
-- Full Accounts Receivable, Accounts Payable, expenses, tax/provision, gateway-fee, budget, project-economics, document-metadata, reconciliation, and approval-queue UI/API.
+- Visible authenticated Finance Approval Queue/reconciliation HQ UI. The APIs are real and guarded; UI wiring remains deferred rather than weakening authentication for a cosmetic surface.
+- Concrete provider adapters, provider-hosted checkout/session creation, tokenized saved-method/mandate handling, subscription schedules, and real provider settlement ingestion/application.
+- Full Accounts Receivable, Accounts Payable, expenses, tax/provision, gateway-fee, budget, project-economics, document-metadata, and expanded finance dashboards.
 - Actual refund, commission, vendor-payment, or beneficiary execution. These require later explicit approval and provider integration.
 - Extension of partner roles/lifecycle/KYC metadata, commission plans, recurring/lifetime-originator options, dashboard, and payout approval integration.
 - Complete anti-diversion signal registry, brand misuse/customer-report intake, suspension review, and synthetic `verify partner` / `verify payment instructions` pages.
@@ -66,6 +85,22 @@ The following remain Phase 6 work and must not be represented as complete:
 - Python compilation of `falguna/phase6_commercial.py`: passed.
 - `git diff --check`: passed before the implementation commit.
 - Full suite: not run in this checkpoint. The accepted Phase 5 report documents a roughly 26-minute full suite with known environment-specific ffmpeg/flite/network failures; this checkpoint does not claim those are resolved.
+
+Continuation verification:
+
+- Phase 6 backend + authenticated HTTP suites: **36 passed** in 26.69s.
+- Broader focused run across Phase 6, billing, finance ledger, partner management, commercial, customer portal, and HQ HTTP: **254 passed, 1 failed** in 222.78s.
+- The one failure is the pre-existing `WorkforceMediaHQServerTests::test_executive_coordinator_full_loop_over_http` two-second client timeout at `/api/executive/sync`. It reproduced alone (1 failed in 3.49s). The route does not pass through any `/api/p6/*` code and no assertion failed; the HTTP response did not arrive inside the test's fixed two-second timeout. It was not weakened, skipped, or represented as fixed.
+- Python compilation for `falguna/phase6_commercial.py` and `falguna/hq_web.py`: passed.
+- `git diff --check`: passed.
+
+## End-to-end flows proven in this continuation
+
+- **Flow A — Commercial Payment: proven for the internal sandbox path.** Synthetic linked customer/invoice -> authenticated checkout -> verified capture -> separate verified settlement -> matched reconciliation -> receipt -> existing billing ledger marks paid -> finance cash event -> cash-position read. A partial settlement proves `PARTIALLY_PAID`; amount/currency mismatches prove no invoice/receipt/cash mutation.
+- **Flow B — Partner Commission: not yet proven end-to-end in this continuation.** Existing partner cleared-collection eligibility remains regression-covered, but configurable plans, risk clearance, and Phase 6 approval linkage remain deferred.
+- **Flow C — Fraud Hold: not yet proven.** High-value and beneficiary-change flags exist, but the full partner/payment risk-event/hold/review model remains deferred.
+- **Flow D — Customer Verification: not yet proven.** No public verification surface was exposed without the required anti-forgery and data-minimization design.
+- **Flow E — Refund: partially proven only through approval controls.** Refund requests can traverse maker -> verifier -> Aryan approval and stop before execution; eligibility calculation, sandbox refund application, reconciliation, and commission clawback integration remain deferred.
 
 ## Security findings and remaining risks
 
@@ -87,10 +122,10 @@ The following remain Phase 6 work and must not be represented as complete:
 
 ## Exact next steps
 
-1. Add transaction-safe authenticated HQ service/API integration with explicit session-to-commercial-identity mapping and organization isolation tests.
-2. Connect payment intents to existing invoices without replacing the existing evidence ledger; implement a sandbox adapter and verified-webhook application transaction.
-3. Add reconciliation and approval-queue APIs/UI, including settlement mismatch, duplicate refund, and concurrency tests.
-4. Extend the existing partner module with role/lifecycle/KYC seams, configurable commission plans, clawbacks/holds, anti-diversion risk events, and approval-gated payout preparation.
-5. Implement draft-only policy records/templates and refund eligibility calculation, explicitly marked for qualified legal review.
-6. Add acquisition/service-economics/opportunity-intelligence foundations and jurisdiction-policy records.
-7. Run focused suites after each coherent slice, then full regression and desktop/mobile browser acceptance. Do not begin Phase 7.
+1. Extend the existing partner module with role/lifecycle/KYC seams, configurable cleared-collection commission plans, contribution tracking, clawbacks/holds, and approval-gated release preparation.
+2. Add evidence-backed anti-diversion risk events and human-controlled hold/review/suspend/clear/escalate actions; prove Fraud Hold Flow C.
+3. Add data-minimized synthetic partner/payment-instruction verification services/pages and prove Flow D.
+4. Wire the authenticated reconciliation and approval APIs into a real HQ Finance UI without exposing CSRF tokens or bypassing session/organization authorization.
+5. Complete refund eligibility, sandbox refund state/reconciliation, and partner commission clawback; prove Flow E.
+6. Add subscription/retainer schedules, payables/expenses/provider-fee/tax-provision reporting, acquisition/source analytics, service tiers, and bounded jurisdiction/opportunity policy records.
+7. Add multi-connection concurrency tests, rerun focused suites, then run the full regression and authenticated desktop/mobile browser acceptance. Do not begin Phase 7.
