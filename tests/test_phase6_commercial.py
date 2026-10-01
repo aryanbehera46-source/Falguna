@@ -6,7 +6,7 @@ from pathlib import Path
 
 from falguna.audit import AuditLog
 from falguna.phase6_commercial import (
-    AccessContext, ApprovalWorkflow, CommercialIdentityStore,
+    AccessContext, ApprovalWorkflow, CommercialIdentityStore, CommercialOperations,
     CommercialSecurityError, FinanceAccounts, PaymentOrchestrator,
 )
 from falguna.store import StateStore
@@ -26,6 +26,7 @@ class Phase6Case(unittest.TestCase):
         self.payments = PaymentOrchestrator(self.store, self.audit, self.identities)
         self.approvals = ApprovalWorkflow(self.store, self.audit, self.identities)
         self.accounts = FinanceAccounts(self.store, self.audit, self.identities)
+        self.operations = CommercialOperations(self.store, self.audit, self.identities)
 
     def tearDown(self):
         self.store.close()
@@ -156,6 +157,25 @@ class ApprovalControlTests(Phase6Case):
         with self.assertRaisesRegex(CommercialSecurityError, "AI actors"):
             self.approvals.request(ai, "REFUND", "PAYMENT", "p1", {})
 
+    def test_material_change_invalidates_verification_and_is_audited(self):
+        request = self.approvals.request(self.finance, "REFUND", "PAYMENT", "p1", {"reason": "one"}, 500, "INR", "b1")
+        self.approvals.verify(self.finance2, request["id"])
+        amended = self.approvals.amend(self.finance, request["id"], {"reason": "changed"}, 600, "INR", "b2")
+        self.assertEqual(amended["status"], "PENDING_VERIFICATION")
+        self.assertIsNone(amended["verifier_identity_id"])
+        events = self.store.list("p6_approval_events", "approval_request_id=?", (request["id"],))
+        self.assertEqual([event["event_type"] for event in events], ["REQUESTED", "VERIFIED", "MATERIAL_CHANGE_REQUIRES_REVERIFICATION"])
+        self.assertNotEqual(events[1]["snapshot_hash"], events[2]["snapshot_hash"])
+
+    def test_rejection_requires_reason_and_is_append_only(self):
+        request = self.approvals.request(self.finance, "VENDOR_PAYMENT", "VENDOR", "v1", {}, 250, "INR")
+        with self.assertRaisesRegex(CommercialSecurityError, "reason"):
+            self.approvals.reject(self.finance2, request["id"], "")
+        rejected = self.approvals.reject(self.finance2, request["id"], "evidence mismatch")
+        self.assertEqual(rejected["status"], "REJECTED")
+        events = self.store.list("p6_approval_events", "approval_request_id=?", (request["id"],))
+        self.assertEqual(events[-1]["event_type"], "REJECTED")
+
 
 class FinanceInvariantTests(Phase6Case):
     def test_financial_event_requires_evidence(self):
@@ -188,6 +208,90 @@ class FinanceInvariantTests(Phase6Case):
     def test_cross_org_cash_position_is_denied(self):
         with self.assertRaisesRegex(CommercialSecurityError, "cross-organization"):
             self.accounts.cash_position(AccessContext(self.finance.identity_id, "other"), "INR")
+
+
+class InvoiceSettlementReconciliationTests(Phase6Case):
+    def setUp(self):
+        super().setUp()
+        now = "2026-10-01T00:00:00+00:00"
+        self.client_id = self.store.create("clients", {"name": "Synthetic Client", "primary_contact": None,
+            "contact_channel": None, "status": "ACTIVE", "total_won_value": 1000, "created_at": now, "updated_at": now})
+        self.store.create("comm_organizations", {"name": "Synthetic Org", "domain": "synthetic.invalid",
+            "linked_client_id": self.client_id, "notes": None, "created_at": now, "updated_at": now}, record_id="ttt")
+        self.invoice_id = self.store.create("rh_invoices", {"client_id": self.client_id, "opportunity_id": None,
+            "active_job_id": None, "amount": 1000, "currency": "INR", "milestone": None, "due_date": None,
+            "amount_received": 0, "status": "SENT", "evidence_json": "[]", "created_at": now, "updated_at": now})
+
+    def _checkout(self, amount=1000, key="checkout"):
+        return self.operations.create_checkout_for_invoice(self.finance, self.invoice_id, amount, key,
+            "Twenty Two Technologies", "beneficiary:ttt-primary", ["UPI", "CARD"])
+
+    def _settle_payment(self, payment):
+        self.payments.apply_verified_event(self.finance, payment["id"], "CAPTURED", payment["amount"], "INR",
+                                           {"provider": "synthetic"}, "capture:" + payment["id"], "txn:" + payment["id"])
+        return self.payments.apply_verified_event(self.finance, payment["id"], "SETTLED", payment["amount"], "INR",
+                                                  {"provider": "synthetic", "settled": True}, "settled:" + payment["id"], "txn:" + payment["id"])
+
+    def test_checkout_requires_invoice_organization_scope(self):
+        with self.assertRaisesRegex(CommercialSecurityError, "cross-organization"):
+            self.operations.create_checkout_for_invoice(self.other_owner, self.invoice_id, 1000, "wrong-org",
+                "TTT", "beneficiary:ttt-primary", ["UPI"])
+
+    def test_checkout_cannot_exceed_amount_due(self):
+        with self.assertRaisesRegex(CommercialSecurityError, "cannot exceed"):
+            self._checkout(1001)
+
+    def test_end_to_end_settlement_updates_invoice_receipt_ledger_and_cash(self):
+        payment = self._checkout(); self._settle_payment(payment)
+        reconciliation = self.operations.reconcile_settlement(self.finance, payment["id"], "settlement-1", 1000,
+            "INR", {"bank_batch": "synthetic"}, "reconcile-1")
+        self.assertEqual(reconciliation["status"], "MATCHED")
+        self.assertEqual(self.store.get("rh_invoices", self.invoice_id)["status"], "PAID")
+        self.assertEqual(len(self.store.list("p6_receipts")), 1)
+        self.assertEqual(self.accounts.cash_position(self.finance, "INR")["cash_balance"], 1000)
+
+    def test_partial_milestone_is_honest(self):
+        payment = self._checkout(400, "partial"); self._settle_payment(payment)
+        reconciliation = self.operations.reconcile_settlement(self.finance, payment["id"], "settlement-partial", 400,
+            "INR", {"bank_batch": "synthetic"}, "reconcile-partial")
+        self.assertEqual(reconciliation["status"], "PARTIAL")
+        invoice = self.store.get("rh_invoices", self.invoice_id)
+        self.assertEqual(invoice["status"], "PARTIALLY_PAID")
+        self.assertEqual(invoice["amount_received"], 400)
+
+    def test_mismatch_never_marks_invoice_paid_or_creates_receipt(self):
+        payment = self._checkout(); self._settle_payment(payment)
+        reconciliation = self.operations.reconcile_settlement(self.finance, payment["id"], "settlement-bad", 900,
+            "USD", {"bank_batch": "synthetic"}, "reconcile-bad")
+        self.assertEqual(reconciliation["status"], "MISMATCH")
+        self.assertIn("AMOUNT_MISMATCH", reconciliation["findings_json"])
+        self.assertIn("CURRENCY_MISMATCH", reconciliation["findings_json"])
+        self.assertEqual(self.store.get("rh_invoices", self.invoice_id)["status"], "SENT")
+        self.assertEqual(self.store.list("p6_receipts"), [])
+
+    def test_unsettled_capture_requires_review(self):
+        payment = self._checkout()
+        self.payments.apply_verified_event(self.finance, payment["id"], "CAPTURED", 1000, "INR",
+                                           {"provider": "synthetic"}, "capture", "txn-1")
+        reconciliation = self.operations.reconcile_settlement(self.finance, payment["id"], "settlement-early", 1000,
+            "INR", {"provider": "synthetic"}, "reconcile-early")
+        self.assertEqual(reconciliation["status"], "REVIEW_REQUIRED")
+        self.assertEqual(self.store.get("rh_invoices", self.invoice_id)["status"], "SENT")
+
+    def test_duplicate_settlement_is_review_required(self):
+        first = self._checkout(400, "first"); self._settle_payment(first)
+        self.operations.reconcile_settlement(self.finance, first["id"], "same-settlement", 400, "INR", {"verified": True}, "r1")
+        second = self._checkout(300, "second"); self._settle_payment(second)
+        duplicate = self.operations.reconcile_settlement(self.finance, second["id"], "same-settlement", 300, "INR", {"verified": True}, "r2")
+        self.assertEqual(duplicate["status"], "REVIEW_REQUIRED")
+        self.assertIn("DUPLICATE_SETTLEMENT", duplicate["findings_json"])
+
+    def test_reconciliation_replay_is_idempotent(self):
+        payment = self._checkout(); self._settle_payment(payment)
+        first = self.operations.reconcile_settlement(self.finance, payment["id"], "settlement-1", 1000, "INR", {"verified": True}, "same")
+        second = self.operations.reconcile_settlement(self.finance, payment["id"], "settlement-1", 1000, "INR", {"verified": True}, "same")
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(self.store.list("p6_receipts")), 1)
 
 
 if __name__ == "__main__":

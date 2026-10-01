@@ -370,7 +370,7 @@ class StateStore:
             # recommend against this TTT-owned state, but never execute it.
             "p6_commercial_identities", "p6_payment_intents", "p6_payment_events",
             "p6_webhook_events", "p6_approval_requests", "p6_financial_events",
-            "p6_reserve_policies"}
+            "p6_reserve_policies", "p6_reconciliations", "p6_receipts", "p6_approval_events"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

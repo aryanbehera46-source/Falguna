@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
 from .audit import AuditLog
+from .billing import BillingStore
 from .store import StateStore, utcnow
 
 ROLES = {"CUSTOMER", "PARTNER", "FINANCE_OPERATOR", "SALES_OPERATOR", "ADMIN", "OWNER"}
@@ -181,6 +182,18 @@ class ApprovalWorkflow:
     def __init__(self, store: StateStore, audit: AuditLog, identities: CommercialIdentityStore):
         self.store, self.audit, self.identities = store, audit, identities
 
+    def _event(self, row: Dict[str, Any], event_type: str, before: Optional[str], after: str,
+               actor_identity_id: str, details: Optional[Dict[str, Any]] = None) -> None:
+        protected = {key: row.get(key) for key in ("action_type", "target_type", "target_id", "amount",
+                     "currency", "beneficiary_ref", "payload_json", "risk_flags_json")}
+        self.store.create("p6_approval_events", {
+            "approval_request_id": row["id"], "organization_id": row["organization_id"],
+            "event_type": event_type, "status_before": before, "status_after": after,
+            "actor_identity_id": actor_identity_id,
+            "snapshot_hash": hashlib.sha256(_json(protected).encode()).hexdigest(),
+            "details_json": _json(details or {}), "created_at": utcnow(),
+        })
+
     def request(self, context: AccessContext, action_type: str, target_type: str, target_id: str,
                 payload: Dict[str, Any], amount: Optional[float] = None, currency: Optional[str] = None,
                 beneficiary_ref: Optional[str] = None, risk_flags: Optional[Iterable[str]] = None) -> Dict[str, Any]:
@@ -199,7 +212,9 @@ class ApprovalWorkflow:
             "maker_at": now, "verified_at": None, "approved_at": None, "rejection_reason": None,
             "execution_reference": None, "created_at": now, "updated_at": now,
         })
-        return self.store.get("p6_approval_requests", request_id)
+        row = self.store.get("p6_approval_requests", request_id)
+        self._event(row, "REQUESTED", None, "PENDING_VERIFICATION", maker["id"])
+        return row
 
     def verify(self, context: AccessContext, request_id: str) -> Dict[str, Any]:
         row = self._scoped(context, request_id, "approvals:verify")
@@ -207,7 +222,9 @@ class ApprovalWorkflow:
             raise CommercialSecurityError("independent verifier required")
         self.store.update("p6_approval_requests", request_id, status="PENDING_ARYAN_APPROVAL",
                           verifier_identity_id=context.identity_id, verified_at=utcnow())
-        return self.store.get("p6_approval_requests", request_id)
+        updated = self.store.get("p6_approval_requests", request_id)
+        self._event(updated, "VERIFIED", row["status"], updated["status"], context.identity_id)
+        return updated
 
     def approve_by_aryan(self, context: AccessContext, request_id: str) -> Dict[str, Any]:
         row = self._scoped(context, request_id, "finance:read")
@@ -218,7 +235,45 @@ class ApprovalWorkflow:
             raise CommercialSecurityError("verified request and independent final approver required")
         self.store.update("p6_approval_requests", request_id, status="APPROVED_PENDING_EXECUTION",
                           final_approver_identity_id=context.identity_id, approved_at=utcnow())
-        return self.store.get("p6_approval_requests", request_id)
+        updated = self.store.get("p6_approval_requests", request_id)
+        self._event(updated, "ARYAN_APPROVED", row["status"], updated["status"], context.identity_id)
+        return updated
+
+    def amend(self, context: AccessContext, request_id: str, payload: Dict[str, Any],
+              amount: Optional[float] = None, currency: Optional[str] = None,
+              beneficiary_ref: Optional[str] = None) -> Dict[str, Any]:
+        row = self._scoped(context, request_id, "approvals:make")
+        if row["maker_identity_id"] != context.identity_id:
+            raise CommercialSecurityError("only the original maker may amend the request")
+        if row["status"] not in {"PENDING_VERIFICATION", "PENDING_ARYAN_APPROVAL"}:
+            raise CommercialSecurityError("only a pending request may be amended")
+        before = row["status"]
+        self.store.update("p6_approval_requests", request_id, payload_json=_json(payload), amount=amount,
+                          currency=currency, beneficiary_ref=beneficiary_ref,
+                          status="PENDING_VERIFICATION", verifier_identity_id=None, verified_at=None,
+                          final_approver_identity_id=None, approved_at=None)
+        updated = self.store.get("p6_approval_requests", request_id)
+        self._event(updated, "MATERIAL_CHANGE_REQUIRES_REVERIFICATION", before, updated["status"],
+                    context.identity_id, {"prior_verification_invalidated": before == "PENDING_ARYAN_APPROVAL"})
+        return updated
+
+    def reject(self, context: AccessContext, request_id: str, reason: str) -> Dict[str, Any]:
+        row = self._scoped(context, request_id, "approvals:verify")
+        if not (reason or "").strip():
+            raise CommercialSecurityError("rejection reason is required")
+        if row["status"] not in {"PENDING_VERIFICATION", "PENDING_ARYAN_APPROVAL"}:
+            raise CommercialSecurityError("only a pending request may be rejected")
+        self.store.update("p6_approval_requests", request_id, status="REJECTED", rejection_reason=reason)
+        updated = self.store.get("p6_approval_requests", request_id)
+        self._event(updated, "REJECTED", row["status"], "REJECTED", context.identity_id, {"reason": reason})
+        return updated
+
+    def queue(self, context: AccessContext) -> Dict[str, Any]:
+        self.identities.authorize(context, "finance:read", context.organization_id)
+        items = list(reversed(self.store.list("p6_approval_requests", "organization_id=?", (context.organization_id,))))
+        for item in items:
+            item["events"] = self.store.list("p6_approval_events", "approval_request_id=?", (item["id"],))
+        return {"organization_id": context.organization_id, "items": items}
 
     def _scoped(self, context: AccessContext, request_id: str, permission: str) -> Dict[str, Any]:
         row = self.store.get("p6_approval_requests", request_id)
@@ -293,3 +348,129 @@ class FinanceAccounts:
                 "protected_cash": round(protected, 2), "free_cash": round(balance - protected, 2),
                 "minimum_runway_months": float(policy["minimum_runway_months"]),
                 "target_runway_months": float(policy["target_runway_months"])}
+
+
+class CommercialOperations:
+    """Invoice -> sandbox payment -> settlement -> reconciliation -> receipt.
+
+    The invoice remains authoritative for receivables, the payment intent for
+    provider state, and immutable finance events for cash. Reconciliation is
+    the only bridge between those ledgers.
+    """
+
+    RECONCILIATION_STATUSES = {"MATCHED", "PARTIAL", "MISMATCH", "UNMATCHED", "REVIEW_REQUIRED"}
+
+    def __init__(self, store: StateStore, audit: AuditLog, identities: CommercialIdentityStore):
+        self.store, self.audit, self.identities = store, audit, identities
+        self.payments = PaymentOrchestrator(store, audit, identities)
+        self.accounts = FinanceAccounts(store, audit, identities)
+        self.billing = BillingStore(store, audit)
+
+    def _invoice_organization(self, invoice: Dict[str, Any]) -> Optional[str]:
+        rows = self.store.list("comm_organizations", "linked_client_id=?", (invoice["client_id"],))
+        return rows[-1]["id"] if rows else None
+
+    def create_checkout_for_invoice(self, context: AccessContext, invoice_id: str, amount: float,
+                                    idempotency_key: str, legal_owner_name: str,
+                                    beneficiary_ref: str, allowed_methods: Iterable[str]) -> Dict[str, Any]:
+        invoice = self.billing.get(invoice_id)
+        if not invoice:
+            raise CommercialSecurityError("invoice not found")
+        organization_id = self._invoice_organization(invoice)
+        if not organization_id:
+            raise CommercialSecurityError("invoice is not linked to a commercial organization")
+        self.identities.authorize(context, "payments:create", organization_id)
+        if invoice["status"] in {"CANCELLED", "PAID"}:
+            raise CommercialSecurityError(f"invoice is already {invoice['status']}")
+        remaining = round(float(invoice["amount"]) - float(invoice.get("amount_received") or 0), 2)
+        if amount <= 0 or amount > remaining:
+            raise CommercialSecurityError("checkout amount must be positive and cannot exceed invoice amount due")
+        kind = "MILESTONE" if amount < remaining or invoice.get("milestone") else "ONE_TIME"
+        return self.payments.create_intent(
+            context, organization_id, amount, invoice["currency"], kind, idempotency_key,
+            legal_owner_name, beneficiary_ref, allowed_methods, invoice_id=invoice_id,
+            metadata={"source": "INVOICE", "invoice_id": invoice_id, "sandbox": True},
+        )
+
+    def reconcile_settlement(self, context: AccessContext, payment_id: str, settlement_ref: str,
+                             settled_amount: float, settled_currency: str, evidence: Any,
+                             idempotency_key: str) -> Dict[str, Any]:
+        if not evidence:
+            raise CommercialSecurityError("settlement reconciliation requires verified provider evidence")
+        payment = self.store.get("p6_payment_intents", payment_id)
+        if not payment:
+            raise CommercialSecurityError("payment intent not found")
+        self.identities.authorize(context, "finance:read", payment["organization_id"])
+        existing = self.store.list("p6_reconciliations", "organization_id=? AND idempotency_key=?",
+                                   (payment["organization_id"], idempotency_key))
+        if existing:
+            return existing[-1]
+        invoice = self.billing.get(payment.get("invoice_id")) if payment.get("invoice_id") else None
+        findings = []
+        status = "MATCHED"
+        if payment["status"] != "SETTLED":
+            findings.append("PAYMENT_NOT_SETTLED")
+            status = "REVIEW_REQUIRED"
+        if not invoice:
+            findings.append("PAYMENT_WITHOUT_VALID_INVOICE")
+            status = "UNMATCHED"
+        elif self._invoice_organization(invoice) != payment["organization_id"]:
+            findings.append("INVOICE_ORGANIZATION_MISMATCH")
+            status = "MISMATCH"
+        if settled_currency.upper() != payment["currency"]:
+            findings.append("CURRENCY_MISMATCH")
+            status = "MISMATCH"
+        if round(float(settled_amount), 2) != round(float(payment["amount"]), 2):
+            findings.append("AMOUNT_MISMATCH")
+            status = "MISMATCH"
+        if not settlement_ref:
+            findings.append("MISSING_SETTLEMENT_REFERENCE")
+            status = "REVIEW_REQUIRED"
+        duplicates = self.store.list("p6_reconciliations", "organization_id=? AND settlement_ref=?",
+                                     (payment["organization_id"], settlement_ref)) if settlement_ref else []
+        if duplicates:
+            findings.append("DUPLICATE_SETTLEMENT")
+            status = "REVIEW_REQUIRED"
+        if invoice and status == "MATCHED":
+            remaining = round(float(invoice["amount"]) - float(invoice.get("amount_received") or 0), 2)
+            if settled_amount < remaining:
+                status = "PARTIAL"
+                findings.append("PARTIAL_COLLECTION")
+        now = utcnow()
+        reconciliation_id = self.store.create("p6_reconciliations", {
+            "organization_id": payment["organization_id"], "invoice_id": payment.get("invoice_id"),
+            "payment_intent_id": payment_id, "provider_transaction_ref": payment.get("provider_transaction_ref"),
+            "settlement_ref": settlement_ref, "expected_amount": payment["amount"], "settled_amount": settled_amount,
+            "expected_currency": payment["currency"], "settled_currency": settled_currency.upper(),
+            "status": status, "findings_json": _json(findings), "evidence_json": _json(evidence),
+            "reviewed_by_identity_id": context.identity_id, "idempotency_key": idempotency_key,
+            "created_at": now, "updated_at": now,
+        })
+        if status in {"MATCHED", "PARTIAL"}:
+            payment_evidence = {"type": "VERIFIED_PROVIDER_SETTLEMENT", "settlement_ref": settlement_ref,
+                                "payment_intent_id": payment_id, "reconciliation_id": reconciliation_id}
+            self.billing.record_payment(invoice["id"], settled_amount, context.identity_id, payment_evidence)
+            self.accounts.record_event(context, "SETTLED_COLLECTION", "CASH", "CREDIT", settled_amount,
+                                       settled_currency, "RECONCILIATION", reconciliation_id,
+                                       evidence, f"settlement:{settlement_ref}")
+            receipt_id = self.store.create("p6_receipts", {
+                "organization_id": payment["organization_id"], "invoice_id": invoice["id"],
+                "payment_intent_id": payment_id, "reconciliation_id": reconciliation_id,
+                "amount": settled_amount, "currency": settled_currency.upper(),
+                "provider_transaction_ref": payment.get("provider_transaction_ref") or settlement_ref,
+                "status": "ISSUED", "issued_at": now, "created_at": now,
+            })
+            self.audit.append("P6_SETTLEMENT_RECONCILED", {"reconciliation_id": reconciliation_id,
+                              "receipt_id": receipt_id, "status": status, "actor": context.identity_id})
+        else:
+            self.audit.append("P6_SETTLEMENT_REVIEW_REQUIRED", {"reconciliation_id": reconciliation_id,
+                              "status": status, "findings": findings, "actor": context.identity_id})
+        return self.store.get("p6_reconciliations", reconciliation_id)
+
+    def reconciliation_snapshot(self, context: AccessContext) -> Dict[str, Any]:
+        self.identities.authorize(context, "finance:read", context.organization_id)
+        rows = list(reversed(self.store.list("p6_reconciliations", "organization_id=?", (context.organization_id,))))
+        receipts = list(reversed(self.store.list("p6_receipts", "organization_id=?", (context.organization_id,))))
+        return {"organization_id": context.organization_id, "items": rows, "receipts": receipts,
+                "counts": {status: sum(1 for row in rows if row["status"] == status)
+                           for status in sorted(self.RECONCILIATION_STATUSES)}}

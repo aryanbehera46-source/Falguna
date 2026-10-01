@@ -33,6 +33,7 @@ import json
 import secrets
 import threading
 import time
+from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -110,6 +111,11 @@ from .outcomes import OutcomeStore
 from .language import LanguageInterpretationStore, LanguageUnderstandingService
 from .clarification_coordinator import ClarificationCoordinator
 from .payment_comms import PaymentCommsBridge
+from .phase6_commercial import (
+    AccessContext, ApprovalWorkflow, CommercialIdentityStore, CommercialOperations,
+    CommercialSecurityError, FinanceAccounts, PaymentOrchestrator,
+)
+from .site_auth import StaffAuthService
 from .customer_portal import CustomerPortalService
 from .customer_context import CustomerContextService
 from .whatsapp_admin import resolve_configured_whatsapp_provider
@@ -530,6 +536,31 @@ class TTTHQHandler(BaseHTTPRequestHandler):
     def app_root(self):
         return self.server.app_root
 
+    def _commercial_context(self, store, mutate=False):
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie") or "")
+        except Exception:
+            pass
+        morsel = jar.get("ttt_staff_session")
+        session_id = morsel.value if morsel else ""
+        auth = StaffAuthService(store)
+        user = auth.current_user(session_id)
+        if not user:
+            self._json({"error": "authenticated TTT staff session required"}, HTTPStatus.UNAUTHORIZED)
+            return None
+        if mutate and not auth.check_csrf(session_id, self.headers.get("X-CSRF-Token") or ""):
+            self._json({"error": "valid session CSRF token required"}, HTTPStatus.FORBIDDEN)
+            return None
+        organization_id = (self.headers.get("X-TTT-Organization") or "").strip()
+        identities = store.list("p6_commercial_identities", "subject_type=? AND subject_ref=? AND status='ACTIVE'",
+                                ("STAFF_USER", user["id"]))
+        matching = [item for item in identities if item["organization_id"] == organization_id]
+        if not organization_id or not matching:
+            self._json({"error": "active commercial identity for requested organization required"}, HTTPStatus.FORBIDDEN)
+            return None
+        return AccessContext(matching[-1]["id"], organization_id)
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/":
@@ -579,6 +610,22 @@ class TTTHQHandler(BaseHTTPRequestHandler):
             return self._json(op)
         control, store = open_control_plane(self.app_root)
         try:
+            if path.startswith("/api/p6/"):
+                context = self._commercial_context(store)
+                if context is None:
+                    return
+                identities = CommercialIdentityStore(store, control.audit)
+                try:
+                    if path == "/api/p6/reconciliation":
+                        return self._json(CommercialOperations(store, control.audit, identities).reconciliation_snapshot(context))
+                    if path == "/api/p6/approvals":
+                        return self._json(ApprovalWorkflow(store, control.audit, identities).queue(context))
+                    if path == "/api/p6/finance/cash-position":
+                        query = parse_qs(urlparse(self.path).query)
+                        currency = (query.get("currency") or ["INR"])[0]
+                        return self._json(FinanceAccounts(store, control.audit, identities).cash_position(context, currency))
+                except CommercialSecurityError as exc:
+                    return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             if path == "/api/hq/what-changed":
                 query = parse_qs(urlparse(self.path).query)
                 limit = 8
@@ -1375,6 +1422,56 @@ class TTTHQHandler(BaseHTTPRequestHandler):
             control, store = open_control_plane(self.app_root)
             try:
                 orchestrator = LifecycleOrchestrator(store, control.audit)
+                if path.startswith("/api/p6/"):
+                    context = self._commercial_context(store, mutate=True)
+                    if context is None:
+                        return
+                    identities = CommercialIdentityStore(store, control.audit)
+                    try:
+                        operations = CommercialOperations(store, control.audit, identities)
+                        payments = PaymentOrchestrator(store, control.audit, identities)
+                        approvals = ApprovalWorkflow(store, control.audit, identities)
+                        if path.startswith("/api/p6/invoices/") and path.endswith("/checkout"):
+                            invoice_id = path.split("/")[4]
+                            result = operations.create_checkout_for_invoice(
+                                context, invoice_id, float(body.get("amount")), body.get("idempotency_key", ""),
+                                body.get("legal_owner_name", ""), body.get("beneficiary_ref", ""),
+                                body.get("allowed_methods") or [],
+                            )
+                            return self._json(result, HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/payments/") and path.endswith("/provider-event"):
+                            payment_id = path.split("/")[4]
+                            result = payments.apply_verified_event(
+                                context, payment_id, body.get("status", ""), float(body.get("amount")),
+                                body.get("currency", ""), body.get("evidence"), body.get("idempotency_key", ""),
+                                body.get("provider_event_ref"),
+                            )
+                            return self._json(result)
+                        if path.startswith("/api/p6/payments/") and path.endswith("/reconcile"):
+                            payment_id = path.split("/")[4]
+                            result = operations.reconcile_settlement(
+                                context, payment_id, body.get("settlement_ref", ""), float(body.get("settled_amount")),
+                                body.get("settled_currency", ""), body.get("evidence"), body.get("idempotency_key", ""),
+                            )
+                            return self._json(result)
+                        if path == "/api/p6/approvals":
+                            result = approvals.request(
+                                context, body.get("action_type", ""), body.get("target_type", ""), body.get("target_id", ""),
+                                body.get("payload") or {}, body.get("amount"), body.get("currency"),
+                                body.get("beneficiary_ref"), body.get("risk_flags") or [],
+                            )
+                            return self._json(result, HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/approvals/") and path.endswith("/verify"):
+                            return self._json(approvals.verify(context, path.split("/")[4]))
+                        if path.startswith("/api/p6/approvals/") and path.endswith("/approve"):
+                            return self._json(approvals.approve_by_aryan(context, path.split("/")[4]))
+                        if path.startswith("/api/p6/approvals/") and path.endswith("/amend"):
+                            return self._json(approvals.amend(context, path.split("/")[4], body.get("payload") or {},
+                                body.get("amount"), body.get("currency"), body.get("beneficiary_ref")))
+                        if path.startswith("/api/p6/approvals/") and path.endswith("/reject"):
+                            return self._json(approvals.reject(context, path.split("/")[4], body.get("reason", "")))
+                    except CommercialSecurityError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
                 if path == "/api/ask-falguna":
                     message = str(body.get("message") or "").strip()
                     if not message:

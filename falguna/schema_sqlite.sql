@@ -1118,6 +1118,13 @@ CREATE TABLE IF NOT EXISTS p6_approval_requests (
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_p6_approvals_org ON p6_approval_requests(organization_id, status, created_at);
+CREATE TABLE IF NOT EXISTS p6_approval_events (
+    id TEXT PRIMARY KEY, approval_request_id TEXT NOT NULL REFERENCES p6_approval_requests(id),
+    organization_id TEXT NOT NULL, event_type TEXT NOT NULL, status_before TEXT,
+    status_after TEXT NOT NULL, actor_identity_id TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p6_approval_events_request ON p6_approval_events(approval_request_id, created_at);
 CREATE TABLE IF NOT EXISTS p6_financial_events (
     id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, event_type TEXT NOT NULL,
     account_bucket TEXT NOT NULL, direction TEXT NOT NULL, amount REAL NOT NULL,
@@ -1133,3 +1140,21 @@ CREATE TABLE IF NOT EXISTS p6_reserve_policies (
     target_runway_months REAL NOT NULL DEFAULT 6, operating_reserve_override REAL,
     policy_notes TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS p6_reconciliations (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, invoice_id TEXT,
+    payment_intent_id TEXT, provider_transaction_ref TEXT, settlement_ref TEXT,
+    expected_amount REAL, settled_amount REAL, expected_currency TEXT, settled_currency TEXT,
+    status TEXT NOT NULL, findings_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+    reviewed_by_identity_id TEXT, idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_reconciliation_org ON p6_reconciliations(organization_id, status, created_at);
+CREATE TABLE IF NOT EXISTS p6_receipts (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, invoice_id TEXT NOT NULL,
+    payment_intent_id TEXT NOT NULL, reconciliation_id TEXT NOT NULL,
+    amount REAL NOT NULL, currency TEXT NOT NULL, provider_transaction_ref TEXT NOT NULL,
+    status TEXT NOT NULL, issued_at TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(reconciliation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_receipt_org ON p6_receipts(organization_id, invoice_id, created_at);
