@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from falguna.hq_web import TTTHQHandler
+from falguna.hq_web import HQ_INDEX_HTML, TTTHQHandler
 from falguna.phase6_commercial import CommercialIdentityStore
 from falguna.partner_management import PartnerStore
 from falguna.runtime import open_control_plane
@@ -75,6 +75,18 @@ class Phase6AuthenticatedHQTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIn("authenticated", body["error"])
 
+    def test_commercial_session_bootstrap_is_authenticated_and_scoped(self):
+        status, body = self._request("/api/p6/session")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["organization_id"], "ttt-org")
+        self.assertEqual(body["role"], "FINANCE_OPERATOR")
+        self.assertEqual(body["csrf_token"], self.csrf)
+
+    def test_commercial_session_rejects_missing_session(self):
+        status, body = self._request("/api/p6/session", authenticated=False)
+        self.assertEqual(status, 401)
+        self.assertIn("authenticated", body["error"])
+
     def test_commercial_api_rejects_cross_organization_header(self):
         status, _ = self._request("/api/p6/approvals", organization="another-org")
         self.assertEqual(status, 403)
@@ -102,6 +114,12 @@ class Phase6AuthenticatedHQTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertFalse(result["may_collect_customer_money"])
         self.assertNotIn("email", result)
+
+    def test_commercial_finance_ui_is_wired_to_authenticated_routes(self):
+        self.assertIn('id="view-p6Finance"', HQ_INDEX_HTML)
+        self.assertIn("async function loadP6Finance()", HQ_INDEX_HTML)
+        self.assertIn("/api/p6/session", HQ_INDEX_HTML)
+        self.assertIn("X-CSRF-Token", HQ_INDEX_HTML)
 
 
 if __name__ == "__main__":

@@ -1188,3 +1188,40 @@ CREATE TABLE IF NOT EXISTS p6_risk_event_actions (
     reason TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_p6_risk_actions_event ON p6_risk_event_actions(risk_event_id, created_at);
+CREATE TABLE IF NOT EXISTS p6_commission_releases (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, commission_id TEXT NOT NULL,
+    approval_request_id TEXT NOT NULL, cleared_collections REAL NOT NULL,
+    excluded_amount REAL NOT NULL, refund_chargeback_amount REAL NOT NULL,
+    eligible_base REAL NOT NULL, rate REAL NOT NULL, commission_amount REAL NOT NULL,
+    currency TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_commission_release ON p6_commission_releases(commission_id, status);
+CREATE TABLE IF NOT EXISTS p6_refunds (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, payment_intent_id TEXT NOT NULL,
+    invoice_id TEXT NOT NULL, approval_request_id TEXT NOT NULL, amount REAL NOT NULL,
+    currency TEXT NOT NULL, eligibility_basis_json TEXT NOT NULL, reason TEXT NOT NULL,
+    status TEXT NOT NULL, provider_ref TEXT, evidence_json TEXT,
+    idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_refunds_payment ON p6_refunds(payment_intent_id, status);
+CREATE TABLE IF NOT EXISTS p6_subscriptions (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, client_id TEXT NOT NULL,
+    opportunity_id TEXT, plan_name TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL,
+    cadence TEXT NOT NULL, next_billing_date TEXT NOT NULL, provider_token_ref TEXT,
+    mandate_ref TEXT, autopay_status TEXT NOT NULL, status TEXT NOT NULL,
+    last_invoice_id TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p6_subscriptions_due ON p6_subscriptions(status, next_billing_date);
+CREATE TABLE IF NOT EXISTS p6_payables (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, payable_type TEXT NOT NULL,
+    beneficiary_ref TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL,
+    linked_project_id TEXT, linked_budget_id TEXT, expense_metadata_json TEXT NOT NULL,
+    approval_request_id TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_payables_org ON p6_payables(organization_id, status, created_at);

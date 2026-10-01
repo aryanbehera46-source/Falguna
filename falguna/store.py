@@ -380,6 +380,7 @@ class StateStore:
             "p6_webhook_events", "p6_approval_requests", "p6_financial_events",
             "p6_reserve_policies", "p6_reconciliations", "p6_receipts", "p6_approval_events",
             "p6_commission_plans", "p6_partner_contributions", "p6_risk_events", "p6_risk_event_actions"}
+        allowed.update({"p6_commission_releases", "p6_refunds", "p6_subscriptions", "p6_payables"})
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

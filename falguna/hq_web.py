@@ -116,6 +116,7 @@ from .phase6_commercial import (
     CommercialSecurityError, FinanceAccounts, PaymentOrchestrator,
 )
 from .phase6_partner import CommercialRiskService, CustomerVerificationService
+from .phase6_financial_flows import CommissionReleaseService, PayableService, RefundService, SubscriptionService
 from .site_auth import StaffAuthService
 from .customer_portal import CustomerPortalService
 from .customer_context import CustomerContextService
@@ -620,6 +621,22 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                     (query.get("payment_id") or [""])[0], (query.get("customer_ref") or [""])[0],
                     (query.get("beneficiary_ref") or [""])[0],
                 ))
+            if path == "/api/p6/session":
+                jar = SimpleCookie(); jar.load(self.headers.get("Cookie") or "")
+                morsel = jar.get("ttt_staff_session"); session_id = morsel.value if morsel else ""
+                auth = StaffAuthService(store); user = auth.current_user(session_id); session = auth.session(session_id)
+                if not user or not session:
+                    return self._json({"error": "authenticated TTT staff session required"}, HTTPStatus.UNAUTHORIZED)
+                identities_found = store.list("p6_commercial_identities", "subject_type=? AND subject_ref=? AND status='ACTIVE'",
+                                              ("STAFF_USER", user["id"]))
+                requested_org = (self.headers.get("X-TTT-Organization") or "").strip()
+                if requested_org:
+                    identities_found = [item for item in identities_found if item["organization_id"] == requested_org]
+                if len(identities_found) != 1:
+                    return self._json({"error": "exactly one active commercial identity is required"}, HTTPStatus.FORBIDDEN)
+                identity = identities_found[0]
+                return self._json({"organization_id": identity["organization_id"], "role": identity["role"],
+                                   "display_name": identity["display_name"], "csrf_token": session["csrf_token"]})
             if path.startswith("/api/p6/"):
                 context = self._commercial_context(store)
                 if context is None:
@@ -636,6 +653,12 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         return self._json(FinanceAccounts(store, control.audit, identities).cash_position(context, currency))
                     if path == "/api/p6/risks":
                         return self._json(CommercialRiskService(store, control.audit, identities).queue(context))
+                    if path == "/api/p6/finance/operations":
+                        identities.authorize(context, "finance:read", context.organization_id)
+                        scoped = lambda table: list(reversed(store.list(table, "organization_id=?", (context.organization_id,))))
+                        return self._json({"organization_id": context.organization_id,
+                            "commission_releases": scoped("p6_commission_releases"), "refunds": scoped("p6_refunds"),
+                            "subscriptions": scoped("p6_subscriptions"), "payables": scoped("p6_payables")})
                 except CommercialSecurityError as exc:
                     return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             if path == "/api/hq/what-changed":
@@ -1486,6 +1509,41 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                             risk_id = path.split("/")[4]
                             return self._json(CommercialRiskService(store, control.audit, identities).act(
                                 context, risk_id, body.get("action", ""), body.get("reason", "")))
+                        if path.startswith("/api/p6/commissions/") and path.endswith("/release"):
+                            commission_id = path.split("/")[4]
+                            return self._json(CommissionReleaseService(store, control.audit, identities).prepare(
+                                context, commission_id, body.get("currency", "INR"), float(body.get("excluded_amount") or 0),
+                                body.get("idempotency_key", "")), HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/commission-releases/") and path.endswith("/ready"):
+                            release_id = path.split("/")[4]
+                            return self._json(CommissionReleaseService(store, control.audit, identities).mark_releasable(context, release_id))
+                        if path.startswith("/api/p6/payments/") and path.endswith("/refunds"):
+                            payment_id = path.split("/")[4]
+                            return self._json(RefundService(store, control.audit, identities).request(
+                                context, payment_id, float(body.get("amount")), body.get("currency", ""),
+                                body.get("reason", ""), body.get("idempotency_key", "")), HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/refunds/") and path.endswith("/confirm"):
+                            refund_id = path.split("/")[4]
+                            return self._json(RefundService(store, control.audit, identities).confirm_sandbox(
+                                context, refund_id, body.get("provider_ref", ""), body.get("evidence")))
+                        if path == "/api/p6/subscriptions":
+                            return self._json(SubscriptionService(store, control.audit, identities).create(
+                                context, body.get("client_id", ""), body.get("plan_name", ""), float(body.get("amount")),
+                                body.get("currency", ""), body.get("cadence", ""), body.get("next_billing_date", ""),
+                                body.get("provider_token_ref"), body.get("mandate_ref"), body.get("opportunity_id")), HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/subscriptions/") and path.endswith("/invoice"):
+                            subscription_id = path.split("/")[4]
+                            return self._json(SubscriptionService(store, control.audit, identities).create_due_invoice(
+                                context, subscription_id, body.get("as_of")), HTTPStatus.CREATED)
+                        if path == "/api/p6/payables":
+                            return self._json(PayableService(store, control.audit, identities).create(
+                                context, body.get("payable_type", ""), body.get("beneficiary_ref", ""),
+                                float(body.get("amount")), body.get("currency", ""), body.get("metadata") or {},
+                                body.get("idempotency_key", ""), body.get("linked_project_id"), body.get("linked_budget_id")),
+                                HTTPStatus.CREATED)
+                        if path.startswith("/api/p6/payables/") and path.endswith("/ready"):
+                            payable_id = path.split("/")[4]
+                            return self._json(PayableService(store, control.audit, identities).mark_execution_ready(context, payable_id))
                     except CommercialSecurityError as exc:
                         return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
                 if path == "/api/ask-falguna":
@@ -3264,6 +3322,7 @@ Ask Falguna
 <button class="navitem" data-view="ccGoals">Goals</button>
 <button class="navitem" data-view="ccKpis">KPIs</button>
 <button class="navitem" data-view="ccLedger">Finance Ledger</button>
+<button class="navitem" data-view="p6Finance">Commercial Finance</button>
 <button class="navitem" data-view="ccCash">Cash &amp; Runway</button>
 <button class="navitem" data-view="ccBudgets">Budgets</button>
 <button class="navitem" data-view="ccCapital">Capital Allocation</button>
@@ -3475,6 +3534,21 @@ Ask Falguna
 <div class="section"><h2>Expected</h2><div class="list" id="ccCashExpected"></div></div>
 <div class="section"><h2>Projected</h2><div class="list" id="ccCashProjected"></div></div>
 <div class="section"><h2>Runway</h2><div class="list" id="ccCashRunway"></div></div>
+</div>
+<div class="view" id="view-p6Finance">
+<h1>Commercial Finance</h1>
+<div class="pageintro">Authenticated Phase 6 finance operations. Settled, reserved, payable, and pending states remain separate. Nothing on this page moves real money.</div>
+<div class="row">
+<div class="section" style="flex:1"><h2 id="p6CashBalance">—</h2><div class="sub">Settled cash</div></div>
+<div class="section" style="flex:1"><h2 id="p6ProtectedCash">—</h2><div class="sub">Protected cash</div></div>
+<div class="section" style="flex:1"><h2 id="p6FreeCash">—</h2><div class="sub">Free cash</div></div>
+</div>
+<div class="section"><h2>Reconciliation</h2><div class="list" id="p6ReconciliationList"></div></div>
+<div class="section"><h2>Approval Queue</h2><div class="list" id="p6ApprovalList"></div></div>
+<div class="section"><h2>Commission Releases</h2><div class="list" id="p6CommissionList"></div></div>
+<div class="section"><h2>Refunds &amp; Disputes</h2><div class="list" id="p6RefundList"></div></div>
+<div class="section"><h2>Subscriptions &amp; Payables</h2><div class="list" id="p6RecurringPayableList"></div></div>
+<div class="section"><h2>Fraud / Anti-diversion Review</h2><div class="list" id="p6RiskList"></div></div>
 </div>
 <div class="view" id="view-ccBudgets">
 <h1>Budgets</h1>
@@ -4285,7 +4359,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,csServices:loadCsServices,csFoundations:loadCsFoundations,csIntakes:loadCsIntakes,csProjects:loadCsProjects,csDisputes:loadCsDisputes,csCapabilities:loadCsCapabilities,csCapacity:loadCsCapacity,csOutcomes:loadCsOutcomes,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,p6Finance:loadP6Finance,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,csServices:loadCsServices,csFoundations:loadCsFoundations,csIntakes:loadCsIntakes,csProjects:loadCsProjects,csDisputes:loadCsDisputes,csCapabilities:loadCsCapabilities,csCapacity:loadCsCapacity,csOutcomes:loadCsOutcomes,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -4510,6 +4584,35 @@ ${e.status==='RECORDED'?`<div class="actions"><button class="danger void" data-i
 document.querySelectorAll('#ccLedgerList .void').forEach(b=>b.onclick=async()=>{const reason=prompt('Reason for voiding this entry:');if(!reason)return;await api(`/api/cc/ledger/${b.dataset.id}/void`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason,actor:'Aryan'})});await loadCcLedger()});
 }
 $('leCreate').onclick=async()=>{const amount=parseFloat($('leAmount').value);const evidence=$('leEvidence').value.trim();if(isNaN(amount)||!evidence)return alert('Amount and evidence are required.');await api('/api/cc/ledger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry_type:$('leType').value,category:$('leCategory').value,amount,evidence,currency:$('leCurrency').value||'INR',business_unit:$('leBusinessUnit').value||null,occurred_on:$('leOccurredOn').value||null,project_ref:$('leProjectRef').value||null,note:$('leNote').value||null,actor:'Aryan'})});$('leAmount').value='';$('leEvidence').value='';$('leBusinessUnit').value='';$('leNote').value='';await loadCcLedger()};
+let p6Session=null;
+async function p6Api(path,options={}){
+if(!p6Session)p6Session=await api('/api/p6/session');
+const headers=Object.assign({},options.headers||{}, {'X-TTT-Organization':p6Session.organization_id});
+if((options.method||'GET')!=='GET')headers['X-CSRF-Token']=p6Session.csrf_token;
+return api(path,Object.assign({},options,{headers}));
+}
+function p6Items(items,render,empty='No records yet.'){
+return (items||[]).length?(items||[]).map(render).join(''):`<div class="empty">${esc(empty)}</div>`;
+}
+async function loadP6Finance(){
+try{
+const [cash,reconciliation,approvals,operations,risks]=await Promise.all([
+p6Api('/api/p6/finance/cash-position?currency=INR'),p6Api('/api/p6/reconciliation'),p6Api('/api/p6/approvals'),
+p6Api('/api/p6/finance/operations'),p6Api('/api/p6/risks')]);
+$('p6CashBalance').textContent=`${cash.currency} ${cash.cash_balance}`;
+$('p6ProtectedCash').textContent=`${cash.currency} ${cash.protected_cash}`;
+$('p6FreeCash').textContent=`${cash.currency} ${cash.free_cash}`;
+$('p6ReconciliationList').innerHTML=p6Items(reconciliation.items,r=>`<div class="item"><h3>${esc(r.status)} — ${esc(r.settlement_ref||r.id)}</h3><div class="meta"><span>${esc(r.settled_currency||'')}</span><span>${esc(r.settled_amount||'')}</span></div></div>`,'No settlement evidence recorded.');
+$('p6ApprovalList').innerHTML=p6Items(approvals.items,a=>`<div class="item"><h3>${esc(a.action_type)} — ${esc(a.status)}</h3><div class="meta"><span>${esc(a.target_type)} ${esc(a.target_id)}</span><span>${esc(a.currency||'')} ${esc(a.amount==null?'':a.amount)}</span></div>${a.status==='PENDING_VERIFICATION'?`<div class="actions"><button class="p6-verify" data-id="${esc(a.id)}">Verify</button></div>`:''}${a.status==='PENDING_ARYAN_APPROVAL'?`<div class="actions"><button class="p6-approve" data-id="${esc(a.id)}">Aryan approve</button></div>`:''}</div>`);
+$('p6CommissionList').innerHTML=p6Items(operations.commission_releases,r=>`<div class="item"><h3>${esc(r.status)} — ${esc(r.currency)} ${esc(r.amount)}</h3><div class="meta"><span>Commission ${esc(r.commission_id)}</span><span>Approval ${esc(r.approval_request_id)}</span></div></div>`);
+$('p6RefundList').innerHTML=p6Items(operations.refunds,r=>`<div class="item"><h3>${esc(r.status)} — ${esc(r.currency)} ${esc(r.amount)}</h3><div class="meta"><span>Payment ${esc(r.payment_intent_id)}</span><span>${esc(r.reason||'')}</span></div></div>`);
+const recurring=[...(operations.subscriptions||[]).map(s=>Object.assign({kind:'Subscription'},s)),...(operations.payables||[]).map(p=>Object.assign({kind:'Payable'},p))];
+$('p6RecurringPayableList').innerHTML=p6Items(recurring,r=>`<div class="item"><h3>${esc(r.kind)} — ${esc(r.status)}</h3><div class="meta"><span>${esc(r.currency)} ${esc(r.amount)}</span><span>${esc(r.next_billing_at||r.due_date||'')}</span></div></div>`);
+$('p6RiskList').innerHTML=p6Items(risks.items,r=>`<div class="item"><h3>${esc(r.signal_type)} — ${esc(r.status)}</h3><div class="meta"><span>${esc(r.severity)}</span><span>${esc(r.partner_id||'')}</span></div></div>`,'No commercial risk signals recorded.');
+document.querySelectorAll('#p6ApprovalList .p6-verify').forEach(b=>b.onclick=async()=>{await p6Api(`/api/p6/approvals/${b.dataset.id}/verify`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadP6Finance()});
+document.querySelectorAll('#p6ApprovalList .p6-approve').forEach(b=>b.onclick=async()=>{if(!confirm('Confirm Aryan final approval? This authorizes the sandbox workflow only; it does not move money.'))return;await p6Api(`/api/p6/approvals/${b.dataset.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadP6Finance()});
+}catch(error){const message=`Commercial finance unavailable: ${error.message||error}`;['p6ReconciliationList','p6ApprovalList','p6CommissionList','p6RefundList','p6RecurringPayableList','p6RiskList'].forEach(id=>$(id).innerHTML=`<div class="empty">${esc(message)}</div>`)}
+}
 async function loadCcCash(){const d=await api('/api/cc/cash-runway');
 $('ccCashActual').innerHTML=`<div class="item"><h3>Invoice cash in: $${esc(d.actual.invoice_cash_in_to_date)}</h3></div><div class="item"><h3>Ledger inflows: $${esc(d.actual.ledger_inflows_recorded)}</h3></div><div class="item"><h3>Ledger outflows: $${esc(d.actual.ledger_outflows_recorded)}</h3></div><div class="item"><h3>Combined cash estimate: $${esc(d.actual.combined_cash_estimate)}</h3><div class="meta"><span>${esc(d.actual.source)}</span></div></div>`;
 $('ccCashExpected').innerHTML=`<div class="item"><h3>Receivables outstanding: $${esc(d.expected.receivables_outstanding)}</h3></div><div class="item"><h3>Receivables overdue: $${esc(d.expected.receivables_overdue)}</h3></div><div class="item"><h3>Due within ${esc(d.expected.receivables_due_within_days)} days: $${esc(d.expected.receivables_due_soon)}</h3></div>`;
