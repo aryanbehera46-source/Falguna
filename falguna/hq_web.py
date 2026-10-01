@@ -115,6 +115,7 @@ from .phase6_commercial import (
     AccessContext, ApprovalWorkflow, CommercialIdentityStore, CommercialOperations,
     CommercialSecurityError, FinanceAccounts, PaymentOrchestrator,
 )
+from .phase6_partner import CommercialRiskService, CustomerVerificationService
 from .site_auth import StaffAuthService
 from .customer_portal import CustomerPortalService
 from .customer_context import CustomerContextService
@@ -610,6 +611,15 @@ class TTTHQHandler(BaseHTTPRequestHandler):
             return self._json(op)
         control, store = open_control_plane(self.app_root)
         try:
+            if path.startswith("/api/public/verify-partner/"):
+                partner_id = path.rsplit("/", 1)[-1]
+                return self._json(CustomerVerificationService(store).verify_partner(partner_id))
+            if path == "/api/public/verify-payment":
+                query = parse_qs(urlparse(self.path).query)
+                return self._json(CustomerVerificationService(store).verify_payment_instruction(
+                    (query.get("payment_id") or [""])[0], (query.get("customer_ref") or [""])[0],
+                    (query.get("beneficiary_ref") or [""])[0],
+                ))
             if path.startswith("/api/p6/"):
                 context = self._commercial_context(store)
                 if context is None:
@@ -624,6 +634,8 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                         query = parse_qs(urlparse(self.path).query)
                         currency = (query.get("currency") or ["INR"])[0]
                         return self._json(FinanceAccounts(store, control.audit, identities).cash_position(context, currency))
+                    if path == "/api/p6/risks":
+                        return self._json(CommercialRiskService(store, control.audit, identities).queue(context))
                 except CommercialSecurityError as exc:
                     return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             if path == "/api/hq/what-changed":
@@ -1470,6 +1482,10 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                                 body.get("amount"), body.get("currency"), body.get("beneficiary_ref")))
                         if path.startswith("/api/p6/approvals/") and path.endswith("/reject"):
                             return self._json(approvals.reject(context, path.split("/")[4], body.get("reason", "")))
+                        if path.startswith("/api/p6/risks/") and path.endswith("/action"):
+                            risk_id = path.split("/")[4]
+                            return self._json(CommercialRiskService(store, control.audit, identities).act(
+                                context, risk_id, body.get("action", ""), body.get("reason", "")))
                     except CommercialSecurityError as exc:
                         return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
                 if path == "/api/ask-falguna":

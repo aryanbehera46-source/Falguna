@@ -225,6 +225,14 @@ class StateStore:
             ("send_method", "TEXT"), ("provider_name", "TEXT"),
             ("send_attempts", "INTEGER"), ("failure_reason", "TEXT"),
         ],
+        # Phase 6 Partner Network expansion: additive metadata over the
+        # existing, proven partner/referral/commission ledgers.
+        "pm_partners": [
+            ("role_type", "TEXT"), ("maturity_tier", "TEXT"), ("kyc_status", "TEXT"),
+            ("public_verification_enabled", "INTEGER"), ("related_party_disclosed", "INTEGER"),
+            ("no_side_deal_accepted", "INTEGER"), ("no_unauthorized_subcontracting_accepted", "INTEGER"),
+        ],
+        "pm_commissions": [("commission_plan_id", "TEXT"), ("excluded_amount", "REAL")],
         # TTT Communications V2, Milestone 11 (Digital Marketing Operations
         # Foundation): a real campaign owner -- NULL for every campaign
         # created before this column existed, exactly the same additive
@@ -370,7 +378,8 @@ class StateStore:
             # recommend against this TTT-owned state, but never execute it.
             "p6_commercial_identities", "p6_payment_intents", "p6_payment_events",
             "p6_webhook_events", "p6_approval_requests", "p6_financial_events",
-            "p6_reserve_policies", "p6_reconciliations", "p6_receipts", "p6_approval_events"}
+            "p6_reserve_policies", "p6_reconciliations", "p6_receipts", "p6_approval_events",
+            "p6_commission_plans", "p6_partner_contributions", "p6_risk_events", "p6_risk_event_actions"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

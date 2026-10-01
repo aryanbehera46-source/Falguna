@@ -1158,3 +1158,33 @@ CREATE TABLE IF NOT EXISTS p6_receipts (
     UNIQUE(reconciliation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_p6_receipt_org ON p6_receipts(organization_id, invoice_id, created_at);
+CREATE TABLE IF NOT EXISTS p6_commission_plans (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, name TEXT NOT NULL,
+    rate REAL NOT NULL, recurring_enabled INTEGER NOT NULL DEFAULT 0,
+    lifetime_originator_enabled INTEGER NOT NULL DEFAULT 0,
+    excluded_pass_through_types_json TEXT NOT NULL, status TEXT NOT NULL,
+    actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, name)
+);
+CREATE TABLE IF NOT EXISTS p6_partner_contributions (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, partner_id TEXT NOT NULL,
+    referral_id TEXT, opportunity_id TEXT, contribution_type TEXT NOT NULL,
+    evidence_json TEXT NOT NULL, status TEXT NOT NULL, actor TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p6_contribution_partner ON p6_partner_contributions(partner_id, created_at);
+CREATE TABLE IF NOT EXISTS p6_risk_events (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, event_type TEXT NOT NULL,
+    severity TEXT NOT NULL, partner_id TEXT, customer_ref TEXT, project_id TEXT,
+    payment_intent_id TEXT, evidence_json TEXT NOT NULL, status TEXT NOT NULL,
+    source TEXT NOT NULL, reviewer_identity_id TEXT, current_action TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p6_risk_org ON p6_risk_events(organization_id, status, severity, created_at);
+CREATE TABLE IF NOT EXISTS p6_risk_event_actions (
+    id TEXT PRIMARY KEY, risk_event_id TEXT NOT NULL REFERENCES p6_risk_events(id),
+    organization_id TEXT NOT NULL, action TEXT NOT NULL, status_before TEXT,
+    status_after TEXT NOT NULL, actor_identity_id TEXT NOT NULL,
+    reason TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p6_risk_actions_event ON p6_risk_event_actions(risk_event_id, created_at);

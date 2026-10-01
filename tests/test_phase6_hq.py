@@ -11,6 +11,7 @@ from pathlib import Path
 
 from falguna.hq_web import TTTHQHandler
 from falguna.phase6_commercial import CommercialIdentityStore
+from falguna.partner_management import PartnerStore
 from falguna.runtime import open_control_plane
 from falguna.site_auth import StaffAuthService
 from falguna.store import utcnow
@@ -38,6 +39,12 @@ class Phase6AuthenticatedHQTests(unittest.TestCase):
         self.invoice_id = self.store.create("rh_invoices", {"client_id": client_id, "opportunity_id": None,
             "active_job_id": None, "amount": 500, "currency": "INR", "milestone": None, "due_date": None,
             "amount_received": 0, "status": "SENT", "evidence_json": "[]", "created_at": now, "updated_at": now})
+        partners = PartnerStore(self.store, self.control.audit)
+        self.partner_id = partners.register({"full_name": "Synthetic Partner", "email": "partner@invalid.test",
+            "agreement_accepted": True}, "test")
+        partners.approve(self.partner_id, "test")
+        self.store.update("pm_partners", self.partner_id, role_type="REFERRAL_PARTNER", maturity_tier="VERIFIED",
+                          kyc_status="VERIFIED", public_verification_enabled=1)
         self.store.close()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), TTTHQHandler)
         self.server.app_root = self.repo; self.server.falguna_url = "http://127.0.0.1:1"
@@ -88,6 +95,13 @@ class Phase6AuthenticatedHQTests(unittest.TestCase):
         status, snapshot = self._request("/api/p6/reconciliation")
         self.assertEqual(status, 200)
         self.assertEqual(snapshot["organization_id"], "ttt-org")
+
+    def test_public_partner_verification_is_data_minimized(self):
+        status, result = self._request(f"/api/public/verify-partner/{self.partner_id}", authenticated=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["may_collect_customer_money"])
+        self.assertNotIn("email", result)
 
 
 if __name__ == "__main__":
