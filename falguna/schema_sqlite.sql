@@ -1070,3 +1070,66 @@ CREATE TABLE IF NOT EXISTS comm_payment_drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_comm_payment_drafts_invoice ON comm_payment_drafts(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_comm_payment_drafts_dispute ON comm_payment_drafts(dispute_id);
+
+-- Phase 6 Commercial Platform foundation (sandbox/adapter mode only).
+-- TTT HQ owns this state. No PAN/CVV/provider secret storage and no
+-- provider execution path exists in this phase.
+CREATE TABLE IF NOT EXISTS p6_commercial_identities (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, subject_type TEXT NOT NULL,
+    subject_ref TEXT NOT NULL, display_name TEXT NOT NULL, role TEXT NOT NULL,
+    permissions_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE', actor TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(organization_id, subject_type, subject_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_identity_org ON p6_commercial_identities(organization_id, role, status);
+CREATE TABLE IF NOT EXISTS p6_payment_intents (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, customer_ref TEXT NOT NULL,
+    invoice_id TEXT, kind TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL,
+    status TEXT NOT NULL, capture_mode TEXT NOT NULL, allowed_methods_json TEXT NOT NULL,
+    provider TEXT NOT NULL, provider_session_ref TEXT, provider_transaction_ref TEXT,
+    payment_method_token_ref TEXT, mandate_token_ref TEXT, milestone_ref TEXT,
+    legal_owner_name TEXT NOT NULL, beneficiary_ref TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL, metadata_json TEXT NOT NULL, actor TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(organization_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_payment_org ON p6_payment_intents(organization_id, status, created_at);
+CREATE TABLE IF NOT EXISTS p6_payment_events (
+    id TEXT PRIMARY KEY, payment_intent_id TEXT NOT NULL REFERENCES p6_payment_intents(id),
+    organization_id TEXT NOT NULL, event_type TEXT NOT NULL, status_before TEXT,
+    status_after TEXT NOT NULL, amount REAL, currency TEXT, evidence_json TEXT NOT NULL,
+    provider_event_ref TEXT, idempotency_key TEXT NOT NULL, actor TEXT NOT NULL,
+    created_at TEXT NOT NULL, UNIQUE(payment_intent_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_payment_events_intent ON p6_payment_events(payment_intent_id, created_at);
+CREATE TABLE IF NOT EXISTS p6_webhook_events (
+    id TEXT PRIMARY KEY, provider TEXT NOT NULL, provider_event_ref TEXT NOT NULL,
+    payment_intent_id TEXT REFERENCES p6_payment_intents(id), organization_id TEXT NOT NULL,
+    signature_verified INTEGER NOT NULL, payload_hash TEXT NOT NULL, processing_status TEXT NOT NULL,
+    failure_reason TEXT, received_at TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(provider, provider_event_ref)
+);
+CREATE TABLE IF NOT EXISTS p6_approval_requests (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, action_type TEXT NOT NULL,
+    target_type TEXT NOT NULL, target_id TEXT NOT NULL, amount REAL, currency TEXT,
+    beneficiary_ref TEXT, risk_flags_json TEXT NOT NULL, payload_json TEXT NOT NULL,
+    status TEXT NOT NULL, maker_identity_id TEXT NOT NULL, verifier_identity_id TEXT,
+    final_approver_identity_id TEXT, maker_at TEXT NOT NULL, verified_at TEXT,
+    approved_at TEXT, rejection_reason TEXT, execution_reference TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p6_approvals_org ON p6_approval_requests(organization_id, status, created_at);
+CREATE TABLE IF NOT EXISTS p6_financial_events (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, event_type TEXT NOT NULL,
+    account_bucket TEXT NOT NULL, direction TEXT NOT NULL, amount REAL NOT NULL,
+    currency TEXT NOT NULL, source_type TEXT NOT NULL, source_id TEXT NOT NULL,
+    evidence_json TEXT NOT NULL, idempotency_key TEXT NOT NULL, actor TEXT NOT NULL,
+    reverses_event_id TEXT REFERENCES p6_financial_events(id), created_at TEXT NOT NULL,
+    UNIQUE(organization_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_p6_finance_org ON p6_financial_events(organization_id, currency, created_at);
+CREATE TABLE IF NOT EXISTS p6_reserve_policies (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL UNIQUE, currency TEXT NOT NULL,
+    essential_monthly_burn REAL NOT NULL DEFAULT 0, minimum_runway_months REAL NOT NULL DEFAULT 3,
+    target_runway_months REAL NOT NULL DEFAULT 6, operating_reserve_override REAL,
+    policy_notes TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);

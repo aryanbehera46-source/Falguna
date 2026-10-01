@@ -365,7 +365,12 @@ class StateStore:
             "comm_message_interpretations",
             # Phase 5 Final Client Experience, Section 20: payment
             # communication bridge (falguna/payment_comms.py)
-            "comm_payment_drafts"}
+            "comm_payment_drafts",
+            # Phase 6 Commercial Platform foundation. FALGUNA may read and
+            # recommend against this TTT-owned state, but never execute it.
+            "p6_commercial_identities", "p6_payment_intents", "p6_payment_events",
+            "p6_webhook_events", "p6_approval_requests", "p6_financial_events",
+            "p6_reserve_policies"}
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())
