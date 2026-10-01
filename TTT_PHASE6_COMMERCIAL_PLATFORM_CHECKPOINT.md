@@ -7,6 +7,7 @@
 **Implementation checkpoint:** `a49834d`  
 **Continuation starting commit:** `a836b79`
 **Authenticated integration/reconciliation commit:** `7f5dac0`
+**Partner risk/verification commit:** `f98305d`
 **External actions:** None. No push, merge, deploy, customer contact, provider activation, account creation, spending, or money movement.
 
 ## Files changed
@@ -30,6 +31,15 @@ This continuation turned the original data-model foundation into a guarded opera
 - Added append-only approval events with a hash of amount/currency/beneficiary/action/payload/risk fields at every decision point.
 - Material approval changes reset the request to `PENDING_VERIFICATION`, clear prior verifier/final-approver state, and append an invalidation event. Rejection requires a reason and is also append-only.
 - Corrected a partial-write hazard found during testing: settlement evidence is now validated before a reconciliation row can be created.
+
+The follow-on partner/risk slice adds:
+
+- Partner role types, maturity tier, KYC-status metadata seam, public-verification opt-in, related-party disclosure, no-side-deal, and unauthorized-subcontracting policy metadata over the existing partner ledger.
+- Organization-scoped commission plans with configurable rates, recurring/lifetime-originator capability flags, and excluded pass-through categories. No single global commission percentage is imposed.
+- Partner contribution records linked to referral/opportunity evidence.
+- Evidence-backed anti-diversion risk events covering alternate beneficiaries, off-platform payment, alleged representative payment, disappearing leads, duplicate customers, abnormal refunds/commissions, official-flow refusal, unauthorized price/scope changes, brand misuse, undisclosed related parties, diversion, and unauthorized subcontracting.
+- Human-controlled `HOLD`, `REVIEW`, `SUSPEND_ACCESS`, `CLEAR`, and `ESCALATE` actions with an append-only action history. FALGUNA may flag evidence but has no action method or authority.
+- Public, data-minimized local verification APIs for partners and payment instructions. Exact customer and beneficiary references are required for payment verification; failed verification reveals no amount or beneficiary.
 
 ## Architecture decisions
 
@@ -62,6 +72,9 @@ This continuation turned the original data-model foundation into a guarded opera
 - Invoice -> checkout -> capture -> settlement -> reconciliation -> receipt -> existing billing ledger -> finance cash event.
 - Honest partial/milestone collection path and mismatch/review path.
 - Append-only approval audit history, rejection, and re-verification after material change.
+- Configurable partner profile/commission-plan foundation and evidence-backed contribution records.
+- Anti-diversion risk-event queue and human-only hold/review/suspend/clear/escalate controls.
+- Data-minimized partner/payment-instruction verification with explicit no-money-collection warning.
 
 ## Deferred requirements
 
@@ -72,7 +85,8 @@ The following remain Phase 6 work and must not be represented as complete:
 - Full Accounts Receivable, Accounts Payable, expenses, tax/provision, gateway-fee, budget, project-economics, document-metadata, and expanded finance dashboards.
 - Actual refund, commission, vendor-payment, or beneficiary execution. These require later explicit approval and provider integration.
 - Extension of partner roles/lifecycle/KYC metadata, commission plans, recurring/lifetime-originator options, dashboard, and payout approval integration.
-- Complete anti-diversion signal registry, brand misuse/customer-report intake, suspension review, and synthetic `verify partner` / `verify payment instructions` pages.
+- Full partner maturity transition service, performance dashboard, configurable exclusion calculation against collected amounts, and commission-release approval integration.
+- Branded customer verification HTML pages; the local JSON verification APIs and service controls are implemented.
 - Structured draft commercial/legal policy templates and configurable refund-policy evaluator.
 - Acquisition/source analytics, small-to-enterprise service-tier economics, opportunity intelligence, and jurisdiction deny/unsupported policy seam.
 - Race-condition/concurrency tests with multiple database connections and authenticated HTTP adversarial tests.
@@ -89,6 +103,8 @@ The following remain Phase 6 work and must not be represented as complete:
 Continuation verification:
 
 - Phase 6 backend + authenticated HTTP suites: **36 passed** in 26.69s.
+- Phase 6 commercial, partner/risk, and authenticated HTTP suites after the follow-on slice: **50 passed** in 38.40s.
+- Related regression across Phase 6, partner management, commercial, billing, and customer portal: **179 passed** in 141.11s.
 - Broader focused run across Phase 6, billing, finance ledger, partner management, commercial, customer portal, and HQ HTTP: **254 passed, 1 failed** in 222.78s.
 - The one failure is the pre-existing `WorkforceMediaHQServerTests::test_executive_coordinator_full_loop_over_http` two-second client timeout at `/api/executive/sync`. It reproduced alone (1 failed in 3.49s). The route does not pass through any `/api/p6/*` code and no assertion failed; the HTTP response did not arrive inside the test's fixed two-second timeout. It was not weakened, skipped, or represented as fixed.
 - Python compilation for `falguna/phase6_commercial.py` and `falguna/hq_web.py`: passed.
@@ -97,9 +113,9 @@ Continuation verification:
 ## End-to-end flows proven in this continuation
 
 - **Flow A — Commercial Payment: proven for the internal sandbox path.** Synthetic linked customer/invoice -> authenticated checkout -> verified capture -> separate verified settlement -> matched reconciliation -> receipt -> existing billing ledger marks paid -> finance cash event -> cash-position read. A partial settlement proves `PARTIALLY_PAID`; amount/currency mismatches prove no invoice/receipt/cash mutation.
-- **Flow B — Partner Commission: not yet proven end-to-end in this continuation.** Existing partner cleared-collection eligibility remains regression-covered, but configurable plans, risk clearance, and Phase 6 approval linkage remain deferred.
-- **Flow C — Fraud Hold: not yet proven.** High-value and beneficiary-change flags exist, but the full partner/payment risk-event/hold/review model remains deferred.
-- **Flow D — Customer Verification: not yet proven.** No public verification surface was exposed without the required anti-forgery and data-minimization design.
+- **Flow B — Partner Commission: partially proven.** A real referral can receive an organization-scoped configurable commission plan, and the existing cleared-collection eligibility/clawback ledger remains regression-green. Risk clearance -> maker -> verifier -> Aryan release linkage remains deferred; no payout exists.
+- **Flow C — Fraud Hold: proven for the internal control path.** Evidence-backed suspicious action -> risk event -> human financial/control hold -> append-only review history -> no finance event or money movement. A human suspension action also suspends the linked approved partner; FALGUNA cannot do this.
+- **Flow D — Customer Verification: proven for the local synthetic API/service path.** Public partner lookup is opt-in and data-minimized. Payment instruction lookup requires exact payment/customer/beneficiary matching, rejects forged beneficiaries, and withholds payment details when the customer reference is wrong.
 - **Flow E — Refund: partially proven only through approval controls.** Refund requests can traverse maker -> verifier -> Aryan approval and stop before execution; eligibility calculation, sandbox refund application, reconciliation, and commission clawback integration remain deferred.
 
 ## Security findings and remaining risks
@@ -122,10 +138,9 @@ Continuation verification:
 
 ## Exact next steps
 
-1. Extend the existing partner module with role/lifecycle/KYC seams, configurable cleared-collection commission plans, contribution tracking, clawbacks/holds, and approval-gated release preparation.
-2. Add evidence-backed anti-diversion risk events and human-controlled hold/review/suspend/clear/escalate actions; prove Fraud Hold Flow C.
-3. Add data-minimized synthetic partner/payment-instruction verification services/pages and prove Flow D.
-4. Wire the authenticated reconciliation and approval APIs into a real HQ Finance UI without exposing CSRF tokens or bypassing session/organization authorization.
-5. Complete refund eligibility, sandbox refund state/reconciliation, and partner commission clawback; prove Flow E.
-6. Add subscription/retainer schedules, payables/expenses/provider-fee/tax-provision reporting, acquisition/source analytics, service tiers, and bounded jurisdiction/opportunity policy records.
-7. Add multi-connection concurrency tests, rerun focused suites, then run the full regression and authenticated desktop/mobile browser acceptance. Do not begin Phase 7.
+1. Link configurable commission exclusions and cleared-collection calculations to risk clearance and the Phase 6 maker/verifier/Aryan release request; complete Flow B without a payout executor.
+2. Complete refund eligibility, sandbox refund state/reconciliation, and partner commission clawback; prove Flow E.
+3. Wire authenticated reconciliation, approval, and risk APIs into real HQ Finance/Partner UI surfaces without weakening session, CSRF, or organization authorization.
+4. Add branded local verification pages over the data-minimized APIs.
+5. Add subscription/retainer schedules, payables/expenses/provider-fee/tax-provision reporting, acquisition/source analytics, service tiers, and bounded jurisdiction/opportunity policy records.
+6. Add multi-connection concurrency tests, rerun focused suites, then run the full regression and authenticated desktop/mobile browser acceptance. Do not begin Phase 7.
