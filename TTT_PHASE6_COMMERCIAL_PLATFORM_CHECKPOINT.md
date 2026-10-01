@@ -162,3 +162,34 @@ Continuation verification:
 4. Finish acquisition/source economics, customer-lifetime/account-expansion, service tiers, and bounded jurisdiction/opportunity policy records without invented cost or profitability data.
 5. Add the mandatory multi-connection concurrency/race suite and repair any exposed transaction-boundary defects.
 6. Run full repository regression and authenticated desktop/mobile browser acceptance. Until these pass, this remains a checkpoint and not final acceptance. Do not begin Phase 7.
+
+## 2026-10-02 final-acceptance attempt
+
+**Decision: PHASE 6 CHECKPOINT — NOT FINAL ACCEPTANCE.** The recurring, refund-status, economics, full-regression, and initial genuine concurrency work advanced materially, but the required race matrix and authenticated browser acceptance are not complete enough to satisfy the acceptance standard.
+
+Implementation commit `a816d1d` adds:
+
+- Flow F through the internal sandbox boundary: subscription -> due-cycle invoice -> token/mandate-backed autopay attempt -> verified capture -> verified settlement -> reconciliation -> receipt -> cash ledger -> collected subscription state.
+- Honest failed-attempt/retry state plus pause/resume/cancel enforcement. Terminal subscriptions cannot resume and paused/cancelled subscriptions cannot initiate attempts.
+- A unique persisted subscription-cycle claim preventing two separate database connections from creating two invoices for one cycle.
+- Refund reconciliation records and customer-safe portal refund state. Pending refunds do not expose a provider reference or claim confirmation; only verified `CONFIRMED` refunds do.
+- Evidence-backed acquisition/channel economics for all required channel categories. Settled revenue and refunds come from stored records. Known contribution remains `null` until known delivery-cost evidence exists; CAC and margin are never inferred.
+- SQLite WAL and a bounded busy timeout for genuine multi-connection operation, plus concurrent signed-webhook replay handling.
+- Authenticated API routes for autopay attempts/failure/synchronization/subscription state and commercial-economics reads/writes.
+
+Verification:
+
+- Phase 6 commercial, partner, financial-flow, genuine concurrency, authenticated HQ, and customer-portal suites: **75 passed in 29.81s**.
+- Genuine separate-connection concurrency currently proven for identical signed webhook arrival and same-cycle recurring invoice generation. Both finish with exactly one persisted financial/business record and no database-lock corruption.
+- Full repository regression: **2,209 passed, 5 skipped, 18 failed in 1,128.28s**.
+- Failure classification: no failure entered Phase 6 code. One is the already-recorded `/api/executive/sync` fixed two-second timeout and reproduces alone. One research HTTP test also reproduces as a fixed five-second model/provider timeout. Six media/voice-agent failures and two voice-provider failures are caused by the environment's ffmpeg lacking flite. Eight video-pipeline failures are caused by ffmpeg/ffprobe being unavailable to that test environment. One trading-data test expected an unreachable live Stooq provider, but the provider was reachable and returned `OK` during this run.
+- Local browser smoke: the real HQ loaded, Performance & Finance expanded, Commercial Finance routed correctly, all required finance sections rendered, and the browser console contained no warnings/errors. Without a session, every commercial-finance panel visibly failed closed with `authenticated TTT staff session required`.
+- Authenticated browser acceptance was not completed: the available in-app browser blocked navigation to the separate local login port and its page-evaluation boundary does not permit setting cookies. Authenticated HTTP coverage remains green, but this is not represented as browser proof.
+
+Remaining acceptance blockers:
+
+1. Complete the rest of the mandated genuine multi-connection matrix: duplicate capture/settlement/refund/commission release, refund-vs-settlement, clawback-vs-release, approval-vs-rejection, beneficiary mutation during approval, retry-vs-webhook, payable readiness duplication, and reconciliation-vs-refund.
+2. Complete authenticated desktop/mobile browser acceptance with a browser surface able to establish the synthetic staff session; exercise action controls and responsive layout, not only fail-closed rendering.
+3. Re-run the full suite in an environment with ffmpeg/ffprobe/flite and controlled network/model-provider availability if a completely green repository-wide result is required. The recorded failures are not Phase 6 correctness failures, but they prevent a green full-suite claim.
+
+No push, merge, deploy, provider activation, real customer/partner data, external communication, spending, bank connection, real refund, payout, or money movement occurred.
