@@ -253,10 +253,26 @@ class ApprovalWorkflow:
         return updated
 
     def approve_by_aryan(self, context: AccessContext, request_id: str) -> Dict[str, Any]:
-        row = self._scoped(context, request_id, "finance:read")
-        identity = self.store.get("p6_commercial_identities", context.identity_id)
-        if identity["role"] != "OWNER" or identity["subject_ref"].strip().lower() != "aryan":
-            raise CommercialSecurityError("Aryan owner identity is the required final approver")
+        # Final-approver fix: the previous check compared the identity's
+        # subject_ref to the literal string "aryan". Real HTTP sessions
+        # resolve subject_ref to the staff account's immutable, server-
+        # assigned id (TTTHQHandler._commercial_context() always sets
+        # subject_type="STAFF_USER", subject_ref=<site_staff_users.id>,
+        # which StaffAuthService.create_user() always generates fresh) --
+        # that id can never equal the literal "aryan", so no real login,
+        # including the real Aryan's, could ever pass the old check.
+        # Authorization now rests entirely on the identity's own
+        # persisted, immutable record via the existing permission
+        # framework: _scoped()/authorize() requires an ACTIVE commercial
+        # identity, organization-scoped to this request (cross-
+        # organization denied), holding the explicit "approvals:final_
+        # approve" permission. Only the OWNER role carries that
+        # permission (via its "*" grant in ROLE_PERMISSIONS); ADMIN and
+        # FINANCE_OPERATOR identities do not and are denied regardless
+        # of display_name or any other mutable/claimed field. Nothing
+        # but the stored role/permissions on the authenticated identity
+        # row decides this.
+        row = self._scoped(context, request_id, "approvals:final_approve")
         if row["status"] != "PENDING_ARYAN_APPROVAL" or row["verifier_identity_id"] == context.identity_id:
             raise CommercialSecurityError("verified request and independent final approver required")
         # Race-matrix fix: expected includes verifier_identity_id, not just

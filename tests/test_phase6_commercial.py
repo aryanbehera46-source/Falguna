@@ -136,7 +136,7 @@ class ApprovalControlTests(Phase6Case):
     def test_non_owner_cannot_final_approve(self):
         request = self.approvals.request(self.finance, "REFUND", "PAYMENT", "p1", {}, 500, "INR")
         self.approvals.verify(self.finance2, request["id"])
-        with self.assertRaisesRegex(CommercialSecurityError, "Aryan owner"):
+        with self.assertRaisesRegex(CommercialSecurityError, "permission denied: approvals:final_approve"):
             self.approvals.approve_by_aryan(self.finance, request["id"])
 
     def test_full_gate_stops_at_approved_pending_execution(self):

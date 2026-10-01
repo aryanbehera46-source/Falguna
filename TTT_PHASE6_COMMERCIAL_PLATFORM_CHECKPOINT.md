@@ -1,6 +1,8 @@
 # TTT / FALGUNA Phase 6 Commercial Platform Checkpoint
 
-**Status:** **PHASE 6 CHECKPOINT — NOT FINAL ACCEPTANCE**
+**Superseded:** this checkpoint's one remaining blocker (the `approve_by_aryan()` final-approval defect) is fixed and verified. See `TTT_PHASE6_FINAL_ACCEPTANCE_REPORT.md` — **PHASE 6 — FINAL ACCEPTANCE**. Everything below is the historical record of how this phase got there.
+
+**Status:** **PHASE 6 CHECKPOINT — NOT FINAL ACCEPTANCE** *(historical; superseded above)*
 **Date:** 2026-10-01  
 **Branch:** `phase6/commercial-platform-foundation-v1`  
 **Accepted baseline:** `b42067f` — Phase 5 Final Client Experience  
