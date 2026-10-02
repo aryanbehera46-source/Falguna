@@ -8,6 +8,7 @@ from falguna.audit import AuditLog
 from falguna.billing import BillingStore
 from falguna.commercial import ProjectStore
 from falguna.comms import CommsStore
+from falguna.ecosystem import EcosystemService
 from falguna.partner_management import PartnerStore, ReferralStore, CommissionStore
 from falguna.phase6_commercial import CommercialIdentityStore
 from falguna.phase7_portals import ExternalPortalAuth
@@ -45,6 +46,32 @@ now = store.get("pm_referrals", referral)["created_at"]
 store.create("p6_partner_contributions", {"organization_id": "ttt", "partner_id": partner, "referral_id": referral, "opportunity_id": None, "contribution_type": "INTRODUCTION", "evidence_json": "{}", "status": "RECORDED", "actor": "test", "created_at": now, "updated_at": now})
 partner_identity = CommercialIdentityStore(store, audit).create("ttt", "PARTNER", partner, "Browser Partner", "PARTNER", "test")
 ExternalPortalAuth(store).provision(partner_identity, "partner@example.test", "correct-horse-battery-partner")
+
+# Phase 8 synthetic opportunity/feed fixture: human-reviewed route, evidenced
+# profile and deterministic reasoned match. No external provider or real data.
+ecosystem = EcosystemService(store, audit)
+intake = ecosystem.create_intake(
+    organization_id="ttt", customer_ref=org,
+    original_message="Need a bilingual workflow for two synthetic shops",
+    normalized_meaning="Customer needs a bilingual workflow for two synthetic retail locations",
+    geography="India", preferred_language="Hindi", category="AI_AUTOMATION",
+)
+route = ecosystem.recommend_route(intake, "PARTNER_OR_SPECIALIST_COORDINATION",
+                                  ["evidenced specialist capability is required"],
+                                  [{"fixture": "synthetic browser evidence"}], [])
+ecosystem.decide_route(route, "PARTNER_OR_SPECIALIST_COORDINATION", "test-owner", "Synthetic fixture review")
+profile = ecosystem.create_profile(
+    organization_id="ttt", profile_type="DELIVERY_SPECIALIST", display_name="Browser Partner",
+    partner_id=partner, capabilities=[{"tag": "workflow-automation", "evidence_status": "EVIDENCE_REVIEWED", "evidence": [{"fixture": True}]}],
+    geography=["India"], languages=["Hindi"], verification_level="EVIDENCE_REVIEWED",
+    verification_evidence=[{"fixture": True}],
+)
+opportunity = ecosystem.publish_opportunity(
+    intake, customer_safe_brief="Bilingual retail workflow implementation",
+    capability_requirements=["workflow-automation"], required_verification_level="EVIDENCE_REVIEWED",
+    actor_identity_id="test-owner",
+)
+ecosystem.evaluate_match(opportunity, profile)
 
 server = ThreadingHTTPServer(("127.0.0.1", 8878), SiteHandler)
 server.app_root = root

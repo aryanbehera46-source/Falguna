@@ -886,10 +886,12 @@ def _portal_nav(role, active, csrf):
     links = []
     if role == "CUSTOMER":
         links = [("/app", "Overview"), ("/app/projects", "Projects"),
-                 ("/app/billing", "Billing & payments"), ("/app/support", "Support"), ("/app/account", "Account & security")]
+                 ("/app/requests", "Commercial requests"), ("/app/billing", "Billing & payments"),
+                 ("/app/support", "Support"), ("/app/account", "Account & security")]
     else:
         links = [("/partners/app", "Partner overview"), ("/partners/app/leads", "Registered leads"),
                  ("/partners/app/leads/new", "Register a lead"), ("/partners/app/commissions", "Contributions & commissions"),
+                 ("/partners/app/opportunities", "Opportunity feed"),
                  ("/partners/app/account", "Account & security")]
 
     def is_current(href):
@@ -1052,6 +1054,48 @@ def render_customer_app(identity, bundle, payments, active, csrf, project_detail
             f'<span class="eyebrow">Customer application</span><h1>Welcome, {esc(identity["display_name"])}.</h1>'
             f'</div></section><section class="tight"><div class="container app-shell">'
             f'{_portal_nav("CUSTOMER", active, csrf)}<div>{content}</div></div></section>')
+
+
+def render_customer_requests(identity, requests, csrf, success=False, error=None):
+    notice = ('<div class="alert alert-success" role="status">Request recorded for internal review. No contract or assignment was created.</div>' if success else
+              (f'<div class="alert alert-error" role="status">{esc(error)}</div>' if error else ''))
+    rows = "".join(
+        f'<tr><td>{esc(r["id"])}</td><td>{esc(r.get("category") or "Unclassified")}</td>'
+        f'<td>{esc(r["status"])}</td><td>{esc(r["created_at"])}</td></tr>' for r in requests
+    ) or '<tr><td colspan="4">No ecosystem requests are recorded yet.</td></tr>'
+    return (notice + '<div class="card"><h2>Describe a commercial need</h2>'
+            '<p>TTT will preserve your request, clarify uncertainty and record a reviewed route. Submitting does not create a contract or expose private details to partners.</p>'
+            '<form class="stack" method="post" action="/app/requests">'
+            f'<input type="hidden" name="csrf_token" value="{esc(csrf)}">'
+            '<div class="field"><label for="request-message">What do you need?</label><textarea id="request-message" name="message" required minlength="20"></textarea></div>'
+            '<div class="field"><label for="request-category">Best-fit category (optional)</label><input id="request-category" name="category"></div>'
+            '<div class="field"><label for="request-geography">Geography (optional)</label><input id="request-geography" name="geography"></div>'
+            '<div class="field"><label for="request-language">Preferred language (optional)</label><input id="request-language" name="preferred_language"></div>'
+            '<button class="btn btn-primary" type="submit">Record request</button></form></div>'
+            '<div class="card"><h3>Your requests</h3><table><thead><tr><th>Request</th><th>Category</th><th>Status</th><th>Created</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table></div>')
+
+
+def render_partner_opportunity_feed(bundle, csrf, success=False, error=None):
+    notice = ('<div class="alert alert-success" role="status">Interest recorded for TTT review. You are not assigned yet.</div>' if success else
+              (f'<div class="alert alert-error" role="status">{esc(error)}</div>' if error else ''))
+    if not bundle.get("ecosystem_profile"):
+        return notice + '<div class="card"><h2>Opportunity feed</h2><p>No active ecosystem profile is linked yet. TTT must review capabilities and verification evidence before opportunities can appear.</p></div>'
+    cards = []
+    for item in bundle.get("ecosystem_feed", []):
+        budget = (_format_money(item.get("currency"), item.get("budget_min")) + "–" +
+                  _format_money(item.get("currency"), item.get("budget_max"))) if item.get("budget_visibility") == "RANGE" else "Not disclosed"
+        reasons = "".join(f'<li>{esc(reason)}</li>' for reason in item.get("match_reasons", []))
+        cards.append(f'<div class="card"><h3>{esc(item["customer_safe_brief"])}</h3>'
+                     f'<p>{esc(item.get("category") or "General")} · {esc(item.get("geography") or "Any geography")} · Budget: {budget}</p>'
+                     f'<p><b>Why this is shown:</b></p><ul>{reasons}</ul>'
+                     '<p>TTT owns the customer relationship. You may not collect customer money or represent yourself as assigned.</p>'
+                     '<form class="stack" method="post" action="/partners/app/opportunities/apply">'
+                     f'<input type="hidden" name="csrf_token" value="{esc(csrf)}"><input type="hidden" name="opportunity_id" value="{esc(item["id"])}">'
+                     f'<div class="field"><label for="statement-{esc(item["id"])}">Capability statement</label><textarea id="statement-{esc(item["id"])}" name="statement" required minlength="20"></textarea></div>'
+                     f'<div class="field"><label for="conflict-{esc(item["id"])}">Conflict disclosure (if any)</label><input id="conflict-{esc(item["id"])}" name="conflict_disclosure"></div>'
+                     '<button class="btn btn-primary" type="submit">Express interest</button></form></div>')
+    return notice + ("".join(cards) if cards else '<div class="card"><h2>Opportunity feed</h2><p>No currently eligible opportunities. Matching requires capability, verification, geography/language and conflict checks.</p></div>')
 
 
 def render_invoice_detail(detail):
@@ -1695,7 +1739,7 @@ class SiteHandler(BaseHTTPRequestHandler):
             return self._html(200, page("Customer & Partner Sign In", "Secure access to TTT external applications.", path, render_portal_login(csrf_token)), set_cookies)
         is_project_detail = path.startswith("/app/projects/") and path != "/app/projects"
         is_invoice_detail = path.startswith("/app/billing/") and path != "/app/billing"
-        if path in {"/app", "/app/projects", "/app/billing", "/app/support", "/app/account"} or is_project_detail or is_invoice_detail:
+        if path in {"/app", "/app/projects", "/app/requests", "/app/billing", "/app/support", "/app/account"} or is_project_detail or is_invoice_detail:
             if not external_identity or external_identity.get("role") != "CUSTOMER":
                 return self._redirect("/portal/login", set_cookies)
             session = store.get("p7_external_sessions", external_session_id)
@@ -1706,6 +1750,10 @@ class SiteHandler(BaseHTTPRequestHandler):
                 account = external_auth.account_security(external_session_id)
                 return self._html(200, page("Account & Security", "Your account and active sessions.", path,
                     '<section class="tight"><div class="container app-shell">' + _portal_nav("CUSTOMER", path, session["csrf_token"]) + '<div>' + render_account_security(account, session["csrf_token"]) + '</div></div></section>'), set_cookies)
+            if path == "/app/requests":
+                requests = portals.customer_ecosystem_requests(external_identity)
+                body = '<section class="tight"><div class="container app-shell">' + _portal_nav("CUSTOMER", path, session["csrf_token"]) + '<div>' + render_customer_requests(external_identity, requests, session["csrf_token"]) + '</div></div></section>'
+                return self._html(200, page("Commercial Requests", "Route a legitimate commercial need through TTT.", path, body), set_cookies)
             if is_invoice_detail:
                 detail = portals.customer_invoice_detail(external_identity, path[len("/app/billing/"):])
                 if detail is None:
@@ -1724,7 +1772,7 @@ class SiteHandler(BaseHTTPRequestHandler):
             return self._html(200, page("Customer Application", "Your TTT projects, billing and support.", path,
                                           render_customer_app(external_identity, bundle, payments, path, session["csrf_token"],
                                                                project_detail=project_detail)), set_cookies)
-        if path in {"/partners/app", "/partners/app/leads", "/partners/app/leads/new", "/partners/app/commissions", "/partners/app/account"}:
+        if path in {"/partners/app", "/partners/app/leads", "/partners/app/leads/new", "/partners/app/commissions", "/partners/app/opportunities", "/partners/app/account"}:
             if not external_identity or external_identity.get("role") != "PARTNER":
                 return self._redirect("/portal/login", set_cookies)
             session = store.get("p7_external_sessions", external_session_id)
@@ -1733,6 +1781,9 @@ class SiteHandler(BaseHTTPRequestHandler):
                 account = external_auth.account_security(external_session_id)
                 body = '<section class="tight"><div class="container app-shell">' + _portal_nav("PARTNER", path, session["csrf_token"]) + '<div>' + render_account_security(account, session["csrf_token"]) + '</div></div></section>'
                 return self._html(200, page("Account & Security", "Your account and active sessions.", path, body), set_cookies)
+            if path == "/partners/app/opportunities":
+                body = '<section class="tight"><div class="container app-shell">' + _portal_nav("PARTNER", path, session["csrf_token"]) + '<div>' + render_partner_opportunity_feed(bundle, session["csrf_token"]) + '</div></div></section>'
+                return self._html(200, page("Opportunity Feed", "Eligible customer-safe ecosystem opportunities.", path, body), set_cookies)
             return self._html(200, page("Partner Application", "Your attributed opportunities and commission status.", path,
                                           render_partner_app(external_identity, bundle, path, session["csrf_token"])), set_cookies)
         if path == "/pay":
@@ -1844,6 +1895,10 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return self._handle_partner_policy_acknowledge(store, jar)
             if path == "/partners/app/leads":
                 return self._handle_partner_register_lead(store, jar)
+            if path == "/app/requests":
+                return self._handle_customer_ecosystem_request(store, jar)
+            if path == "/partners/app/opportunities/apply":
+                return self._handle_partner_opportunity_application(store, jar)
             return self._not_found([])
         finally:
             store.close()
@@ -2074,6 +2129,51 @@ class SiteHandler(BaseHTTPRequestHandler):
         return self._html(200, page("Partner Application", "Lead registered.", "/partners/app/leads/new",
                                       render_partner_app(identity, bundle, "/partners/app/leads/new", session["csrf_token"],
                                                           lead_form_success=True)))
+
+    def _handle_customer_ecosystem_request(self, store, jar):
+        session_id, fields = self._external_session_id(jar), self._read_urlencoded()
+        auth = ExternalPortalAuth(store)
+        identity = auth.identity(session_id) if session_id else None
+        if not identity or identity.get("role") != "CUSTOMER":
+            return self._redirect("/portal/login", [])
+        session = store.get("p7_external_sessions", session_id)
+        control, _ = open_control_plane(self.app_root)
+        portals = ExternalPortalService(store, control.audit)
+        error = None
+        if not auth.check_csrf(session_id, fields.get("csrf_token", "")):
+            error = "Security check failed. Please reload and try again."
+        elif len(fields.get("message", "").strip()) < 20:
+            error = "Please describe the need in at least 20 characters."
+        else:
+            try:
+                portals.customer_create_ecosystem_request(identity, fields["message"], fields.get("category"),
+                                                          fields.get("geography"), fields.get("preferred_language"))
+            except (ValueError, PermissionError) as exc:
+                error = str(exc)
+        requests = portals.customer_ecosystem_requests(identity)
+        body = '<section class="tight"><div class="container app-shell">' + _portal_nav("CUSTOMER", "/app/requests", session["csrf_token"]) + '<div>' + render_customer_requests(identity, requests, session["csrf_token"], success=not error, error=error) + '</div></div></section>'
+        return self._html(400 if error else 200, page("Commercial Requests", "Route a commercial need through TTT.", "/app/requests", body))
+
+    def _handle_partner_opportunity_application(self, store, jar):
+        session_id, fields = self._external_session_id(jar), self._read_urlencoded()
+        auth = ExternalPortalAuth(store)
+        identity = auth.identity(session_id) if session_id else None
+        if not identity or identity.get("role") != "PARTNER":
+            return self._redirect("/portal/login", [])
+        session = store.get("p7_external_sessions", session_id)
+        control, _ = open_control_plane(self.app_root)
+        portals, error = ExternalPortalService(store, control.audit), None
+        if not auth.check_csrf(session_id, fields.get("csrf_token", "")):
+            error = "Security check failed. Please reload and try again."
+        else:
+            try:
+                portals.partner_apply_to_opportunity(identity, fields.get("opportunity_id", ""),
+                                                     fields.get("statement", ""), fields.get("conflict_disclosure"))
+            except (ValueError, PartnerError, PermissionError) as exc:
+                error = str(exc)
+        bundle = portals.partner_bundle(identity)
+        body = '<section class="tight"><div class="container app-shell">' + _portal_nav("PARTNER", "/partners/app/opportunities", session["csrf_token"]) + '<div>' + render_partner_opportunity_feed(bundle, session["csrf_token"], success=not error, error=error) + '</div></div></section>'
+        return self._html(400 if error else 200, page("Opportunity Feed", "Eligible customer-safe ecosystem opportunities.", "/partners/app/opportunities", body))
 
     def _handle_payment_verification(self, store, jar, csrf_cookie_val):
         fields = self._read_urlencoded()

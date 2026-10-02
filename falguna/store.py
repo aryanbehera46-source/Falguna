@@ -441,7 +441,14 @@ class StateStore:
             "p6_commission_plans", "p6_partner_contributions", "p6_risk_events", "p6_risk_event_actions"}
         allowed.update({"p6_commission_releases", "p6_refunds", "p6_subscriptions", "p6_payables",
                         "p6_subscription_cycles", "p6_subscription_attempts", "p6_refund_reconciliations",
-                        "p6_opportunity_economics", "p7_external_accounts", "p7_external_sessions"})
+                        "p6_opportunity_economics", "p7_external_accounts", "p7_external_sessions",
+                        # Phase 8 Digital Business Ecosystem. These are TTT-owned
+                        # commercial/network records; FALGUNA may recommend but
+                        # never assigns work, verifies capability or binds TTT.
+                        "p8_intakes", "p8_routing_decisions", "p8_network_profiles",
+                        "p8_profile_capabilities", "p8_opportunities", "p8_matches",
+                        "p8_opportunity_applications", "p8_assignments", "p8_blg_engagements",
+                        "p8_blg_stage_events", "p8_governance_events", "p8_product_signals"})
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 
 from .audit import AuditLog
 from .customer_portal import CustomerPortalService
+from .ecosystem import EcosystemService
 from .partner_management import PartnerError, PartnerStore, ReferralError, ReferralStore
 from .site_auth import AuthError, hash_password, verify_password
 from .store import StateStore, utcnow
@@ -147,6 +148,30 @@ class ExternalPortalService:
             customer_org_id, actor=identity["id"], requested_by_organization_id=customer_org_id,
         )
 
+    def customer_ecosystem_requests(self, identity: Dict[str, Any]) -> list[Dict[str, Any]]:
+        if identity.get("role") != "CUSTOMER":
+            raise PermissionError("customer identity required")
+        return self.store.list(
+            "p8_intakes", "organization_id=? AND customer_ref=?",
+            (identity["organization_id"], identity["subject_ref"]),
+        )
+
+    def customer_create_ecosystem_request(self, identity: Dict[str, Any], message: str,
+                                          category: Optional[str], geography: Optional[str],
+                                          preferred_language: Optional[str]) -> str:
+        if identity.get("role") != "CUSTOMER":
+            raise PermissionError("customer identity required")
+        # The original message is retained exactly. Until an internal
+        # language pass exists, normalized_meaning is an explicitly pending
+        # placeholder, never a fabricated translation/classification.
+        return EcosystemService(self.store, self.audit).create_intake(
+            organization_id=identity["organization_id"], customer_ref=identity["subject_ref"],
+            original_message=message, normalized_meaning=message,
+            created_by_identity_id=identity["id"], category=category, geography=geography,
+            preferred_language=preferred_language,
+            clarification_questions=["Internal English normalization and scope review required."],
+        )
+
     def partner_bundle(self, identity: Dict[str, Any]) -> Dict[str, Any]:
         if identity.get("role") != "PARTNER":
             raise PermissionError("partner identity required")
@@ -163,8 +188,24 @@ class ExternalPortalService:
         referral_ids = {r["id"] for r in referrals}
         commissions = [c for c in self.store.list("pm_commissions") if c.get("referral_id") in referral_ids]
         contributions = self.store.list("p6_partner_contributions", "partner_id=?", (partner_id,))
+        profiles = self.store.list("p8_network_profiles", "organization_id=? AND partner_id=?",
+                                   (identity["organization_id"], partner_id))
+        ecosystem_feed = EcosystemService(self.store, self.audit).feed_for_profile(profiles[0]["id"]) if profiles else []
         return {"partner": safe_partner, "referrals": referrals, "commissions": commissions,
-                "contributions": contributions}
+                "contributions": contributions, "ecosystem_profile": profiles[0] if profiles else None,
+                "ecosystem_feed": ecosystem_feed}
+
+    def partner_apply_to_opportunity(self, identity: Dict[str, Any], opportunity_id: str,
+                                     statement: str, conflict_disclosure: Optional[str]) -> str:
+        if identity.get("role") != "PARTNER":
+            raise PermissionError("partner identity required")
+        profiles = self.store.list("p8_network_profiles", "organization_id=? AND partner_id=?",
+                                   (identity["organization_id"], identity["subject_ref"]))
+        if not profiles:
+            raise PartnerError("an active ecosystem profile is required")
+        return EcosystemService(self.store, self.audit).apply(
+            opportunity_id, profiles[0]["id"], statement, conflict_disclosure,
+        )
 
     def customer_payments(self, identity: Dict[str, Any]) -> Dict[str, Any]:
         if identity.get("role") != "CUSTOMER":

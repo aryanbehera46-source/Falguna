@@ -1273,3 +1273,93 @@ CREATE TABLE IF NOT EXISTS p6_payables (
     UNIQUE(organization_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_p6_payables_org ON p6_payables(organization_id, status, created_at);
+
+-- Phase 8 Digital Business Ecosystem. Additive, local/synthetic-safe records.
+CREATE TABLE IF NOT EXISTS p8_intakes (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, customer_ref TEXT,
+    original_message TEXT NOT NULL, normalized_meaning TEXT NOT NULL,
+    source_language TEXT, geography TEXT, preferred_language TEXT,
+    category TEXT, industry TEXT, budget_min REAL, budget_max REAL, currency TEXT,
+    timing TEXT, risk_flags_json TEXT NOT NULL, clarification_questions_json TEXT NOT NULL,
+    status TEXT NOT NULL, created_by_identity_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p8_intakes_owner ON p8_intakes(organization_id, customer_ref, status, created_at);
+CREATE TABLE IF NOT EXISTS p8_routing_decisions (
+    id TEXT PRIMARY KEY, intake_id TEXT NOT NULL REFERENCES p8_intakes(id),
+    recommended_mode TEXT, decided_mode TEXT, recommendation_reasons_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL, uncertainty_json TEXT NOT NULL, review_status TEXT NOT NULL,
+    recommended_by TEXT NOT NULL, decided_by_identity_id TEXT, decision_reason TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p8_route_intake ON p8_routing_decisions(intake_id, created_at);
+CREATE TABLE IF NOT EXISTS p8_network_profiles (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, profile_type TEXT NOT NULL,
+    display_name TEXT NOT NULL, legal_name TEXT, partner_id TEXT, geography_json TEXT NOT NULL,
+    languages_json TEXT NOT NULL, availability_status TEXT NOT NULL,
+    verification_level TEXT NOT NULL, verification_evidence_json TEXT NOT NULL,
+    licensing_status TEXT NOT NULL, licensing_evidence_json TEXT NOT NULL,
+    commercial_relationship TEXT NOT NULL, conflict_disclosures_json TEXT NOT NULL,
+    maturity_tier TEXT, status TEXT NOT NULL, completed_assignments INTEGER NOT NULL DEFAULT 0,
+    qa_passes INTEGER NOT NULL DEFAULT 0, disputes INTEGER NOT NULL DEFAULT 0,
+    policy_violations INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p8_profiles_eligible ON p8_network_profiles(organization_id, status, verification_level, availability_status);
+CREATE TABLE IF NOT EXISTS p8_profile_capabilities (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES p8_network_profiles(id),
+    capability_tag TEXT NOT NULL, evidence_status TEXT NOT NULL, evidence_json TEXT NOT NULL,
+    regulated INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(profile_id, capability_tag)
+);
+CREATE TABLE IF NOT EXISTS p8_opportunities (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, intake_id TEXT NOT NULL REFERENCES p8_intakes(id),
+    customer_safe_brief TEXT NOT NULL, geography TEXT, language TEXT, category TEXT, industry TEXT,
+    capability_requirements_json TEXT NOT NULL, budget_visibility TEXT NOT NULL,
+    budget_min REAL, budget_max REAL, currency TEXT, timing TEXT,
+    risk_flags_json TEXT NOT NULL, required_verification_level TEXT NOT NULL,
+    application_state TEXT NOT NULL, assignment_state TEXT NOT NULL,
+    customer_relationship_owner TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p8_opportunity_feed ON p8_opportunities(organization_id, status, assignment_state, created_at);
+CREATE TABLE IF NOT EXISTS p8_matches (
+    id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES p8_opportunities(id),
+    profile_id TEXT NOT NULL REFERENCES p8_network_profiles(id), eligible INTEGER NOT NULL,
+    reasons_json TEXT NOT NULL, gaps_json TEXT NOT NULL, conflicts_json TEXT NOT NULL,
+    economics_review_required INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(opportunity_id, profile_id)
+);
+CREATE TABLE IF NOT EXISTS p8_opportunity_applications (
+    id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES p8_opportunities(id),
+    profile_id TEXT NOT NULL REFERENCES p8_network_profiles(id), statement TEXT NOT NULL,
+    status TEXT NOT NULL, conflict_disclosure TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(opportunity_id, profile_id)
+);
+CREATE TABLE IF NOT EXISTS p8_assignments (
+    id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES p8_opportunities(id),
+    profile_id TEXT NOT NULL REFERENCES p8_network_profiles(id), application_id TEXT,
+    status TEXT NOT NULL, scope TEXT NOT NULL, customer_contact_allowed INTEGER NOT NULL DEFAULT 0,
+    money_collection_allowed INTEGER NOT NULL DEFAULT 0, assigned_by_identity_id TEXT NOT NULL,
+    approval_evidence_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p8_blg_engagements (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, intake_id TEXT NOT NULL REFERENCES p8_intakes(id),
+    tier TEXT NOT NULL, current_stage TEXT NOT NULL, regulated_boundaries_json TEXT NOT NULL,
+    outcome_disclaimer TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p8_blg_stage_events (
+    id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL REFERENCES p8_blg_engagements(id),
+    from_stage TEXT, to_stage TEXT NOT NULL, evidence_json TEXT NOT NULL,
+    actor_identity_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p8_governance_events (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, event_type TEXT NOT NULL,
+    profile_id TEXT, opportunity_id TEXT, severity TEXT NOT NULL, evidence_json TEXT NOT NULL,
+    status TEXT NOT NULL, recommended_action TEXT, decided_action TEXT,
+    decided_by_identity_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p8_product_signals (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, problem_signature TEXT NOT NULL,
+    supporting_intake_ids_json TEXT NOT NULL, signal_type TEXT NOT NULL,
+    evidence_count INTEGER NOT NULL, recommendation_only INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);

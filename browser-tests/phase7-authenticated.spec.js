@@ -20,7 +20,7 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
       page.on('console', m => { if (['warning', 'error'].includes(m.type())) errors.push(m.text()); });
       page.on('pageerror', e => errors.push(e.message));
       await login(page, 'customer');
-      for (const route of ['/app', '/app/projects', '/app/billing', '/app/support', '/app/account', '/pay']) {
+      for (const route of ['/app', '/app/projects', '/app/requests', '/app/billing', '/app/support', '/app/account', '/pay']) {
         await page.goto(route);
         await expect(page.locator('main')).toBeVisible();
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
@@ -28,6 +28,10 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
       await page.goto('/app/billing');
       await page.getByRole('link', { name: 'Browser milestone' }).click();
       await expect(page.getByRole('heading', { name: /Invoice/ })).toBeVisible();
+      await page.goto('/app/requests');
+      await page.getByLabel('What do you need?').fill('Please assess a synthetic inventory workflow for our test location.');
+      await page.getByRole('button', { name: 'Record request' }).click();
+      await expect(page.getByText(/No contract or assignment was created/)).toBeVisible();
       await page.goto('/partners/app');
       await expect(page).toHaveURL(/\/app$/);
       expect(errors).toEqual([]);
@@ -38,13 +42,19 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
       page.on('console', m => { if (['warning', 'error'].includes(m.type())) errors.push(m.text()); });
       page.on('pageerror', e => errors.push(e.message));
       await login(page, 'partner');
-      for (const route of ['/partners/app', '/partners/app/leads', '/partners/app/leads/new', '/partners/app/commissions', '/partners/app/account']) {
+      for (const route of ['/partners/app', '/partners/app/leads', '/partners/app/leads/new', '/partners/app/commissions', '/partners/app/opportunities', '/partners/app/account']) {
         await page.goto(route);
         await expect(page.locator('main')).toBeVisible();
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
       }
       await page.goto('/partners/app/leads');
       await expect(page.getByText('Browser Lead')).toBeVisible();
+      await page.goto('/partners/app/opportunities');
+      await expect(page.getByText('Bilingual retail workflow implementation')).toBeVisible();
+      await expect(page.getByText(/may not collect customer money/)).toBeVisible();
+      await page.getByLabel('Capability statement').fill('I can deliver this synthetic scope using the reviewed workflow capability.');
+      await page.getByRole('button', { name: 'Express interest' }).click();
+      await expect(page.getByText(/not assigned yet/)).toBeVisible();
       await page.goto('/app');
       await expect(page).toHaveURL(/\/partners\/app$/);
       await page.goto('/partners');
