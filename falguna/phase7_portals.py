@@ -90,12 +90,49 @@ class ExternalPortalAuth:
 
     def check_csrf(self, session_id: str, csrf: str) -> bool:
         session = self.store.get("p7_external_sessions", session_id) if session_id else None
-        return bool(session and not session.get("revoked_at") and hmac.compare_digest(session.get("csrf_token", ""), csrf or ""))
+        if not session or session.get("revoked_at") or datetime.fromisoformat(session["expires_at"]) <= _now():
+            return False
+        account = self.store.get("p7_external_accounts", session["account_id"])
+        return bool(account and account.get("status") == "ACTIVE" and
+                    hmac.compare_digest(session.get("csrf_token", ""), csrf or ""))
 
     def logout(self, session_id: str) -> None:
         session = self.store.get("p7_external_sessions", session_id) if session_id else None
         if session and not session.get("revoked_at"):
             self.store.update("p7_external_sessions", session_id, revoked_at=utcnow())
+
+    def account_security(self, session_id: str) -> Dict[str, Any]:
+        session = self.store.get("p7_external_sessions", session_id) if session_id else None
+        identity = self.identity(session_id)
+        if not session or not identity:
+            raise AuthError("active session required")
+        account = self.store.get("p7_external_accounts", session["account_id"])
+        sessions = self.store.list("p7_external_sessions", "account_id=?", (account["id"],))
+        return {
+            "email": account["email"], "display_name": identity["display_name"],
+            "role": identity["role"], "last_login_at": account.get("last_login_at"),
+            "sessions": [{
+                "id": row["id"], "created_at": row["created_at"], "expires_at": row["expires_at"],
+                "user_agent": row.get("user_agent") or "Unknown browser", "current": row["id"] == session_id,
+                "active": not bool(row.get("revoked_at")) and datetime.fromisoformat(row["expires_at"]) > _now(),
+            } for row in sessions],
+            "mfa_status": "REQUIRED_FOR_PRODUCTION_NOT_CONFIGURED",
+            "recovery_status": "OPERATOR_ASSISTED_NO_EMAIL_CHANNEL",
+        }
+
+    def change_password(self, session_id: str, csrf: str, current_password: str, new_password: str) -> None:
+        if not self.check_csrf(session_id, csrf):
+            raise AuthError("security check failed")
+        session = self.store.get("p7_external_sessions", session_id)
+        account = self.store.get("p7_external_accounts", session["account_id"]) if session else None
+        if not account or not verify_password(current_password, account["password_hash"]):
+            raise AuthError("current password is incorrect")
+        if len(new_password) < 12:
+            raise AuthError("new password must be at least 12 characters")
+        self.store.update("p7_external_accounts", account["id"], password_hash=hash_password(new_password))
+        for row in self.store.list("p7_external_sessions", "account_id=?", (account["id"],)):
+            if row["id"] != session_id and not row.get("revoked_at"):
+                self.store.update("p7_external_sessions", row["id"], revoked_at=utcnow())
 
 
 class ExternalPortalService:
@@ -142,12 +179,36 @@ class ExternalPortalService:
                 "provider", "provider_session_ref", "payment_method_token_ref", "mandate_token_ref",
                 "legal_owner_name", "beneficiary_ref", "created_at", "updated_at",
             )} | {"allowed_methods": json.loads(row.get("allowed_methods_json") or "[]")})
+        invoice_ids = {i["id"] for i in self.customer_bundle(identity)["invoices"]}
+        receipts = [{k: r.get(k) for k in ("id", "invoice_id", "payment_intent_id", "amount", "currency", "provider_transaction_ref", "status", "issued_at")}
+                    for r in self.store.list("p6_receipts") if r.get("invoice_id") in invoice_ids]
+        client_ids = [c["id"] for c in self.customer_bundle(identity)["clients"]]
         subscriptions = [
-            {k: s.get(k) for k in ("id", "plan_name", "amount", "currency", "cadence", "next_billing_date", "autopay_status", "status")}
-            for s in self.store.list("p6_subscriptions", "organization_id=? AND client_id=?",
-                                     (identity["organization_id"], customer_ref))
+            {k: s.get(k) for k in ("id", "plan_name", "amount", "currency", "cadence", "next_billing_date", "provider_token_ref", "mandate_ref", "autopay_status", "status", "last_invoice_id")}
+            for client_id in client_ids for s in self.store.list("p6_subscriptions", "organization_id=? AND client_id=?",
+                                     (identity["organization_id"], client_id))
         ]
-        return {"payments": safe, "subscriptions": subscriptions}
+        return {"payments": safe, "receipts": receipts, "subscriptions": subscriptions}
+
+    def customer_invoice_detail(self, identity: Dict[str, Any], invoice_id: str) -> Optional[Dict[str, Any]]:
+        bundle = self.customer_bundle(identity)
+        invoice = next((i for i in bundle["invoices"] if i["id"] == invoice_id), None)
+        if not invoice:
+            return None
+        payments = self.customer_payments(identity)
+        return {"invoice": invoice,
+                "receipts": [r for r in payments["receipts"] if r["invoice_id"] == invoice_id],
+                "refunds": [r for r in bundle["refunds"] if r["invoice_id"] == invoice_id],
+                "disputes": [d for d in bundle["disputes"] if d["invoice_id"] == invoice_id],
+                "subscriptions": [s for s in payments["subscriptions"] if s.get("last_invoice_id") == invoice_id]}
+
+    def verify_partner(self, partner_id: str) -> Dict[str, Any]:
+        partner = self.store.get("pm_partners", (partner_id or "").strip())
+        if not partner:
+            return {"state": "UNKNOWN", "valid": False}
+        active = partner.get("status") == "APPROVED" and partner.get("verification_status") == "VERIFIED"
+        return {"state": "ACTIVE_VALID" if active else "SUSPENDED_INVALID", "valid": active,
+                "partner_id": partner["id"], "name": partner.get("full_name") if active else None}
 
     def customer_project_detail(self, identity: Dict[str, Any], project_id: str) -> Optional[Dict[str, Any]]:
         """Phase 7, Sections 1-2: the authenticated customer project-detail

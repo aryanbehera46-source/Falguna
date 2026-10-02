@@ -63,6 +63,25 @@ class ExternalAuthenticationTests(Phase7PortalCase):
         self.auth.logout(result["session_id"])
         self.assertIsNone(self.auth.identity(result["session_id"]))
 
+    def test_password_change_requires_current_password_and_revokes_other_sessions(self):
+        _, _, _, identity_id = self.customer("Acme", 1200)
+        self.auth.provision(identity_id, "customer@example.test", "correct-horse-battery")
+        current = self.auth.login("customer@example.test", "correct-horse-battery")
+        other = self.auth.login("customer@example.test", "correct-horse-battery")
+        with self.assertRaises(AuthError):
+            self.auth.change_password(current["session_id"], current["csrf_token"], "wrong", "new-correct-horse-battery")
+        self.auth.change_password(current["session_id"], current["csrf_token"], "correct-horse-battery", "new-correct-horse-battery")
+        self.assertIsNotNone(self.auth.identity(current["session_id"]))
+        self.assertIsNone(self.auth.identity(other["session_id"]))
+        self.assertEqual(self.auth.account_security(current["session_id"])["mfa_status"], "REQUIRED_FOR_PRODUCTION_NOT_CONFIGURED")
+
+    def test_expired_session_cannot_pass_csrf_check(self):
+        _, _, _, identity_id = self.customer("Acme", 1200)
+        self.auth.provision(identity_id, "customer@example.test", "correct-horse-battery")
+        result = self.auth.login("customer@example.test", "correct-horse-battery")
+        self.store.update("p7_external_sessions", result["session_id"], expires_at="2020-01-01T00:00:00+00:00")
+        self.assertFalse(self.auth.check_csrf(result["session_id"], result["csrf_token"]))
+
 
 class CustomerPortalIsolationTests(Phase7PortalCase):
     def test_customer_identity_cannot_select_another_customer(self):
@@ -90,6 +109,19 @@ class CustomerPortalIsolationTests(Phase7PortalCase):
         self.assertEqual([p["id"] for p in result["payments"]], [own])
         self.assertNotIn(other, [p["id"] for p in result["payments"]])
 
+    def test_invoice_detail_is_customer_scoped_and_excludes_internal_dispute_evidence(self):
+        _, _, invoice_a, id_a = self.customer("Acme", 1200)
+        _, _, invoice_b, _ = self.customer("Beta", 900)
+        identity_a = self.store.get("p6_commercial_identities", id_a)
+        dispute_id = self.store.create("cs_disputes", {"invoice_id": invoice_a, "project_id": None, "client_id": None,
+            "reason": "Customer-safe summary", "evidence_json": '{"internal_risk":"never expose"}', "amount_disputed": 100,
+            "status": "OPEN", "reviewer": None, "resolution": None, "refund_amount": 0, "commission_impact_json": None,
+            "actor": "test", "created_at": "2026-10-02T00:00:00+00:00", "updated_at": "2026-10-02T00:00:00+00:00", "resolved_at": None})
+        detail = self.portals.customer_invoice_detail(identity_a, invoice_a)
+        self.assertEqual(detail["disputes"][0]["id"], dispute_id)
+        self.assertNotIn("evidence_json", detail["disputes"][0])
+        self.assertIsNone(self.portals.customer_invoice_detail(identity_a, invoice_b))
+
 
 class PartnerPortalIsolationTests(Phase7PortalCase):
     def test_partner_bundle_contains_only_linked_partner_records(self):
@@ -103,6 +135,15 @@ class PartnerPortalIsolationTests(Phase7PortalCase):
         bundle = self.portals.partner_bundle(self.store.get("p6_commercial_identities", identity_id))
         self.assertEqual([r["id"] for r in bundle["referrals"]], [r1])
         self.assertNotIn(r2, [r["id"] for r in bundle["referrals"]])
+
+    def test_public_partner_verification_has_three_unambiguous_states(self):
+        partners = PartnerStore(self.store, self.audit)
+        active = partners.register({"full_name": "Active Partner", "email": "active@example.test", "agreement_accepted": True}, "test")
+        partners.approve(active, "test")
+        inactive = partners.register({"full_name": "Inactive Partner", "email": "inactive@example.test", "agreement_accepted": True}, "test")
+        self.assertEqual(self.portals.verify_partner(active)["state"], "ACTIVE_VALID")
+        self.assertEqual(self.portals.verify_partner(inactive)["state"], "SUSPENDED_INVALID")
+        self.assertEqual(self.portals.verify_partner("not-real")["state"], "UNKNOWN")
 
 
 

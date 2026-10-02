@@ -2,7 +2,8 @@
   "name": "falguna-bootstrap-browser-verification",
   "private": true,
   "scripts": {
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test:phase7": "playwright test --config phase7.playwright.config.js"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1"
