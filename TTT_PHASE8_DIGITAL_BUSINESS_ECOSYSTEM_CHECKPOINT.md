@@ -8,7 +8,9 @@
 
 **Starting commit:** `412af4743e90be76ff623faeb753e5cd072beeb1` (`Accept Phase 7 web application foundation`)
 
-**Final commits:** the implementation/checkpoint commit containing this file
+**Implementation commit:** `c5e540f` (`Start Phase 8 digital business ecosystem`)
+
+**Checkpoint-record commit:** the documentation-only commit containing this update
 **Environment:** isolated worktree; local synthetic data and sandbox/provider-neutral financial state only
 
 ## Decision
