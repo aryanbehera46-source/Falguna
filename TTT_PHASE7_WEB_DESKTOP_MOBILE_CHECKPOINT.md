@@ -1,7 +1,7 @@
 # TTT / FALGUNA Phase 7 — Web, Desktop & Mobile Applications Checkpoint
 
 **Date:** 2026-10-02  
-**Status:** PHASE 7 CHECKPOINT — NOT FINAL ACCEPTANCE  
+**Status:** VALIDATED PHASE 7 CONTINUATION CHECKPOINT — NOT FINAL ACCEPTANCE
 **Branch:** `phase7/web-desktop-mobile-v1`  
 **Baseline:** accepted Phase 6 commit `0c49f9b` (`phase6/commercial-platform-foundation-v1`)  
 **Environment:** isolated worktree and synthetic browser/test data only
@@ -37,6 +37,8 @@ Native desktop/mobile wrappers are not justified in this checkpoint. The current
 - Uses the existing `CustomerPortalService` and its customer-safe projections rather than a parallel store.
 - Displays project state, delivery route, invoice amount/received/outstanding truth, due dates, refund/dispute-backed bundle data, and a support/communications foundation.
 - A customer identity's immutable `subject_ref` selects the one permitted communications organization; cross-customer selection is not exposed.
+- Added customer-scoped project detail routes with the approved SOW, recorded milestones, and client-owned invoices. Unknown and cross-customer project IDs return the same 404.
+- Added customer-safe communication history. Internal notes, internal sender identity, drafts, failures, and approved-but-not-actually-sent outbound messages are excluded; only customer inbound messages and genuinely `SENT` replies render.
 
 ### Partner application
 
@@ -44,6 +46,15 @@ Native desktop/mobile wrappers are not justified in this checkpoint. The current
 - Displays only the linked partner profile, registered leads, recorded contributions and commission records.
 - Surfaces verification/KYC/policy metadata seams and the explicit prohibition on collecting customer money.
 - Does not expose private customer finance or any payout execution path.
+- Added authenticated, session-CSRF-protected policy acknowledgement and lead registration.
+- The immutable external identity selects the partner; request fields cannot choose or reassign ownership.
+- Existing duplicate/conflict detection remains the attribution authority: new referrals remain `PENDING_REVIEW`, conflicts are flagged for review, and an existing valid attribution is not silently replaced.
+- Added self-reported industry and relationship-disclosure fields without changing the accepted attribution lifecycle.
+
+### Public self-service intake
+
+- Added a structured, self-selected commercial-need category to both contact forms and persisted it as a routing hint.
+- This is not represented as automated AI classification; staff still triage the submitted category and free text.
 
 ### Payment and verification surface
 
@@ -69,20 +80,27 @@ Native desktop/mobile wrappers are not justified in this checkpoint. The current
 
 ## Verification
 
-- Python compilation: `falguna/site_web.py` and `falguna/phase7_portals.py` passed.
-- New Phase 7 portal tests: **5 passed** (provisioning boundary, login/session revocation, customer isolation, payment isolation, partner isolation).
-- Existing website HTTP suite plus new public/guard checks: **24 passed**.
-- Phase 6 affected regression plus customer portal and Phase 7 suites: **84 passed** in 50.971s.
+- Python compilation: all six touched Python modules passed (`site_web`, `customer_portal`, `partner_management`, `phase7_portals`, `site_content`, and `store`).
+- Customer portal, partner management, Phase 7 portal, and complete website HTTP suites: **121 passed** in 100.709s.
+- Shared billing, commercial, commercial-web, payment-comms, Phase 6 commercial, finance, partner, final-approval-security, and Phase 6 HQ regressions: **178 passed** in 88.417s.
+- Focused post-fix safety/UI-state checks: **9 passed** in 4.332s.
+- Total recorded assertions across the final focused and shared regression runs: **299 passed**. The 9 focused checks are a subset and are not added to this unique total.
 - CLI help exposes the new `site` command.
 
-### Browser QA (local synthetic preview, port 8877)
+### Browser QA (local synthetic preview, port 8877; 2026-10-02 continuation)
 
-- Homepage loaded with all eight intent routes and no browser console warnings/errors.
-- Desktop at 1440×960: 4-column intent grid, full navigation, document width exactly 1440 (no horizontal overflow).
-- Mobile at 390×844: 1-column intent grid, mobile navigation toggle, document width exactly 390 (no horizontal overflow).
-- Customer/partner login rendered at mobile width; unauthenticated `/app` redirected to `/portal/login`.
-- Payment surface visibly showed sandbox status and the no-representative-money warning.
-- A synthetic customer completed the real login form and reached `/app`; the account resolved to the correct customer application with project/metric state and no console warnings/errors.
+- Public routes checked: homepage/all eight intents, Business Launch & Growth, partner program, project intake/category selector, and sandbox payment/verification surface.
+- A synthetic customer completed the real login flow and opened overview, project list, project detail, SOW, milestones, linked invoice, billing, and customer-safe support history.
+- A synthetic partner completed the real login, policy acknowledgement, lead form, lead registration, lead list, overview, and commission-status routes. The created browser-QA lead remained `PENDING_REVIEW` under the authenticated partner.
+- Desktop at 1440×960 and mobile at 390×844: every checked public/customer/partner route reported document width equal to viewport width, with no horizontal overflow.
+- Direct route navigation confirmed no project-detail/list shadowing or partner lead-route shadowing.
+- Browser console collection reported no warnings or errors on the checked flows.
+- No external provider, payment, email, WhatsApp, deployment, or live-data action was used.
+
+Two concrete defects found during validation were fixed before this checkpoint:
+
+1. The partner-safe bundle omitted `policy_acknowledged_at`, so the UI could continue presenting the gate after acknowledgement. The safe timestamp projection and an explicit rendered-form transition assertion were added.
+2. Customer communication filtering treated `APPROVED` outbound content as customer-visible even though the communications state machine only establishes a real send at `SENT`. The projection now exposes outbound messages only at `SENT`, with a regression test for approved-but-unsent content.
 
 The existing website test harness reports Python `ResourceWarning` messages for test-server sockets that are not explicitly closed after shutdown. All assertions pass; this is test-harness cleanup debt, not an application-route failure.
 
@@ -90,15 +108,29 @@ The existing website test harness reports Python `ResourceWarning` messages for 
 
 Phase 7 is not complete. Remaining work includes:
 
-1. Complete customer milestone/timeline/action-required/SOW presentation and detailed receipt/refund/subscription screens.
-2. Add partner lead registration and policy acknowledgement mutations with session CSRF, duplicate protection and the accepted human gates.
-3. Add authenticated invoice lookup/receipt detail and partner public-verification UI; keep all provider actions sandbox-only.
-4. Add external account provisioning/admin workflow, recovery, MFA/WebAuthn decision, session management and security event/audit views before production use.
-5. Split host-aware canonical URLs/navigation when real `app.`, `clients.`, `partners.` and `pay.` subdomains are configured; no DNS work was performed.
-6. Add structured campaign/service/industry landing-page content and richer intake classification while preserving verified-capability claims.
-7. Run wider repository regression in a controlled media/provider environment and add dedicated browser automation for authenticated customer, partner and payment journeys.
-8. Perform accessibility keyboard/screen-reader review and production threat review.
-9. Decide on PWA installation/push/offline only from real requirements; native wrappers remain unjustified today.
+1. Complete the remaining customer financial presentation: authenticated invoice/receipt detail plus refund, dispute, and subscription views. Current billing still renders the invoice table only.
+2. Add the partner contribution-detail view and partner-facing public-verification UI where the accepted Phase 6 record supports them; keep all provider actions sandbox-only.
+3. Add external account provisioning/admin workflow, recovery, MFA/WebAuthn decision, session management, and security-event/audit views before production use.
+4. Add dedicated repeatable browser automation for authenticated customer, partner, and payment journeys; this checkpoint completed manual real-browser QA only.
+5. Perform accessibility keyboard/screen-reader review and production threat review.
+6. Split host-aware canonical URLs/navigation only when real `app.`, `clients.`, `partners.`, and `pay.` subdomains are configured; no DNS work was performed.
+7. Decide on PWA installation/push/offline only from real requirements; native wrappers remain unjustified today.
+
+These are substantive acceptance items, not merely report cleanup. Phase 7 therefore cannot move directly to final acceptance yet, but the Claude continuation slice itself is validated and ready for a clean checkpoint commit.
+
+## Files in this validated slice
+
+- `falguna/customer_portal.py`
+- `falguna/partner_management.py`
+- `falguna/phase7_portals.py`
+- `falguna/site_content.py`
+- `falguna/site_web.py`
+- `falguna/store.py`
+- `tests/test_customer_portal.py`
+- `tests/test_partner_management.py`
+- `tests/test_phase7_portals.py`
+- `tests/test_site_web.py`
+- `TTT_PHASE7_WEB_DESKTOP_MOBILE_CHECKPOINT.md`
 
 ## External-action ledger
 
@@ -106,4 +138,4 @@ No push, merge, deploy, DNS change, live provider activation, real-data write, s
 
 ## Exact next action
 
-Build the next authenticated vertical slice on this branch: customer project detail with milestone/timeline/action-required/SOW data, invoice/receipt/refund detail, and automated HTTP/browser isolation tests. Then add the partner lead-registration mutation with CSRF, duplicate-safe attribution and policy acknowledgement—still synthetic and sandbox-only.
+Build the final customer financial-detail vertical slice on this branch: authenticated invoice/receipt detail plus refund, dispute, and subscription presentation, with customer isolation and repeatable browser tests. Then close the remaining partner contribution/verification presentation and run the accessibility/threat-review acceptance pass. Do not start Phase 8.

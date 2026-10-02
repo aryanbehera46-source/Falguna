@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 
 from .audit import AuditLog
 from .customer_portal import CustomerPortalService
+from .partner_management import PartnerError, PartnerStore, ReferralError, ReferralStore
 from .site_auth import AuthError, hash_password, verify_password
 from .store import StateStore, utcnow
 
@@ -119,7 +120,7 @@ class ExternalPortalService:
         safe_partner = {k: partner.get(k) for k in (
             "id", "full_name", "organization_name", "status", "verification_status", "role_type",
             "maturity_tier", "kyc_status", "agreement_accepted", "agreement_reference",
-            "no_side_deal_accepted",
+            "no_side_deal_accepted", "policy_acknowledged_at",
         )}
         referrals = self.store.list("pm_referrals", "partner_id=?", (partner_id,))
         referral_ids = {r["id"] for r in referrals}
@@ -147,3 +148,46 @@ class ExternalPortalService:
                                      (identity["organization_id"], customer_ref))
         ]
         return {"payments": safe, "subscriptions": subscriptions}
+
+    def customer_project_detail(self, identity: Dict[str, Any], project_id: str) -> Optional[Dict[str, Any]]:
+        """Phase 7, Sections 1-2: the authenticated customer project-detail
+        read. Delegates entirely to CustomerPortalService.get_project_detail,
+        which scopes the lookup through the same customer-owned bundle
+        get_portal_bundle() already proves isolated -- a project id outside
+        this customer's own organization returns None exactly like an
+        unknown id, never a different error that would confirm the id
+        belongs to someone else."""
+        if identity.get("role") != "CUSTOMER":
+            raise PermissionError("customer identity required")
+        customer_org_id = identity["subject_ref"]
+        return CustomerPortalService(self.store, self.audit).get_project_detail(
+            customer_org_id, project_id, actor=identity["id"], requested_by_organization_id=customer_org_id,
+        )
+
+    def partner_acknowledge_policy(self, identity: Dict[str, Any]) -> Dict[str, Any]:
+        """Phase 7, Section 8: the partner's own, dated acknowledgement of
+        the no-money-collection/anti-diversion policy -- required before
+        partner_register_lead() below will accept a new lead."""
+        if identity.get("role") != "PARTNER":
+            raise PermissionError("partner identity required")
+        return PartnerStore(self.store, self.audit).acknowledge_policy(identity["subject_ref"], actor=identity["id"])
+
+    def partner_register_lead(self, identity: Dict[str, Any], fields: Dict[str, Any]) -> str:
+        """Phase 7, Section 5: authenticated, policy-gated lead registration.
+        Delegates to the already-proven ReferralStore.register() (duplicate
+        detection, normalization, PENDING_REVIEW attribution state) rather
+        than building a parallel intake path -- this method's only added
+        value is resolving partner_id from the immutable authenticated
+        identity (never a request field) and enforcing the Section 8 policy
+        acknowledgement gate before a lead can be registered at all."""
+        if identity.get("role") != "PARTNER":
+            raise PermissionError("partner identity required")
+        partner_id = identity["subject_ref"]
+        partner = self.store.get("pm_partners", partner_id)
+        if not partner:
+            raise PermissionError("linked partner not found")
+        if not partner.get("policy_acknowledged_at"):
+            raise ReferralError(
+                "you must acknowledge the TTT partner payment policy before registering a lead"
+            )
+        return ReferralStore(self.store, self.audit).register(partner_id, dict(fields), actor=identity["id"])

@@ -602,3 +602,59 @@ class AuthorizationBypassOverHTTPTests(_LivePartnerHQServerCase):
         status, board = self._get("/api/rh/opportunities")
         self.assertEqual(status, 200)
         self.assertTrue(any(o["id"] == opportunity_id and o["source"] == "partner_referral" for o in board["items"]))
+
+
+class PolicyAcknowledgementTests(PartnerManagementTestCase):
+    """Phase 7, Section 8: a partner's own, dated acknowledgement of the
+    anti-diversion/no-money-collection policy -- distinct from
+    phase6_partner.PartnerNetworkService.configure_partner()'s staff-only
+    hardcoded flags."""
+
+    def test_approved_partner_can_acknowledge_policy(self):
+        pid = self._approved_partner()
+        updated = self.partners.acknowledge_policy(pid, actor="jane@partnerco.com")
+        self.assertIsNotNone(updated["policy_acknowledged_at"])
+        self.assertEqual(updated["policy_acknowledged_by"], "jane@partnerco.com")
+        self.assertEqual(updated["no_side_deal_accepted"], 1)
+        self.assertEqual(updated["no_unauthorized_subcontracting_accepted"], 1)
+
+    def test_pending_partner_cannot_acknowledge_policy(self):
+        pid = self.partners.register({"full_name": "Pending Partner", "email": "pending@partnerco.com", "agreement_accepted": True}, actor="Aryan")
+        with self.assertRaises(PartnerError):
+            self.partners.acknowledge_policy(pid, actor="pending@partnerco.com")
+
+    def test_suspended_partner_cannot_acknowledge_policy(self):
+        pid = self._approved_partner()
+        self.partners.suspend(pid, actor="Aryan", reason="synthetic test suspension")
+        with self.assertRaises(PartnerError):
+            self.partners.acknowledge_policy(pid, actor="jane@partnerco.com")
+
+    def test_unknown_partner_cannot_acknowledge_policy(self):
+        with self.assertRaises(PartnerError):
+            self.partners.acknowledge_policy("does-not-exist", actor="nobody")
+
+
+class ReferralIntakeFieldsTests(PartnerManagementTestCase):
+    """Phase 7, Section 5: the two new self-reported intake fields
+    (industry, relationship_disclosure) persist on the referral exactly as
+    submitted, without disturbing the already-proven duplicate detection
+    and attribution lifecycle."""
+
+    def test_industry_and_relationship_disclosure_are_stored_verbatim(self):
+        pid = self._approved_partner()
+        referral_id = self.referrals.register(pid, {
+            "prospect_name": "New Co", "requested_service": "Website rebuild",
+            "industry": "Hospitality", "relationship_disclosure": "I am a part-time consultant for this company",
+        }, actor="jane@partnerco.com")
+        row = self.store.get("pm_referrals", referral_id)
+        self.assertEqual(row["industry"], "Hospitality")
+        self.assertEqual(row["relationship_disclosure"], "I am a part-time consultant for this company")
+
+    def test_industry_and_relationship_disclosure_are_optional(self):
+        pid = self._approved_partner()
+        referral_id = self.referrals.register(pid, {
+            "prospect_name": "New Co 2", "requested_service": "Website rebuild",
+        }, actor="jane@partnerco.com")
+        row = self.store.get("pm_referrals", referral_id)
+        self.assertIsNone(row["industry"])
+        self.assertIsNone(row["relationship_disclosure"])

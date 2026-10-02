@@ -147,6 +147,30 @@ class PartnerStore:
         self.audit.append("PM_PARTNER_APPROVED", {"partner_id": partner_id, "actor": actor})
         return self.store.get("pm_partners", partner_id)
 
+    def acknowledge_policy(self, partner_id: str, actor: str) -> Dict[str, Any]:
+        """Phase 7, Section 8: the partner's OWN affirmative acknowledgement
+        of the TTT anti-diversion / no-money-collection policy, made through
+        the partner's own external portal session -- distinct from
+        phase6_partner.PartnerNetworkService.configure_partner(), which is
+        staff-only and hardcodes the same two acceptance flags as part of
+        setting up a partner's internal profile. This method is the one a
+        real partner calls on themselves, and it is required (see
+        phase7_portals.ExternalPortalService.partner_register_lead) before
+        that partner may register a new lead -- so a partner cannot reach
+        the lead-registration flow without ever having seen and agreed to
+        the warning."""
+        partner = self._require(partner_id)
+        if partner["status"] != "APPROVED":
+            raise PartnerError(f"partner must be APPROVED to acknowledge policy (currently {partner['status']})")
+        now = utcnow()
+        self.store.update(
+            "pm_partners", partner_id,
+            no_side_deal_accepted=1, no_unauthorized_subcontracting_accepted=1,
+            policy_acknowledged_at=now, policy_acknowledged_by=actor,
+        )
+        self.audit.append("PM_PARTNER_POLICY_ACKNOWLEDGED", {"partner_id": partner_id, "actor": actor})
+        return self.store.get("pm_partners", partner_id)
+
     def suspend(self, partner_id: str, actor: str, reason: str) -> Dict[str, Any]:
         partner = self._require(partner_id)
         if partner["status"] != "APPROVED":
@@ -241,9 +265,11 @@ class ReferralStore:
             "contact_email": (fields.get("contact_email") or "").strip() or None,
             "contact_phone": (fields.get("contact_phone") or "").strip() or None,
             "region": fields.get("region") or None,
+            "industry": (fields.get("industry") or "").strip() or None,
             "requested_service": requested_service,
             "estimated_value": float(estimated_value) if estimated_value not in (None, "") else None,
             "referral_source": fields.get("referral_source") or "partner_portal",
+            "relationship_disclosure": (fields.get("relationship_disclosure") or "").strip() or None,
             "notes": fields.get("notes") or None,
             "normalized_email": email, "normalized_phone": phone, "normalized_domain": domain, "normalized_org": org,
             "attribution_status": "PENDING_REVIEW",

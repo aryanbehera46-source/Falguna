@@ -35,6 +35,7 @@ row; this module computes nothing, infers nothing, and never estimates a
 status or a percentage that isn't already on file.
 """
 
+import json
 from typing import Any, Dict, List, Optional
 
 from .audit import AuditLog
@@ -63,7 +64,8 @@ class CustomerPortalService:
     @staticmethod
     def _customer_safe_invoice(invoice: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "id": invoice["id"], "amount": invoice["amount"], "currency": invoice["currency"],
+            "id": invoice["id"], "client_id": invoice.get("client_id"),
+            "amount": invoice["amount"], "currency": invoice["currency"],
             "amount_received": invoice["amount_received"], "status": invoice["status"],
             "due_date": invoice.get("due_date"), "milestone": invoice.get("milestone"),
         }
@@ -92,6 +94,100 @@ class CustomerPortalService:
             "status": refund["status"], "provider_ref": refund.get("provider_ref") if refund["status"] == "CONFIRMED" else None,
             "created_at": refund["created_at"],
         }
+
+    @staticmethod
+    def _customer_safe_message(message: Dict[str, Any]) -> Dict[str, Any]:
+        # Deliberately excludes sender_agent (an internal AI role name, or
+        # "Aryan" -- see comm_messages schema comment) and every risk/
+        # moderation field: a customer should see who sent a reply by
+        # direction ("us" vs "them"), never which internal agent drafted
+        # it. is_internal_note messages are already stripped upstream by
+        # CustomerContextService.customer_facing_context() before this is
+        # ever called.
+        return {
+            "id": message["id"], "direction": message["direction"],
+            "body": message["body"], "created_at": message.get("created_at"),
+        }
+
+    @classmethod
+    def _customer_safe_conversation(cls, conversation: Dict[str, Any]) -> Dict[str, Any]:
+        # A DRAFT/un-sent outbound message is a staff-side work-in-progress
+        # awaiting human approval (see falguna/comms.py's status lifecycle)
+        # -- showing it to the customer before it is actually SENT would
+        # let them see content Aryan/staff may still edit or never send at
+        # all. APPROVED is still an internal pre-send state, so it is also
+        # excluded. The customer's own inbound messages are always real and
+        # always shown regardless of status.
+        safe_messages = [
+            cls._customer_safe_message(m) for m in conversation.get("messages", [])
+            if m.get("direction") == "INBOUND" or m.get("status") == "SENT"
+        ]
+        return {
+            "id": conversation["id"], "channel": conversation["channel"],
+            "department": conversation["department"], "subject": conversation.get("subject"),
+            "status": conversation["status"], "priority": conversation.get("priority"),
+            "created_at": conversation.get("created_at"), "updated_at": conversation.get("updated_at"),
+            "messages": safe_messages,
+        }
+
+    @staticmethod
+    def _customer_safe_sow(closing_record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The approved scope/SOW reference for a project, read verbatim off
+        its real rh_closing_records row -- never invented, never estimated.
+        Returns None when no closing record exists yet (an honest "nothing
+        on file" rather than a fabricated placeholder)."""
+        if not closing_record:
+            return None
+        return {
+            "final_scope": closing_record.get("final_scope"),
+            "final_price": closing_record.get("final_price"),
+            "currency": closing_record.get("currency"),
+            "payment_terms": closing_record.get("payment_terms"),
+            "deadline": closing_record.get("deadline"),
+            "deliverables": closing_record.get("deliverables"),
+            "acceptance_criteria": closing_record.get("acceptance_criteria"),
+        }
+
+    @staticmethod
+    def _customer_safe_milestones(
+        closing_record: Optional[Dict[str, Any]], invoices: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Projects the loosely-structured rh_closing_records.milestones_json
+        (just a list of {"name", "amount", ...} dicts -- see
+        SalesOperationsService._execute_close(), there is no guaranteed
+        date/status/id per milestone) into a customer-safe view, enriched
+        ONLY where a real invoice's `milestone` label matches by name.
+        Never invents a status, due date, or amount-received: a milestone
+        with no matching invoice is reported as SCOPED, meaning only "this
+        is part of the agreed scope," nothing about delivery progress."""
+        if not closing_record or not closing_record.get("milestones_json"):
+            return []
+        try:
+            raw = json.loads(closing_record["milestones_json"])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        invoices_by_label: Dict[str, Dict[str, Any]] = {}
+        for invoice in invoices:
+            label = (invoice.get("milestone") or "").strip().lower()
+            if label and label not in invoices_by_label:
+                invoices_by_label[label] = invoice
+        out = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("title") or "Milestone")
+            matched = invoices_by_label.get(name.strip().lower())
+            out.append({
+                "name": name,
+                "amount": entry.get("amount"),
+                "status": matched["status"] if matched else "SCOPED",
+                "invoice_id": matched["id"] if matched else None,
+                "due_date": matched.get("due_date") if matched else None,
+                "amount_received": matched.get("amount_received") if matched else None,
+            })
+        return out
 
 
     def get_portal_bundle(
@@ -127,9 +223,49 @@ class CustomerPortalService:
         for client_id in client_ids:
             projects += [self._customer_safe_project(p) for p in self.store.list("cs_projects", "client_id=?", (client_id,))]
 
+        safe_conversations = [self._customer_safe_conversation(c) for c in ctx["conversations"]]
+        open_support_ids = {c["id"] for c in ctx["open_support_issues"]}
+        safe_open_support_issues = [c for c in safe_conversations if c["id"] in open_support_ids]
+
         return {
             "organization": ctx["organization"], "contacts": ctx["contacts"], "clients": ctx["clients"],
-            "projects": projects, "conversations": ctx["conversations"],
-            "open_support_issues": ctx["open_support_issues"],
+            "projects": projects, "conversations": safe_conversations,
+            "open_support_issues": safe_open_support_issues,
             "invoices": invoices, "disputes": disputes, "refunds": refunds,
+        }
+
+    def get_project_detail(
+        self, organization_id: str, project_id: str, actor: str = "system",
+        requested_by_organization_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Phase 7, Sections 1-2: the authenticated customer project-detail
+        view -- name/id, status, the real approved SOW reference (if any),
+        milestones derived from that same real SOW, and the invoices tied
+        to the project's own client. Reuses `get_portal_bundle()`'s own
+        scoping rather than querying cs_projects directly by id, so a
+        project id that does not belong to this organization's own bundle
+        is indistinguishable from one that doesn't exist at all -- no
+        existence leak across organizations. Returns None for either case;
+        the HTTP layer renders both as the same 404."""
+        bundle = self.get_portal_bundle(
+            organization_id, actor=actor, requested_by_organization_id=requested_by_organization_id,
+        )
+        project = next((p for p in bundle["projects"] if p["id"] == project_id), None)
+        if project is None:
+            return None
+        raw_project = self.store.get("cs_projects", project_id)
+        closing_record = None
+        if raw_project and raw_project.get("opportunity_id"):
+            closings = self.store.list("rh_closing_records", "opportunity_id=?", (raw_project["opportunity_id"],))
+            closing_record = closings[-1] if closings else None
+        project_client_id = raw_project.get("client_id") if raw_project else None
+        client_invoices = (
+            [i for i in bundle["invoices"] if i.get("client_id") == project_client_id]
+            if project_client_id else bundle["invoices"]
+        )
+        return {
+            "project": project,
+            "sow": self._customer_safe_sow(closing_record),
+            "milestones": self._customer_safe_milestones(closing_record, client_invoices),
+            "invoices": client_invoices,
         }

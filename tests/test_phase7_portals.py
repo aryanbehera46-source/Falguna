@@ -6,7 +6,7 @@ from falguna.audit import AuditLog
 from falguna.billing import BillingStore
 from falguna.commercial import ProjectStore
 from falguna.comms import CommsStore
-from falguna.partner_management import PartnerStore, ReferralStore
+from falguna.partner_management import PartnerStore, ReferralError, ReferralStore
 from falguna.phase6_commercial import CommercialIdentityStore
 from falguna.phase7_portals import ExternalPortalAuth, ExternalPortalService
 from falguna.revenue_hunter import OpportunityStore
@@ -103,6 +103,74 @@ class PartnerPortalIsolationTests(Phase7PortalCase):
         bundle = self.portals.partner_bundle(self.store.get("p6_commercial_identities", identity_id))
         self.assertEqual([r["id"] for r in bundle["referrals"]], [r1])
         self.assertNotIn(r2, [r["id"] for r in bundle["referrals"]])
+
+
+
+class PartnerLeadRegistrationTests(Phase7PortalCase):
+    def _partner_identity(self):
+        partners = PartnerStore(self.store, self.audit)
+        pid = partners.register({"full_name": "Policy Partner", "email": "policy@example.test", "agreement_accepted": True}, "test")
+        partners.approve(pid, "test")
+        identity_id = self.identities.create("ttt", "PARTNER", pid, "Policy Partner", "PARTNER", "test")
+        return pid, self.store.get("p6_commercial_identities", identity_id)
+
+    def test_lead_registration_is_blocked_until_policy_is_acknowledged(self):
+        pid, identity = self._partner_identity()
+        with self.assertRaises(ReferralError):
+            self.portals.partner_register_lead(identity, {"prospect_name": "Acme", "requested_service": "Website"})
+        self.assertEqual(self.store.list("pm_referrals", "partner_id=?", (pid,)), [])
+
+    def test_lead_registration_succeeds_after_policy_acknowledgement(self):
+        pid, identity = self._partner_identity()
+        self.portals.partner_acknowledge_policy(identity)
+        self.assertIsNotNone(self.portals.partner_bundle(identity)["partner"]["policy_acknowledged_at"])
+        referral_id = self.portals.partner_register_lead(identity, {
+            "prospect_name": "Acme", "requested_service": "Website", "industry": "Retail",
+        })
+        row = self.store.get("pm_referrals", referral_id)
+        self.assertEqual(row["partner_id"], pid)
+        self.assertEqual(row["industry"], "Retail")
+
+    def test_customer_identity_cannot_register_a_partner_lead(self):
+        _, _, _, customer_identity_id = self.customer("Acme", 1000)
+        customer_identity = self.store.get("p6_commercial_identities", customer_identity_id)
+        with self.assertRaises(PermissionError):
+            self.portals.partner_register_lead(customer_identity, {"prospect_name": "X", "requested_service": "Y"})
+
+    def test_partner_identity_cannot_acknowledge_policy_for_another_partner(self):
+        # partner_acknowledge_policy always resolves the partner id from the
+        # identity's own immutable subject_ref -- there is no field in the
+        # call that could name a different partner, so this proves the
+        # absence of such a path rather than a specific bypass attempt.
+        pid, identity = self._partner_identity()
+        updated = self.portals.partner_acknowledge_policy(identity)
+        self.assertEqual(updated["id"], pid)
+
+
+class CustomerProjectDetailIsolationTests(Phase7PortalCase):
+    def test_customer_cannot_fetch_another_customers_project_detail(self):
+        org_a, client_a, _, id_a = self.customer("Acme", 1200)
+        org_b, client_b, _, _ = self.customer("Beta", 900)
+        identity_a = self.store.get("p6_commercial_identities", id_a)
+        project_b = self.store.list("cs_projects", "client_id=?", (client_b,))[0]
+        self.assertIsNone(self.portals.customer_project_detail(identity_a, project_b["id"]))
+
+    def test_customer_can_fetch_own_project_detail(self):
+        org_a, client_a, _, id_a = self.customer("Acme", 1200)
+        identity_a = self.store.get("p6_commercial_identities", id_a)
+        project_a = self.store.list("cs_projects", "client_id=?", (client_a,))[0]
+        detail = self.portals.customer_project_detail(identity_a, project_a["id"])
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["project"]["id"], project_a["id"])
+
+    def test_partner_identity_cannot_call_customer_project_detail(self):
+        partners = PartnerStore(self.store, self.audit)
+        pid = partners.register({"full_name": "P", "email": "p@example.test", "agreement_accepted": True}, "test")
+        partners.approve(pid, "test")
+        identity_id = self.identities.create("ttt", "PARTNER", pid, "P", "PARTNER", "test")
+        identity = self.store.get("p6_commercial_identities", identity_id)
+        with self.assertRaises(PermissionError):
+            self.portals.customer_project_detail(identity, "whatever")
 
 
 if __name__ == "__main__":

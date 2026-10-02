@@ -9,6 +9,7 @@ limiting, and the staff login/session lifecycle.
 """
 import http.client
 import io
+import re
 import subprocess
 import tempfile
 import threading
@@ -18,7 +19,16 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
+from falguna.audit import AuditLog
+from falguna.billing import BillingStore
+from falguna.commercial import ProjectStore
+from falguna.comms import CommsStore
+from falguna.partner_management import PartnerStore, ReferralStore
+from falguna.phase6_commercial import CommercialIdentityStore
+from falguna.phase7_portals import ExternalPortalAuth
+from falguna.revenue_hunter import OpportunityStore
 from falguna.runtime import open_control_plane
+from falguna.sales_ops import ClientStore
 from falguna.site_auth import StaffAuthService, MAX_FAILED_LOGINS
 from falguna.site_content import ServiceStore, CaseStudyStore, JobStore
 import falguna.site_web as site_web
@@ -358,6 +368,225 @@ class StaffLoginTests(_SiteLiveServerCase):
         resp, body = self._login("staff@test.invalid", "CorrectHorseBattery9!")
         self.assertEqual(resp.status, 401)
         self.assertIn("locked", body.lower())
+
+
+
+class _ExternalAppLiveServerCase(_SiteLiveServerCase):
+    """Live-server fixture for the Phase 7 customer/partner external
+    applications -- builds real, isolated customer and partner identities/
+    accounts on top of the same live server _SiteLiveServerCase already
+    starts, then drives them through the real /portal/login HTTP flow."""
+
+    def setUp(self):
+        super().setUp()
+        self.audit = AuditLog(Path(self.repo) / ".falguna" / "audit.jsonl")
+        self.comms = CommsStore(self.store, self.audit)
+        self.clients = ClientStore(self.store, self.audit)
+        self.opps = OpportunityStore(self.store, self.audit)
+        self.projects = ProjectStore(self.store, self.audit)
+        self.billing = BillingStore(self.store, self.audit)
+        self.identities = CommercialIdentityStore(self.store, self.audit)
+        self.ext_auth = ExternalPortalAuth(self.store)
+        self.partners = PartnerStore(self.store, self.audit)
+        self.referrals = ReferralStore(self.store, self.audit, partners=self.partners)
+
+    def _make_customer(self, name, amount=1000.0, password="correct-horse-battery-x"):
+        org = self.comms.find_or_create_organization(name, domain=f"{name.lower()}.invalid")
+        client = self.clients.upsert(name, "test")
+        self.store.update("comm_organizations", org, linked_client_id=client)
+        contact = self.comms.find_or_create_contact(f"contact@{name.lower()}.invalid", name=name, organization_id=org)
+        self.comms.open_conversation("EMAIL", "support", subject=f"{name} support", contact_id=contact,
+                                      organization_id=org, actor="test", linked_client_id=client)
+        opp = self.opps.create({"title": f"{name} project", "description": "Synthetic", "client_name": name}, "test")
+        project_id = self.projects.create_for_opportunity(opp, client, "test", "CUSTOM_BUILD")
+        invoice_id = self.billing.create_invoice(client, "test", amount)
+        identity_id = self.identities.create("ttt", "CUSTOMER_ORG", org, name, "CUSTOMER", "test")
+        email = f"{name.lower()}@example.test"
+        self.ext_auth.provision(identity_id, email, password)
+        return {"org": org, "client": client, "project_id": project_id, "invoice_id": invoice_id,
+                "identity_id": identity_id, "email": email, "password": password}
+
+    def _make_partner(self, name="Jane Partner", password="correct-horse-battery-y"):
+        slug = re.sub(r"[^a-z0-9]", "", name.lower())
+        pid = self.partners.register({"full_name": name, "email": f"{slug}@partner.test", "agreement_accepted": True}, "test")
+        self.partners.approve(pid, "test")
+        identity_id = self.identities.create("ttt", "PARTNER", pid, name, "PARTNER", "test")
+        email = f"{slug}-ext@example.test"
+        self.ext_auth.provision(identity_id, email, password)
+        return {"partner_id": pid, "identity_id": identity_id, "email": email, "password": password}
+
+    def _portal_login(self, email, password):
+        csrf = self._csrf_cookie("/portal/login")
+        resp, body = self._post_form("/portal/login", {
+            "csrf_token": csrf, "email": email, "password": password,
+        }, cookie_header=f"csrf={csrf}")
+        set_cookie = resp.getheader("Set-Cookie") or ""
+        m = re.search(r"ttt_external_session=([^;,\s]+)", set_cookie)
+        return resp, body, (m.group(1) if m else None)
+
+    def _get_authed(self, path, session_id):
+        return self._get(path, headers={"Cookie": f"ttt_external_session={session_id}"})
+
+    def _post_authed(self, path, fields, session_id, csrf_token):
+        fields = dict(fields); fields["csrf_token"] = csrf_token
+        return self._post_form(path, fields, cookie_header=f"ttt_external_session={session_id}")
+
+
+class CustomerAppLiveTests(_ExternalAppLiveServerCase):
+    def test_login_redirects_customer_to_app_with_a_session_cookie(self):
+        customer = self._make_customer("Acme")
+        resp, _, session_id = self._portal_login(customer["email"], customer["password"])
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(resp.getheader("Location"), "/app")
+        self.assertIsNotNone(session_id)
+
+    def test_wrong_password_is_rejected_with_a_generic_message(self):
+        customer = self._make_customer("Acme")
+        resp, body, session_id = self._portal_login(customer["email"], "totally-wrong-password")
+        self.assertEqual(resp.status, 401)
+        self.assertIsNone(session_id)
+        self.assertIn("invalid email or password", body)
+
+    def test_project_detail_page_renders_the_real_project_for_its_owner(self):
+        customer = self._make_customer("Acme")
+        _, _, session_id = self._portal_login(customer["email"], customer["password"])
+        resp, body = self._get_authed(f"/app/projects/{customer['project_id']}", session_id)
+        self.assertEqual(resp.status, 200)
+        self.assertIn(customer["project_id"], body)
+
+    def test_project_detail_page_404s_for_another_customers_project(self):
+        customer_a = self._make_customer("Acme")
+        customer_b = self._make_customer("Beta")
+        _, _, session_id_a = self._portal_login(customer_a["email"], customer_a["password"])
+        resp, _ = self._get_authed(f"/app/projects/{customer_b['project_id']}", session_id_a)
+        self.assertEqual(resp.status, 404)
+
+    def test_unknown_project_id_also_404s(self):
+        customer = self._make_customer("Acme")
+        _, _, session_id = self._portal_login(customer["email"], customer["password"])
+        resp, _ = self._get_authed("/app/projects/does-not-exist", session_id)
+        self.assertEqual(resp.status, 404)
+
+    def test_support_page_shows_real_inbound_message_and_hides_unsent_drafts(self):
+        customer = self._make_customer("Acme")
+        conv_id = self.store.list("comm_conversations", "organization_id=?", (customer["org"],))[0]["id"]
+        self.comms.add_message(conv_id, "INBOUND", "Where is my project status?", actor="website")
+        self.comms.add_message(conv_id, "OUTBOUND", "Draft reply not yet approved by staff.", kind="message", actor="AI")
+        _, _, session_id = self._portal_login(customer["email"], customer["password"])
+        resp, body = self._get_authed("/app/support", session_id)
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Where is my project status?", body)
+        self.assertNotIn("Draft reply not yet approved", body)
+
+    def test_unauthenticated_app_access_redirects_to_portal_login(self):
+        resp, _ = self._get("/app/projects/anything")
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(resp.getheader("Location"), "/portal/login")
+
+    def test_partner_session_cannot_reach_customer_app(self):
+        partner = self._make_partner()
+        _, _, session_id = self._portal_login(partner["email"], partner["password"])
+        resp, _ = self._get_authed("/app", session_id)
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(resp.getheader("Location"), "/portal/login")
+
+
+class PartnerAppLiveTests(_ExternalAppLiveServerCase):
+    def test_login_redirects_partner_to_partner_app(self):
+        partner = self._make_partner()
+        resp, _, session_id = self._portal_login(partner["email"], partner["password"])
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(resp.getheader("Location"), "/partners/app")
+        self.assertIsNotNone(session_id)
+
+    def test_lead_form_shows_policy_acknowledgement_first(self):
+        partner = self._make_partner()
+        _, _, session_id = self._portal_login(partner["email"], partner["password"])
+        resp, body = self._get_authed("/partners/app/leads/new", session_id)
+        self.assertEqual(resp.status, 200)
+        self.assertIn("I understand and agree", body)
+        self.assertNotIn('name="prospect_name"', body)
+
+    def test_lead_registration_is_rejected_before_policy_acknowledgement(self):
+        partner = self._make_partner()
+        _, _, session_id = self._portal_login(partner["email"], partner["password"])
+        session_row = self.store.list("p7_external_sessions", "id=?", (session_id,))[0]
+        resp, body = self._post_authed("/partners/app/leads", {
+            "prospect_name": "Acme", "requested_service": "Website",
+        }, session_id, session_row["csrf_token"])
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.store.list("pm_referrals", "partner_id=?", (partner["partner_id"],)), [])
+
+    def test_policy_acknowledgement_then_lead_registration_succeeds(self):
+        partner = self._make_partner()
+        _, _, session_id = self._portal_login(partner["email"], partner["password"])
+        session_row = self.store.list("p7_external_sessions", "id=?", (session_id,))[0]
+        resp, _ = self._post_authed("/partners/app/policy/acknowledge", {}, session_id, session_row["csrf_token"])
+        self.assertEqual(resp.status, 303)
+        resp, body = self._get_authed("/partners/app/leads/new", session_id)
+        self.assertEqual(resp.status, 200)
+        self.assertIn('name="prospect_name"', body)
+        self.assertNotIn("I understand and agree", body)
+        resp, body = self._post_authed("/partners/app/leads", {
+            "prospect_name": "Acme", "requested_service": "Website", "industry": "Retail",
+        }, session_id, session_row["csrf_token"])
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Lead registered", body)
+        rows = self.store.list("pm_referrals", "partner_id=?", (partner["partner_id"],))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["industry"], "Retail")
+
+    def test_forged_csrf_on_lead_registration_is_rejected(self):
+        partner = self._make_partner()
+        _, _, session_id = self._portal_login(partner["email"], partner["password"])
+        resp, _ = self._post_authed("/partners/app/leads", {
+            "prospect_name": "Acme", "requested_service": "Website",
+        }, session_id, "forged-csrf-token-not-matching-any-session")
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.store.list("pm_referrals", "partner_id=?", (partner["partner_id"],)), [])
+
+    def test_another_partners_leads_never_appear_in_this_partners_view(self):
+        partner_a = self._make_partner("Partner Alpha")
+        partner_b = self._make_partner("Partner Beta")
+        self.referrals.register(partner_b["partner_id"], {"prospect_name": "Beta Lead", "requested_service": "AI"}, "test")
+        _, _, session_id_a = self._portal_login(partner_a["email"], partner_a["password"])
+        resp, body = self._get_authed("/partners/app/leads", session_id_a)
+        self.assertEqual(resp.status, 200)
+        self.assertNotIn("Beta Lead", body)
+
+    def test_customer_session_cannot_reach_partner_app(self):
+        customer = self._make_customer("Acme")
+        _, _, session_id = self._portal_login(customer["email"], customer["password"])
+        resp, _ = self._get_authed("/partners/app", session_id)
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(resp.getheader("Location"), "/portal/login")
+
+
+class SelfServiceIntakeCategoryTests(_SiteLiveServerCase):
+    def test_general_enquiry_stores_the_chosen_intake_category(self):
+        csrf = self._csrf_cookie("/contact/general")
+        resp, _ = self._post_form("/contact/general", {
+            "csrf_token": csrf, "name": "Jamie", "email": "jamie3@example.com", "message": "hello",
+            "intake_category": "business_launch_growth",
+        }, cookie_header=f"csrf={csrf}")
+        self.assertEqual(resp.status, 200)
+        rows = self.store.list("site_enquiries", "email = 'jamie3@example.com'")
+        self.assertEqual(rows[0]["intake_category"], "business_launch_growth")
+
+    def test_intake_category_is_optional(self):
+        csrf = self._csrf_cookie("/contact/general")
+        resp, _ = self._post_form("/contact/general", {
+            "csrf_token": csrf, "name": "Jamie", "email": "jamie4@example.com", "message": "hello",
+        }, cookie_header=f"csrf={csrf}")
+        self.assertEqual(resp.status, 200)
+        rows = self.store.list("site_enquiries", "email = 'jamie4@example.com'")
+        self.assertIsNone(rows[0]["intake_category"])
+
+    def test_contact_form_renders_the_intake_category_selector(self):
+        resp, body = self._get("/contact/general")
+        self.assertEqual(resp.status, 200)
+        self.assertIn('name="intake_category"', body)
+        self.assertIn("Business Launch and Growth support", body)
 
 
 if __name__ == "__main__":

@@ -294,9 +294,22 @@ class EnquiryStore:
         if not name.strip() or not email.strip() or "@" not in email or not message.strip():
             raise ContentError("name, a valid email, and a message are required")
 
+        extra = extra or {}
+        # Phase 7, Section 11 (self-service intake / universal routing): a
+        # self-reported category the submitter picked for what kind of
+        # commercial need this is (direct delivery, advisory, partner
+        # coordination, vendor sourcing, referral/mediation, product fit,
+        # Business Launch & Growth, needs-a-licensed-professional, or
+        # unsupported/unsure). Deliberately a structured selector the
+        # person fills in themselves, not an automatic classification this
+        # module performs on their free-text message -- that capability
+        # does not exist and this does not claim it does. Staff triage the
+        # enquiry using this as a routing hint alongside the free-text
+        # message, same as kind/company always were.
+        intake_category = (extra.get("intake_category") or "").strip() or None
+
         opportunity_id = None
         if kind == "project" and self.opportunity_store is not None:
-            extra = extra or {}
             opportunity_id = self.opportunity_store.create({
                 "title": extra.get("project_title") or f"Website enquiry: {name.strip()}",
                 "client_name": company.strip() if company else name.strip(),
@@ -313,6 +326,7 @@ class EnquiryStore:
             "opportunity_id": opportunity_id,
             "source_ip_hash": hash_ip(source_ip),
             "created_at": utcnow(),
+            "intake_category": intake_category,
         })
 
         conversation_id = None
@@ -323,10 +337,11 @@ class EnquiryStore:
             department = "sales" if kind == "project" else "general"
             subject = (extra or {}).get("project_title") if extra else None
             subject = subject or f"{'Project enquiry' if kind == 'project' else 'General enquiry'} from {name.strip()}"
+            tags = ["website", kind] + ([intake_category] if intake_category else [])
             conv = self.comms_store.open_conversation(
                 "WEBSITE", department, subject=subject, contact_id=contact_id, organization_id=org_id,
                 priority="high" if kind == "project" else "normal",
-                tags=["website", kind], actor="website",
+                tags=tags, actor="website",
                 linked_opportunity_id=opportunity_id,
                 source_ref_type="site_enquiry", source_ref_id=row_id,
             )

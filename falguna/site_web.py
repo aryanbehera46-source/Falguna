@@ -34,6 +34,7 @@ from .runtime import open_control_plane
 from .site_auth import StaffAuthService, AuthError
 from .phase7_portals import ExternalPortalAuth, ExternalPortalService
 from .phase6_partner import CustomerVerificationService, PUBLIC_PAYMENT_WARNING
+from .partner_management import PartnerError, ReferralError
 from .site_content import (
     ApplicationStore, CaseStudyStore, EnquiryStore, JobStore, PostStore,
     ProductStore, ServiceStore, ContentError, hash_ip,
@@ -43,6 +44,24 @@ SITE_NAME = "Twenty Two Technologies"
 SITE_DOMAIN = "twentytwotechnologies.com"
 SITE_EMAIL = "hello@twentytwotechnologies.com"
 SALES_EMAIL = "sales@twentytwotechnologies.com"
+
+# Phase 7, Section 11 -- self-service intake / universal routing. A fixed,
+# honest set of categories a submitter picks for themselves; TTT staff use
+# it as a triage hint alongside the free-text message. Deliberately NOT an
+# automatic classifier: no code here infers a category from message text,
+# because that capability has not been built or verified (see
+# EnquiryStore.submit's own docstring note on this).
+INTAKE_CATEGORIES = [
+    ("direct_delivery", "Direct TTT engineering delivery"),
+    ("advisory_consulting", "Advisory / consulting"),
+    ("specialist_partner", "Specialist or partner coordination"),
+    ("vendor_sourcing", "Provider / vendor sourcing"),
+    ("referral_mediation", "Referral / mediation"),
+    ("product_fit", "An existing product or SaaS might already fit"),
+    ("business_launch_growth", "Business Launch & Growth support"),
+    ("licensed_professional", "Needs a licensed professional (legal, medical, financial, etc.)"),
+    ("unsupported", "Not sure / something else"),
+]
 CAREERS_EMAIL = "careers@twentytwotechnologies.com"
 MEDIA_EMAIL = "media@twentytwotechnologies.com"
 FOUNDED_YEAR = 2020
@@ -246,6 +265,7 @@ form.stack{display:flex;flex-direction:column;gap:18px;max-width:640px}
 .metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:22px 0}
 .metric{padding:20px;border:1px solid var(--line);border-radius:14px;background:#111113}.metric b{font-size:1.55rem;display:block}.metric span{color:var(--ink-soft);font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}
 .notice{padding:18px;border-left:3px solid var(--amber);background:#161410;color:var(--paper-dim);margin:18px 0}
+.thread{display:flex;flex-direction:column;gap:10px;margin-top:14px}.msg{padding:12px 14px;border-radius:12px;max-width:85%}.msg p{margin:0 0 4px}.msg-meta{font-size:.72rem;color:var(--ink-soft)}.msg-in{background:#1b1b1e;align-self:flex-start}.msg-out{background:#162018;align-self:flex-end;text-align:right}
 @media(max-width:900px){.intent-grid{grid-template-columns:repeat(2,1fr)}.app-shell{grid-template-columns:1fr}.app-nav{position:static;display:flex;overflow-x:auto}.app-nav a{white-space:nowrap}.metric-grid{grid-template-columns:1fr}}
 @media(max-width:520px){.intent-grid{grid-template-columns:1fr}.intent-card{min-height:112px}}
 
@@ -858,31 +878,281 @@ def render_portal_login(csrf_token: str, error: Optional[str] = None) -> str:
     <button class="btn btn-primary" type="submit">Sign in</button></form></div></section>"""
 
 
-def _portal_nav(role: str, active: str, csrf: str) -> str:
+def _portal_nav(role, active, csrf):
     links = []
     if role == "CUSTOMER":
-        links = [("/app", "Overview"), ("/app/projects", "Projects"), ("/app/billing", "Billing & payments"), ("/app/support", "Support")]
+        links = [("/app", "Overview"), ("/app/projects", "Projects"),
+                 ("/app/billing", "Billing & payments"), ("/app/support", "Support")]
     else:
-        links = [("/partners/app", "Partner overview"), ("/partners/app/leads", "Registered leads"), ("/partners/app/commissions", "Commissions")]
-    rows = "".join(f'<a href="{h}"'+(' aria-current="page"' if h == active else '')+f'>{esc(l)}</a>' for h,l in links)
+        links = [("/partners/app", "Partner overview"), ("/partners/app/leads", "Registered leads"),
+                 ("/partners/app/leads/new", "Register a lead"), ("/partners/app/commissions", "Commissions")]
+
+    def is_current(href):
+        if href == active:
+            return True
+        if href == "/app/projects" and active.startswith("/app/projects/"):
+            return True
+        return False
+
+    rows = "".join(f'<a href="{h}"' + (' aria-current="page"' if is_current(h) else '') + f'>{esc(l)}</a>' for h, l in links)
     return f'<nav class="app-nav" aria-label="Application">{rows}<form method="post" action="/portal/logout"><input type="hidden" name="csrf_token" value="{esc(csrf)}"><button class="btn btn-ghost" type="submit">Sign out</button></form></nav>'
 
 
-def render_customer_app(identity: Dict[str, Any], bundle: Dict[str, Any], payments: Dict[str, Any], active: str, csrf: str) -> str:
+def _format_money(currency, amount):
+    if amount is None:
+        return "—"
+    try:
+        return f'{esc(currency or "")} {float(amount):,.2f}'.strip()
+    except (TypeError, ValueError):
+        return "—"
+
+
+def render_project_detail(detail):
+    """Phase 7, Sections 1-2: one project's customer-facing detail --
+    status, the real approved SOW reference (when one exists), milestones
+    derived from that same SOW (never invented), and the invoices tied to
+    this project's own client. `detail` is exactly what
+    ExternalPortalService.customer_project_detail() returns."""
+    project, sow, milestones, invoices = detail["project"], detail["sow"], detail["milestones"], detail["invoices"]
+
+    if sow is None:
+        sow_html = ('<div class="card"><h3>Approved scope</h3>'
+                     '<p>No formal scope of work is on file for this project yet.</p></div>')
+    else:
+        scope_text = esc(sow.get("final_scope") or "Not recorded.")
+        deliverables_text = esc(sow.get("deliverables") or "Not recorded.")
+        acceptance_text = esc(sow.get("acceptance_criteria") or "Not recorded.")
+        price_text = _format_money(sow.get("currency"), sow.get("final_price"))
+        sow_html = (
+            '<div class="card"><h3>Approved scope</h3>'
+            f'<p>{scope_text}</p>'
+            f'<p><b>Agreed price:</b> {price_text}'
+            f' &middot; <b>Payment terms:</b> {esc(sow.get("payment_terms") or "Not recorded.")}'
+            f' &middot; <b>Deadline:</b> {esc(sow.get("deadline") or "Not recorded.")}</p>'
+            f'<p><b>Deliverables:</b> {deliverables_text}</p>'
+            f'<p><b>Acceptance criteria:</b> {acceptance_text}</p>'
+            '</div>'
+        )
+
+    if milestones:
+        milestone_rows = "".join(
+            f'<tr><td>{esc(m["name"])}</td><td>{esc(m["status"])}</td>'
+            f'<td>{_format_money(None, m.get("amount"))}</td>'
+            f'<td>{esc(m.get("due_date") or "—")}</td></tr>'
+            for m in milestones
+        )
+    else:
+        milestone_rows = '<tr><td colspan="4">No milestones are recorded in the approved scope yet.</td></tr>'
+    milestones_html = (
+        '<div class="card"><h3>Milestones</h3>'
+        '<table><thead><tr><th>Milestone</th><th>Status</th><th>Amount</th><th>Due</th></tr></thead>'
+        f'<tbody>{milestone_rows}</tbody></table></div>'
+    )
+
+    if invoices:
+        invoice_rows = "".join(
+            f'<tr><td>{esc(i.get("milestone") or i["id"])}</td><td>{esc(i["status"])}</td>'
+            f'<td>{_format_money(i["currency"], i["amount"])}</td><td>{esc(i.get("due_date") or "—")}</td></tr>'
+            for i in invoices
+        )
+    else:
+        invoice_rows = '<tr><td colspan="4">No invoices are linked to this project yet.</td></tr>'
+    invoices_html = (
+        '<div class="card"><h3>Linked invoices</h3>'
+        '<table><thead><tr><th>Reference</th><th>Status</th><th>Amount</th><th>Due</th></tr></thead>'
+        f'<tbody>{invoice_rows}</tbody></table></div>'
+    )
+
+    return (
+        f'<div class="card"><h3>{esc(project["id"])}</h3>'
+        f'<p>Status: {esc(project["status"])} &middot; Delivery route: {esc(project["delivery_route"])}</p>'
+        '<a class="btn btn-ghost" href="/app/projects">Back to projects</a></div>'
+        f'{sow_html}{milestones_html}{invoices_html}'
+        '<div class="card"><h3>Need help with this project?</h3>'
+        '<a class="btn btn-ghost" href="/contact/general">Contact support</a></div>'
+    )
+
+
+def render_project_not_found():
+    return ('<div class="card"><h3>Project not found</h3>'
+             '<p>This project is not linked to your account.</p>'
+             '<a class="btn btn-ghost" href="/app/projects">Back to projects</a></div>')
+
+
+def render_support_section(bundle):
+    """Phase 7, Section 4: real conversation/message history, reusing the
+    existing Phase 5 communications architecture's own customer-safe
+    projection (CustomerPortalService._customer_safe_conversation) rather
+    than inventing a parallel support model. Only ever shows messages that
+    are the customer's own (INBOUND) or that staff have actually sent/
+    approved -- a DRAFT reply awaiting human review is never shown here."""
+    conversations = bundle["conversations"]
+    if not conversations:
+        threads_html = '<div class="card"><p>No conversations on file yet.</p></div>'
+    else:
+        cards = []
+        for conv in conversations:
+            if conv["messages"]:
+                msg_html = "".join(
+                    '<div class="msg msg-' + ("out" if m["direction"] == "OUTBOUND" else "in") + '">'
+                    f'<p>{esc(m["body"])}</p><span class="msg-meta">{esc(m.get("created_at") or "")}</span></div>'
+                    for m in conv["messages"]
+                )
+            else:
+                msg_html = '<p>No messages yet.</p>'
+            subject = esc(conv.get("subject") or conv["department"].replace("_", " ").title())
+            cards.append(
+                f'<div class="card"><h3>{subject}</h3>'
+                f'<p>Status: {esc(conv["status"])} &middot; {esc(conv["department"].replace("_", " ").title())}</p>'
+                f'<div class="thread">{msg_html}</div></div>'
+            )
+        threads_html = "".join(cards)
+    return (
+        '<div class="card"><h3>Support and communication</h3>'
+        '<p>Your customer-safe communication history and open support issues are shown below.</p>'
+        '<a class="btn btn-primary" href="/contact/general">Contact support</a></div>'
+        f'{threads_html}'
+    )
+
+
+def render_customer_app(identity, bundle, payments, active, csrf, project_detail="__unset__"):
     projects, invoices = bundle["projects"], bundle["invoices"]
     outstanding = sum(max(0, float(i["amount"]) - float(i["amount_received"])) for i in invoices)
-    rows = "".join(f'<tr><td>{esc(i.get("milestone") or i["id"])}</td><td>{esc(i["status"])}</td><td>{esc(i["currency"])} {float(i["amount"]):,.2f}</td><td>{esc(i.get("due_date") or "—")}</td></tr>' for i in invoices) or '<tr><td colspan="4">No invoices are currently available.</td></tr>'
-    project_rows = "".join(f'<div class="card"><h3>{esc(p["id"])}</h3><p>Status: {esc(p["status"])}<br>Delivery route: {esc(p["delivery_route"])}</p></div>' for p in projects) or '<div class="card"><h3>No active projects</h3><p>Your approved projects will appear here.</p></div>'
-    content = project_rows if active == "/app/projects" else f'<div class="card"><h3>Invoices</h3><table><thead><tr><th>Reference</th><th>Status</th><th>Amount</th><th>Due</th></tr></thead><tbody>{rows}</tbody></table></div>' if active == "/app/billing" else '<div class="card"><h3>Support and communication</h3><p>Your customer-safe communication history and open support issues are connected here.</p><a class="btn btn-ghost" href="/contact/general">Contact support</a></div>' if active == "/app/support" else f'<div class="metric-grid"><div class="metric"><b>{len(projects)}</b><span>Projects</span></div><div class="metric"><b>{len(invoices)}</b><span>Invoices</span></div><div class="metric"><b>{outstanding:,.2f}</b><span>Outstanding</span></div></div>{project_rows}'
-    return f'<section class="hero" style="padding-bottom:38px"><div class="container"><span class="eyebrow">Customer application</span><h1>Welcome, {esc(identity["display_name"])}.</h1></div></section><section class="tight"><div class="container app-shell">{_portal_nav("CUSTOMER", active, csrf)}<div>{content}</div></div></section>'
+    rows = "".join(
+        f'<tr><td>{esc(i.get("milestone") or i["id"])}</td><td>{esc(i["status"])}</td>'
+        f'<td>{esc(i["currency"])} {float(i["amount"]):,.2f}</td><td>{esc(i.get("due_date") or "—")}</td></tr>'
+        for i in invoices
+    ) or '<tr><td colspan="4">No invoices are currently available.</td></tr>'
+    project_rows = "".join(
+        f'<a class="card card-link" href="/app/projects/{esc(p["id"])}"><h3>{esc(p["id"])}</h3>'
+        f'<p>Status: {esc(p["status"])}<br>Delivery route: {esc(p["delivery_route"])}</p></a>'
+        for p in projects
+    ) or '<div class="card"><h3>No active projects</h3><p>Your approved projects will appear here.</p></div>'
+
+    if active.startswith("/app/projects/") and active != "/app/projects":
+        content = render_project_not_found() if project_detail is None else render_project_detail(project_detail)
+    elif active == "/app/projects":
+        content = project_rows
+    elif active == "/app/billing":
+        content = (f'<div class="card"><h3>Invoices</h3><table><thead><tr><th>Reference</th><th>Status</th>'
+                    f'<th>Amount</th><th>Due</th></tr></thead><tbody>{rows}</tbody></table></div>')
+    elif active == "/app/support":
+        content = render_support_section(bundle)
+    else:
+        content = (f'<div class="metric-grid"><div class="metric"><b>{len(projects)}</b><span>Projects</span></div>'
+                    f'<div class="metric"><b>{len(invoices)}</b><span>Invoices</span></div>'
+                    f'<div class="metric"><b>{outstanding:,.2f}</b><span>Outstanding</span></div></div>{project_rows}')
+
+    return (f'<section class="hero" style="padding-bottom:38px"><div class="container">'
+            f'<span class="eyebrow">Customer application</span><h1>Welcome, {esc(identity["display_name"])}.</h1>'
+            f'</div></section><section class="tight"><div class="container app-shell">'
+            f'{_portal_nav("CUSTOMER", active, csrf)}<div>{content}</div></div></section>')
 
 
-def render_partner_app(identity: Dict[str, Any], bundle: Dict[str, Any], active: str, csrf: str) -> str:
+def render_policy_acknowledgement(csrf, error=None):
+    alert = f'<div class="alert alert-error">{esc(error)}</div>' if error else ""
+    return (
+        '<div class="card"><h3>Partner payment policy</h3>'
+        f'<p>{esc(PUBLIC_PAYMENT_WARNING)}</p>'
+        '<p>You must read and agree to this before registering a new lead.</p>'
+        f'{alert}'
+        '<form method="post" action="/partners/app/policy/acknowledge">'
+        f'<input type="hidden" name="csrf_token" value="{esc(csrf)}">'
+        '<button class="btn btn-primary" type="submit">I understand and agree</button></form></div>'
+    )
+
+
+def render_lead_form(csrf, error=None, success=False):
+    if success:
+        return ('<div class="card"><h3>Lead registered</h3>'
+                 '<p class="alert alert-success">Thank you -- this lead has been registered and will go through '
+                 'TTT qualification. Attribution and any duplicate/conflict review happen automatically; you can '
+                 'track its status from Registered Leads.</p>'
+                 '<a class="btn btn-ghost" href="/partners/app/leads">Back to registered leads</a></div>')
+    alert = f'<div class="alert alert-error">{esc(error)}</div>' if error else ""
+    return (
+        '<div class="card"><h3>Register a new lead</h3>'
+        f'<p>{esc(PUBLIC_PAYMENT_WARNING)}</p>'
+        f'{alert}'
+        '<form class="stack" method="post" action="/partners/app/leads">'
+        f'<input type="hidden" name="csrf_token" value="{esc(csrf)}">'
+        '<div class="field"><label for="lead_prospect_name">Prospect / contact name</label>'
+        '<input id="lead_prospect_name" name="prospect_name" required></div>'
+        '<div class="field"><label for="lead_org">Organization (optional)</label>'
+        '<input id="lead_org" name="organization_name"></div>'
+        '<div class="field"><label for="lead_email">Contact email</label>'
+        '<input id="lead_email" name="contact_email" type="email"></div>'
+        '<div class="field"><label for="lead_phone">Contact phone</label>'
+        '<input id="lead_phone" name="contact_phone"></div>'
+        '<div class="field"><label for="lead_region">Country / region</label>'
+        '<input id="lead_region" name="region"></div>'
+        '<div class="field"><label for="lead_industry">Industry / business type</label>'
+        '<input id="lead_industry" name="industry"></div>'
+        '<div class="field"><label for="lead_service">What do they need?</label>'
+        '<input id="lead_service" name="requested_service" required></div>'
+        '<div class="field"><label for="lead_value">Estimated opportunity size (optional)</label>'
+        '<input id="lead_value" name="estimated_value" placeholder="e.g. 5000"></div>'
+        '<div class="field"><label for="lead_source">Source / context</label>'
+        '<input id="lead_source" name="referral_source" placeholder="e.g. existing contact, event, referral"></div>'
+        '<div class="field"><label for="lead_disclosure">Relationship disclosure (optional)</label>'
+        '<input id="lead_disclosure" name="relationship_disclosure" '
+        'placeholder="e.g. this is a company I am also an employee of"></div>'
+        '<div class="field"><label for="lead_notes">Notes</label><textarea id="lead_notes" name="notes"></textarea></div>'
+        '<button class="btn btn-primary" type="submit">Register lead</button></form></div>'
+    )
+
+
+def render_partner_app(identity, bundle, active, csrf, lead_form_error=None, lead_form_success=False):
     p, refs, commissions = bundle["partner"], bundle["referrals"], bundle["commissions"]
-    lead_rows = "".join(f'<tr><td>{esc(r["prospect_name"])}</td><td>{esc(r["requested_service"])}</td><td>{esc(r["attribution_status"])}</td></tr>' for r in refs) or '<tr><td colspan="3">No registered leads.</td></tr>'
-    commission_rows = "".join(f'<tr><td>{esc(c["id"])}</td><td>{esc(c["status"])}</td><td>{float(c.get("commission_amount") or 0):,.2f}</td></tr>' for c in commissions) or '<tr><td colspan="3">No commission records.</td></tr>'
-    content = f'<div class="card"><h3>Registered leads</h3><table><thead><tr><th>Prospect</th><th>Need</th><th>Attribution</th></tr></thead><tbody>{lead_rows}</tbody></table></div>' if active.endswith("/leads") else f'<div class="card"><h3>Commission status</h3><table><thead><tr><th>Reference</th><th>Status</th><th>Recorded amount</th></tr></thead><tbody>{commission_rows}</tbody></table></div>' if active.endswith("/commissions") else f'<div class="metric-grid"><div class="metric"><b>{len(refs)}</b><span>Registered leads</span></div><div class="metric"><b>{len(commissions)}</b><span>Commission records</span></div><div class="metric"><b>{esc(p.get("verification_status") or "—")}</b><span>Verification</span></div></div><div class="notice">{esc(PUBLIC_PAYMENT_WARNING)}</div>'
-    return f'<section class="hero" style="padding-bottom:38px"><div class="container"><span class="eyebrow">Partner application</span><h1>{esc(p["full_name"])}.</h1><p class="lede hero-sub">Partner ID {esc(p["id"])} · {esc(p.get("status") or "")}</p></div></section><section class="tight"><div class="container app-shell">{_portal_nav("PARTNER", active, csrf)}<div>{content}</div></div></section>'
+    policy_ok = bool(p.get("policy_acknowledged_at"))
+    lead_rows = "".join(
+        f'<tr><td>{esc(r["prospect_name"])}</td><td>{esc(r["requested_service"])}</td>'
+        f'<td>{esc(r["attribution_status"])}</td>'
+        f'<td>{"Duplicate/conflict under review" if r.get("duplicate_flag") else "—"}</td></tr>'
+        for r in refs
+    ) or '<tr><td colspan="4">No registered leads.</td></tr>'
+    commission_rows = "".join(
+        f'<tr><td>{esc(c["id"])}</td><td>{esc(c["status"])}</td><td>{float(c.get("commission_amount") or 0):,.2f}</td></tr>'
+        for c in commissions
+    ) or '<tr><td colspan="3">No commission records.</td></tr>'
+
+    if active.endswith("/leads/new"):
+        content = render_policy_acknowledgement(csrf) if not policy_ok else render_lead_form(
+            csrf, error=lead_form_error, success=lead_form_success,
+        )
+    elif active.endswith("/leads"):
+        register_link = '<a class="btn btn-primary" href="/partners/app/leads/new">Register a new lead</a>'
+        content = (
+            f'<div class="card"><h3>Registered leads</h3>{register_link}'
+            '<table><thead><tr><th>Prospect</th><th>Need</th><th>Attribution</th><th>Flag</th></tr></thead>'
+            f'<tbody>{lead_rows}</tbody></table></div>'
+        )
+    elif active.endswith("/commissions"):
+        content = (
+            '<div class="card"><h3>Commission status</h3>'
+            '<table><thead><tr><th>Reference</th><th>Status</th><th>Recorded amount</th></tr></thead>'
+            f'<tbody>{commission_rows}</tbody></table></div>'
+        )
+    else:
+        policy_prompt = "" if policy_ok else (
+            '<div class="card"><h3>Before you register a lead</h3>'
+            '<p>You have not yet acknowledged the TTT partner payment policy.</p>'
+            '<a class="btn btn-ghost" href="/partners/app/leads/new">Review and acknowledge</a></div>'
+        )
+        content = (
+            f'<div class="metric-grid"><div class="metric"><b>{len(refs)}</b><span>Registered leads</span></div>'
+            f'<div class="metric"><b>{len(commissions)}</b><span>Commission records</span></div>'
+            f'<div class="metric"><b>{esc(p.get("verification_status") or "—")}</b><span>Verification</span></div></div>'
+            f'<div class="notice">{esc(PUBLIC_PAYMENT_WARNING)}</div>{policy_prompt}'
+        )
+
+    return (
+        f'<section class="hero" style="padding-bottom:38px"><div class="container">'
+        f'<span class="eyebrow">Partner application</span><h1>{esc(p["full_name"])}.</h1>'
+        f'<p class="lede hero-sub">Partner ID {esc(p["id"])} &middot; {esc(p.get("status") or "")}</p>'
+        f'</div></section><section class="tight"><div class="container app-shell">'
+        f'{_portal_nav("PARTNER", active, csrf)}<div>{content}</div></div></section>'
+    )
 
 
 def render_pay(identity: Optional[Dict[str, Any]], payment_bundle: Optional[Dict[str, Any]], csrf_token: str, verification: Optional[Dict[str, Any]] = None) -> str:
@@ -896,6 +1166,15 @@ def render_pay(identity: Optional[Dict[str, Any]], payment_bundle: Optional[Dict
     return f'''<section class="hero"><div class="container"><span class="eyebrow">TTT Payments · sandbox</span><h1>Pay and verify from the official record.</h1><p class="lede hero-sub">This Phase 7 surface displays provider-neutral sandbox state only. A browser response never creates payment success.</p></div></section><section class="tight"><div class="container">{result}<div class="notice">{esc(PUBLIC_PAYMENT_WARNING)}</div>{account}<div class="card" style="margin-top:22px"><h3>Verify payment instructions</h3><form class="stack" method="post" action="/pay/verify"><input type="hidden" name="csrf_token" value="{esc(csrf_token)}"><div class="field"><label>Payment reference</label><input name="payment_id" required></div><div class="field"><label>Customer reference</label><input name="customer_ref" required></div><div class="field"><label>Beneficiary reference</label><input name="beneficiary_ref" required></div><button class="btn btn-primary" type="submit">Verify instruction</button></form></div></div></section>'''
 
 
+def _intake_category_field() -> str:
+    options = "".join(f'<option value="{esc(k)}">{esc(label)}</option>' for k, label in INTAKE_CATEGORIES)
+    return (
+        '<div class="field"><label for="intake_category">What best describes what you need?</label>'
+        '<select id="intake_category" name="intake_category">'
+        '<option value="">Not sure -- describe it below</option>' + options + '</select></div>'
+    )
+
+
 def _contact_form_fields(kind: str) -> str:
     if kind == "project":
         return """
@@ -907,8 +1186,8 @@ def _contact_form_fields(kind: str) -> str:
           <option>Ongoing/retainer</option><option>Contract-to-hire</option>
         </select></div>
       <div class="field"><label for="budget_hint">Budget range (optional)</label><input id="budget_hint" name="budget_hint" placeholder="e.g. $2,000-$5,000 first milestone"></div>
-      <div class="field"><label for="timeline">Timeline</label><input id="timeline" name="timeline" placeholder="e.g. need first milestone in 3 weeks"></div>"""
-    return '<div class="field"><label for="company">Company (optional)</label><input id="company" name="company"></div>'
+      <div class="field"><label for="timeline">Timeline</label><input id="timeline" name="timeline" placeholder="e.g. need first milestone in 3 weeks"></div>""" + _intake_category_field()
+    return '<div class="field"><label for="company">Company (optional)</label><input id="company" name="company"></div>' + _intake_category_field()
 
 
 def render_contact_form(kind: str, error: Optional[str] = None, success: bool = False,
@@ -1381,16 +1660,27 @@ class SiteHandler(BaseHTTPRequestHandler):
             if external_identity:
                 return self._redirect("/app" if external_identity["role"] == "CUSTOMER" else "/partners/app", set_cookies)
             return self._html(200, page("Customer & Partner Sign In", "Secure access to TTT external applications.", path, render_portal_login(csrf_token)), set_cookies)
-        if path in {"/app", "/app/projects", "/app/billing", "/app/support"}:
+        is_project_detail = path.startswith("/app/projects/") and path != "/app/projects"
+        if path in {"/app", "/app/projects", "/app/billing", "/app/support"} or is_project_detail:
             if not external_identity or external_identity.get("role") != "CUSTOMER":
                 return self._redirect("/portal/login", set_cookies)
             session = store.get("p7_external_sessions", external_session_id)
             portals = ExternalPortalService(store, audit)
             bundle = portals.customer_bundle(external_identity)
             payments = portals.customer_payments(external_identity)
+            project_detail = "__unset__"
+            if is_project_detail:
+                project_id = path[len("/app/projects/"):]
+                project_detail = portals.customer_project_detail(external_identity, project_id)
+                if project_detail is None:
+                    # No existence leak: a project id outside this
+                    # customer's own organization is indistinguishable from
+                    # one that was never real at all.
+                    return self._not_found(set_cookies)
             return self._html(200, page("Customer Application", "Your TTT projects, billing and support.", path,
-                                          render_customer_app(external_identity, bundle, payments, path, session["csrf_token"])), set_cookies)
-        if path in {"/partners/app", "/partners/app/leads", "/partners/app/commissions"}:
+                                          render_customer_app(external_identity, bundle, payments, path, session["csrf_token"],
+                                                               project_detail=project_detail)), set_cookies)
+        if path in {"/partners/app", "/partners/app/leads", "/partners/app/leads/new", "/partners/app/commissions"}:
             if not external_identity or external_identity.get("role") != "PARTNER":
                 return self._redirect("/portal/login", set_cookies)
             session = store.get("p7_external_sessions", external_session_id)
@@ -1500,6 +1790,10 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return self._handle_external_logout(store, jar)
             if path == "/pay/verify":
                 return self._handle_payment_verification(store, jar, csrf_cookie_val)
+            if path == "/partners/app/policy/acknowledge":
+                return self._handle_partner_policy_acknowledge(store, jar)
+            if path == "/partners/app/leads":
+                return self._handle_partner_register_lead(store, jar)
             return self._not_found([])
         finally:
             store.close()
@@ -1535,6 +1829,7 @@ class SiteHandler(BaseHTTPRequestHandler):
                 extra={
                     "project_title": fields.get("project_title"), "project_type": fields.get("project_type"),
                     "budget_hint": fields.get("budget_hint"), "timeline": fields.get("timeline"),
+                    "intake_category": fields.get("intake_category"),
                 }, source_ip=self._client_ip(),
             )
         except ContentError as exc:
@@ -1666,6 +1961,52 @@ class SiteHandler(BaseHTTPRequestHandler):
                                           render_portal_login("", "Security check failed.")))
         auth.logout(session_id)
         return self._redirect("/portal/login", ["ttt_external_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"])
+
+    def _handle_partner_policy_acknowledge(self, store, jar):
+        session_id = self._external_session_id(jar)
+        fields = self._read_urlencoded()
+        auth = ExternalPortalAuth(store)
+        identity = auth.identity(session_id) if session_id else None
+        if not identity or identity.get("role") != "PARTNER" or not auth.check_csrf(session_id, fields.get("csrf_token", "")):
+            return self._redirect("/portal/login", [])
+        control, _ = open_control_plane(self.app_root)
+        try:
+            ExternalPortalService(store, control.audit).partner_acknowledge_policy(identity)
+        except (PartnerError, PermissionError):
+            # A partner whose profile is not APPROVED (or otherwise
+            # ineligible) cannot acknowledge the policy -- send them back
+            # to their overview rather than a raw error; nothing sensitive
+            # about why is exposed to the browser.
+            return self._redirect("/partners/app", [])
+        return self._redirect("/partners/app/leads/new", [])
+
+    def _handle_partner_register_lead(self, store, jar):
+        session_id = self._external_session_id(jar)
+        fields = self._read_urlencoded()
+        auth = ExternalPortalAuth(store)
+        identity = auth.identity(session_id) if session_id else None
+        if not identity or identity.get("role") != "PARTNER":
+            return self._redirect("/portal/login", [])
+        session = store.get("p7_external_sessions", session_id)
+        if not auth.check_csrf(session_id, fields.get("csrf_token", "")):
+            control, _ = open_control_plane(self.app_root)
+            bundle = ExternalPortalService(store, control.audit).partner_bundle(identity)
+            return self._html(400, page("Partner Application", "Security check failed.", "/partners/app/leads/new",
+                                          render_partner_app(identity, bundle, "/partners/app/leads/new", session["csrf_token"],
+                                                              lead_form_error="Security check failed. Please reload and try again.")))
+        control, _ = open_control_plane(self.app_root)
+        portals = ExternalPortalService(store, control.audit)
+        try:
+            portals.partner_register_lead(identity, fields)
+        except (ReferralError, PartnerError, PermissionError) as exc:
+            bundle = portals.partner_bundle(identity)
+            return self._html(400, page("Partner Application", "Could not register lead.", "/partners/app/leads/new",
+                                          render_partner_app(identity, bundle, "/partners/app/leads/new", session["csrf_token"],
+                                                              lead_form_error=str(exc))))
+        bundle = portals.partner_bundle(identity)
+        return self._html(200, page("Partner Application", "Lead registered.", "/partners/app/leads/new",
+                                      render_partner_app(identity, bundle, "/partners/app/leads/new", session["csrf_token"],
+                                                          lead_form_success=True)))
 
     def _handle_payment_verification(self, store, jar, csrf_cookie_val):
         fields = self._read_urlencoded()

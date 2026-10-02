@@ -233,6 +233,15 @@ class StateStore:
             ("role_type", "TEXT"), ("maturity_tier", "TEXT"), ("kyc_status", "TEXT"),
             ("public_verification_enabled", "INTEGER"), ("related_party_disclosed", "INTEGER"),
             ("no_side_deal_accepted", "INTEGER"), ("no_unauthorized_subcontracting_accepted", "INTEGER"),
+            # Phase 7: a partner's OWN affirmative acknowledgement of the
+            # TTT anti-diversion/no-money-collection policy, distinct from
+            # the staff-only no_side_deal_accepted/no_unauthorized_
+            # subcontracting_accepted flags above (those record what STAFF
+            # configured; these record the partner's own, dated act of
+            # agreeing, via the external portal). NULL means "never
+            # acknowledged", exactly as true for every partner that existed
+            # before this column pair did.
+            ("policy_acknowledged_at", "TEXT"), ("policy_acknowledged_by", "TEXT"),
         ],
         "pm_commissions": [("commission_plan_id", "TEXT"), ("excluded_amount", "REAL")],
         # TTT Communications V2, Milestone 11 (Digital Marketing Operations
@@ -283,6 +292,22 @@ class StateStore:
             ("standard_assumptions", "TEXT"), ("qa_requirements", "TEXT"),
             ("regional_pricing_json", "TEXT"),
         ],
+        # Phase 7 web/desktop/mobile continuation: partner lead intake needs
+        # two more self-reported fields the original pm_referrals schema
+        # never had a slot for -- NULL for every referral registered before
+        # this column existed, exactly the same additive convention as
+        # every other column in this table.
+        "pm_referrals": [("industry", "TEXT"), ("relationship_disclosure", "TEXT")],
+        # Phase 7: a self-reported routing hint from the public intake
+        # forms (Section 11) -- which of the known commercial-need
+        # categories the submitter believes best matches their request.
+        # This is a structured selector filled in by the person submitting
+        # the form, not an automatic classification Claude/Falguna makes on
+        # their behalf -- deliberately so, per the explicit instruction not
+        # to claim a capability (automatic intent classification) that
+        # hasn't been built and verified. NULL for every enquiry submitted
+        # before this column existed.
+        "site_enquiries": [("intake_category", "TEXT")],
     }
 
     def migrate(self) -> None:
