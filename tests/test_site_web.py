@@ -134,6 +134,7 @@ class RoutingTests(_SiteLiveServerCase):
                       "/work", "/work/royal-table", "/products", "/careers", "/careers/apply",
                       "/careers/test-role", "/insights", "/contact", "/contact/start-a-project",
                       "/contact/general", "/legal/privacy", "/legal/terms", "/legal/accessibility",
+                      "/solutions", "/business-launch-growth", "/partners", "/pay", "/portal/login",
                       "/login", "/sitemap.xml", "/robots.txt"]:
             resp, _ = self._get(path)
             self.assertEqual(resp.status, 200, f"{path} returned {resp.status}")
@@ -168,6 +169,12 @@ class RoutingTests(_SiteLiveServerCase):
         resp, _ = self._get("/staff")
         self.assertEqual(resp.status, 303)
         self.assertEqual(resp.getheader("Location"), "/login")
+
+    def test_external_apps_redirect_to_external_login_when_unauthenticated(self):
+        for path in ("/app", "/partners/app"):
+            resp, _ = self._get(path)
+            self.assertEqual(resp.status, 303)
+            self.assertEqual(resp.getheader("Location"), "/portal/login")
 
     def test_security_headers_present_on_every_response(self):
         resp, _ = self._get("/")

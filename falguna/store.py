@@ -416,7 +416,7 @@ class StateStore:
             "p6_commission_plans", "p6_partner_contributions", "p6_risk_events", "p6_risk_event_actions"}
         allowed.update({"p6_commission_releases", "p6_refunds", "p6_subscriptions", "p6_payables",
                         "p6_subscription_cycles", "p6_subscription_attempts", "p6_refund_reconciliations",
-                        "p6_opportunity_economics"})
+                        "p6_opportunity_economics", "p7_external_accounts", "p7_external_sessions"})
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

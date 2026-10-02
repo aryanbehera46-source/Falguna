@@ -14,6 +14,7 @@ from .usability import evidence_summary, mission_view
 from .workers import StructuredEditWorker
 from .web import serve
 from .hq_web import serve_hq
+from .site_web import serve_site
 
 
 def main():
@@ -28,6 +29,9 @@ def main():
     hq.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
     hq.add_argument("--port", type=int, default=8766)
     hq.add_argument("--falguna-url", default="http://127.0.0.1:8765")
+    site = sub.add_parser("site")
+    site.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
+    site.add_argument("--port", type=int, default=8767)
     create = sub.add_parser("create-mission")
     create.add_argument("--title", required=True)
     create.add_argument("--requirement", required=True)
@@ -59,6 +63,10 @@ def main():
         if args.command == "hq":
             store.close()
             serve_hq(root, args.host, args.port, args.falguna_url)
+            return
+        if args.command == "site":
+            store.close()
+            serve_site(root, args.host, args.port)
             return
         if args.command == "init":
             print(json.dumps({"status": "initialized", "root": str(root)}))

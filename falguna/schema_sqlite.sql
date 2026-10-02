@@ -1082,6 +1082,24 @@ CREATE TABLE IF NOT EXISTS p6_commercial_identities (
     UNIQUE(organization_id, subject_type, subject_ref)
 );
 CREATE INDEX IF NOT EXISTS idx_p6_identity_org ON p6_commercial_identities(organization_id, role, status);
+
+-- Phase 7 external application authentication. Accounts are provisioned by
+-- trusted operators only and must point at an immutable Phase 6 identity.
+-- Customer/partner authorization is therefore derived server-side from the
+-- linked identity; no browser-supplied organization, role, or subject is
+-- trusted as an access boundary.
+CREATE TABLE IF NOT EXISTS p7_external_accounts (
+    id TEXT PRIMARY KEY, identity_id TEXT NOT NULL UNIQUE REFERENCES p6_commercial_identities(id),
+    email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE',
+    failed_login_count INTEGER NOT NULL DEFAULT 0, locked_until TEXT,
+    last_login_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p7_external_sessions (
+    id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES p7_external_accounts(id),
+    csrf_token TEXT NOT NULL, ip_hash TEXT, user_agent TEXT, expires_at TEXT NOT NULL,
+    revoked_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p7_external_sessions_account ON p7_external_sessions(account_id, expires_at);
 CREATE TABLE IF NOT EXISTS p6_payment_intents (
     id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, customer_ref TEXT NOT NULL,
     invoice_id TEXT, kind TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL,

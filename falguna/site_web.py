@@ -32,6 +32,8 @@ from .comms import CommsStore
 from .revenue_hunter import OpportunityStore
 from .runtime import open_control_plane
 from .site_auth import StaffAuthService, AuthError
+from .phase7_portals import ExternalPortalAuth, ExternalPortalService
+from .phase6_partner import CustomerVerificationService, PUBLIC_PAYMENT_WARNING
 from .site_content import (
     ApplicationStore, CaseStudyStore, EnquiryStore, JobStore, PostStore,
     ProductStore, ServiceStore, ContentError, hash_ip,
@@ -233,6 +235,19 @@ form.stack{display:flex;flex-direction:column;gap:18px;max-width:640px}
 .alert{padding:16px 18px;border-radius:10px;font-size:.92rem;margin-bottom:18px}
 .alert-success{background:#123326;border:1px solid #1d5c3f;color:#bdf0d3}
 .alert-error{background:#3a1414;border:1px solid #6b1f1f;color:#ffc9c2}
+.intent-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.intent-card{display:flex;min-height:150px;flex-direction:column;justify-content:space-between;padding:22px;border:1px solid var(--line);border-radius:14px;text-decoration:none;background:#111113;transition:.2s var(--ease)}
+.intent-card:hover{border-color:var(--accent-2);transform:translateY(-2px)}
+.intent-card strong{font-size:1.05rem}.intent-card span{color:var(--ink-soft);font-size:.86rem}
+.app-shell{display:grid;grid-template-columns:240px minmax(0,1fr);gap:34px;align-items:start}
+.app-nav{position:sticky;top:104px;padding:18px;border:1px solid var(--line);border-radius:14px;background:#111113}
+.app-nav a{display:block;text-decoration:none;padding:10px;border-radius:9px;color:var(--ink-soft)}
+.app-nav a[aria-current="page"],.app-nav a:hover{background:#1b1b1e;color:var(--paper)}
+.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:22px 0}
+.metric{padding:20px;border:1px solid var(--line);border-radius:14px;background:#111113}.metric b{font-size:1.55rem;display:block}.metric span{color:var(--ink-soft);font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}
+.notice{padding:18px;border-left:3px solid var(--amber);background:#161410;color:var(--paper-dim);margin:18px 0}
+@media(max-width:900px){.intent-grid{grid-template-columns:repeat(2,1fr)}.app-shell{grid-template-columns:1fr}.app-nav{position:static;display:flex;overflow-x:auto}.app-nav a{white-space:nowrap}.metric-grid{grid-template-columns:1fr}}
+@media(max-width:520px){.intent-grid{grid-template-columns:1fr}.intent-card{min-height:112px}}
 
 /* tags / status badges */
 .badge{display:inline-block;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:5px 10px;border-radius:999px;border:1px solid var(--line);color:var(--ink-soft)}
@@ -264,8 +279,8 @@ th{color:var(--ink-soft);font-weight:600;font-size:.78rem;text-transform:upperca
 
 NAV_ITEMS = [
     ("/services", "Services"), ("/work", "Work"),
-    ("/products", "Products"), ("/about", "Company"),
-    ("/contact", "Contact"),
+    ("/solutions", "Solutions"), ("/business-launch-growth", "Launch & Growth"),
+    ("/products", "Products"), ("/partners", "Partners"),
 ]
 
 FOOTER_SERVICES = [
@@ -280,7 +295,7 @@ FOOTER_COMPANY = [
 ]
 FOOTER_LEGAL = [
     ("/legal/privacy", "Privacy Policy"), ("/legal/terms", "Terms of Service"),
-    ("/legal/accessibility", "Accessibility"), ("/login", "Staff Sign In"),
+    ("/legal/accessibility", "Accessibility"), ("/portal/login", "Customer / Partner Sign In"),
 ]
 
 
@@ -338,7 +353,7 @@ def render_footer() -> str:
       {col("Legal", FOOTER_LEGAL)}
     </div>
     <div class="footer-bottom">
-      <span>&copy; {FOUNDED_YEAR} Twenty Two Technologies Pvt. Ltd. All rights reserved.</span>
+      <span>&copy; {FOUNDED_YEAR} Twenty Two Technologies. All rights reserved.</span>
       <span>Built and operated on our own engineering stack.</span>
     </div>
   </div>
@@ -348,7 +363,7 @@ def render_footer() -> str:
 
 ORG_JSONLD = {
     "@context": "https://schema.org", "@type": "Organization",
-    "name": "Twenty Two Technologies Pvt. Ltd.", "legalName": "Twenty Two Technologies Pvt. Ltd.",
+    "name": "Twenty Two Technologies",
     "url": f"https://{SITE_DOMAIN}", "foundingDate": str(FOUNDED_YEAR),
     "email": SITE_EMAIL,
     "sameAs": [],
@@ -429,6 +444,23 @@ def render_home(services: List[Dict[str, Any]], case_studies: List[Dict[str, Any
     <div class="btn-row">
       <a class="btn btn-primary" href="/contact/start-a-project">Discuss your project</a>
       <a class="btn btn-ghost" href="/work">Explore selected work</a>
+    </div>
+  </div>
+</section>
+
+<section class="tight" aria-labelledby="intent-heading">
+  <div class="container">
+    <div class="section-head"><span class="eyebrow">Start with your goal</span><h2 id="intent-heading">Where do you want to go?</h2>
+      <p>Choose the closest path. We will route the request to direct delivery, advisory, a qualified specialist, a product, or a licensed professional where required.</p></div>
+    <div class="intent-grid">
+      <a class="intent-card" href="/contact/start-a-project?intent=software"><strong>I need software</strong><span>Web, mobile, platforms and internal tools &rarr;</span></a>
+      <a class="intent-card" href="/contact/start-a-project?intent=ai"><strong>I need AI or automation</strong><span>Useful systems with human control &rarr;</span></a>
+      <a class="intent-card" href="/business-launch-growth"><strong>I want to start or grow</strong><span>Validation through expansion &rarr;</span></a>
+      <a class="intent-card" href="/solutions"><strong>I need a specialist</strong><span>Direct, coordinated or referred help &rarr;</span></a>
+      <a class="intent-card" href="/partners"><strong>I want to partner</strong><span>Register opportunities and contributions &rarr;</span></a>
+      <a class="intent-card" href="/portal/login"><strong>I am a customer</strong><span>Projects, invoices and support &rarr;</span></a>
+      <a class="intent-card" href="/pay"><strong>I need to pay or verify</strong><span>Official sandbox payment records &rarr;</span></a>
+      <a class="intent-card" href="/products#falguna"><strong>I want FALGUNA</strong><span>AI product by Twenty Two Technologies &rarr;</span></a>
     </div>
   </div>
 </section>
@@ -785,6 +817,85 @@ def render_contact_hub() -> str:
 """
 
 
+def render_solutions() -> str:
+    return """<section class="hero"><div class="container"><span class="eyebrow">Solutions</span>
+    <h1>One front door. The right delivery route.</h1><p class="lede hero-sub">We assess the need, evidence and risk before choosing direct delivery, advisory, coordinated specialists, sourced providers, referral, or a product fit.</p></div></section>
+    <section><div class="container"><div class="grid grid-3">
+    <div class="card"><h3>Direct delivery</h3><p>Software, web applications, automation and product engineering where our demonstrated capability fits.</p></div>
+    <div class="card"><h3>Coordinated expertise</h3><p>A clearly identified specialist or provider, with scope and accountability made explicit.</p></div>
+    <div class="card"><h3>Responsible routing</h3><p>Regulated legal, tax, medical and financial advice is routed to appropriately qualified professionals.</p></div>
+    </div><div class="btn-row"><a class="btn btn-primary" href="/contact/start-a-project">Describe what you need</a></div></div></section>"""
+
+
+def render_business_launch_growth() -> str:
+    stages = [("01", "Validate", "Clarify the customer, problem, evidence and commercial model."),
+              ("02", "Build the identity", "Brand, positioning and a credible market presence."),
+              ("03", "Build the system", "Software, operations and measurable delivery workflows."),
+              ("04", "Reach customers", "Structured acquisition foundations and campaign-ready assets."),
+              ("05", "Grow deliberately", "Improve what works, expand capacity and enter new markets with evidence.")]
+    cards = "".join(f'<div class="card"><span class="index">{n}</span><h3>{esc(t)}</h3><p>{esc(d)}</p></div>' for n,t,d in stages)
+    return f"""<section class="hero"><div class="container"><span class="eyebrow">Business Launch &amp; Growth</span>
+    <h1>From idea and capital to a working business.</h1><p class="lede hero-sub">A practical route through validation, branding, technology, operations, customer acquisition, growth and expansion.</p></div></section>
+    <section><div class="container"><div class="grid grid-3">{cards}</div>
+    <div class="notice">We do not present regulated legal, tax, medical or financial advice as our own. Where a requirement needs a licensed professional, that boundary and provider role will be explicit.</div>
+    <div class="btn-row"><a class="btn btn-primary" href="/contact/start-a-project?intent=business-growth">Plan the next step</a></div></div></section>"""
+
+
+def render_partner_program() -> str:
+    return """<section class="hero"><div class="container"><span class="eyebrow">Partner with TTT</span>
+    <h1>Bring opportunities. Contribute clearly. Earn under written rules.</h1><p class="lede hero-sub">The partner network is designed for attributable leads and verified contributions, with transparent eligibility, holds and clawbacks.</p>
+    <div class="btn-row"><a class="btn btn-primary" href="/contact/general">Express interest</a><a class="btn btn-ghost" href="/portal/login">Partner sign in</a></div></div></section>
+    <section><div class="container"><div class="grid grid-3"><div class="card"><h3>Attribution</h3><p>Registered leads and contribution history create an auditable record.</p></div><div class="card"><h3>Eligibility</h3><p>Commission status follows the official policy and verified commercial state.</p></div><div class="card"><h3>No money collection</h3><p>Partners and representatives may not collect customer money. Only official TTT payment instructions are valid.</p></div></div></div></section>"""
+
+
+def render_portal_login(csrf_token: str, error: Optional[str] = None) -> str:
+    alert = f'<div class="alert alert-error">{esc(error)}</div>' if error else ""
+    return f"""<section class="hero"><div class="container"><span class="eyebrow">Secure application</span><h1>Customer and partner sign in.</h1>
+    <p class="lede hero-sub">Use the account issued for your organization or partner profile.</p>{alert}
+    <form class="stack" method="post" action="/portal/login"><input type="hidden" name="csrf_token" value="{esc(csrf_token)}">
+    <div class="field"><label for="portal-email">Email</label><input id="portal-email" name="email" type="email" autocomplete="username" required></div>
+    <div class="field"><label for="portal-password">Password</label><input id="portal-password" name="password" type="password" autocomplete="current-password" required></div>
+    <button class="btn btn-primary" type="submit">Sign in</button></form></div></section>"""
+
+
+def _portal_nav(role: str, active: str, csrf: str) -> str:
+    links = []
+    if role == "CUSTOMER":
+        links = [("/app", "Overview"), ("/app/projects", "Projects"), ("/app/billing", "Billing & payments"), ("/app/support", "Support")]
+    else:
+        links = [("/partners/app", "Partner overview"), ("/partners/app/leads", "Registered leads"), ("/partners/app/commissions", "Commissions")]
+    rows = "".join(f'<a href="{h}"'+(' aria-current="page"' if h == active else '')+f'>{esc(l)}</a>' for h,l in links)
+    return f'<nav class="app-nav" aria-label="Application">{rows}<form method="post" action="/portal/logout"><input type="hidden" name="csrf_token" value="{esc(csrf)}"><button class="btn btn-ghost" type="submit">Sign out</button></form></nav>'
+
+
+def render_customer_app(identity: Dict[str, Any], bundle: Dict[str, Any], payments: Dict[str, Any], active: str, csrf: str) -> str:
+    projects, invoices = bundle["projects"], bundle["invoices"]
+    outstanding = sum(max(0, float(i["amount"]) - float(i["amount_received"])) for i in invoices)
+    rows = "".join(f'<tr><td>{esc(i.get("milestone") or i["id"])}</td><td>{esc(i["status"])}</td><td>{esc(i["currency"])} {float(i["amount"]):,.2f}</td><td>{esc(i.get("due_date") or "—")}</td></tr>' for i in invoices) or '<tr><td colspan="4">No invoices are currently available.</td></tr>'
+    project_rows = "".join(f'<div class="card"><h3>{esc(p["id"])}</h3><p>Status: {esc(p["status"])}<br>Delivery route: {esc(p["delivery_route"])}</p></div>' for p in projects) or '<div class="card"><h3>No active projects</h3><p>Your approved projects will appear here.</p></div>'
+    content = project_rows if active == "/app/projects" else f'<div class="card"><h3>Invoices</h3><table><thead><tr><th>Reference</th><th>Status</th><th>Amount</th><th>Due</th></tr></thead><tbody>{rows}</tbody></table></div>' if active == "/app/billing" else '<div class="card"><h3>Support and communication</h3><p>Your customer-safe communication history and open support issues are connected here.</p><a class="btn btn-ghost" href="/contact/general">Contact support</a></div>' if active == "/app/support" else f'<div class="metric-grid"><div class="metric"><b>{len(projects)}</b><span>Projects</span></div><div class="metric"><b>{len(invoices)}</b><span>Invoices</span></div><div class="metric"><b>{outstanding:,.2f}</b><span>Outstanding</span></div></div>{project_rows}'
+    return f'<section class="hero" style="padding-bottom:38px"><div class="container"><span class="eyebrow">Customer application</span><h1>Welcome, {esc(identity["display_name"])}.</h1></div></section><section class="tight"><div class="container app-shell">{_portal_nav("CUSTOMER", active, csrf)}<div>{content}</div></div></section>'
+
+
+def render_partner_app(identity: Dict[str, Any], bundle: Dict[str, Any], active: str, csrf: str) -> str:
+    p, refs, commissions = bundle["partner"], bundle["referrals"], bundle["commissions"]
+    lead_rows = "".join(f'<tr><td>{esc(r["prospect_name"])}</td><td>{esc(r["requested_service"])}</td><td>{esc(r["attribution_status"])}</td></tr>' for r in refs) or '<tr><td colspan="3">No registered leads.</td></tr>'
+    commission_rows = "".join(f'<tr><td>{esc(c["id"])}</td><td>{esc(c["status"])}</td><td>{float(c.get("commission_amount") or 0):,.2f}</td></tr>' for c in commissions) or '<tr><td colspan="3">No commission records.</td></tr>'
+    content = f'<div class="card"><h3>Registered leads</h3><table><thead><tr><th>Prospect</th><th>Need</th><th>Attribution</th></tr></thead><tbody>{lead_rows}</tbody></table></div>' if active.endswith("/leads") else f'<div class="card"><h3>Commission status</h3><table><thead><tr><th>Reference</th><th>Status</th><th>Recorded amount</th></tr></thead><tbody>{commission_rows}</tbody></table></div>' if active.endswith("/commissions") else f'<div class="metric-grid"><div class="metric"><b>{len(refs)}</b><span>Registered leads</span></div><div class="metric"><b>{len(commissions)}</b><span>Commission records</span></div><div class="metric"><b>{esc(p.get("verification_status") or "—")}</b><span>Verification</span></div></div><div class="notice">{esc(PUBLIC_PAYMENT_WARNING)}</div>'
+    return f'<section class="hero" style="padding-bottom:38px"><div class="container"><span class="eyebrow">Partner application</span><h1>{esc(p["full_name"])}.</h1><p class="lede hero-sub">Partner ID {esc(p["id"])} · {esc(p.get("status") or "")}</p></div></section><section class="tight"><div class="container app-shell">{_portal_nav("PARTNER", active, csrf)}<div>{content}</div></div></section>'
+
+
+def render_pay(identity: Optional[Dict[str, Any]], payment_bundle: Optional[Dict[str, Any]], csrf_token: str, verification: Optional[Dict[str, Any]] = None) -> str:
+    result = ""
+    if verification is not None:
+        result = f'<div class="alert {"alert-success" if verification.get("valid") else "alert-error"}"><strong>{"Verified" if verification.get("valid") else "Not verified"}</strong><br>{esc(verification.get("warning") or PUBLIC_PAYMENT_WARNING)}</div>'
+    account = '<p><a class="btn btn-primary" href="/portal/login">Sign in to view your payments</a></p>'
+    if identity and payment_bundle is not None:
+        rows = "".join(f'<tr><td>{esc(p["id"])}</td><td>{esc(p["status"])}</td><td>{esc(p["currency"])} {float(p["amount"]):,.2f}</td><td>{esc(", ".join(p["allowed_methods"]))}</td></tr>' for p in payment_bundle["payments"]) or '<tr><td colspan="4">No payment sessions are available.</td></tr>'
+        account = f'<div class="card"><h3>Your payment records</h3><table><thead><tr><th>Reference</th><th>Status</th><th>Amount</th><th>Capabilities</th></tr></thead><tbody>{rows}</tbody></table></div>'
+    return f'''<section class="hero"><div class="container"><span class="eyebrow">TTT Payments · sandbox</span><h1>Pay and verify from the official record.</h1><p class="lede hero-sub">This Phase 7 surface displays provider-neutral sandbox state only. A browser response never creates payment success.</p></div></section><section class="tight"><div class="container">{result}<div class="notice">{esc(PUBLIC_PAYMENT_WARNING)}</div>{account}<div class="card" style="margin-top:22px"><h3>Verify payment instructions</h3><form class="stack" method="post" action="/pay/verify"><input type="hidden" name="csrf_token" value="{esc(csrf_token)}"><div class="field"><label>Payment reference</label><input name="payment_id" required></div><div class="field"><label>Customer reference</label><input name="customer_ref" required></div><div class="field"><label>Beneficiary reference</label><input name="beneficiary_ref" required></div><button class="btn btn-primary" type="submit">Verify instruction</button></form></div></div></section>'''
+
+
 def _contact_form_fields(kind: str) -> str:
     if kind == "project":
         return """
@@ -932,7 +1043,7 @@ def render_legal_terms() -> str:
   <span class="eyebrow">Legal</span><h1>Terms of Service</h1></div></section>
 <section class="tight"><div class="container" style="max-width:760px">
   {LEGAL_REVIEW_NOTE}
-  <p>This website is operated by Twenty Two Technologies Pvt. Ltd. Use of this site does not itself
+  <p>This website is operated under the Twenty Two Technologies brand. Use of this site does not itself
   create a client relationship or contract; engagement terms are agreed separately, in writing, per
   project.</p>
   <p>Content on this site describes our real capabilities and work as accurately as we can state it.
@@ -1011,7 +1122,8 @@ def render_staff_home(user: Dict[str, Any], applications: List[Dict[str, Any]],
 # ============================================================
 
 STATIC_PATHS = [
-    "/", "/about", "/services", "/work", "/products", "/careers", "/insights",
+    "/", "/about", "/services", "/solutions", "/business-launch-growth", "/partners",
+    "/work", "/products", "/careers", "/insights", "/pay",
     "/contact", "/contact/start-a-project", "/contact/general",
     "/legal/privacy", "/legal/terms", "/legal/accessibility",
 ]
@@ -1032,6 +1144,9 @@ ROBOTS_TXT = f"""User-agent: *
 Allow: /
 Disallow: /staff
 Disallow: /login
+Disallow: /portal
+Disallow: /app
+Disallow: /partners/app
 Sitemap: https://{SITE_DOMAIN}/sitemap.xml
 """.encode("utf-8")
 
@@ -1154,6 +1269,10 @@ class SiteHandler(BaseHTTPRequestHandler):
         c = jar.get("ttt_staff_session")
         return c.value if c else None
 
+    def _external_session_id(self, jar: cookies.SimpleCookie) -> Optional[str]:
+        c = jar.get("ttt_external_session")
+        return c.value if c else None
+
     def _serve_static(self, path: str):
         """Serve real static assets (currently: brand/logo files) from
         STATIC_DIR. No database access needed, so this runs before the
@@ -1218,6 +1337,12 @@ class SiteHandler(BaseHTTPRequestHandler):
                                               render_home(services, case_studies, products)), set_cookies)
             if path == "/about":
                 return self._html(200, page("About", "Twenty Two Technologies: established 2020, real engineering principles.", "/about", render_about()), set_cookies)
+            if path == "/solutions":
+                return self._html(200, page("Solutions", "Commercial needs routed to the right accountable delivery model.", path, render_solutions()), set_cookies)
+            if path == "/business-launch-growth":
+                return self._html(200, page("Business Launch & Growth", "Practical support from validation through growth.", path, render_business_launch_growth()), set_cookies)
+            if path == "/partners":
+                return self._html(200, page("Partner Network", "A governed opportunity and contribution network.", path, render_partner_program()), set_cookies)
 
             if path == "/services":
                 return self._html(200, page("Services", "Custom software, AI systems, and digital marketing services.", "/services", render_services_index(services)), set_cookies)
@@ -1243,12 +1368,41 @@ class SiteHandler(BaseHTTPRequestHandler):
             if path == "/products":
                 return self._html(200, page("Products & Ventures", "Independent products developed in-house by Twenty Two Technologies.", "/products", render_products(products)), set_cookies)
 
-            return self._route_get_part2(path, query, store, jobs, posts, jar, csrf_token, set_cookies)
+            return self._route_get_part2(path, query, store, control.audit, jobs, posts, jar, csrf_token, set_cookies)
         finally:
             store.close()
 
 
-    def _route_get_part2(self, path, query, store, jobs, posts, jar, csrf_token, set_cookies):
+    def _route_get_part2(self, path, query, store, audit, jobs, posts, jar, csrf_token, set_cookies):
+        external_session_id = self._external_session_id(jar)
+        external_auth = ExternalPortalAuth(store)
+        external_identity = external_auth.identity(external_session_id) if external_session_id else None
+        if path == "/portal/login":
+            if external_identity:
+                return self._redirect("/app" if external_identity["role"] == "CUSTOMER" else "/partners/app", set_cookies)
+            return self._html(200, page("Customer & Partner Sign In", "Secure access to TTT external applications.", path, render_portal_login(csrf_token)), set_cookies)
+        if path in {"/app", "/app/projects", "/app/billing", "/app/support"}:
+            if not external_identity or external_identity.get("role") != "CUSTOMER":
+                return self._redirect("/portal/login", set_cookies)
+            session = store.get("p7_external_sessions", external_session_id)
+            portals = ExternalPortalService(store, audit)
+            bundle = portals.customer_bundle(external_identity)
+            payments = portals.customer_payments(external_identity)
+            return self._html(200, page("Customer Application", "Your TTT projects, billing and support.", path,
+                                          render_customer_app(external_identity, bundle, payments, path, session["csrf_token"])), set_cookies)
+        if path in {"/partners/app", "/partners/app/leads", "/partners/app/commissions"}:
+            if not external_identity or external_identity.get("role") != "PARTNER":
+                return self._redirect("/portal/login", set_cookies)
+            session = store.get("p7_external_sessions", external_session_id)
+            bundle = ExternalPortalService(store, audit).partner_bundle(external_identity)
+            return self._html(200, page("Partner Application", "Your attributed opportunities and commission status.", path,
+                                          render_partner_app(external_identity, bundle, path, session["csrf_token"])), set_cookies)
+        if path == "/pay":
+            payment_bundle = None
+            if external_identity and external_identity.get("role") == "CUSTOMER":
+                payment_bundle = ExternalPortalService(store, audit).customer_payments(external_identity)
+            return self._html(200, page("Payments", "Official invoice and payment verification.", path,
+                                          render_pay(external_identity, payment_bundle, csrf_token)), set_cookies)
         if path == "/careers":
             return self._html(200, page("Careers", "Open roles at Twenty Two Technologies.", "/careers", render_careers_index(jobs)), set_cookies)
         if path == "/careers/apply":
@@ -1340,6 +1494,12 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return self._handle_login(store, jar, csrf_cookie_val, ip_hash)
             if path == "/logout":
                 return self._handle_logout(store, jar)
+            if path == "/portal/login":
+                return self._handle_external_login(store, jar, csrf_cookie_val, ip_hash)
+            if path == "/portal/logout":
+                return self._handle_external_logout(store, jar)
+            if path == "/pay/verify":
+                return self._handle_payment_verification(store, jar, csrf_cookie_val)
             return self._not_found([])
         finally:
             store.close()
@@ -1477,6 +1637,46 @@ class SiteHandler(BaseHTTPRequestHandler):
             StaffAuthService(store).logout(session_id)
         expire_cookie = "ttt_staff_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
         return self._redirect("/login", [expire_cookie])
+
+    def _handle_external_login(self, store, jar, csrf_cookie_val, ip_hash):
+        fields = self._read_urlencoded()
+        csrf_token = jar.get("csrf").value if jar.get("csrf") else ""
+        if not csrf_cookie_val or fields.get("csrf_token") != csrf_cookie_val:
+            return self._html(400, page("Sign in", "External application sign in.", "/portal/login",
+                                          render_portal_login(csrf_token, "Security check failed. Please reload and try again.")))
+        if rate_limited(f"portal-login:{ip_hash}"):
+            return self._html(429, page("Sign in", "External application sign in.", "/portal/login",
+                                          render_portal_login(csrf_token, "Too many attempts. Please wait before trying again.")))
+        try:
+            result = ExternalPortalAuth(store).login(fields.get("email", ""), fields.get("password", ""),
+                                                       ip_hash=ip_hash, user_agent=self.headers.get("User-Agent"))
+        except AuthError as exc:
+            return self._html(401, page("Sign in", "External application sign in.", "/portal/login",
+                                          render_portal_login(csrf_token, str(exc))))
+        cookie = f"ttt_external_session={result['session_id']}; Path=/; HttpOnly; SameSite=Lax; Max-Age={12*3600}"
+        location = "/app" if result["identity"]["role"] == "CUSTOMER" else "/partners/app"
+        return self._redirect(location, [cookie])
+
+    def _handle_external_logout(self, store, jar):
+        session_id = self._external_session_id(jar)
+        fields = self._read_urlencoded()
+        auth = ExternalPortalAuth(store)
+        if not session_id or not auth.check_csrf(session_id, fields.get("csrf_token", "")):
+            return self._html(400, page("Sign out", "Security check failed.", "/portal/login",
+                                          render_portal_login("", "Security check failed.")))
+        auth.logout(session_id)
+        return self._redirect("/portal/login", ["ttt_external_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"])
+
+    def _handle_payment_verification(self, store, jar, csrf_cookie_val):
+        fields = self._read_urlencoded()
+        csrf_token = jar.get("csrf").value if jar.get("csrf") else ""
+        if not csrf_cookie_val or fields.get("csrf_token") != csrf_cookie_val:
+            return self._html(400, page("Payments", "Security check failed.", "/pay", render_pay(None, None, csrf_token)))
+        result = CustomerVerificationService(store).verify_payment_instruction(
+            fields.get("payment_id", ""), fields.get("customer_ref", ""), fields.get("beneficiary_ref", ""),
+        )
+        return self._html(200, page("Payments", "Official payment verification result.", "/pay",
+                                      render_pay(None, None, csrf_token, result)))
 
 
 def serve_site(root, host: str = "127.0.0.1", port: int = 8767) -> None:
