@@ -28,6 +28,7 @@ from .codex_transport import CodexCliJSONTransport, DEFAULT_CODEX_MODEL, Resilie
 from .continuity import ProjectUnderstandingCache, browser_e2e_applicable, resolve_continuation
 from .discovery import ProjectDiscovery
 from .gateway import OpenAICompatibleGateway
+from .frontier import AUTONOMY_LEVELS, MODES, FrontierControlPlane, FrontierError
 from .memory import (
     KnowledgeError, KnowledgeStore, MemoryConflict, MemoryError, MemorySettingsStore, MemoryStore,
     MemorySuggestionStore, assemble_chat_context, build_embedding_adapter, embedding_status,
@@ -430,6 +431,10 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             })
         if path == "/api/settings":
             return self._settings()
+        if path == "/api/frontier":
+            return self._frontier_dashboard()
+        if path.startswith("/api/frontier/objectives/"):
+            return self._frontier_objective(path.split("/")[4])
         if path == "/api/models":
             return self._models_status()
         if path == "/api/search":
@@ -1464,6 +1469,14 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             body = self._body()
             if path == "/api/runs":
                 return self._start(body)
+            if path == "/api/frontier/objectives":
+                return self._frontier_create_objective(body)
+            if path.startswith("/api/frontier/objectives/") and path.endswith("/plan"):
+                return self._frontier_plan(path.split("/")[4])
+            if path.startswith("/api/frontier/objectives/") and path.endswith("/checkpoint"):
+                return self._frontier_checkpoint(path.split("/")[4])
+            if path.startswith("/api/frontier/objectives/") and path.endswith("/stop"):
+                return self._frontier_stop(path.split("/")[4], body)
             if path.startswith("/api/runs/") and path.endswith("/decision"):
                 run_id = path.split("/")[3]
                 control, store = open_control_plane(self.app_root)
@@ -1590,6 +1603,68 @@ class FalgunaHandler(BaseHTTPRequestHandler):
         token = self._launch(body.get("project"), body.get("objective", ""), body.get("max_cost_usd"),
                               work_mode=body.get("work_mode"), model=body.get("model"))
         return self._json({"operation": token, "state": "STARTING"}, HTTPStatus.ACCEPTED)
+
+    def _frontier_org(self):
+        # Local Phase 9 context selector only. It is not authority to mutate
+        # TTT HQ state; FrontierControlPlane exposes that state read-only.
+        return (self.headers.get("X-Falguna-Organization") or "ttt-org").strip()
+
+    def _frontier_dashboard(self):
+        control, store = open_control_plane(self.app_root)
+        try:
+            data = FrontierControlPlane(store, control.audit).dashboard(self._frontier_org())
+            data.update({"modes": list(MODES), "autonomy_levels": list(AUTONOMY_LEVELS)})
+            return self._json(data)
+        finally:
+            store.close()
+
+    def _frontier_objective(self, objective_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            try:
+                bundle = FrontierControlPlane(store, control.audit).objective_bundle(objective_id, self._frontier_org())
+            except FrontierError as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return self._json(bundle)
+        finally:
+            store.close()
+
+    def _frontier_create_objective(self, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            result = FrontierControlPlane(store, control.audit).create_objective(
+                self._frontier_org(), body.get("title"), body.get("description"), body.get("mode", "WORK"),
+                body.get("autonomy_level", "ASSIST"), owner="Aryan (local UI)", schedule=body.get("schedule"),
+                stop_conditions=body.get("stop_conditions"), limits=body.get("limits"),
+            )
+            return self._json(result, HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _frontier_plan(self, objective_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            service = FrontierControlPlane(store, control.audit)
+            service.plan_standard_graph(objective_id, self._frontier_org())
+            return self._json(service.objective_bundle(objective_id, self._frontier_org()))
+        finally:
+            store.close()
+
+    def _frontier_checkpoint(self, objective_id):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json(FrontierControlPlane(store, control.audit).create_continuity_bundle(objective_id, self._frontier_org()), HTTPStatus.CREATED)
+        finally:
+            store.close()
+
+    def _frontier_stop(self, objective_id, body):
+        control, store = open_control_plane(self.app_root)
+        try:
+            return self._json(FrontierControlPlane(store, control.audit).emergency_stop(
+                objective_id, self._frontier_org(), "Aryan (local UI)", body.get("reason", "")
+            ))
+        finally:
+            store.close()
 
     def _launch(self, project_id, objective, max_cost_usd, conversation_id=None, research_id=None,
                 work_mode=None, model=None):
@@ -3176,10 +3251,10 @@ $('bellBtn').innerHTML=icon('bell',16)+'<span class="bell-dot hidden" id="bellDo
 function navBtn([id,label]){return `<button class="nav-item" data-view="${id}"><span class="nav-icon">${icon(id,15)}</span>${label}</button>`}
 $('nav').innerHTML=[['chat','Chat'],['search','Search'],['projects','Projects']].map(navBtn).join('')
   +`<details class="nav-adv" id="navAdvanced"><summary class="nav-adv-summary">Workspace<span class="nav-adv-chev" aria-hidden="true"></span></summary>`
-  +[['work','Work'],['mission','Mission Control'],['memory','Memory'],['files','Files'],['history','History']].map(navBtn).join('')
+  +[['frontier','Objectives'],['work','Work'],['mission','Mission Control'],['memory','Memory'],['files','Files'],['history','History']].map(navBtn).join('')
   +`</details>`
   +navBtn(['settings','Settings']);
-const ADVANCED_VIEWS=new Set(['work','mission','memory','files','history']);
+const ADVANCED_VIEWS=new Set(['frontier','work','mission','memory','files','history']);
 
 let sideConversationCache=[];
 function paintSideConversations(list,activeId){
@@ -3301,7 +3376,7 @@ function currentRoute(){
   return {view:parts[0]||'chat', id:parts[1]?decodeURIComponent(parts[1]):null};
 }
 function go(hash){location.hash=hash}
-const VIEW_TITLES={chat:'Falguna',search:'Search',work:'Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Files',history:'History',settings:'Settings',activity:'Activity',help:'Help',tools:'Plugins'};
+const VIEW_TITLES={chat:'Falguna',search:'Research',frontier:'Objectives',work:'Code & Work',mission:'Mission Control',memory:'Memory',projects:'Projects',files:'Studio',history:'History',settings:'Settings',activity:'Activity',help:'Help',tools:'Plugins'};
 function setActiveNav(view){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   $('viewTitle').textContent=VIEW_TITLES[view]||'Falguna';
@@ -3323,6 +3398,7 @@ async function router(){
     if(view==='chat'){await renderSideChats();return renderChatView(id)}
     if(view==='work'){await renderSideMissions();return renderWorkView(id)}
     if(view==='search'){await renderSideResearch();return renderSearchView(id)}
+    if(view==='frontier'){hideSideList();return renderFrontierView(id)}
     if(view==='mission'){hideSideList();return renderMissionControlView()}
     if(view==='memory'){hideSideList();return renderMemoryView(id)}
     if(view==='browser'){hideSideList();return renderBrowserSessionView(id)}
@@ -4631,6 +4707,41 @@ async function refreshBrowserSession(id){
       pollLive();
     }catch(err){showToast(err.message,{error:true})}
   });
+}
+
+/* --------------------------------------------------------- Phase 9 Objectives */
+async function renderFrontierView(objectiveId){
+  const vp=$('viewport');
+  vp.innerHTML='<div class="page"><div class="empty-state">Loading Phase 9 objectives&hellip;</div></div>';
+  const data=await api('/api/frontier');
+  if(objectiveId){
+    const bundle=await api('/api/frontier/objectives/'+encodeURIComponent(objectiveId));
+    const o=bundle.objective,nodes=bundle.nodes||[];
+    vp.innerHTML=`<div class="page" style="max-width:1050px">
+      <button type="button" class="pill-btn" id="p9Back">&larr; Objectives</button>
+      <div class="page-head"><div><div class="section-label">${esc(o.mode)} · ${esc(o.autonomy_level.replaceAll('_',' '))}</div><h1>${esc(o.title)}</h1><p class="lede">${esc(o.description)}</p></div><span class="status-pill ${esc(o.status.toLowerCase())}">${esc(o.status.replaceAll('_',' '))}</span></div>
+      <div class="settings-note">Next: ${esc(o.next_action||'Not set')} · Last checkpoint: ${esc(o.last_checkpoint_at?timeAgo(o.last_checkpoint_at):'none')}</div>
+      <div class="mc-controls"><button type="button" class="action" id="p9Plan" ${nodes.length?'disabled':''}>Create execution graph</button><button type="button" class="pill-btn" id="p9Checkpoint">Save continuity bundle</button><button type="button" class="pill-btn danger" id="p9Stop" ${['STOPPED','COMPLETED'].includes(o.status)?'disabled':''}>Emergency stop</button></div>
+      <div class="section-label">Execution graph</div><div class="result-list">${nodes.length?nodes.map(n=>`<div class="result-row" style="cursor:default"><div class="kind">${esc(n.node_type)} · ${esc(n.assigned_agent_id?'Assigned':'Unassigned')}</div><div class="title">${esc(n.title)}</div><div class="meta"><span class="status-pill ${esc(n.status.toLowerCase())}">${esc(n.status.replaceAll('_',' '))}</span> · Action policy: ${esc(n.approval_class)} · Dependencies: ${esc(String((n.dependencies||[]).length))}</div></div>`).join(''):'<div class="empty-state">No graph yet. Planning creates inspect, research, execution, QA, security and reporting nodes with real dependencies.</div>'}</div>
+      <div class="section-label">Evidence and approvals</div><div class="settings-list"><div>${esc(String((bundle.evidence||[]).length))} evidence item(s)</div><div>${esc(String((bundle.approvals||[]).filter(a=>a.status==='PENDING').length))} pending approval(s)</div><div>${esc(String((bundle.events||[]).length))} durable event(s)</div></div>
+    </div>`;
+    $('p9Back').onclick=()=>go('#/frontier');
+    $('p9Plan').onclick=async()=>{try{await api(`/api/frontier/objectives/${objectiveId}/plan`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderFrontierView(objectiveId)}catch(err){showToast(err.message,{error:true})}};
+    $('p9Checkpoint').onclick=async()=>{try{const b=await api(`/api/frontier/objectives/${objectiveId}/checkpoint`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});showToast(`Continuity bundle v${b.version} saved`);renderFrontierView(objectiveId)}catch(err){showToast(err.message,{error:true})}};
+    $('p9Stop').onclick=async()=>{const ok=await confirmModal({title:'Emergency stop objective?',body:'Pending and running graph nodes will be cancelled. Completed evidence remains preserved.',confirmLabel:'Stop objective',danger:true});if(!ok)return;try{await api(`/api/frontier/objectives/${objectiveId}/stop`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'Emergency stop from local Falguna UI'})});renderFrontierView(objectiveId)}catch(err){showToast(err.message,{error:true})}};
+    return;
+  }
+  const objectives=data.objectives||[],gate=data.independence_gate||{};
+  vp.innerHTML=`<div class="page" style="max-width:1050px">
+    <div class="page-head"><div><div class="section-label">Phase 9 · In progress</div><h1>Persistent objectives</h1><p class="lede">Long-running Work, Code, Research, Browser, Data and TTT-internal goals that survive chat closure and recover from interruption.</p></div><span class="status-pill running">Control plane active</span></div>
+    <div class="metric-grid"><div class="metric-card"><span>Objectives</span><strong>${esc(String(objectives.length))}</strong></div><div class="metric-card"><span>Specialist agents</span><strong>${esc(String((data.agents||[]).length))}</strong></div><div class="metric-card"><span>Independence Gate</span><strong>${esc(`${gate.passed||0}/${gate.runs||0}`)}</strong></div></div>
+    <form id="p9Create" class="settings-list" style="margin:18px 0"><div><label for="p9Title"><b>New objective</b></label><input id="p9Title" required placeholder="What should Falguna keep working toward?"><textarea id="p9Description" required placeholder="Outcome, constraints and evidence expected"></textarea><div class="composer-options"><select id="p9Mode">${(data.modes||[]).map(x=>`<option>${esc(x)}</option>`).join('')}</select><select id="p9Autonomy">${(data.autonomy_levels||[]).map(x=>`<option ${x==='ASSIST'?'selected':''}>${esc(x)}</option>`).join('')}</select><button class="action" type="submit">Create objective</button></div></div></form>
+    <div class="settings-note">Live external actions, production deployment, payments and live trading are disabled. TTT HQ remains the authoritative commercial system; this view is read-only against company state.</div>
+    <div class="section-label">Objectives</div><div class="result-list">${objectives.length?objectives.map(o=>`<button class="result-row" data-p9-open="${esc(o.id)}"><div class="kind">${esc(o.mode)} · ${esc(o.autonomy_level.replaceAll('_',' '))}</div><div class="title">${esc(o.title)}</div><div class="meta"><span class="status-pill ${esc(o.status.toLowerCase())}">${esc(o.status.replaceAll('_',' '))}</span> · ${esc(timeAgo(o.updated_at))}</div></button>`).join(''):'<div class="empty-state">No persistent objectives yet.</div>'}</div>
+    <div class="section-label">Runtime foundations</div><div class="settings-list"><div><b>Agent team</b><br>${esc((data.agents||[]).map(a=>a.display_name).join(', '))}</div><div><b>TTT internal context</b><br>${esc(data.ttt_context?.access||'Unavailable')} · commercial mutation disabled</div><div><b>Model laboratory</b><br>${esc(String((data.models||[]).length))} registered candidate or approved model asset(s)</div><div><b>Permissioned plugins</b><br>${esc(String((data.plugins||[]).length))} registered manifest(s)</div></div>
+  </div>`;
+  document.querySelectorAll('[data-p9-open]').forEach(b=>b.onclick=()=>go('#/frontier/'+b.dataset.p9Open));
+  $('p9Create').onsubmit=async e=>{e.preventDefault();try{const result=await api('/api/frontier/objectives',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:$('p9Title').value,description:$('p9Description').value,mode:$('p9Mode').value,autonomy_level:$('p9Autonomy').value,limits:{max_cost_usd:0,external_actions:false}})});go('#/frontier/'+result.objective.id)}catch(err){showToast(err.message,{error:true})}};
 }
 
 /* ------------------------------------------------------------------ Files view */

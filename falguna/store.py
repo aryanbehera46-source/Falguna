@@ -454,7 +454,12 @@ class StateStore:
                         "p8_intakes", "p8_routing_decisions", "p8_network_profiles",
                         "p8_profile_capabilities", "p8_opportunities", "p8_matches",
                         "p8_opportunity_applications", "p8_assignments", "p8_blg_engagements",
-                        "p8_blg_stage_events", "p8_governance_events", "p8_product_signals"})
+                        "p8_blg_stage_events", "p8_governance_events", "p8_product_signals",
+                        # Phase 9 Frontier & Independence control-plane state.
+                        "p9_objectives", "p9_graph_nodes", "p9_agents", "p9_evidence",
+                        "p9_approvals", "p9_events", "p9_model_assets", "p9_benchmark_runs",
+                        "p9_plugins", "p9_studio_artifacts", "p9_continuity_bundles",
+                        "p9_twin_nodes", "p9_simulations"})
         if table not in allowed:
             raise ValueError("unknown table")
         record_id = record_id or str(uuid.uuid4())

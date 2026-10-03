@@ -1,4 +1,103 @@
 CREATE TABLE IF NOT EXISTS missions (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+
+-- Phase 9: FALGUNA Frontier & Independence. These tables are an additive,
+-- provider-neutral control plane over the existing mission, research,
+-- browser/computer, memory and TTT HQ systems. They do not duplicate TTT's
+-- authoritative commercial records and contain no live-action executor.
+CREATE TABLE IF NOT EXISTS p9_objectives (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, title TEXT NOT NULL,
+    description TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL,
+    autonomy_level TEXT NOT NULL, schedule_json TEXT NOT NULL,
+    stop_conditions_json TEXT NOT NULL, limits_json TEXT NOT NULL,
+    source_type TEXT, source_id TEXT, owner TEXT NOT NULL,
+    last_checkpoint_at TEXT, heartbeat_at TEXT, next_action TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_graph_nodes (
+    id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES p9_objectives(id),
+    organization_id TEXT NOT NULL, node_type TEXT NOT NULL, title TEXT NOT NULL,
+    status TEXT NOT NULL, dependencies_json TEXT NOT NULL,
+    assigned_agent_id TEXT, tool_name TEXT, approval_class TEXT NOT NULL,
+    input_json TEXT NOT NULL, output_json TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT, lease_expires_at TEXT, error TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_agents (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, role TEXT NOT NULL,
+    display_name TEXT NOT NULL, capabilities_json TEXT NOT NULL,
+    permissions_json TEXT NOT NULL, status TEXT NOT NULL,
+    current_node_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_evidence (
+    id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES p9_objectives(id),
+    node_id TEXT REFERENCES p9_graph_nodes(id), organization_id TEXT NOT NULL,
+    kind TEXT NOT NULL, uri TEXT, sha256 TEXT, summary TEXT NOT NULL,
+    provenance_json TEXT NOT NULL, confidence TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_approvals (
+    id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES p9_objectives(id),
+    node_id TEXT NOT NULL REFERENCES p9_graph_nodes(id), organization_id TEXT NOT NULL,
+    action_class TEXT NOT NULL, status TEXT NOT NULL, request_reason TEXT NOT NULL,
+    decided_by TEXT, decision_reason TEXT, decided_at TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_events (
+    id TEXT PRIMARY KEY, objective_id TEXT NOT NULL REFERENCES p9_objectives(id),
+    node_id TEXT, organization_id TEXT NOT NULL, event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_model_assets (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, provider_kind TEXT NOT NULL,
+    model_id TEXT NOT NULL, version TEXT NOT NULL, ownership TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL, constraints_json TEXT NOT NULL,
+    dataset_provenance_json TEXT NOT NULL, status TEXT NOT NULL,
+    evaluation_summary_json TEXT NOT NULL, approved_by TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_benchmark_runs (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, program TEXT NOT NULL,
+    subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, suite_version TEXT NOT NULL,
+    dimensions_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+    passed INTEGER NOT NULL, external_audit_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_plugins (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, name TEXT NOT NULL,
+    version TEXT NOT NULL, manifest_json TEXT NOT NULL, scopes_json TEXT NOT NULL,
+    approval_policy TEXT NOT NULL, status TEXT NOT NULL, sandbox_json TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_studio_artifacts (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, objective_id TEXT,
+    node_id TEXT, artifact_type TEXT NOT NULL, title TEXT NOT NULL,
+    uri TEXT NOT NULL, version INTEGER NOT NULL, parent_version_id TEXT,
+    sha256 TEXT NOT NULL, metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_continuity_bundles (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, objective_id TEXT NOT NULL,
+    version INTEGER NOT NULL, state_json TEXT NOT NULL, sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_twin_nodes (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, node_kind TEXT NOT NULL,
+    label TEXT NOT NULL, state_json TEXT NOT NULL, provenance_json TEXT NOT NULL,
+    confidence TEXT NOT NULL, authoritative_system TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS p9_simulations (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, title TEXT NOT NULL,
+    assumptions_json TEXT NOT NULL, scenarios_json TEXT NOT NULL,
+    outcomes_json TEXT NOT NULL, uncertainty_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p9_objectives_org_status ON p9_objectives(organization_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_p9_nodes_objective_status ON p9_graph_nodes(objective_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_p9_events_objective ON p9_events(objective_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_p9_model_version ON p9_model_assets(organization_id, model_id, version);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_p9_plugin_version ON p9_plugins(organization_id, name, version);
 CREATE TABLE IF NOT EXISTS requirements (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id), body TEXT NOT NULL, acceptance_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL REFERENCES requirements(id), title TEXT NOT NULL, status TEXT NOT NULL, repository TEXT NOT NULL, base_ref TEXT NOT NULL, policy_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS task_steps (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), ordinal INTEGER NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
