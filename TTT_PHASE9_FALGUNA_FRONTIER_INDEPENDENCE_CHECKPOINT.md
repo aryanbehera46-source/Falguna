@@ -2,7 +2,9 @@
 
 **Date:** 2026-10-03
 
-**Status:** **PHASE 9 IN PROGRESS — NOT FINAL ACCEPTANCE**
+**Status:** **PHASE 9 — FINAL ACCEPTANCE**
+
+**Final acceptance:** See `TTT_PHASE9_FINAL_ACCEPTANCE_REPORT.md`. The accepted classification is `PRIMARY_INTERNAL_BUILDER_READY_WITH_EXTERNAL_AUDIT`. Final implementation commit: `dc32397`; the final acceptance/report commit follows this checkpoint update. No Phase 10 work is authorized or included.
 
 **Branch:** `phase9/falguna-frontier-independence-v1`
 
