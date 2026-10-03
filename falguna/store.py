@@ -115,6 +115,12 @@ class StateStore:
         # traced to a company objective", fully backward compatible.
         "wf_tasks": [("venture_id", "TEXT"), ("co_objective_id", "TEXT")],
         "missions": [("venture_id", "TEXT"), ("co_objective_id", "TEXT")],
+        "p8_network_profiles": [("review_status", "TEXT"), ("review_reason", "TEXT"), ("reviewed_by_identity_id", "TEXT")],
+        "p8_matches": [("review_status", "TEXT"), ("review_reason", "TEXT"), ("reviewed_by_identity_id", "TEXT")],
+        "p8_opportunity_applications": [("review_reason", "TEXT"), ("reviewed_by_identity_id", "TEXT")],
+        "p8_assignments": [("reassignment_reason", "TEXT")],
+        "p8_governance_events": [("decision_reason", "TEXT")],
+        "p8_product_signals": [("review_reason", "TEXT"), ("reviewed_by_identity_id", "TEXT")],
         "media_brands": [("venture_id", "TEXT")],
         # TTT Group OS / Company Orchestrator v2 (Section 18: Boardroom v2) --
         # every Boardroom topic can now carry a structured link to the

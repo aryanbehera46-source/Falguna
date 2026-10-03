@@ -119,6 +119,7 @@ from .phase6_partner import CommercialRiskService, CustomerVerificationService
 from .phase6_financial_flows import (CommissionReleaseService, CommercialEconomicsService, PayableService,
                                      RefundService, SubscriptionService)
 from .site_auth import StaffAuthService
+from .ecosystem import BLG_STAGES, EcosystemError, EcosystemService, ROUTING_MODES
 from .customer_portal import CustomerPortalService
 from .customer_context import CustomerContextService
 from .whatsapp_admin import resolve_configured_whatsapp_provider
@@ -638,6 +639,15 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                 identity = identities_found[0]
                 return self._json({"organization_id": identity["organization_id"], "role": identity["role"],
                                    "display_name": identity["display_name"], "csrf_token": session["csrf_token"]})
+            if path == "/api/p8/operator":
+                context = self._commercial_context(store)
+                if context is None:
+                    return
+                try:
+                    identity = CommercialIdentityStore(store, control.audit).authorize(context, "ecosystem:manage", context.organization_id)
+                    return self._json(EcosystemService(store, control.audit).operator_snapshot(identity["organization_id"]))
+                except CommercialSecurityError as exc:
+                    return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             if path.startswith("/api/p6/"):
                 context = self._commercial_context(store)
                 if context is None:
@@ -1571,6 +1581,54 @@ class TTTHQHandler(BaseHTTPRequestHandler):
                             payable_id = path.split("/")[4]
                             return self._json(PayableService(store, control.audit, identities).mark_execution_ready(context, payable_id))
                     except CommercialSecurityError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+                if path.startswith("/api/p8/"):
+                    context = self._commercial_context(store, mutate=True)
+                    if context is None:
+                        return
+                    identities = CommercialIdentityStore(store, control.audit)
+                    try:
+                        identity = identities.authorize(context, "ecosystem:manage", context.organization_id)
+                        service = EcosystemService(store, control.audit)
+                        actor = identity["id"]
+                        if path.startswith("/api/p8/routes/") and path.endswith("/decide"):
+                            return self._json(service.decide_route(path.split("/")[4], body.get("mode", ""), actor, body.get("reason", "")))
+                        if path.startswith("/api/p8/profiles/") and path.endswith("/review"):
+                            return self._json(service.review_profile(path.split("/")[4], context.organization_id, actor,
+                                body.get("action", ""), body.get("reason", ""), body.get("evidence")))
+                        if path.startswith("/api/p8/matches/") and path.endswith("/review"):
+                            return self._json(service.decide_match(path.split("/")[4], context.organization_id, actor,
+                                bool(body.get("accepted")), body.get("reason", "")))
+                        if path.startswith("/api/p8/applications/") and path.endswith("/review"):
+                            return self._json(service.review_application(path.split("/")[4], context.organization_id, actor,
+                                body.get("action", ""), body.get("reason", "")))
+                        if path.startswith("/api/p8/applications/") and path.endswith("/assign"):
+                            application_id = path.split("/")[4]
+                            application = store.get("p8_opportunity_applications", application_id)
+                            opportunity = store.get("p8_opportunities", application["opportunity_id"]) if application else None
+                            if not opportunity or opportunity["organization_id"] != context.organization_id:
+                                raise EcosystemError("application is outside the operator organization")
+                            return self._json({"id": service.assign(application_id, actor, body.get("scope", ""),
+                                body.get("evidence") or [], bool(body.get("customer_contact_allowed")))}, HTTPStatus.CREATED)
+                        if path.startswith("/api/p8/assignments/") and path.endswith("/reassign"):
+                            return self._json({"id": service.reassign(path.split("/")[4], body.get("replacement_application_id", ""),
+                                context.organization_id, actor, body.get("reason", ""), body.get("evidence") or [])}, HTTPStatus.CREATED)
+                        if path.startswith("/api/p8/blg/") and path.endswith("/advance"):
+                            engagement_id = path.split("/")[4]
+                            engagement = store.get("p8_blg_engagements", engagement_id)
+                            if not engagement or engagement["organization_id"] != context.organization_id:
+                                raise EcosystemError("engagement is outside the operator organization")
+                            return self._json(service.advance_blg(engagement_id, body.get("to_stage", ""), actor, body.get("evidence") or []))
+                        if path == "/api/p8/governance":
+                            return self._json({"id": service.create_governance_event(context.organization_id, body.get("event_type", ""),
+                                body.get("severity", ""), body.get("evidence") or [], actor, body.get("profile_id"), body.get("opportunity_id"))}, HTTPStatus.CREATED)
+                        if path.startswith("/api/p8/governance/") and path.endswith("/decide"):
+                            return self._json(service.decide_governance(path.split("/")[4], context.organization_id, actor,
+                                body.get("action", ""), body.get("reason", "")))
+                        if path.startswith("/api/p8/product-signals/") and path.endswith("/review"):
+                            return self._json(service.review_product_signal(path.split("/")[4], context.organization_id, actor,
+                                body.get("action", ""), body.get("reason", "")))
+                    except (CommercialSecurityError, EcosystemError) as exc:
                         return self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
                 if path == "/api/ask-falguna":
                     message = str(body.get("message") or "").strip()
@@ -3329,6 +3387,7 @@ Ask Falguna
 <button class="navitem" data-view="orchDecisions">Unified Decisions</button>
 <button class="navitem" data-view="orchAlerts">Operational Alerts</button>
 <button class="navitem" data-view="coordinatorRecommendations">Executive Coordinator</button>
+<button class="navitem" data-view="p8Ecosystem">Ecosystem Review</button>
 <details class="navexec" data-exec="briefing" open>
 <summary class="navsec navsec-exec">Briefing<span class="chev" aria-hidden="true"></span></summary>
 <button class="navitem" data-view="coCeoV2">CEO Brief</button>
@@ -3575,6 +3634,19 @@ Ask Falguna
 <div class="section"><h2>Refunds &amp; Disputes</h2><div class="list" id="p6RefundList"></div></div>
 <div class="section"><h2>Subscriptions &amp; Payables</h2><div class="list" id="p6RecurringPayableList"></div></div>
 <div class="section"><h2>Fraud / Anti-diversion Review</h2><div class="list" id="p6RiskList"></div></div>
+</div>
+<div class="view" id="view-p8Ecosystem">
+<h1>Digital Business Ecosystem</h1>
+<div class="pageintro">Private TTT HQ operator control plane. FALGUNA recommendations remain advisory; every route, verification, match, application, assignment, risk and growth-stage decision is human-controlled and audited.</div>
+<div class="row"><div class="section" style="flex:1"><h2 id="p8IntakeCount">—</h2><div class="sub">Commercial intakes</div></div><div class="section" style="flex:1"><h2 id="p8AssignmentCount">—</h2><div class="sub">Assignments</div></div><div class="section" style="flex:1"><h2 id="p8SignalCount">—</h2><div class="sub">Product signals</div></div></div>
+<div class="section"><h2>Review inbox · intake and routing</h2><div class="sub">Original customer text and internal normalization are shown together. Route overrides require a reason.</div><div class="list" id="p8Intakes"></div></div>
+<div class="section"><h2>Provider verification</h2><div class="sub">Claims never become TTT verified without evidence. Suspension and termination remain explicit human actions.</div><div class="list" id="p8Profiles"></div></div>
+<div class="section"><h2>Explainable matching</h2><div class="list" id="p8Matches"></div></div>
+<div class="section"><h2>Partner applications and assignment</h2><div class="sub">Assignment preserves TTT customer ownership and always prohibits provider money collection.</div><div class="list" id="p8Applications"></div></div>
+<div class="section"><h2>Governance and risk</h2><div class="list" id="p8Governance"></div></div>
+<div class="section"><h2>Business Launch &amp; Growth</h2><div class="list" id="p8Blg"></div></div>
+<div class="section"><h2>Opportunity and product signals</h2><div class="list" id="p8Signals"></div></div>
+<div class="section"><h2>Evidence-only ecosystem analytics</h2><div class="list" id="p8Analytics"></div></div>
 </div>
 <div class="view" id="view-ccBudgets">
 <h1>Budgets</h1>
@@ -4385,7 +4457,7 @@ const $=id=>document.getElementById(id);
 let _apiInflight=0;function _setApiLoading(on){_apiInflight+=on?1:-1;if(_apiInflight<0)_apiInflight=0;const bar=$('globalLoadingBar');if(!bar)return;bar.classList.toggle('active',_apiInflight>0)}async function api(url,options){_setApiLoading(true);try{const r=await fetch(url,options);const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error||'Request failed'),{data:j});return j}finally{_setApiLoading(false)}}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let FALGUNA_URL='http://127.0.0.1:8765';
-const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,p6Finance:loadP6Finance,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,csServices:loadCsServices,csFoundations:loadCsFoundations,csIntakes:loadCsIntakes,csProjects:loadCsProjects,csDisputes:loadCsDisputes,csCapabilities:loadCsCapabilities,csCapacity:loadCsCapacity,csOutcomes:loadCsOutcomes,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
+const rhLoaders={commandCenter:loadCommandCenter,tlOverview:loadTlOverview,tlStrategies:loadTlStrategies,tlPaperPortfolio:loadTlPaperPortfolio,tlRiskGraveyard:loadTlRiskGraveyard,ccGoals:loadCcGoals,ccKpis:loadCcKpis,ccLedger:loadCcLedger,p6Finance:loadP6Finance,p8Ecosystem:loadP8Ecosystem,ccCash:loadCcCash,ccBudgets:loadCcBudgets,ccCapital:loadCcCapital,ccDeptPerf:loadCcDeptPerf,ccRiskRegister:loadCcRiskRegister,rhToday:loadRhToday,rhSalesManager:loadRhSalesManager,rhOpportunities:loadRhOpportunities,rhOutboundLeads:loadRhOutboundLeads,rhPipeline:loadRhPipeline,rhDeliveryEngine:loadRhDeliveryEngine,rhClients:loadRhClients,rhActiveJobs:loadRhActiveJobs,rhRevenue:loadRhRevenue,rhSettings:loadRhSettings,wfTasks:loadWfTasks,wfWorkflows:loadWfWorkflows,mediaBrands:loadMediaBrands,mediaContent:loadMediaContent,mediaPublications:loadMediaPublications,mediaExperiments:loadMediaExperiments,vsStudio:loadVsStudio,vsPipeline:loadVsPipeline,vsVentures:loadVsVentures,vsRisks:loadVsRisks,vsGraveyard:loadVsGraveyard,coHome:loadCoHome,coCeoV2:loadCoCeoV2,coObjectives:loadCoObjectives,coPlans:loadCoPlans,coPriorities:loadCoPriorities,coDeptObjectives:loadCoDeptObjectives,coResourceAllocation:loadCoResourceAllocation,coTimeline:loadCoTimeline,coDecisions:loadCoDecisions,coPolicies:loadCoPolicies,coOperatingReviews:loadCoOperatingReviews,pmPartners:loadPmPartners,pmPendingApprovals:loadPmPendingApprovals,pmSuspendedTerminated:loadPmSuspendedTerminated,pmReferrals:loadPmReferrals,pmDuplicateReview:loadPmDuplicateReview,pmAttributionReview:loadPmAttributionReview,pmCommissions:loadPmCommissions,pmPerformance:loadPmPerformance,csServices:loadCsServices,csFoundations:loadCsFoundations,csIntakes:loadCsIntakes,csProjects:loadCsProjects,csDisputes:loadCsDisputes,csCapabilities:loadCsCapabilities,csCapacity:loadCsCapacity,csOutcomes:loadCsOutcomes,needsAryan:loadNeedsAryan,communications:loadCommunications,boardroom:loadBoardroom,orchWorkflows:loadOrchWorkflows,orchDecisions:loadOrchDecisions,orchAlerts:loadOrchAlerts,coordinatorRecommendations:loadCoordinatorRecommendations};
 document.querySelectorAll('.navitem[data-view]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.navitem[data-view]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('view-'+b.dataset.view).classList.add('active');if(rhLoaders[b.dataset.view])rhLoaders[b.dataset.view]().catch(e=>{})});
 function openNavGroupFor(btn){
 document.querySelectorAll('.navgroup,.navexec').forEach(x=>x.classList.remove('has-active'));
@@ -4638,6 +4710,31 @@ $('p6RiskList').innerHTML=p6Items(risks.items,r=>`<div class="item"><h3>${esc(r.
 document.querySelectorAll('#p6ApprovalList .p6-verify').forEach(b=>b.onclick=async()=>{await p6Api(`/api/p6/approvals/${b.dataset.id}/verify`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadP6Finance()});
 document.querySelectorAll('#p6ApprovalList .p6-approve').forEach(b=>b.onclick=async()=>{if(!confirm('Confirm Aryan final approval? This authorizes the sandbox workflow only; it does not move money.'))return;await p6Api(`/api/p6/approvals/${b.dataset.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await loadP6Finance()});
 }catch(error){const message=`Commercial finance unavailable: ${error.message||error}`;['p6ReconciliationList','p6ApprovalList','p6CommissionList','p6RefundList','p6RecurringPayableList','p6RiskList'].forEach(id=>$(id).innerHTML=`<div class="empty">${esc(message)}</div>`)}
+}
+const P8_ROUTES=['DIRECT_TTT_DELIVERY','TTT_ADVISORY','PARTNER_OR_SPECIALIST_COORDINATION','PROVIDER_OR_VENDOR_SOURCING','REFERRAL_OR_MEDIATION','PRODUCT_OR_SAAS_FIT','BUSINESS_LAUNCH_AND_GROWTH','LICENSED_PROFESSIONAL_REQUIRED','UNSUPPORTED'];
+const P8_STAGES=['MARKET_RESEARCH','VALIDATION','BUSINESS_MODEL','POSITIONING_BRANDING','TECHNOLOGY_OPERATIONS','LAUNCH','ACQUISITION','ANALYTICS','GROWTH','EXPANSION'];
+function p8Reason(label){const reason=prompt(label+' — reason/evidence note:');return reason&&reason.trim()}
+async function p8Post(path,payload){return p6Api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})}
+async function loadP8Ecosystem(){
+try{const d=await p6Api('/api/p8/operator'),a=d.analytics||{};$('p8IntakeCount').textContent=a.intakes||0;$('p8AssignmentCount').textContent=a.assignments||0;$('p8SignalCount').textContent=a.product_signals||0;
+const routes=Object.fromEntries((d.routes||[]).map(r=>[r.intake_id,r]));
+$('p8Intakes').innerHTML=p6Items(d.intakes,i=>{const r=routes[i.id];return `<div class="item"><h3>${esc(i.original_message)}</h3><div>${esc(i.normalized_meaning)}</div><div class="meta"><span>${esc(i.status)}</span><span>${esc(i.category||'uncategorized')}</span><span>${esc(i.industry||'industry unknown')}</span><span>${esc(i.geography||'geography unknown')}</span><span>${esc(i.preferred_language||i.source_language||'language unknown')}</span></div><div class="sub">Risk: ${esc(i.risk_flags_json)} · Clarification: ${esc(i.clarification_questions_json)}</div>${r?`<div class="item"><strong>FALGUNA recommends ${esc(r.recommended_mode)}</strong><div>${esc((r.recommendation_reasons||[]).join(' · '))}</div><div class="sub">Uncertainty: ${esc((r.uncertainty||[]).join(' · ')||'none recorded')}</div>${r.review_status==='PENDING_HUMAN_REVIEW'?`<div class="actions"><select id="p8-route-${r.id}">${P8_ROUTES.map(x=>`<option${x===r.recommended_mode?' selected':''}>${x}</option>`).join('')}</select><button class="p8Route" data-id="${r.id}">Record decision</button></div>`:`<div class="meta"><span>Human decision: ${esc(r.decided_mode)}</span><span>${esc(r.decision_reason)}</span></div>`}</div>`:'<div class="sub">No route recommendation recorded.</div>'}</div>`},'No commercial intake requires review.');
+$('p8Profiles').innerHTML=p6Items(d.profiles,p=>`<div class="item"><h3>${esc(p.display_name)} · ${esc(p.profile_type)}</h3><div class="meta"><span>${esc(p.status)}</span><span>${esc(p.verification_level)}</span><span>${esc(p.commercial_relationship)}</span><span>${esc((p.geography||[]).join(', '))}</span><span>${esc((p.languages||[]).join(', '))}</span></div><div>${esc((p.capabilities||[]).map(c=>c.capability_tag+' ('+c.evidence_status+')').join(' · '))}</div><div class="sub">Evidence: ${esc(JSON.stringify(p.verification_evidence||[]))} · Conflicts: ${esc((p.conflict_disclosures||[]).join(', ')||'none disclosed')}</div><div class="actions">${['APPROVE','REJECT','NEEDS_MORE_EVIDENCE','SUSPEND','TERMINATE'].map(x=>`<button class="secondary p8Profile" data-id="${p.id}" data-action="${x}">${x.replaceAll('_',' ')}</button>`).join('')}</div></div>`,'No provider profiles recorded.');
+$('p8Matches').innerHTML=p6Items(d.matches,m=>`<div class="item"><h3>${m.eligible?'Eligible':'Not eligible'} · profile ${esc(m.profile_id)}</h3><div>${esc((m.reasons||[]).join(' · ')||'No positive reason recorded')}</div><div class="sub">Gaps: ${esc((m.gaps||[]).join(' · ')||'none')} · Conflicts: ${esc((m.conflicts||[]).join(' · ')||'none')} · Economics review required</div><div class="meta"><span>${esc(m.review_status||'PENDING_HUMAN_REVIEW')}</span><span>${esc(m.review_reason||'')}</span></div><div class="actions"><button class="p8Match" data-id="${m.id}" data-accepted="true">Accept candidate</button><button class="secondary p8Match" data-id="${m.id}" data-accepted="false">Reject candidate</button></div></div>`,'No evaluated matches.');
+$('p8Applications').innerHTML=p6Items(d.applications,x=>`<div class="item"><h3>${esc(x.status)} · ${esc(x.statement)}</h3><div class="sub">Partner/profile ${esc(x.profile_id)} · Conflict disclosure: ${esc(x.conflict_disclosure||'none')}</div><div class="actions">${['APPROVE','REJECT','HOLD','REQUEST_INFO'].map(y=>`<button class="secondary p8Application" data-id="${x.id}" data-action="${y}">${y.replaceAll('_',' ')}</button>`).join('')}${['APPROVED','PENDING_TTT_REVIEW'].includes(x.status)?`<button class="p8Assign" data-id="${x.id}">Assign</button>`:''}</div></div>`,'No partner applications.');
+$('p8Governance').innerHTML=p6Items(d.governance_events,g=>`<div class="item"><h3>${esc(g.event_type)} · ${esc(g.severity)}</h3><div class="meta"><span>${esc(g.status)}</span><span>${esc(g.decided_action||'awaiting human decision')}</span></div>${g.status==='PENDING_HUMAN_REVIEW'?`<div class="actions">${['DISMISS','MONITOR','REQUEST_EVIDENCE','SUSPEND','TERMINATE','WITHHOLD_COMMISSION_REVIEW'].map(x=>`<button class="secondary p8Gov" data-id="${g.id}" data-action="${x}">${x.replaceAll('_',' ')}</button>`).join('')}</div>`:''}</div>`,'No governance events.');
+$('p8Blg').innerHTML=p6Items(d.blg_engagements,b=>{const n=P8_STAGES[P8_STAGES.indexOf(b.current_stage)+1];return `<div class="item"><h3>${esc(b.tier)} · ${esc(b.current_stage)}</h3><div class="sub">${esc(b.outcome_disclaimer)}</div>${n?`<div class="actions"><button class="p8Blg" data-id="${b.id}" data-stage="${n}">Advance to ${n.replaceAll('_',' ')}</button></div>`:''}</div>`},'No active Business Launch & Growth engagements.');
+$('p8Signals').innerHTML=p6Items(d.product_signals,s=>`<div class="item"><h3>${esc(s.signal_type)} · ${esc(s.problem_signature)}</h3><div class="meta"><span>${esc(s.evidence_count)} evidence item(s)</span><span>${esc(s.status)}</span></div><div class="actions">${['APPROVE','IGNORE','DEFER','REVIEW_LATER'].map(x=>`<button class="secondary p8Signal" data-id="${s.id}" data-action="${x}">${x.replaceAll('_',' ')}</button>`).join('')}</div></div>`,'No product signals recorded.');
+$('p8Analytics').innerHTML=`<div class="item"><h3>Routes</h3><div>${esc(JSON.stringify(a.routes_by_mode||{}))}</div></div><div class="item"><h3>Applications and growth funnel</h3><div>${esc(JSON.stringify(a.applications_by_state||{}))} · ${esc(JSON.stringify(a.blg_by_stage||{}))}</div></div><div class="item"><h3>Financial evidence boundary</h3><div>${esc(a.financial_note)}</div></div>`;
+document.querySelectorAll('.p8Route').forEach(b=>b.onclick=async()=>{const reason=p8Reason('Routing decision');if(!reason)return;await p8Post(`/api/p8/routes/${b.dataset.id}/decide`,{mode:$('p8-route-'+b.dataset.id).value,reason});await loadP8Ecosystem()});
+document.querySelectorAll('.p8Profile').forEach(b=>b.onclick=async()=>{const reason=p8Reason('Provider '+b.dataset.action);if(!reason)return;await p8Post(`/api/p8/profiles/${b.dataset.id}/review`,{action:b.dataset.action,reason});await loadP8Ecosystem()});
+document.querySelectorAll('.p8Match').forEach(b=>b.onclick=async()=>{const reason=p8Reason('Match review');if(!reason)return;await p8Post(`/api/p8/matches/${b.dataset.id}/review`,{accepted:b.dataset.accepted==='true',reason});await loadP8Ecosystem()});
+document.querySelectorAll('.p8Application').forEach(b=>b.onclick=async()=>{const reason=p8Reason('Application '+b.dataset.action);if(!reason)return;await p8Post(`/api/p8/applications/${b.dataset.id}/review`,{action:b.dataset.action,reason});await loadP8Ecosystem()});
+document.querySelectorAll('.p8Assign').forEach(b=>b.onclick=async()=>{const scope=p8Reason('Assignment scope');if(!scope)return;await p8Post(`/api/p8/applications/${b.dataset.id}/assign`,{scope,evidence:[{kind:'operator_approval',note:scope}],customer_contact_allowed:false});await loadP8Ecosystem()});
+document.querySelectorAll('.p8Gov').forEach(b=>b.onclick=async()=>{const reason=p8Reason('Governance '+b.dataset.action);if(!reason)return;await p8Post(`/api/p8/governance/${b.dataset.id}/decide`,{action:b.dataset.action,reason});await loadP8Ecosystem()});
+document.querySelectorAll('.p8Blg').forEach(b=>b.onclick=async()=>{const note=p8Reason('Stage evidence');if(!note)return;await p8Post(`/api/p8/blg/${b.dataset.id}/advance`,{to_stage:b.dataset.stage,evidence:[{kind:'operator_note',note}]});await loadP8Ecosystem()});
+document.querySelectorAll('.p8Signal').forEach(b=>b.onclick=async()=>{const reason=p8Reason('Product signal '+b.dataset.action);if(!reason)return;await p8Post(`/api/p8/product-signals/${b.dataset.id}/review`,{action:b.dataset.action,reason});await loadP8Ecosystem()});
+}catch(error){['p8Intakes','p8Profiles','p8Matches','p8Applications','p8Governance','p8Blg','p8Signals','p8Analytics'].forEach(id=>$(id).innerHTML=`<div class="empty">Ecosystem operator access unavailable: ${esc(error.message||error)}</div>`)}
 }
 async function loadCcCash(){const d=await api('/api/cc/cash-runway');
 $('ccCashActual').innerHTML=`<div class="item"><h3>Invoice cash in: $${esc(d.actual.invoice_cash_in_to_date)}</h3></div><div class="item"><h3>Ledger inflows: $${esc(d.actual.ledger_inflows_recorded)}</h3></div><div class="item"><h3>Ledger outflows: $${esc(d.actual.ledger_outflows_recorded)}</h3></div><div class="item"><h3>Combined cash estimate: $${esc(d.actual.combined_cash_estimate)}</h3><div class="meta"><span>${esc(d.actual.source)}</span></div></div>`;

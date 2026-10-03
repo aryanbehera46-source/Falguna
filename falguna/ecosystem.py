@@ -28,6 +28,11 @@ PROFILE_TYPES = {
 BLG_STAGES = ("MARKET_RESEARCH", "VALIDATION", "BUSINESS_MODEL", "POSITIONING_BRANDING",
               "TECHNOLOGY_OPERATIONS", "LAUNCH", "ACQUISITION", "ANALYTICS", "GROWTH", "EXPANSION")
 VERIFICATION_RANK = {"UNVERIFIED": 0, "SELF_REPORTED": 1, "EVIDENCE_REVIEWED": 2, "TTT_VERIFIED": 3}
+APPLICATION_ACTIONS = {"APPROVE": "APPROVED", "REJECT": "REJECTED", "HOLD": "ON_HOLD", "REQUEST_INFO": "INFO_REQUESTED"}
+GOVERNANCE_TYPES = {"DUPLICATE_CLAIM", "UNAUTHORIZED_PAYMENT_INSTRUCTION", "CIRCUMVENTION_INDICATOR",
+                    "FAKE_CAPABILITY_CONCERN", "SELF_REFERRAL_RELATED_PARTY", "CONFLICT_OF_INTEREST",
+                    "UNAUTHORIZED_SUBCONTRACTING", "CUSTOMER_DIVERSION_SIGNAL"}
+PRODUCT_SIGNAL_TYPES = {"REPEATED_PROBLEM", "REUSABLE_FOUNDATION", "PRODUCTIZED_SERVICE", "SAAS_API_TOOL", "STANDALONE_VENTURE"}
 
 
 class EcosystemError(ValueError):
@@ -106,6 +111,134 @@ class EcosystemService:
         self.audit.append("P8_ROUTE_DECIDED", {"route_id": route_id, "mode": mode, "actor": actor_identity_id})
         return result
 
+    def operator_snapshot(self, organization_id: str) -> Dict[str, Any]:
+        """One organization-scoped read model for the private HQ review inbox."""
+        intakes = list(reversed(self.store.list("p8_intakes", "organization_id=?", (organization_id,))))
+        intake_ids = {item["id"] for item in intakes}
+        routes = [r for r in reversed(self.store.list("p8_routing_decisions")) if r["intake_id"] in intake_ids]
+        profiles = list(reversed(self.store.list("p8_network_profiles", "organization_id=?", (organization_id,))))
+        profile_ids = {item["id"] for item in profiles}
+        opportunities = list(reversed(self.store.list("p8_opportunities", "organization_id=?", (organization_id,))))
+        opportunity_ids = {item["id"] for item in opportunities}
+        matches = [m for m in reversed(self.store.list("p8_matches")) if m["opportunity_id"] in opportunity_ids]
+        applications = [a for a in reversed(self.store.list("p8_opportunity_applications"))
+                        if a["opportunity_id"] in opportunity_ids and a["profile_id"] in profile_ids]
+        assignments = [a for a in reversed(self.store.list("p8_assignments")) if a["opportunity_id"] in opportunity_ids]
+        blg = list(reversed(self.store.list("p8_blg_engagements", "organization_id=?", (organization_id,))))
+        governance = list(reversed(self.store.list("p8_governance_events", "organization_id=?", (organization_id,))))
+        signals = list(reversed(self.store.list("p8_product_signals", "organization_id=?", (organization_id,))))
+        for row, fields in ((routes, ("recommendation_reasons_json", "evidence_json", "uncertainty_json")),
+                            (profiles, ("geography_json", "languages_json", "verification_evidence_json", "licensing_evidence_json", "conflict_disclosures_json")),
+                            (matches, ("reasons_json", "gaps_json", "conflicts_json")),
+                            (assignments, ("approval_evidence_json",)), (blg, ("regulated_boundaries_json",)),
+                            (governance, ("evidence_json",)), (signals, ("supporting_intake_ids_json",))):
+            for item in row:
+                for field in fields:
+                    item[field[:-5] if field.endswith("_json") else field] = _load(item.get(field), [])
+        for profile in profiles:
+            profile["capabilities"] = self.store.list("p8_profile_capabilities", "profile_id=?", (profile["id"],))
+        return {"organization_id": organization_id, "intakes": intakes, "routes": routes, "profiles": profiles,
+                "opportunities": opportunities, "matches": matches, "applications": applications,
+                "assignments": assignments, "blg_engagements": blg, "governance_events": governance,
+                "product_signals": signals, "analytics": self.analytics(organization_id)}
+
+    def review_profile(self, profile_id: str, organization_id: str, actor_identity_id: str, action: str,
+                       reason: str, evidence: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        profile = self.store.get("p8_network_profiles", profile_id)
+        if not profile or profile["organization_id"] != organization_id:
+            raise EcosystemError("profile is outside the operator organization")
+        if action not in {"APPROVE", "REJECT", "NEEDS_MORE_EVIDENCE", "SUSPEND", "TERMINATE"} or not reason.strip():
+            raise EcosystemError("valid profile review action and reason are required")
+        updates: Dict[str, Any] = {}
+        if action == "APPROVE":
+            if not evidence and not _load(profile["verification_evidence_json"], []):
+                raise EcosystemError("verification approval requires actual evidence")
+            updates["verification_level"] = "TTT_VERIFIED"
+            if evidence:
+                updates["verification_evidence_json"] = _json(evidence)
+        elif action in {"SUSPEND", "TERMINATE"}:
+            updates["status"] = "SUSPENDED" if action == "SUSPEND" else "TERMINATED"
+        elif action == "REJECT":
+            updates.update(status="REJECTED", verification_level="UNVERIFIED")
+        else:
+            updates["verification_level"] = "SELF_REPORTED"
+        updates.update(review_status=action, review_reason=reason.strip(), reviewed_by_identity_id=actor_identity_id)
+        self.store.update("p8_network_profiles", profile_id, **updates)
+        self.audit.append("P8_PROFILE_REVIEWED", {"profile_id": profile_id, "action": action, "reason": reason.strip(), "actor": actor_identity_id})
+        return self.store.get("p8_network_profiles", profile_id)
+
+    def review_application(self, application_id: str, organization_id: str, actor_identity_id: str,
+                           action: str, reason: str) -> Dict[str, Any]:
+        application = self.store.get("p8_opportunity_applications", application_id)
+        opportunity = self.store.get("p8_opportunities", application["opportunity_id"]) if application else None
+        if not application or not opportunity or opportunity["organization_id"] != organization_id:
+            raise EcosystemError("application is outside the operator organization")
+        if action not in APPLICATION_ACTIONS or not reason.strip():
+            raise EcosystemError("valid application review action and reason are required")
+        if application["status"] not in {"PENDING_TTT_REVIEW", "ON_HOLD", "INFO_REQUESTED"}:
+            raise EcosystemError("application is not reviewable")
+        self.store.update("p8_opportunity_applications", application_id, status=APPLICATION_ACTIONS[action],
+                          review_reason=reason.strip(), reviewed_by_identity_id=actor_identity_id)
+        self.audit.append("P8_APPLICATION_REVIEWED", {"application_id": application_id, "action": action, "reason": reason.strip(), "actor": actor_identity_id})
+        return self.store.get("p8_opportunity_applications", application_id)
+
+    def decide_match(self, match_id: str, organization_id: str, actor_identity_id: str,
+                     accepted: bool, reason: str) -> Dict[str, Any]:
+        match = self.store.get("p8_matches", match_id)
+        opportunity = self.store.get("p8_opportunities", match["opportunity_id"]) if match else None
+        if not match or not opportunity or opportunity["organization_id"] != organization_id or not reason.strip():
+            raise EcosystemError("organization-scoped match and reason are required")
+        if accepted and not match["eligible"]:
+            raise EcosystemError("an ineligible match cannot be accepted")
+        self.store.update("p8_matches", match_id, review_status="ACCEPTED" if accepted else "REJECTED",
+                          review_reason=reason.strip(), reviewed_by_identity_id=actor_identity_id)
+        self.audit.append("P8_MATCH_REVIEWED", {"match_id": match_id, "accepted": accepted, "reason": reason.strip(), "actor": actor_identity_id})
+        return self.store.get("p8_matches", match_id)
+
+    def create_governance_event(self, organization_id: str, event_type: str, severity: str,
+                                evidence: List[Dict[str, Any]], actor_identity_id: str,
+                                profile_id: Optional[str] = None, opportunity_id: Optional[str] = None) -> str:
+        if event_type not in GOVERNANCE_TYPES or severity not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"} or not evidence:
+            raise EcosystemError("valid governance type, severity and evidence are required")
+        if profile_id:
+            profile = self.store.get("p8_network_profiles", profile_id)
+            if not profile or profile["organization_id"] != organization_id:
+                raise EcosystemError("profile is outside the operator organization")
+        if opportunity_id:
+            opportunity = self.store.get("p8_opportunities", opportunity_id)
+            if not opportunity or opportunity["organization_id"] != organization_id:
+                raise EcosystemError("opportunity is outside the operator organization")
+        event_id = self.store.create("p8_governance_events", {"organization_id": organization_id, "event_type": event_type,
+            "profile_id": profile_id, "opportunity_id": opportunity_id, "severity": severity, "evidence_json": _json(evidence),
+            "status": "PENDING_HUMAN_REVIEW", "recommended_action": None, "decided_action": None,
+            "decided_by_identity_id": None, "decision_reason": None, "created_at": utcnow(), "updated_at": utcnow()})
+        self.audit.append("P8_GOVERNANCE_EVENT_CREATED", {"event_id": event_id, "actor": actor_identity_id})
+        return event_id
+
+    def decide_governance(self, event_id: str, organization_id: str, actor_identity_id: str,
+                          action: str, reason: str) -> Dict[str, Any]:
+        event = self.store.get("p8_governance_events", event_id)
+        if not event or event["organization_id"] != organization_id or event["status"] != "PENDING_HUMAN_REVIEW":
+            raise EcosystemError("reviewable organization-scoped governance event required")
+        if action not in {"DISMISS", "MONITOR", "REQUEST_EVIDENCE", "SUSPEND", "TERMINATE", "WITHHOLD_COMMISSION_REVIEW"} or not reason.strip():
+            raise EcosystemError("valid governance action and reason are required")
+        self.store.update("p8_governance_events", event_id, status="HUMAN_DECIDED", decided_action=action,
+                          decided_by_identity_id=actor_identity_id, decision_reason=reason.strip())
+        self.audit.append("P8_GOVERNANCE_DECIDED", {"event_id": event_id, "action": action, "reason": reason.strip(), "actor": actor_identity_id})
+        return self.store.get("p8_governance_events", event_id)
+
+    def review_product_signal(self, signal_id: str, organization_id: str, actor_identity_id: str,
+                              action: str, reason: str) -> Dict[str, Any]:
+        signal = self.store.get("p8_product_signals", signal_id)
+        if not signal or signal["organization_id"] != organization_id:
+            raise EcosystemError("product signal is outside the operator organization")
+        if action not in {"APPROVE", "IGNORE", "DEFER", "REVIEW_LATER"} or not reason.strip():
+            raise EcosystemError("valid product-signal action and reason are required")
+        self.store.update("p8_product_signals", signal_id, status=action, review_reason=reason.strip(),
+                          reviewed_by_identity_id=actor_identity_id)
+        self.audit.append("P8_PRODUCT_SIGNAL_REVIEWED", {"signal_id": signal_id, "action": action, "reason": reason.strip(), "actor": actor_identity_id})
+        return self.store.get("p8_product_signals", signal_id)
+
     def create_profile(self, *, organization_id: str, profile_type: str, display_name: str,
                        capabilities: List[Dict[str, Any]], geography: Iterable[str] = (),
                        languages: Iterable[str] = (), verification_level: str = "UNVERIFIED",
@@ -129,7 +262,8 @@ class EcosystemService:
             "licensing_status": licensing_status, "licensing_evidence_json": _json(list(licensing_evidence)),
             "commercial_relationship": commercial_relationship, "conflict_disclosures_json": _json(list(conflicts)),
             "maturity_tier": maturity_tier, "status": "ACTIVE", "completed_assignments": 0,
-            "qa_passes": 0, "disputes": 0, "policy_violations": 0, "created_at": now, "updated_at": now,
+            "qa_passes": 0, "disputes": 0, "policy_violations": 0, "review_status": "PENDING_HUMAN_REVIEW",
+            "review_reason": None, "reviewed_by_identity_id": None, "created_at": now, "updated_at": now,
         })
         for capability in capabilities:
             tag = str(capability.get("tag", "")).strip().lower()
@@ -196,7 +330,8 @@ class EcosystemService:
         match_id = self.store.create("p8_matches", {
             "opportunity_id": opportunity_id, "profile_id": profile_id, "eligible": int(hard_ok),
             "reasons_json": _json(reasons), "gaps_json": _json(gaps), "conflicts_json": _json(conflicts),
-            "economics_review_required": 1, "created_at": utcnow(), "updated_at": utcnow(),
+            "economics_review_required": 1, "review_status": "PENDING_HUMAN_REVIEW", "review_reason": None,
+            "reviewed_by_identity_id": None, "created_at": utcnow(), "updated_at": utcnow(),
         })
         return self.store.get("p8_matches", match_id)
 
@@ -230,24 +365,60 @@ class EcosystemService:
         return self.store.create("p8_opportunity_applications", {
             "opportunity_id": opportunity_id, "profile_id": profile_id, "statement": statement.strip(),
             "status": "PENDING_TTT_REVIEW", "conflict_disclosure": conflict_disclosure,
+            "review_reason": None, "reviewed_by_identity_id": None,
             "created_at": utcnow(), "updated_at": utcnow(),
         })
 
     def assign(self, application_id: str, actor_identity_id: str, scope: str,
                approval_evidence: List[Dict[str, Any]], customer_contact_allowed: bool = False) -> str:
         application = self.store.get("p8_opportunity_applications", application_id)
-        if not application or application["status"] != "PENDING_TTT_REVIEW" or not scope.strip() or not approval_evidence:
-            raise EcosystemError("pending application, scope and approval evidence are required")
+        if not application or application["status"] not in {"PENDING_TTT_REVIEW", "APPROVED"} or not actor_identity_id or not scope.strip() or not approval_evidence:
+            raise EcosystemError("reviewable application, TTT actor, scope and approval evidence are required")
+        opportunity = self.store.get("p8_opportunities", application["opportunity_id"])
+        profile = self.store.get("p8_network_profiles", application["profile_id"])
+        if not opportunity or not profile or opportunity["organization_id"] != profile["organization_id"]:
+            raise EcosystemError("assignment cannot cross organization boundaries")
+        if opportunity["assignment_state"] == "ASSIGNED":
+            raise EcosystemError("opportunity is already assigned; use an evidenced reassignment workflow")
         assignment_id = self.store.create("p8_assignments", {
             "opportunity_id": application["opportunity_id"], "profile_id": application["profile_id"],
             "application_id": application_id, "status": "ASSIGNED", "scope": scope.strip(),
             "customer_contact_allowed": int(customer_contact_allowed), "money_collection_allowed": 0,
             "assigned_by_identity_id": actor_identity_id, "approval_evidence_json": _json(approval_evidence),
+            "reassignment_reason": None,
             "created_at": utcnow(), "updated_at": utcnow(),
         })
         self.store.update("p8_opportunity_applications", application_id, status="ACCEPTED")
         self.store.update("p8_opportunities", application["opportunity_id"], assignment_state="ASSIGNED", application_state="CLOSED")
+        self.audit.append("P8_ASSIGNMENT_CREATED", {"assignment_id": assignment_id, "opportunity_id": application["opportunity_id"],
+                                                     "actor": actor_identity_id, "money_collection_allowed": False})
         return assignment_id
+
+    def reassign(self, assignment_id: str, replacement_application_id: str, organization_id: str,
+                 actor_identity_id: str, reason: str, approval_evidence: List[Dict[str, Any]]) -> str:
+        current = self.store.get("p8_assignments", assignment_id)
+        replacement = self.store.get("p8_opportunity_applications", replacement_application_id)
+        opportunity = self.store.get("p8_opportunities", current["opportunity_id"]) if current else None
+        profile = self.store.get("p8_network_profiles", replacement["profile_id"]) if replacement else None
+        if not current or current["status"] != "ASSIGNED" or not replacement or not opportunity or not profile:
+            raise EcosystemError("active assignment and replacement application are required")
+        if opportunity["organization_id"] != organization_id or profile["organization_id"] != organization_id:
+            raise EcosystemError("reassignment cannot cross organization boundaries")
+        if replacement["opportunity_id"] != current["opportunity_id"] or replacement["status"] != "APPROVED":
+            raise EcosystemError("replacement must be an approved application for the same opportunity")
+        if not actor_identity_id or not reason.strip() or not approval_evidence:
+            raise EcosystemError("TTT actor, reassignment reason and approval evidence are required")
+        self.store.update("p8_assignments", assignment_id, status="REASSIGNED", reassignment_reason=reason.strip())
+        new_id = self.store.create("p8_assignments", {"opportunity_id": current["opportunity_id"],
+            "profile_id": replacement["profile_id"], "application_id": replacement_application_id,
+            "status": "ASSIGNED", "scope": current["scope"], "customer_contact_allowed": current["customer_contact_allowed"],
+            "money_collection_allowed": 0, "assigned_by_identity_id": actor_identity_id,
+            "approval_evidence_json": _json(approval_evidence), "reassignment_reason": reason.strip(),
+            "created_at": utcnow(), "updated_at": utcnow()})
+        self.store.update("p8_opportunity_applications", replacement_application_id, status="ACCEPTED")
+        self.audit.append("P8_ASSIGNMENT_REASSIGNED", {"from_assignment_id": assignment_id, "to_assignment_id": new_id,
+                                                        "reason": reason.strip(), "actor": actor_identity_id})
+        return new_id
 
     def start_blg(self, intake_id: str, tier: str, regulated_boundaries: List[str]) -> str:
         intake = self.store.get("p8_intakes", intake_id)
@@ -277,6 +448,8 @@ class EcosystemService:
             "created_at": utcnow(), "updated_at": utcnow(),
         })
         self.store.update("p8_blg_engagements", engagement_id, current_stage=to_stage)
+        self.audit.append("P8_BLG_STAGE_ADVANCED", {"engagement_id": engagement_id, "from": engagement["current_stage"],
+                                                     "to": to_stage, "actor": actor_identity_id})
         return self.store.get("p8_blg_engagements", engagement_id)
 
     def analytics(self, organization_id: str) -> Dict[str, Any]:
@@ -287,8 +460,18 @@ class EcosystemService:
         by_route: Dict[str, int] = {}
         for decision in decisions:
             by_route[decision["decided_mode"]] = by_route.get(decision["decided_mode"], 0) + 1
+        applications = [a for o in opportunities for a in self.store.list("p8_opportunity_applications", "opportunity_id=?", (o["id"],))]
+        assignments = [a for o in opportunities for a in self.store.list("p8_assignments", "opportunity_id=?", (o["id"],))]
+        signals = self.store.list("p8_product_signals", "organization_id=?", (organization_id,))
+        blg = self.store.list("p8_blg_engagements", "organization_id=?", (organization_id,))
+        by_stage: Dict[str, int] = {}
+        for engagement in blg:
+            by_stage[engagement["current_stage"]] = by_stage.get(engagement["current_stage"], 0) + 1
         return {"intakes": len(intakes), "human_decided_routes": len(decisions), "routes_by_mode": by_route,
                 "open_opportunities": sum(o["status"] == "OPEN" for o in opportunities),
                 "active_profiles": sum(p["status"] == "ACTIVE" for p in profiles),
+                "applications_by_state": {state: sum(a["status"] == state for a in applications) for state in sorted({a["status"] for a in applications})},
+                "assignments": len(assignments), "product_signals": len(signals), "blg_by_stage": by_stage,
+                "disputes": sum(int(p.get("disputes") or 0) for p in profiles),
                 "collected_revenue": None, "known_costs": None, "contribution": None,
                 "financial_note": "Not computed without linked evidence; no CAC, margin or profit is inferred."}

@@ -144,5 +144,52 @@ class BusinessLaunchAndAnalyticsTests(EcosystemCase):
         self.assertIsNone(analytics["contribution"])
 
 
+class OperatorControlTests(EcosystemCase):
+    def test_profile_match_and_application_reviews_persist_human_rationale(self):
+        network = NetworkAndMarketplaceTests()
+        network.store, network.service = self.store, self.service
+        profile_id = network.profile()
+        opportunity_id = network.opportunity()
+        match = self.service.evaluate_match(opportunity_id, profile_id)
+        reviewed = self.service.review_profile(profile_id, "ttt", "owner", "APPROVE", "Portfolio evidence reviewed")
+        self.assertEqual(reviewed["review_status"], "APPROVE")
+        match = self.service.decide_match(match["id"], "ttt", "owner", True, "All evidenced requirements met")
+        self.assertEqual(match["review_status"], "ACCEPTED")
+        application_id = self.service.apply(opportunity_id, profile_id, "Available for scope")
+        application = self.service.review_application(application_id, "ttt", "owner", "APPROVE", "Qualified and conflict-free")
+        self.assertEqual(application["status"], "APPROVED")
+        self.assertEqual(application["review_reason"], "Qualified and conflict-free")
+
+    def test_governance_and_product_signal_decisions_remain_human_and_scoped(self):
+        event_id = self.service.create_governance_event("ttt", "CUSTOMER_DIVERSION_SIGNAL", "HIGH",
+            [{"kind": "synthetic"}], "owner")
+        decided = self.service.decide_governance(event_id, "ttt", "owner", "MONITOR", "Insufficient evidence for suspension")
+        self.assertEqual(decided["decision_reason"], "Insufficient evidence for suspension")
+        now = self.store.get("p8_governance_events", event_id)["created_at"]
+        signal_id = self.store.create("p8_product_signals", {"organization_id": "ttt", "problem_signature": "repeat need",
+            "supporting_intake_ids_json": "[]", "signal_type": "PRODUCTIZED_SERVICE", "evidence_count": 2,
+            "recommendation_only": 1, "status": "PENDING_HUMAN_REVIEW", "review_reason": None,
+            "reviewed_by_identity_id": None, "created_at": now, "updated_at": now})
+        signal = self.service.review_product_signal(signal_id, "ttt", "owner", "DEFER", "Need more demand evidence")
+        self.assertEqual(signal["status"], "DEFER")
+        with self.assertRaisesRegex(EcosystemError, "outside"):
+            self.service.review_product_signal(signal_id, "other-org", "owner", "APPROVE", "forged")
+
+    def test_reassignment_requires_same_opportunity_approved_application_and_reason(self):
+        network = NetworkAndMarketplaceTests(); network.store, network.service = self.store, self.service
+        first_profile, second_profile, opportunity_id = network.profile(), network.profile(display_name="Alternative"), network.opportunity()
+        for profile in (first_profile, second_profile):
+            self.service.evaluate_match(opportunity_id, profile)
+        first = self.service.apply(opportunity_id, first_profile, "First")
+        second = self.service.apply(opportunity_id, second_profile, "Alternative")
+        self.service.review_application(second, "ttt", "owner", "APPROVE", "Alternative reviewed")
+        assignment = self.service.assign(first, "owner", "Implement", [{"approval": "synthetic"}])
+        replacement = self.service.reassign(assignment, second, "ttt", "owner", "Capacity change", [{"approval": "owner"}])
+        self.assertEqual(self.store.get("p8_assignments", assignment)["status"], "REASSIGNED")
+        self.assertEqual(self.store.get("p8_assignments", replacement)["money_collection_allowed"], 0)
+        with self.assertRaisesRegex(EcosystemError, "cross organization"):
+            self.service.reassign(replacement, second, "other-org", "owner", "forged", [{"x": 1}])
+
+
 if __name__ == "__main__":
     unittest.main()

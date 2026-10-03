@@ -21,8 +21,8 @@ ROLE_PERMISSIONS = {
     "CUSTOMER": {"payments:read_own"},
     "PARTNER": {"partners:read_own", "leads:create"},
     "FINANCE_OPERATOR": {"payments:read", "payments:create", "finance:read", "approvals:make", "approvals:verify"},
-    "SALES_OPERATOR": {"payments:read", "payments:create", "opportunities:manage"},
-    "ADMIN": {"payments:read", "payments:create", "finance:read", "approvals:make", "approvals:verify", "identities:manage"},
+    "SALES_OPERATOR": {"payments:read", "payments:create", "opportunities:manage", "ecosystem:manage"},
+    "ADMIN": {"payments:read", "payments:create", "finance:read", "approvals:make", "approvals:verify", "identities:manage", "ecosystem:manage"},
     "OWNER": {"*"},
 }
 PAYMENT_KINDS = {"ONE_TIME", "MILESTONE", "SUBSCRIPTION", "RETAINER", "BANK_TRANSFER"}
