@@ -225,6 +225,8 @@ class FrontierControlPlane:
         node = self._org_row("p9_graph_nodes", node_id, organization_id)
         if node["status"] != "RUNNING" or node["lease_owner"] != worker_id:
             raise FrontierError("Only the active lease owner can complete this node")
+        if node.get("lease_expires_at") and node["lease_expires_at"] <= utcnow():
+            raise FrontierError("Worker lease expired before node completion")
         self.store.update("p9_graph_nodes", node_id, status="COMPLETED", output_json=_json(output), lease_owner=None, lease_expires_at=None)
         for item in evidence or []:
             self.record_evidence(node["objective_id"], organization_id, item.get("kind", "RESULT"), item.get("summary", ""), node_id=node_id, uri=item.get("uri"), sha256=item.get("sha256"), provenance=item.get("provenance"), confidence=item.get("confidence", "OBSERVED"))
@@ -240,10 +242,54 @@ class FrontierControlPlane:
         recovered = []
         for node in self.store.list("p9_graph_nodes", "organization_id=? AND status=?", (organization_id, "RUNNING")):
             if node.get("lease_expires_at") and node["lease_expires_at"] < now:
-                self.store.update("p9_graph_nodes", node["id"], status="READY", lease_owner=None, lease_expires_at=None, error="Worker lease expired; safely requeued")
-                self._event(node["objective_id"], organization_id, "NODE_RECOVERED", {"prior_worker": node.get("lease_owner")}, "recovery", node["id"])
-                recovered.append(node["id"])
+                if self.store.compare_and_set(
+                    "p9_graph_nodes", node["id"],
+                    {"status": "RUNNING", "lease_owner": node.get("lease_owner"), "lease_expires_at": node["lease_expires_at"]},
+                    status="READY", lease_owner=None, lease_expires_at=None,
+                    error="Worker lease expired; safely requeued",
+                ):
+                    self._event(node["objective_id"], organization_id, "NODE_RECOVERED", {"prior_worker": node.get("lease_owner")}, "recovery", node["id"])
+                    recovered.append(node["id"])
         return recovered
+
+    def heartbeat_node(self, node_id: str, organization_id: str, worker_id: str,
+                       lease_seconds: int = 300, checkpoint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Atomically renew an owned lease and durably retain a safe progress marker."""
+        node = self._org_row("p9_graph_nodes", node_id, organization_id)
+        if node["status"] != "RUNNING" or node["lease_owner"] != worker_id:
+            raise FrontierError("Only the active lease owner can heartbeat this node")
+        if node.get("lease_expires_at") and node["lease_expires_at"] <= utcnow():
+            raise FrontierError("Worker lease expired before heartbeat")
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=max(30, min(int(lease_seconds), 3600)))).isoformat()
+        if not self.store.compare_and_set(
+            "p9_graph_nodes", node_id,
+            {"status": "RUNNING", "lease_owner": worker_id},
+            lease_expires_at=expires,
+        ):
+            raise FrontierError("Worker lease changed before heartbeat")
+        self.store.update("p9_objectives", node["objective_id"], heartbeat_at=utcnow())
+        if checkpoint is not None:
+            self._event(node["objective_id"], organization_id, "NODE_CHECKPOINT", {
+                "checkpoint": checkpoint, "checkpoint_digest": _digest(checkpoint),
+            }, worker_id, node_id)
+        return self.store.get("p9_graph_nodes", node_id)
+
+    def fail_node(self, node_id: str, organization_id: str, worker_id: str,
+                  reason: str, retryable: bool = False, max_attempts: int = 2) -> Dict[str, Any]:
+        """Fail or boundedly requeue a node without losing its attempt history."""
+        node = self._org_row("p9_graph_nodes", node_id, organization_id)
+        if node["status"] != "RUNNING" or node["lease_owner"] != worker_id:
+            raise FrontierError("Only the active lease owner can fail this node")
+        retry = bool(retryable and int(node["attempt"] or 0) < max(1, min(int(max_attempts), 5)))
+        status = "READY" if retry else "FAILED"
+        self.store.update("p9_graph_nodes", node_id, status=status, error=str(reason)[:2000],
+                          lease_owner=None, lease_expires_at=None)
+        if not retry:
+            self.store.update("p9_objectives", node["objective_id"], status="FAILED",
+                              next_action="Review failed graph node")
+        self._event(node["objective_id"], organization_id, "NODE_REQUEUED" if retry else "NODE_FAILED",
+                    {"reason": str(reason)[:500], "attempt": node["attempt"]}, worker_id, node_id)
+        return self.store.get("p9_graph_nodes", node_id)
 
     def decide_approval(self, approval_id: str, organization_id: str, decision: str,
                         actor: str, reason: str) -> Dict[str, Any]:

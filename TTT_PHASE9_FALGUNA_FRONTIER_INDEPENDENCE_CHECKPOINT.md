@@ -1,4 +1,4 @@
-# TTT / FALGUNA Phase 9 — Frontier & Independence Checkpoint 1
+# TTT / FALGUNA Phase 9 — Frontier & Independence Checkpoint 2
 
 **Date:** 2026-10-03
 
@@ -103,3 +103,102 @@ This is the first integrated backbone, not final Phase 9 acceptance. The graph c
 ## External-action ledger
 
 No push, merge, deploy, DNS change, payment, refund, payout, provider activation, real customer/provider data, outreach, spending, live trade, company/legal action or Phase 10 work occurred.
+
+## Checkpoint 2 — durable worker execution and Independence Gate Trial #1
+
+**Starting commits:** accepted Phase 8 `e4bc28c3018d6e20aa9d4a69c31aaae7c826427a`; Phase 9 control plane `00fc866`; prior checkpoint `7679662c0ffc0ecc68ba448129ecb5a2d3c9a80f`.
+
+**Bounded outcome:** the Phase 9 graph now dispatches allowlisted node types into the existing FALGUNA `WorkerAdapter`, Research provider/store, and `PlaywrightBrowserRuntime` contracts. Trial #1 passed. This is one measured trial and does **not** establish FALGUNA independence or close Phase 9.
+
+### Files changed
+
+- `falguna/frontier.py` — lease heartbeat/checkpoint events and bounded node failure/requeue.
+- `falguna/frontier_workers.py` — governed dispatcher plus Code, Research, and local Browser QA adapters.
+- `tests/test_phase9_worker_integration.py` — focused integration and adversarial coverage.
+- `tests/phase9_independence_gate_trial1.py` — reproducible disposable Trial #1 runner.
+- `docs/phase9_independence_gate_trial_1.json` — machine-readable Trial #1 result.
+- This checkpoint record.
+
+### Worker adapter architecture
+
+- `GraphWorkerDispatcher` resolves only an explicitly registered node type, re-checks the objective's autonomy/action class, claims the durable node, writes a `NODE_CHECKPOINT`, executes the adapter, redacts secret-shaped output fields, and persists output plus graph evidence.
+- `CodeGraphWorker` invokes the existing `WorkerAdapter.execute()` contract, requires a real Git repository under an approved local root, records changed files and a diff digest, and rejects traversal/out-of-root paths.
+- `ResearchGraphWorker` invokes the existing search-provider seam and `ResearchStore`; stored sources include URL/title/date/provider provenance, retrieved text remains inert, and uncited synthesis is identified as non-evidentiary.
+- `BrowserGraphWorker` invokes the existing persisted browser session/runtime, accepts only a narrow QA action allowlist, and restricts this slice to `localhost`/`127.0.0.1` HTTP(S) origins. Browser status, URL, action count, and screenshot attachment ID become graph output/evidence.
+- Lease renewal is owner-only and atomic. Failures requeue only within a bounded attempt budget; exhausted nodes fail the objective. Expired leases keep prior attempts/checkpoints and return to `READY`.
+
+### Trial #1 definition and execution trace
+
+Disposable task: repair a seeded Python greeting defect and matching local HTML in a temporary Git repository, then test, visually verify, independently review, and create a candidate commit.
+
+Trace (durable state only, no hidden reasoning):
+
+1. Created one durable CODE objective and a seven-node dependency graph.
+2. INSPECT recorded repository HEAD and file inventory.
+3. RESEARCH stored a bounded Python primary-source record; instruction-like source text remained inert data.
+4. CODE was claimed, checkpointed at `REPO_INSPECTED`, and deliberately interrupted before any edit.
+5. A continuity bundle was created; the expired lease was recovered and re-leased to a replacement worker.
+6. The existing scripted `WorkerAdapter` repaired only `feature.py` and `index.html`; the side effect ran once.
+7. TEST passed the focused seeded assertion.
+8. BROWSER used the existing Playwright runtime against a temporary localhost server, loaded the repaired UI, extracted the result element, and captured screenshot evidence.
+9. SECURITY performed a separate deterministic scope/diff review and recorded the diff digest with no forbidden paths.
+10. REPORT created candidate commit `cb2b98878d1f2c63204e5183cd028404e44cd1ed` inside the disposable repository and confirmed it was clean.
+11. All seven nodes completed; a final continuity bundle and existing `INDEPENDENCE_GATE` benchmark record were produced.
+
+### Interruption/resume evidence
+
+- Objective and graph survived: yes.
+- Progress checkpoint survived: yes (`NODE_CHECKPOINT`).
+- Expired in-progress CODE lease recovered: yes (`NODE_RECOVERED`).
+- CODE attempts: 2 (interrupted lease plus replacement lease).
+- Completed nodes repeated: 0.
+- Code side effect executions: 1.
+- Duplicate resume of an already completed node: denied because the node was no longer `READY`.
+- Human intervention required: 0.
+
+### Independence Gate Trial #1 metrics
+
+- Result: **PASSED**.
+- Correct implementation: passed.
+- Focused tests: passed.
+- Browser evidence: passed and applicable.
+- Independent diff/security review: passed.
+- Interruption recovery: passed.
+- Unauthorized or consequential actions executed: 0.
+- Retry/re-lease count: 1.
+- Recorded final trial duration: 2.972 seconds on this machine.
+- Durable graph evidence records: 7.
+- Gate interpretation: `MEASURED_NOT_PROVEN`; one success is not repeatability or independence.
+- Machine-readable artifact: `docs/phase9_independence_gate_trial_1.json`.
+
+### Security/adversarial findings
+
+- Forged/unregistered worker types fail before a lease is claimed.
+- Cross-organization records retain the existing controlled-not-found boundary.
+- Stale/expired leases cannot heartbeat or complete. Recovery now compare-and-sets the exact owner and expiry, so it cannot overwrite a concurrent valid renewal.
+- Duplicate completed-node resume is rejected; the Trial #1 idempotency key and side-effect counter demonstrate no duplicate edit/commit path.
+- Prompt-like Research source text is persisted only as untrusted source data and cannot select tools or change authorization.
+- Code repository traversal/out-of-approved-root paths fail closed.
+- Browser navigation outside localhost fails closed, and consequential browser action classes remain blocked by `AutonomyPolicy`.
+- Secret/token/password/API-key-shaped output fields are redacted before graph output becomes user-visible evidence.
+- No concrete unresolved defect remains in this bounded integration slice. Two integration issues found while running the real trial were fixed: heartbeat-expiry test timing and the browser runtime's canonical `target` URL field. Security review also found and closed the stale-lease recovery race described above.
+
+### Validation totals
+
+- Python compilation: passed for all changed Python modules and tests.
+- Final focused Phase 9 worker/control-plane plus relevant Phase 8/7/6 regression invocation: **53 passed** in 41.316 seconds.
+- Trial #1: **7/7 graph nodes completed**, including real local Playwright execution and screenshot evidence.
+- Objectives UI was not changed, so no new desktop/mobile UI acceptance run was required for this slice.
+
+### Remaining Phase 9 work
+
+- Generalize dispatch beyond the bounded Trial #1 handlers and wire production construction/configuration into the running FALGUNA service.
+- Add crash-safe dispatcher scheduling/worker-process supervision rather than explicit single-node calls.
+- Run at least two additional materially different Independence Gate repo tasks before assessing repeatability; never infer independence from Trial #1.
+- Add real multi-agent execution beyond the existing role registry.
+- Build Work Mode execution inspection/control UI only after the production dispatcher seam is stable.
+- Strengthen project/decision/procedural memory and bind Studio artifacts to objective nodes.
+- Add permissioned plugin/tool execution, governed safe TTT actions, and cloud/offline resilience simulations.
+- Complete the remaining Phase 9 model-lab, desktop distribution, voice, data-workspace, self-building, and separately governed Markets-research acceptance items. No Phase 10 work may start.
+
+**Recommended next slice after usage reset:** productionize the dispatcher lifecycle (scheduler, restart reconciliation, heartbeat supervision, runtime construction) and run Independence Gate Trials #2 and #3 on different synthetic task shapes, with one process-level restart test and one policy-denial task. Stop again at a measured checkpoint; do not declare Phase 9 accepted unless the full existing acceptance bar is genuinely met.
