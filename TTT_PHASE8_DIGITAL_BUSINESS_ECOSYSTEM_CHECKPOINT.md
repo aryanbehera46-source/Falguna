@@ -2,7 +2,11 @@
 
 **Date:** 2026-10-02
 
-**Status:** **PHASE 8 IN PROGRESS — BACKBONE CHECKPOINT**
+**Status:** **PHASE 8 — FINAL ACCEPTANCE**
+
+**Superseded by:** `TTT_PHASE8_FINAL_ACCEPTANCE_REPORT.md` (2026-10-03)
+
+The backbone checkpoint below is retained as historical implementation context. Phase 8 was closed after completion of the private TTT HQ operator control plane, organization-scoped security hardening, focused and regression testing, and desktop/mobile browser acceptance. See the final acceptance report for the authoritative closure state, exact verification totals, limitations and external-action ledger.
 
 **Branch:** `phase8/digital-business-ecosystem-v1`
 
