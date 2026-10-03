@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.parse import urlparse
@@ -115,10 +116,13 @@ class GraphWorkerDispatcher:
 
     def __init__(self, control: FrontierControlPlane, organization_id: str,
                  handlers: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]],
-                 max_attempts: int = 2):
+                 max_attempts: int = 2, heartbeat_seconds: float = 10.0,
+                 lease_seconds: int = 60):
         self.control, self.organization_id = control, organization_id
         self.handlers = {str(key).upper(): value for key, value in handlers.items()}
         self.max_attempts = max(1, min(int(max_attempts), 5))
+        self.heartbeat_seconds = max(0.1, float(heartbeat_seconds))
+        self.lease_seconds = max(30, min(int(lease_seconds), 3600))
 
     def run_node(self, node_id: str, worker_id: str) -> Dict[str, Any]:
         node = self.control._org_row("p9_graph_nodes", node_id, self.organization_id)
@@ -129,14 +133,32 @@ class GraphWorkerDispatcher:
         handler = self.handlers.get(node["node_type"])
         if handler is None:
             raise WorkerDispatchError("No governed adapter is registered for this worker type")
-        claimed = self.control.claim_node(node_id, self.organization_id, worker_id)
+        claimed = self.control.claim_node(node_id, self.organization_id, worker_id, self.lease_seconds)
         inputs = json.loads(claimed.get("input_json") or "{}")
-        self.control.heartbeat_node(node_id, self.organization_id, worker_id, checkpoint={"stage": "DISPATCHED", "attempt": claimed["attempt"]})
+        self.control.heartbeat_node(node_id, self.organization_id, worker_id, self.lease_seconds,
+                                    checkpoint={"stage": "DISPATCHED", "attempt": claimed["attempt"]})
+        stopped = threading.Event()
+
+        def renew() -> None:
+            while not stopped.wait(self.heartbeat_seconds):
+                try:
+                    self.control.heartbeat_node(node_id, self.organization_id, worker_id,
+                                                self.lease_seconds)
+                except FrontierError:
+                    return
+
+        heartbeat = threading.Thread(target=renew, name=f"p9-heartbeat-{node_id[:8]}", daemon=True)
+        heartbeat.start()
         try:
-            output = _redact(handler(inputs, {"node_id": node_id, "objective_id": node["objective_id"], "worker_id": worker_id}))
+            output = _redact(handler(inputs, {"node_id": node_id, "objective_id": node["objective_id"],
+                                               "worker_id": worker_id,
+                                               "idempotency_key": inputs.get("side_effect_key") or node_id}))
             evidence = [{"kind": f"{node['node_type']}_RESULT", "summary": f"{node['node_type']} worker completed with durable output",
                          "provenance": {"adapter": handler.__class__.__name__, "attempt": claimed["attempt"]}}]
             return self.control.complete_node(node_id, self.organization_id, worker_id, output, evidence)
         except Exception as exc:
             self.control.fail_node(node_id, self.organization_id, worker_id, str(exc), retryable=True, max_attempts=self.max_attempts)
             raise
+        finally:
+            stopped.set()
+            heartbeat.join(timeout=self.heartbeat_seconds + 0.5)

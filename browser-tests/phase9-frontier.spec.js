@@ -18,8 +18,13 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
       await expect(page.getByText('Produce checkpoint and finished deliverables')).toBeVisible();
       await page.getByRole('button', { name: 'Save continuity bundle' }).click();
       await expect(page.getByText('Continuity bundle v1 saved')).toBeVisible();
+      await page.getByRole('button', { name: 'Pause' }).click();
+      await expect(page.getByText('PAUSED', { exact: true })).toBeVisible();
       await page.reload();
       await expect(page.getByText('Inspect context and constraints')).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Resume' })).toBeVisible();
+      await page.getByRole('button', { name: 'Resume' }).click();
+      await expect(page.getByRole('button', { name: 'Pause' })).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
       expect(errors).toEqual([]);
     });

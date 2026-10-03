@@ -319,6 +319,26 @@ class FrontierControlPlane:
         self.audit.append("P9_EMERGENCY_STOP", {"objective_id": objective_id, "organization_id": organization_id, "actor": actor, "reason": reason})
         return self.objective_bundle(objective_id, organization_id)
 
+    def pause_objective(self, objective_id: str, organization_id: str, actor: str) -> Dict[str, Any]:
+        objective = self._org_row("p9_objectives", objective_id, organization_id)
+        if objective["status"] in {"COMPLETED", "FAILED", "STOPPED"}:
+            raise FrontierError("Finished objectives cannot be paused")
+        # Running leases are allowed to finish; the supervisor will not claim
+        # another node while the objective is paused.
+        self.store.update("p9_objectives", objective_id, status="PAUSED",
+                          next_action="Resume when authorized")
+        self._event(objective_id, organization_id, "OBJECTIVE_PAUSED", {}, actor)
+        return self.objective_bundle(objective_id, organization_id)
+
+    def resume_objective(self, objective_id: str, organization_id: str, actor: str) -> Dict[str, Any]:
+        objective = self._org_row("p9_objectives", objective_id, organization_id)
+        if objective["status"] != "PAUSED":
+            raise FrontierError("Only paused objectives can be resumed")
+        self.store.update("p9_objectives", objective_id, status="READY",
+                          next_action="Continue ready graph nodes")
+        self._event(objective_id, organization_id, "OBJECTIVE_RESUMED", {}, actor)
+        return self.objective_bundle(objective_id, organization_id)
+
     def record_evidence(self, objective_id: str, organization_id: str, kind: str, summary: str,
                         node_id: Optional[str] = None, uri: Optional[str] = None,
                         sha256: Optional[str] = None, provenance: Optional[Dict[str, Any]] = None,
@@ -452,7 +472,9 @@ class FrontierControlPlane:
     def independence_summary(self, organization_id: str) -> Dict[str, Any]:
         runs = self.store.list("p9_benchmark_runs", "organization_id=? AND program=?", (organization_id, "INDEPENDENCE_GATE"))
         passed = [row for row in runs if row["passed"]]
-        return {"runs": len(runs), "passed": len(passed), "repeatable": len(passed) >= 3, "independent": len(passed) >= 3, "status": "MEASURED_NOT_PROVEN" if len(passed) < 3 else "GATE_SATISFIED"}
+        return {"runs": len(runs), "passed": len(passed), "repeatable": len(passed) >= 3,
+                "independent": False,
+                "status": "MEASURED_NOT_PROVEN" if len(passed) < 3 else "INDEPENDENCE_PROVEN_FOR_DEFINED_TASK_CLASSES"}
 
     def ttt_context_summary(self, organization_id: str) -> Dict[str, Any]:
         """Read-only governed view; never copies or mutates commercial state."""

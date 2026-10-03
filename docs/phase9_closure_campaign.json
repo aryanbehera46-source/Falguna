@@ -1,0 +1,68 @@
+{
+  "campaign": {
+    "duration_seconds": 4.658,
+    "external_actions": 0,
+    "real_data": false,
+    "status": "PASSED"
+  },
+  "process_restart": {
+    "attempts": 2,
+    "completed_nodes_repeated": 0,
+    "events": [
+      "OBJECTIVE_CREATED",
+      "NODE_ADDED",
+      "NODE_CLAIMED",
+      "NODE_CHECKPOINT",
+      "NODE_RECOVERED",
+      "NODE_CLAIMED",
+      "NODE_CHECKPOINT",
+      "NODE_COMPLETED"
+    ],
+    "first_pid_killed": 78192,
+    "meaningful_checkpoint_before_kill": true,
+    "side_effect_count": 1,
+    "stale_output_rejected": true,
+    "status": "PASSED"
+  },
+  "trial_2": {
+    "artifact": "Evidence-backed accessibility recommendation",
+    "classification": "MEASURED_NOT_PROVEN",
+    "inference_labeled": true,
+    "meaningful_browser_actions": 4,
+    "nodes": 4,
+    "parallel_worker_path": [
+      "browser-agent",
+      "security-agent"
+    ],
+    "sourced_evidence": 2,
+    "status": "PASSED",
+    "trial": "Independence Gate Trial #2",
+    "unauthorized_actions": 0
+  },
+  "trial_3": {
+    "classification": "INDEPENDENCE_PROVEN_FOR_DEFINED_TASK_CLASSES",
+    "code_attempts": 2,
+    "code_side_effect_count": 1,
+    "focused_tests": true,
+    "nodes": 6,
+    "parallel_workers": [
+      "qa",
+      "security"
+    ],
+    "status": "PASSED",
+    "trial": "Independence Gate Trial #3",
+    "unauthorized_actions": 0,
+    "working_tree_clean": true
+  },
+  "trial_4": {
+    "access": "READ_ONLY_GOVERNED",
+    "approval_bypass": false,
+    "artifact": "TTT internal review checklist",
+    "authoritative_system": "TTT_HQ",
+    "commercial_mutations": 0,
+    "nodes": 2,
+    "payment_denied": true,
+    "status": "PASSED",
+    "trial": "TTT Internal Operational Trial #4"
+  }
+}

@@ -1477,6 +1477,8 @@ class FalgunaHandler(BaseHTTPRequestHandler):
                 return self._frontier_checkpoint(path.split("/")[4])
             if path.startswith("/api/frontier/objectives/") and path.endswith("/stop"):
                 return self._frontier_stop(path.split("/")[4], body)
+            if path.startswith("/api/frontier/objectives/") and path.endswith(("/pause", "/resume")):
+                return self._frontier_lifecycle(path.split("/")[4], path.rsplit("/", 1)[-1])
             if path.startswith("/api/runs/") and path.endswith("/decision"):
                 run_id = path.split("/")[3]
                 control, store = open_control_plane(self.app_root)
@@ -1663,6 +1665,15 @@ class FalgunaHandler(BaseHTTPRequestHandler):
             return self._json(FrontierControlPlane(store, control.audit).emergency_stop(
                 objective_id, self._frontier_org(), "Aryan (local UI)", body.get("reason", "")
             ))
+        finally:
+            store.close()
+
+    def _frontier_lifecycle(self, objective_id, action):
+        control, store = open_control_plane(self.app_root)
+        try:
+            service = FrontierControlPlane(store, control.audit)
+            method = service.pause_objective if action == "pause" else service.resume_objective
+            return self._json(method(objective_id, self._frontier_org(), "Aryan (local UI)"))
         finally:
             store.close()
 
@@ -4721,13 +4732,14 @@ async function renderFrontierView(objectiveId){
       <button type="button" class="pill-btn" id="p9Back">&larr; Objectives</button>
       <div class="page-head"><div><div class="section-label">${esc(o.mode)} · ${esc(o.autonomy_level.replaceAll('_',' '))}</div><h1>${esc(o.title)}</h1><p class="lede">${esc(o.description)}</p></div><span class="status-pill ${esc(o.status.toLowerCase())}">${esc(o.status.replaceAll('_',' '))}</span></div>
       <div class="settings-note">Next: ${esc(o.next_action||'Not set')} · Last checkpoint: ${esc(o.last_checkpoint_at?timeAgo(o.last_checkpoint_at):'none')}</div>
-      <div class="mc-controls"><button type="button" class="action" id="p9Plan" ${nodes.length?'disabled':''}>Create execution graph</button><button type="button" class="pill-btn" id="p9Checkpoint">Save continuity bundle</button><button type="button" class="pill-btn danger" id="p9Stop" ${['STOPPED','COMPLETED'].includes(o.status)?'disabled':''}>Emergency stop</button></div>
+      <div class="mc-controls"><button type="button" class="action" id="p9Plan" ${nodes.length?'disabled':''}>Create execution graph</button><button type="button" class="pill-btn" id="p9Checkpoint">Save continuity bundle</button><button type="button" class="pill-btn" id="p9Pause" ${['STOPPED','COMPLETED','FAILED'].includes(o.status)?'disabled':''}>${o.status==='PAUSED'?'Resume':'Pause'}</button><button type="button" class="pill-btn danger" id="p9Stop" ${['STOPPED','COMPLETED'].includes(o.status)?'disabled':''}>Emergency stop</button></div>
       <div class="section-label">Execution graph</div><div class="result-list">${nodes.length?nodes.map(n=>`<div class="result-row" style="cursor:default"><div class="kind">${esc(n.node_type)} · ${esc(n.assigned_agent_id?'Assigned':'Unassigned')}</div><div class="title">${esc(n.title)}</div><div class="meta"><span class="status-pill ${esc(n.status.toLowerCase())}">${esc(n.status.replaceAll('_',' '))}</span> · Action policy: ${esc(n.approval_class)} · Dependencies: ${esc(String((n.dependencies||[]).length))}</div></div>`).join(''):'<div class="empty-state">No graph yet. Planning creates inspect, research, execution, QA, security and reporting nodes with real dependencies.</div>'}</div>
-      <div class="section-label">Evidence and approvals</div><div class="settings-list"><div>${esc(String((bundle.evidence||[]).length))} evidence item(s)</div><div>${esc(String((bundle.approvals||[]).filter(a=>a.status==='PENDING').length))} pending approval(s)</div><div>${esc(String((bundle.events||[]).length))} durable event(s)</div></div>
+      <div class="section-label">Evidence and approvals</div><div class="settings-list"><div>${esc(String((bundle.evidence||[]).length))} evidence item(s)${(bundle.evidence||[]).slice(-5).map(e=>`<br><b>${esc(e.kind)}</b> · ${esc(e.summary||'Recorded evidence')}`).join('')}</div><div>${esc(String((bundle.approvals||[]).filter(a=>a.status==='PENDING').length))} pending approval(s)${(bundle.approvals||[]).slice(-5).map(a=>`<br><b>${esc(a.action_class)}</b> · ${esc(a.status)}`).join('')}</div><div>${esc(String((bundle.events||[]).length))} durable event(s)${(bundle.events||[]).slice(-5).map(e=>`<br>${esc(e.event_type.replaceAll('_',' '))} · ${esc(timeAgo(e.created_at))}`).join('')}</div></div>
     </div>`;
     $('p9Back').onclick=()=>go('#/frontier');
     $('p9Plan').onclick=async()=>{try{await api(`/api/frontier/objectives/${objectiveId}/plan`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderFrontierView(objectiveId)}catch(err){showToast(err.message,{error:true})}};
     $('p9Checkpoint').onclick=async()=>{try{const b=await api(`/api/frontier/objectives/${objectiveId}/checkpoint`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});showToast(`Continuity bundle v${b.version} saved`);renderFrontierView(objectiveId)}catch(err){showToast(err.message,{error:true})}};
+    $('p9Pause').onclick=async()=>{try{const action=o.status==='PAUSED'?'resume':'pause';await api(`/api/frontier/objectives/${objectiveId}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});renderFrontierView(objectiveId)}catch(err){showToast(err.message,{error:true})}};
     $('p9Stop').onclick=async()=>{const ok=await confirmModal({title:'Emergency stop objective?',body:'Pending and running graph nodes will be cancelled. Completed evidence remains preserved.',confirmLabel:'Stop objective',danger:true});if(!ok)return;try{await api(`/api/frontier/objectives/${objectiveId}/stop`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'Emergency stop from local Falguna UI'})});renderFrontierView(objectiveId)}catch(err){showToast(err.message,{error:true})}};
     return;
   }
